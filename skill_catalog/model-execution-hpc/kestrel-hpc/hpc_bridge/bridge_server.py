@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Persistent local JSON bridge for Kestrel SSH/SFTP commands."""
+
+from __future__ import annotations
+
+import getpass
+import json
+import os
+import shutil
+import socket
+import time
+import traceback
+from pathlib import Path
+
+import paramiko
+
+
+ROOT = Path(__file__).resolve().parent
+COMMANDS = ROOT / "commands"
+PROCESSED = COMMANDS / "processed"
+RESULTS = ROOT / "results"
+HOST = "kestrel.nlr.gov"
+USER = "yhuang168"
+
+
+def ensure_dirs() -> None:
+    COMMANDS.mkdir(parents=True, exist_ok=True)
+    PROCESSED.mkdir(parents=True, exist_ok=True)
+    RESULTS.mkdir(parents=True, exist_ok=True)
+
+
+def connect() -> paramiko.SSHClient:
+    print(f"Connecting to {USER}@{HOST}")
+    password = getpass.getpass("Password+OTP: ")
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    sock = socket.create_connection((HOST, 22), timeout=30)
+    transport = paramiko.Transport(sock)
+    opts = transport.get_security_options()
+    if hasattr(opts, "digests") and "hmac-sha2-256" in opts.digests:
+        opts.digests = ["hmac-sha2-256"] + [d for d in opts.digests if d != "hmac-sha2-256"]
+    transport.connect(username=USER, password=password)
+    client._transport = transport  # Paramiko exposes no public setter for this path.
+    print("Connected. Watching JSON command files.")
+    return client
+
+
+def read_command(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def write_result(command_id: str, result: dict) -> None:
+    result = {"id": command_id, **result}
+    tmp = RESULTS / f"{command_id}.json.tmp"
+    final = RESULTS / f"{command_id}.json"
+    tmp.write_text(json.dumps(result, indent=2), encoding="utf-8", newline="\n")
+    tmp.replace(final)
+
+
+def move_processed(path: Path) -> None:
+    dest = PROCESSED / path.name
+    if dest.exists():
+        dest.unlink()
+    shutil.move(str(path), str(dest))
+
+
+def exec_command(client: paramiko.SSHClient, command: str, timeout: float | None) -> dict:
+    stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+    out = stdout.read().decode("utf-8", "replace")
+    err = stderr.read().decode("utf-8", "replace")
+    exit_status = stdout.channel.recv_exit_status()
+    return {
+        "status": "ok",
+        "exit_status": exit_status,
+        "stdout": out,
+        "stderr": err,
+    }
+
+
+def upload_file(client: paramiko.SSHClient, local_path: str, remote_path: str) -> dict:
+    local = Path(local_path).expanduser().resolve()
+    if not local.is_file():
+        raise FileNotFoundError(f"Local file not found: {local}")
+    sftp = client.open_sftp()
+    try:
+        sftp.put(str(local), remote_path)
+    finally:
+        sftp.close()
+    return {"status": "ok", "exit_status": 0, "stdout": f"uploaded {local} -> {remote_path}\n", "stderr": ""}
+
+
+def download_file(client: paramiko.SSHClient, remote_path: str, local_path: str) -> dict:
+    local = Path(local_path).expanduser().resolve()
+    local.parent.mkdir(parents=True, exist_ok=True)
+    sftp = client.open_sftp()
+    try:
+        sftp.get(remote_path, str(local))
+    finally:
+        sftp.close()
+    return {"status": "ok", "exit_status": 0, "stdout": f"downloaded {remote_path} -> {local}\n", "stderr": ""}
+
+
+def handle_command(client: paramiko.SSHClient, payload: dict) -> tuple[dict, bool]:
+    action = payload.get("action")
+    timeout = payload.get("timeout")
+    if timeout is not None:
+        timeout = float(timeout)
+    if action == "exec":
+        return exec_command(client, payload["command"], timeout), False
+    if action == "upload":
+        return upload_file(client, payload["local_path"], payload["remote_path"]), False
+    if action == "download":
+        return download_file(client, payload["remote_path"], payload["local_path"]), False
+    if action == "stop":
+        return {"status": "ok", "exit_status": 0, "stdout": "stopping bridge\n", "stderr": ""}, True
+    raise ValueError(f"Unsupported action: {action}")
+
+
+def main() -> int:
+    ensure_dirs()
+    client = connect()
+    should_stop = False
+    try:
+        while not should_stop:
+            for path in sorted(COMMANDS.glob("*.json")):
+                try:
+                    payload = read_command(path)
+                    command_id = payload.get("id") or path.stem
+                    print(f"Processing {path.name}: {payload.get('action')}")
+                    result, should_stop = handle_command(client, payload)
+                except Exception as exc:
+                    command_id = path.stem
+                    result = {
+                        "status": "error",
+                        "exit_status": 1,
+                        "stdout": "",
+                        "stderr": f"{exc}\n{traceback.format_exc()}",
+                    }
+                write_result(command_id, result)
+                move_processed(path)
+                if should_stop:
+                    break
+            time.sleep(0.25)
+    finally:
+        client.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

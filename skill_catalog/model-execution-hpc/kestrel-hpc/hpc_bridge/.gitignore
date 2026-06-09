@@ -1,0 +1,7 @@
+.venv/
+commands/
+results/
+__pycache__/
+*.py[cod]
+*.tmp
+*.log

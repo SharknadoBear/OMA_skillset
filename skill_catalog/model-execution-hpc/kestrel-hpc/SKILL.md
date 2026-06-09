@@ -71,13 +71,22 @@ Use this workflow when Codex needs several rounds of Kestrel navigation but the
 available terminal tool cannot securely answer an interactive Password+OTP
 prompt.
 
-The current working implementation lives in:
+The reusable bridge implementation is kept inside this skill directory:
 
 ```text
-c:\Users\huan111\OneDrive - PNNL\Desktop\WaterPACT_Local\4_Floc_MP_interaction\Workspace\Postprocessing\hpc_bridge
+kestrel-hpc\hpc_bridge
 ```
 
-It uses a local Python virtual environment with Paramiko.  Huan enters
+For the active local Codex skill install, that resolves to:
+
+```text
+C:\Users\huan111\.codex\skills\kestrel-hpc\hpc_bridge
+```
+
+The earlier WaterPACT-local bridge folder is only historical fallback context,
+not the primary reusable bridge location.
+
+The bridge uses a local Python virtual environment with Paramiko. Huan enters
 Password+OTP only in a visible PowerShell window; the bridge keeps one SSH
 session open and watches local JSON command files.  Codex writes commands to
 the local `commands/` folder, the bridge executes them on Kestrel, and results
@@ -87,9 +96,29 @@ are written locally to `results/`.  The bridge supports `exec`, `upload`,
 Start the bridge:
 
 ```powershell
-Set-Location "c:\Users\huan111\OneDrive - PNNL\Desktop\WaterPACT_Local\4_Floc_MP_interaction\Workspace\Postprocessing\hpc_bridge"
-powershell -ExecutionPolicy Bypass -File .\open_bridge.ps1
+Set-Location "C:\Users\huan111\.codex\skills\kestrel-hpc\hpc_bridge"
+.\start_bridge_window.ps1
 ```
+
+The first launch creates a local `.venv` and installs the bridge dependency
+from `requirements.txt`. Runtime folders such as `.venv/`, `commands/`, and
+`results/` are disposable session state and must not be committed.
+
+The checked-in staging copy lives at:
+
+```text
+Agent_skill_dev\skill_catalog\model-execution-hpc\kestrel-hpc\hpc_bridge
+```
+
+Use that repo copy as the source of truth when updating and publishing the
+skill, then sync the active `.codex` copy.
+
+When launching the bridge programmatically, prefer `start_bridge_window.ps1`,
+`run_bridge.cmd`, or `Start-Process -WorkingDirectory <bridge_dir> -FilePath
+powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass',
+'-File', '.\start_bridge_window.ps1'`. Avoid `powershell -Command
+"Set-Location <path>; ..."` for OneDrive paths because `OneDrive - PNNL` can
+be parsed incorrectly if quotes are stripped.
 
 Queue commands from Codex/local shell:
 
