@@ -12,6 +12,7 @@ external-data connector for FVCOM open-boundary workflows.
 
 - Packaged connector: `scripts/hycom_fetcher.py`
 - Packaged common helper: `scripts/grid_utils.py`
+- Package initializer: `scripts/__init__.py`
 - Remote source: HYCOM THREDDS/OPeNDAP, `https://tds.hycom.org/thredds/dodsC`
 
 ## Workflow
@@ -20,7 +21,8 @@ external-data connector for FVCOM open-boundary workflows.
 2. Use `HycomDownloadRequest` for new driver code instead of hard-coding
    monthly loops.
 3. Run examples from the skill `scripts/` directory or add that directory to
-   `PYTHONPATH` before importing `hycom_fetcher`.
+   `PYTHONPATH` before importing `hycom_fetcher`; for package-style use, add
+   the skill folder parent to `PYTHONPATH` and import through `scripts`.
 4. Call `plan_hycom_chunks(request)` before live downloads to review the
    experiment/month split, variables, bounding box, and chunk settings.
 5. For live tests, start with tiny time windows and bounding boxes.

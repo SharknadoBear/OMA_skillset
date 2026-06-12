@@ -12,6 +12,7 @@ external-data connector for FVCOM open-boundary workflows.
 
 - Packaged connector: `scripts/hycom_fetcher.py`
 - Packaged common helper: `scripts/grid_utils.py`
+- Package initializer: `scripts/__init__.py`
 - Remote source: HYCOM THREDDS/OPeNDAP, `https://tds.hycom.org/thredds/dodsC`
 
 ## Runtime Contract
@@ -20,7 +21,8 @@ external-data connector for FVCOM open-boundary workflows.
    Do not ask the user questions at runtime.
 2. Use `HycomDownloadRequest` as the execution interface.
 3. Run from the skill `scripts/` directory or add that directory to
-   `PYTHONPATH` before importing `hycom_fetcher`.
+   `PYTHONPATH` before importing `hycom_fetcher`; for package-style use, add
+   the skill folder parent to `PYTHONPATH` and import through `scripts`.
 4. Call `plan_hycom_chunks(request)` before download and persist or return the
    plan with the run evidence.
 5. Use `fetch_hycom(request)` for gridded fields and `fetch_hycom_points`
