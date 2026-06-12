@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM HYCOM OBC Codex"
+  short_description: "Interactive HYCOM OBC connector workflow"
+  default_prompt: "Use $fvcom-hycom-obc-codex to plan or test a HYCOM OPeNDAP download for FVCOM OBC work."

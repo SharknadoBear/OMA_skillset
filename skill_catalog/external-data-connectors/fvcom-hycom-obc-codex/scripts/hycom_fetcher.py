@@ -49,9 +49,10 @@ from __future__ import annotations
 import time
 import warnings
 import calendar
-from datetime import datetime, date
+from dataclasses import dataclass
+from datetime import datetime, date, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Sequence
 
 # Suppress pydap's DAP-protocol auto-detection warning (HYCOM uses https://
 # which triggers the warning; DAP2 is chosen automatically and works fine).
@@ -88,7 +89,13 @@ def _log(msg: str, log_path: Optional[Path] = None) -> None:
 
 import numpy as np
 import xarray as xr
-from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator, interp1d
+from scipy.interpolate import (
+    LinearNDInterpolator,
+    NearestNDInterpolator,
+    PchipInterpolator,
+    RegularGridInterpolator,
+    interp1d,
+)
 
 
 # ── Notebook progress display ─────────────────────────────────────────────────
@@ -239,6 +246,24 @@ HYCOM_THREDDS_BASE = "https://tds.hycom.org/thredds/dodsC"
 DEFAULT_LON_RANGE = (283.0, 288.0)
 DEFAULT_LAT_RANGE = (36.0,  41.0)
 
+# HYCOM OPeNDAP variable metadata. The u/v aliases mirror the previous OMI
+# knowledge-base reference, where product variables are water_u/water_v but
+# short u/v names also appear in the dimension metadata.
+HYCOM_2D_VARIABLES = {"surf_el"}
+HYCOM_3D_VARIABLES = {"water_temp", "salinity", "water_u", "water_v"}
+HYCOM_VARIABLE_ALIASES = {
+    "ssh": "surf_el",
+    "elev": "surf_el",
+    "elevation": "surf_el",
+    "temp": "water_temp",
+    "temperature": "water_temp",
+    "salt": "salinity",
+    "sal": "salinity",
+    "u": "water_u",
+    "v": "water_v",
+}
+HYCOM_PRODUCT_VARIABLES = HYCOM_2D_VARIABLES | HYCOM_3D_VARIABLES
+
 
 # ── Custom exception ──────────────────────────────────────────────────────────
 
@@ -255,6 +280,23 @@ class HycomDownloadError(RuntimeError):
 
 
 # ── Public routing helper ──────────────────────────────────────────────────────
+
+def _get_experiment_entry_for_date(target_date: date) -> dict:
+    """Return the selected HYCOM experiment registry entry for a date."""
+    candidates = [
+        e for e in HYCOM_EXPERIMENTS
+        if e["start"] <= target_date <= e["end"]
+    ]
+    if not candidates:
+        valid = (
+            f"{HYCOM_EXPERIMENTS[0]['start']} to {HYCOM_EXPERIMENTS[-1]['end']}"
+        )
+        raise ValueError(
+            f"No HYCOM experiment covers {target_date}. "
+            f"Supported range: {valid}."
+        )
+    return max(candidates, key=lambda e: e["start"])
+
 
 def get_experiment_for_date(target_date: date) -> tuple[str, str]:
     """
@@ -290,19 +332,7 @@ def get_experiment_for_date(target_date: date) -> tuple[str, str]:
     >>> get_experiment_for_date(date(2018, 10, 15))
     ('GLBu0.08', 'expt_93.0')
     """
-    candidates = [
-        e for e in HYCOM_EXPERIMENTS
-        if e["start"] <= target_date <= e["end"]
-    ]
-    if not candidates:
-        valid = (
-            f"{HYCOM_EXPERIMENTS[0]['start']} to {HYCOM_EXPERIMENTS[-1]['end']}"
-        )
-        raise ValueError(
-            f"No HYCOM experiment covers {target_date}. "
-            f"Supported range: {valid}."
-        )
-    best = max(candidates, key=lambda e: e["start"])
+    best = _get_experiment_entry_for_date(target_date)
     return best["product"], best["expt"]
 
 
@@ -312,6 +342,144 @@ def _build_base_url(target_date: date) -> str:
     """Return the THREDDS OPeNDAP base URL for the experiment covering *target_date*."""
     product, expt = get_experiment_for_date(target_date)
     return f"{HYCOM_THREDDS_BASE}/{product}/{expt}"
+
+
+@dataclass(frozen=True)
+class HycomDownloadRequest:
+    """Reusable HYCOM request for driver-code composition.
+
+    The request is intentionally small and serializable by ordinary Python
+    callers. Variables may use canonical HYCOM names or the short aliases
+    listed in HYCOM_VARIABLE_ALIASES.
+    """
+
+    start: str | date | datetime
+    end: str | date | datetime
+    variables: Sequence[str] = ("surf_el",)
+    lon_range: tuple[float, float] = DEFAULT_LON_RANGE
+    lat_range: tuple[float, float] = DEFAULT_LAT_RANGE
+    depth_range: Optional[tuple[float, float]] = None
+    max_depth: Optional[float] = 200.0
+    points: Optional[Any] = None
+    cache_dir: Optional[str | Path] = None
+    max_retries: int = 5
+    retry_delay: float = 10.0
+    backoff: float = 2.0
+    chunk_t: int = 20
+    ssh_chunk_t: int = 50
+    label: str = "hycom"
+
+
+def _normalize_hycom_variables(variables: Sequence[str] | str | None) -> list[str]:
+    """Normalize HYCOM variable aliases and validate supported product names."""
+    if variables is None:
+        raise ValueError("At least one HYCOM variable must be supplied.")
+    raw_variables = [variables] if isinstance(variables, str) else list(variables)
+    normalized: list[str] = []
+    for raw in raw_variables:
+        key = str(raw).strip()
+        if not key:
+            continue
+        canonical = HYCOM_VARIABLE_ALIASES.get(key.lower(), key)
+        if canonical not in HYCOM_PRODUCT_VARIABLES:
+            supported = ", ".join(sorted(HYCOM_PRODUCT_VARIABLES | set(HYCOM_VARIABLE_ALIASES)))
+            raise ValueError(f"Unsupported HYCOM variable '{raw}'. Supported: {supported}.")
+        if canonical not in normalized:
+            normalized.append(canonical)
+    if not normalized:
+        raise ValueError("At least one HYCOM variable must be supplied.")
+    return normalized
+
+
+def _parse_request_datetime(value: str | date | datetime, end_of_day: bool = False) -> datetime:
+    """Parse request datetimes; date-only end values include the whole day."""
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, date):
+        dt = datetime(value.year, value.month, value.day)
+        if end_of_day:
+            dt = dt + timedelta(days=1) - timedelta(seconds=1)
+    else:
+        text = str(value).strip()
+        date_only = len(text) == 10 and text[4] == "-" and text[7] == "-"
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if date_only and end_of_day:
+            dt = dt + timedelta(days=1) - timedelta(seconds=1)
+    if dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt.replace(microsecond=0)
+
+
+def _request_datetime_bounds(request: HycomDownloadRequest) -> tuple[datetime, datetime]:
+    """Return validated start/end datetimes for a request."""
+    start_dt = _parse_request_datetime(request.start, end_of_day=False)
+    end_dt = _parse_request_datetime(request.end, end_of_day=True)
+    if end_dt < start_dt:
+        raise ValueError(f"HYCOM request end {end_dt} precedes start {start_dt}.")
+    return start_dt, end_dt
+
+
+def _end_of_day(day: date) -> datetime:
+    return datetime(day.year, day.month, day.day, 23, 59, 59)
+
+
+def _month_end(dt: datetime) -> datetime:
+    last_day = calendar.monthrange(dt.year, dt.month)[1]
+    return datetime(dt.year, dt.month, last_day, 23, 59, 59)
+
+
+def _selected_experiment_window_end(
+    cursor: datetime,
+    limit: datetime,
+    entry: dict,
+) -> datetime:
+    """Shorten a window if HYCOM overlap priority changes on a later day."""
+    selected = (entry["product"], entry["expt"])
+    day = cursor.date() + timedelta(days=1)
+    while datetime(day.year, day.month, day.day) <= limit:
+        next_entry = _get_experiment_entry_for_date(day)
+        next_selected = (next_entry["product"], next_entry["expt"])
+        if next_selected != selected:
+            return datetime(day.year, day.month, day.day) - timedelta(seconds=1)
+        day += timedelta(days=1)
+    return limit
+
+
+def plan_hycom_chunks(request: HycomDownloadRequest) -> list[dict[str, Any]]:
+    """Dry-run chunk plan for a HYCOM request without touching the network.
+
+    The plan splits by month and HYCOM experiment boundary. Download chunking
+    inside each planned window is still controlled by request.chunk_t and
+    request.ssh_chunk_t.
+    """
+    variables = _normalize_hycom_variables(request.variables)
+    start_dt, end_dt = _request_datetime_bounds(request)
+    chunks: list[dict[str, Any]] = []
+
+    cursor = start_dt
+    while cursor <= end_dt:
+        entry = _get_experiment_entry_for_date(cursor.date())
+        candidate_end = min(end_dt, _end_of_day(entry["end"]), _month_end(cursor))
+        window_end = _selected_experiment_window_end(cursor, candidate_end, entry)
+        base_url = f"{HYCOM_THREDDS_BASE}/{entry['product']}/{entry['expt']}"
+        chunks.append({
+            "chunk_index": len(chunks) + 1,
+            "start": cursor.isoformat(sep=" ", timespec="seconds"),
+            "end": window_end.isoformat(sep=" ", timespec="seconds"),
+            "product": entry["product"],
+            "expt": entry["expt"],
+            "base_url": base_url,
+            "variables": tuple(variables),
+            "lon_range": tuple(request.lon_range),
+            "lat_range": tuple(request.lat_range),
+            "depth_range": request.depth_range,
+            "max_depth": request.max_depth,
+            "chunk_t": request.chunk_t,
+            "ssh_chunk_t": request.ssh_chunk_t,
+        })
+        cursor = window_end + timedelta(seconds=1)
+
+    return chunks
 
 
 def _retry(func, url: str, max_retries: int, retry_delay: float, backoff: float,
@@ -394,6 +562,53 @@ def _fetch_coords(
          f"grid: {result['lon'].size} lon \u00d7 {result['lat'].size} lat "
          f"\u00d7 {result['time'].size} time")
     return result
+
+
+def _fetch_depth_values(
+    base_url: str,
+    max_retries: int = 5,
+    retry_delay: float = 10.0,
+    backoff: float = 2.0,
+) -> np.ndarray:
+    """Fetch the HYCOM depth coordinate only."""
+    _log("  fetching depth coordinate")
+
+    def _open(url: str) -> np.ndarray:
+        ds = xr.open_dataset(url + "?depth", engine="pydap", decode_times=False)
+        depth_values = ds["depth"].values.astype(np.float64).copy()
+        ds.close()
+        return depth_values
+
+    return _retry(_open, base_url, max_retries, retry_delay, backoff)
+
+
+def _depth_index_range(
+    hycom_depth: np.ndarray,
+    depth_range: Optional[tuple[float, float]] = None,
+    max_depth: Optional[float] = 200.0,
+) -> tuple[int, int]:
+    """Return inclusive HYCOM depth indices for a requested depth constraint."""
+    if hycom_depth.size == 0:
+        raise ValueError("HYCOM depth coordinate is empty.")
+
+    if depth_range is not None:
+        z0, z1 = sorted((float(depth_range[0]), float(depth_range[1])))
+        mask = (hycom_depth >= z0) & (hycom_depth <= z1)
+        if not mask.any():
+            raise ValueError(f"No HYCOM depth levels found in [{z0}, {z1}] m.")
+        idx = np.where(mask)[0]
+        return int(idx[0]), int(idx[-1])
+
+    if max_depth is None:
+        return 0, int(len(hycom_depth) - 1)
+
+    depth_mask = hycom_depth <= float(max_depth)
+    if not depth_mask.any():
+        return 0, 0
+    depth1 = int(np.where(depth_mask)[0][-1])
+    if depth1 + 1 < len(hycom_depth):
+        depth1 += 1
+    return 0, depth1
 
 
 def _find_indices(
@@ -879,8 +1094,6 @@ def resample_to_fvcom_time(
 # Vertical:   depth-normalization + PchipInterpolator (extrap)
 # Masking:    sentinel > 1.26e29 → NaN; salt < 0 → NaN; temp < -20 → NaN
 
-from scipy.interpolate import PchipInterpolator, RegularGridInterpolator
-
 # HYCOM standard depth levels (metres, positive-down)
 HYCOM_Z_LEVELS = np.array([
     0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 25.0,
@@ -1015,6 +1228,14 @@ def fetch_hycom_ts_month(
 
     if variables is None:
         variables = ["water_temp", "salinity"]
+    variables = _normalize_hycom_variables(variables)
+    three_d_variables = [v for v in variables if v in HYCOM_3D_VARIABLES]
+    if len(three_d_variables) != len(variables):
+        raise ValueError(
+            "fetch_hycom_ts_month only supports 3-D HYCOM variables: "
+            f"{sorted(HYCOM_3D_VARIABLES)}"
+        )
+    variables = three_d_variables
 
     first_day = date(year, month, 1)
     last_day  = date(year, month, calendar.monthrange(year, month)[1])
@@ -1032,24 +1253,13 @@ def fetch_hycom_ts_month(
     _log("  fetching depth coordinate …")
 
     def _open_depth(url):
-        ds = xr.open_dataset(url + "?depth", engine="pydap", decode_times=False)
-        d = ds["depth"].values.astype(np.float64).copy()
-        ds.close()
-        return d
+        return _fetch_depth_values(url, max_retries, retry_delay, backoff)
 
-    hycom_depth = _retry(_open_depth, base_url, max_retries, retry_delay, backoff)
+    hycom_depth = _open_depth(base_url)
     _log(f"  depth: {len(hycom_depth)} levels, max={hycom_depth.max():.0f} m")
 
     # Determine depth index range (only download levels ≤ max_depth + buffer)
-    depth_mask = hycom_depth <= max_depth
-    if not depth_mask.any():
-        depth1 = 0
-    else:
-        depth1 = int(np.where(depth_mask)[0][-1])
-        # Add 1 buffer level if possible
-        if depth1 + 1 < len(hycom_depth):
-            depth1 += 1
-    depth0 = 0
+    depth0, depth1 = _depth_index_range(hycom_depth, max_depth=max_depth)
 
     t_start = np.datetime64(first_day.isoformat(), "s")
     t_end   = np.datetime64(last_day.isoformat(), "s") + np.timedelta64(23, "h")
@@ -1086,6 +1296,229 @@ def fetch_hycom_ts_month(
 
 
 # ── Public: horizontal interpolation T/S to OBC nodes ────────────────────────
+
+def _mask_hycom_variables(ds: xr.Dataset, variables: Sequence[str]) -> xr.Dataset:
+    """Apply common HYCOM fill-value and simple physical masks in place."""
+    for var in variables:
+        if var not in ds:
+            continue
+        arr = ds[var].values
+        arr[arr > _HYCOM_FILL_THRESHOLD] = np.nan
+        lower_name = var.lower()
+        if "salinity" in lower_name or "salt" in lower_name:
+            arr[arr < 0] = np.nan
+        if "temp" in lower_name:
+            arr[arr < -20] = np.nan
+        ds[var].values = arr
+    return ds
+
+
+def fetch_hycom(request: HycomDownloadRequest) -> xr.Dataset:
+    """Fetch arbitrary HYCOM variables over a bounded date and space request.
+
+    This driver composes the existing monthly/block helpers into a request-level
+    API that can be reused by notebooks, Codex sessions, Hermes drivers, and
+    FVCOM preprocessing scripts. It supports 2-D surf_el and 3-D temperature,
+    salinity, water_u, and water_v fields.
+    """
+    global _LOG_PATH
+
+    variables = _normalize_hycom_variables(request.variables)
+    variables_2d = [v for v in variables if v in HYCOM_2D_VARIABLES]
+    variables_3d = [v for v in variables if v in HYCOM_3D_VARIABLES]
+
+    if _LOG_PATH is None and request.cache_dir is not None:
+        _LOG_PATH = Path(request.cache_dir) / "hycom_fetch.log"
+
+    datasets: list[xr.Dataset] = []
+    for chunk in plan_hycom_chunks(request):
+        base_url = str(chunk["base_url"])
+        chunk_start = _parse_request_datetime(str(chunk["start"]))
+        chunk_end = _parse_request_datetime(str(chunk["end"]))
+
+        _log(
+            f"-- {request.label} chunk {chunk['chunk_index']}: "
+            f"{chunk['start']} to {chunk['end']} -> "
+            f"{chunk['product']}/{chunk['expt']}"
+        )
+
+        coords = _fetch_coords(
+            base_url,
+            request.max_retries,
+            request.retry_delay,
+            request.backoff,
+        )
+        t0, t1, lat0, lat1, lon0, lon1 = _find_indices(
+            coords,
+            request.lon_range,
+            request.lat_range,
+            np.datetime64(chunk_start, "s"),
+            np.datetime64(chunk_end, "s"),
+        )
+
+        pieces: list[xr.Dataset] = []
+        if variables_2d:
+            pieces.append(
+                _fetch_ssh_block(
+                    base_url,
+                    t0, t1,
+                    lat0, lat1,
+                    lon0, lon1,
+                    request.max_retries,
+                    request.retry_delay,
+                    request.backoff,
+                    chunk_t=request.ssh_chunk_t,
+                )
+            )
+
+        if variables_3d:
+            hycom_depth = _fetch_depth_values(
+                base_url,
+                request.max_retries,
+                request.retry_delay,
+                request.backoff,
+            )
+            depth0, depth1 = _depth_index_range(
+                hycom_depth,
+                depth_range=request.depth_range,
+                max_depth=request.max_depth,
+            )
+            pieces.append(
+                _fetch_ts_block(
+                    base_url,
+                    variables_3d,
+                    t0, t1,
+                    depth0, depth1,
+                    lat0, lat1,
+                    lon0, lon1,
+                    request.max_retries,
+                    request.retry_delay,
+                    request.backoff,
+                    chunk_t=request.chunk_t,
+                )
+            )
+
+        if not pieces:
+            raise ValueError("No HYCOM variables were selected for download.")
+        chunk_ds = pieces[0] if len(pieces) == 1 else xr.merge(pieces, compat="override")
+        datasets.append(_mask_hycom_variables(chunk_ds, variables))
+
+    return datasets[0] if len(datasets) == 1 else xr.concat(datasets, dim="time")
+
+
+def _coerce_points(points: Any) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """Normalize point/station inputs into names, lon array, and lat array."""
+    if points is None:
+        raise ValueError("points must be supplied for HYCOM point extraction.")
+
+    if isinstance(points, dict):
+        names: list[str] = []
+        lons: list[float] = []
+        lats: list[float] = []
+        for name, value in points.items():
+            if isinstance(value, dict):
+                lon = value.get("lon", value.get("longitude"))
+                lat = value.get("lat", value.get("latitude"))
+            else:
+                lon, lat = value
+            if lon is None or lat is None:
+                raise ValueError(f"Point '{name}' must include lon and lat.")
+            names.append(str(name))
+            lons.append(float(lon))
+            lats.append(float(lat))
+        return names, np.asarray(lons, dtype=np.float64), np.asarray(lats, dtype=np.float64)
+
+    arr = np.asarray(points, dtype=np.float64)
+    if arr.ndim == 1:
+        if arr.size != 2:
+            raise ValueError("A single point must be [lon, lat].")
+        arr = arr.reshape(1, 2)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        raise ValueError("points must be a dict or an array-like of [lon, lat] rows.")
+    names = [f"point_{i + 1}" for i in range(arr.shape[0])]
+    return names, arr[:, 0], arr[:, 1]
+
+
+def _normalize_target_lons_for_grid(target_lon: np.ndarray, remote_lon: np.ndarray) -> np.ndarray:
+    """Convert target longitudes to the remote HYCOM grid convention."""
+    result = target_lon.astype(np.float64).copy()
+    if np.all(remote_lon >= 0):
+        result = np.where(result < 0.0, result + 360.0, result)
+    else:
+        result = np.where(result > 180.0, result - 360.0, result)
+    return result
+
+
+def _interp_da_to_points(
+    da: xr.DataArray,
+    target_lon: np.ndarray,
+    target_lat: np.ndarray,
+) -> xr.DataArray:
+    """Interpolate one HYCOM DataArray to point locations."""
+    lon_arr = da["lon"].values.astype(np.float64)
+    lat_arr = da["lat"].values.astype(np.float64)
+    interp_pts = np.column_stack([target_lat, target_lon])
+
+    if "depth" in da.dims:
+        data = da.transpose("time", "depth", "lat", "lon").values
+        out = np.empty((data.shape[0], data.shape[1], len(target_lon)), dtype=np.float32)
+        for t in range(data.shape[0]):
+            for k in range(data.shape[1]):
+                rgi = RegularGridInterpolator(
+                    (lat_arr, lon_arr),
+                    data[t, k],
+                    method="linear",
+                    bounds_error=False,
+                    fill_value=np.nan,
+                )
+                out[t, k] = rgi(interp_pts).astype(np.float32)
+        return xr.DataArray(
+            out,
+            dims=("time", "depth", "point"),
+            coords={"time": da["time"], "depth": da["depth"]},
+            name=da.name,
+        )
+
+    data = da.transpose("time", "lat", "lon").values
+    out2d = np.empty((data.shape[0], len(target_lon)), dtype=np.float32)
+    for t in range(data.shape[0]):
+        rgi = RegularGridInterpolator(
+            (lat_arr, lon_arr),
+            data[t],
+            method="linear",
+            bounds_error=False,
+            fill_value=np.nan,
+        )
+        out2d[t] = rgi(interp_pts).astype(np.float32)
+    return xr.DataArray(
+        out2d,
+        dims=("time", "point"),
+        coords={"time": da["time"]},
+        name=da.name,
+    )
+
+
+def fetch_hycom_points(
+    request: HycomDownloadRequest,
+    points: Optional[Any] = None,
+) -> xr.Dataset:
+    """Fetch a bounded HYCOM block and interpolate requested variables to points."""
+    point_names, point_lon, point_lat = _coerce_points(points if points is not None else request.points)
+    ds_grid = fetch_hycom(request)
+    target_lon = _normalize_target_lons_for_grid(point_lon, ds_grid["lon"].values)
+
+    ds_points = xr.Dataset(
+        coords={
+            "point": np.asarray(point_names, dtype=object),
+            "lon": ("point", point_lon.astype(np.float64)),
+            "lat": ("point", point_lat.astype(np.float64)),
+        }
+    )
+    for var in _normalize_hycom_variables(request.variables):
+        if var in ds_grid:
+            ds_points[var] = _interp_da_to_points(ds_grid[var], target_lon, point_lat)
+    return ds_points
+
 
 def interp_ts_to_obc(
     ds_ts: xr.Dataset,
@@ -1224,6 +1657,10 @@ def interp_ts_to_obc(
             result["temp"] = obc_data
         elif "sal" in var.lower():
             result["salt"] = obc_data
+        elif var.lower() == "water_u":
+            result["u"] = obc_data
+        elif var.lower() == "water_v":
+            result["v"] = obc_data
         else:
             result[var] = obc_data
 
