@@ -26,6 +26,17 @@ The v1 Python skill implements the first, third, and fourth ideas directly. Feat
 - Use the topographic-length-scale form proportional to `depth / abs(grad(depth))`, scaled by `2*pi / slope_elements`, with `slope_elements` defaulting to 20.
 - Apply slope refinement away from very shallow water to avoid excessive response to noisy nearshore bathymetry.
 
+## Reproducible Gradation Limiting
+
+The paper gives the gradation definition and target values, but not a bit-for-bit implementation recipe. This skill therefore fixes the reproducible implementation:
+
+- Build the raw size field as the pointwise minimum of all active constraints: shoreline distance, feature size, depth caps, smoothed bathymetric slope, and channel refinement when available.
+- Limit neighbor transitions on the structured size grid with `h[j] <= h[i] + g * distance(i, j)` and the symmetric constraint.
+- Use projected meter distances for grid-neighbor spacing.
+- Use priority-queue lower-envelope propagation from fine cells so the bound is enforced without requiring hundreds of directional sweeps on large domains.
+- Never increase a cell size during gradation limiting. This preserves fine cells required by shoreline, feature-size, slope, channel, or depth-cap constraints.
+- After meshing, verify realized triangle gradation with adjacent triangle circumradii and centroid spacing.
+
 ## Interpretation for FVCOM
 
 For FVCOM preprocessing, the paper should guide where resolution is placed, while the FVCOM manual governs acceptance checks and `.2dm` boundary handling. A mesh should not be accepted solely because it is visually attractive; it must also pass angle, slope, area-change, connectivity, and open-boundary diagnostics.

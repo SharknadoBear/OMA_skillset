@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM CUSP Coastline"
+  short_description: "Fetch, monitor, and visually QA CUSP shoreline vectors for FVCOM preprocessing."
+  default_prompt: "Fetch and clip NOAA CUSP coastline data for a bbox, report progress during long runs, create FVCOM-ready vector outputs, make a satellite diagnostic map, and record the visual coastline QA decision."

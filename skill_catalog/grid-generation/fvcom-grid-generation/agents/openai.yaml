@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM Grid Generation"
-  short_description: "Build FVCOM-ready triangular 2DM meshes"
-  default_prompt: "Use $fvcom-grid-generation to generate and quality-check an FVCOM-ready 2DM mesh from local bathymetry."
+  short_description: "Build coastline-aware FVCOM 2DM meshes"
+  default_prompt: "Use $fvcom-grid-generation to prepare a coastline-aware FVCOM grid domain, stop for visual review, generate a 2DM mesh, and quality-check it."
