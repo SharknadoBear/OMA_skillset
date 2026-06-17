@@ -4,7 +4,7 @@ Use this reference when updating `fvcom-cudem-bathy` source logic.
 
 ## CUDEM Scope
 
-NOAA CUDEM is a U.S. coastal and territory product, not a global bathymetry source. V1 of this skill intentionally fails with a no-coverage report when a bbox is outside the indexed CUDEM tiles.
+NOAA CUDEM is a U.S. coastal and territory product, not a global bathymetry source. CUDEM-only commands intentionally fail with a no-coverage report when a bbox is outside the indexed CUDEM tiles. Fallback-enabled commands fill gaps by priority with NOAA Coastal Relief Models and then ETOPO 2022.
 
 NOAA describes CUDEM as 0.25-degree tiled coastal DEMs. The 1/9 arc-second product integrates topography and bathymetry; the coarser products are bathymetry/topobathymetry tiers used farther from the coast or in older regional products. CUDEM is distributed in NetCDF and GeoTIFF formats, with coordinates in decimal degrees, horizontal datum NAD83, vertical datum NAVD88 where provided, and vertical units in meters.
 
@@ -53,6 +53,59 @@ wash_pugetsound
 
 These folders expose HTTPS GeoTIFF tiles hosted under `noaa-nos-coastal-lidar-pds.s3.amazonaws.com`.
 
+## Fallback Sources
+
+Use this priority when the user requests fallback-enabled bathymetry:
+
+```text
+CUDEM -> NOAA Coastal Relief Model -> ETOPO 2022
+```
+
+NOAA CRM product page:
+
+```text
+https://www.ncei.noaa.gov/products/coastal-relief-model
+```
+
+Current 1 arc-second CRM THREDDS catalog:
+
+```text
+https://www.ngdc.noaa.gov/thredds/catalog/crm/cudem/catalog.xml
+```
+
+Legacy CRM catalog, including Southern Alaska:
+
+```text
+https://www.ngdc.noaa.gov/thredds/catalog/crm/catalog.xml
+```
+
+Important CRM details:
+
+- Current CRM volumes are advertised as 1 arc-second where available.
+- Southern Alaska CRM is available as `crm_southak.nc`, but it is 24 arc-second and uses 0-360 longitude coordinates.
+- CRM vertical references vary; current products can use EGM2008, while older products may use Sea Level or Mean Sea Level.
+- Do not treat CRM fallback as vertical-datum harmonization.
+
+ETOPO 2022 product page:
+
+```text
+https://www.ncei.noaa.gov/products/etopo-global-relief-model
+```
+
+ETOPO 2022 15 arc-second bedrock-elevation NetCDF THREDDS catalog:
+
+```text
+https://www.ngdc.noaa.gov/thredds/catalog/global/ETOPO2022/15s/15s_bed_elev_netcdf/catalog.xml
+```
+
+ETOPO 2022 15 arc-second surface-elevation NetCDF THREDDS catalog:
+
+```text
+https://www.ngdc.noaa.gov/thredds/catalog/global/ETOPO2022/15s/15s_surface_elev_netcdf/catalog.xml
+```
+
+Use ETOPO 2022 15 arc-second surface elevation as the global fallback for ordinary FVCOM bathymetry preprocessing. The `bed` catalog contains the bedrock-under-ice subset; it is not the complete global tile set. Outside ice sheets, ocean bathymetry is carried in the surface-elevation tiles.
+
 ## Tile Names
 
 Example names:
@@ -97,3 +150,11 @@ the CUDEM-covered patches. Instead:
    1/3 arc-second values.
 5. Compute positive-down depths and anomaly as
    `cudem_depth_m - original_depth_m`.
+
+For fallback-enabled large-mesh comparisons:
+
+1. Sample CUDEM first.
+2. Sample CRM only for nodes still missing bathymetry.
+3. Sample ETOPO 2022 only for nodes still missing after CUDEM and CRM.
+4. Preserve `best_source`, `best_source_resolution`, and `source_dataset` for every node.
+5. Report mixed-datum warnings in the summary and plots.

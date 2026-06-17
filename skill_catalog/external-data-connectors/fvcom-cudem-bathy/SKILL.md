@@ -1,24 +1,30 @@
 ---
 name: fvcom-cudem-bathy
-description: Fetch NOAA CUDEM bathymetry/topobathymetry for FVCOM preprocessing. Use when Codex needs to build a CUDEM tile index, download or subset CUDEM THREDDS/OPeNDAP NetCDF or Digital Coast GeoTIFF tiles for a bbox, export FVCOM-ready positive-down bathymetry NetCDF/PNG products, or interpolate CUDEM bathymetry to FVCOM grid nodes.
+description: Fetch CUDEM-first NOAA bathymetry/topobathymetry for FVCOM preprocessing, with explicit NOAA Coastal Relief Model and ETOPO 2022 fallback. Use when Codex needs to build CUDEM or combined bathymetry indexes, download or subset CUDEM THREDDS/OPeNDAP NetCDF or Digital Coast GeoTIFF tiles, fill gaps from CRM/ETOPO, export FVCOM-ready positive-down bathymetry NetCDF/PNG products, or interpolate/sample bathymetry to FVCOM grid nodes.
 ---
 
-# FVCOM CUDEM Bathy
+# FVCOM CUDEM-First Bathy
 
-Use this skill to fetch NOAA CUDEM bathymetry/topobathymetry and convert it into products that downstream FVCOM grid-generation skills can consume.
+Use this skill to fetch NOAA CUDEM bathymetry/topobathymetry and convert it into products that downstream FVCOM grid-generation skills can consume. When requested, use a provenance-preserving fallback stack:
+
+```text
+CUDEM -> NOAA Coastal Relief Model -> ETOPO 2022
+```
 
 ## Workflow
 
 1. Work in `Workspace/Preprocessing/fvcom-cudem-bathy` unless the user gives another run directory.
-2. Build or reuse a local `cudem_tile_index.json` before live data fetches.
-3. Use CUDEM-only coverage for v1. If no CUDEM tile covers the bbox, report no coverage instead of silently switching to another product.
-4. Prefer `resolution=auto`, which selects one resolution tier only: `tiled_19as`, then `tiled_13as`, then `tiled_1as`, then `tiled_3as`.
+2. Build or reuse a local `cudem_tile_index.json` for CUDEM-only commands, or `bathy_source_index.json` for CUDEM/CRM/ETOPO fallback commands.
+3. Use CUDEM as the preferred source. Only use CRM/ETOPO through explicit fallback-enabled commands or a user-requested `--fallback-policy`; never hide the fallback source.
+4. For CUDEM-only commands, prefer `resolution=auto`, which selects one resolution tier only: `tiled_19as`, then `tiled_13as`, then `tiled_1as`, then `tiled_3as`.
 5. Prefer OPeNDAP NetCDF tiles when available; use Digital Coast HTTPS GeoTIFF tiles for regions such as SE Alaska and Puget Sound that are not advertised in the root THREDDS tile catalog.
 6. Export both `elevation_m` and `depth_m`; define `depth_m = max(-elevation_m, 0)`.
-7. Preserve metadata: bbox, selected tiles, source URLs, source mode, datum notes, finite coverage, and NOAA citation.
-8. Make a PNG diagnostic map for every bbox fetch.
+7. Preserve metadata: bbox, selected tiles/sources, source URLs, source mode, datum notes, finite coverage, source coverage fractions, and NOAA citations.
+8. Make a PNG diagnostic map for every bbox fetch; fallback-enabled bbox fetches must also write a source-ID PNG.
 9. Interpolate to FVCOM nodes only as a separate CSV product. Do not rewrite `.2dm`, `*_grd.dat`, or depth files unless the user explicitly asks for that later.
-10. For large sparse meshes, prefer mesh-driven tile sampling over a full rectangular native-resolution mosaic.
+10. For large sparse meshes, prefer mesh-driven source sampling over a full rectangular native-resolution mosaic.
+11. Treat mixed-source products as modeling/preprocessing data. CUDEM, CRM, and ETOPO can use different vertical datums; record this clearly and do not claim vertical-datum harmonization.
+12. For ETOPO 2022, index both 15 arc-second `bed` tiles and the global 15 arc-second `surface` tiles. The `bed` catalog only covers ice-sheet bedrock tiles; the `surface` catalog provides the global fallback coverage needed for ordinary coastal domains.
 
 ## Commands
 
@@ -28,10 +34,22 @@ Build a tile index:
 python scripts\build_cudem_index.py --output Workspace\Preprocessing\fvcom-cudem-bathy\cache\cudem_tile_index.json
 ```
 
+Build a combined CUDEM/CRM/ETOPO source index:
+
+```powershell
+python scripts\build_bathy_source_index.py --output Workspace\Preprocessing\fvcom-cudem-bathy\cache\bathy_source_index.json
+```
+
 Fetch one bbox:
 
 ```powershell
 python scripts\fetch_cudem_bathy.py --bbox -75.35 38.75 -74.95 39.10 --run-dir Workspace\Preprocessing\fvcom-cudem-bathy\runs\delaware_bay --name delaware_bay --index Workspace\Preprocessing\fvcom-cudem-bathy\cache\cudem_tile_index.json
+```
+
+Fetch one bbox with CRM/ETOPO fallback:
+
+```powershell
+python scripts\fetch_bathy_sources.py --bbox -75.8150778 37.6409854 -73.5018316 40.2205458 --run-dir Workspace\Preprocessing\fvcom-cudem-bathy\runs\base_cd_bathy_fallback_smoke --name base_cd_bathy_fallback --index Workspace\Preprocessing\fvcom-cudem-bathy\cache\bathy_source_index.json --fallback-policy cudem-crm-etopo --target-spacing-arcsec 3
 ```
 
 Run required smoke tests:
@@ -52,6 +70,12 @@ Compare CUDEM directly against the large SE-AK mesh:
 python scripts\compare_seak_cudem.py --mesh-2dm Resources\SE_AK_merged_complete_v5_latlon.2dm --run-dir Workspace\Preprocessing\fvcom-cudem-bathy\runs\SE_AK --rebuild-index
 ```
 
+Sample CUDEM/CRM/ETOPO fallback sources directly to a large mesh:
+
+```powershell
+python scripts\compare_bathy_sources_to_mesh.py --mesh-2dm Resources\SE_AK_merged_complete_v5_latlon.2dm --run-dir Workspace\Preprocessing\fvcom-cudem-bathy\runs\seak_bathy_fallback_smoke --name seak_bathy_fallback --index Workspace\Preprocessing\fvcom-cudem-bathy\cache\bathy_source_index.json --fallback-policy cudem-crm-etopo
+```
+
 ## References
 
 - Read `references/noaa_cudem_sources.md` before changing source URLs, source priority, datum assumptions, tile parsing, or smoke-test regions.
@@ -59,6 +83,7 @@ python scripts\compare_seak_cudem.py --mesh-2dm Resources\SE_AK_merged_complete_
 ## Guardrails
 
 - Do not download whole CUDEM bulk folders. Fetch only intersecting tiles.
+- Do not download whole CRM or ETOPO files for ordinary runs; use OPeNDAP subsetting/windowed reads.
 - Keep `target_spacing_arcsec` coarse enough for smoke tests when using large HTTPS GeoTIFF tiles.
 - For large meshes, stream/read selected GeoTIFF windows and sample mesh nodes directly.
 - Treat CUDEM products as modeling/planning data, not navigation data.
