@@ -18,7 +18,9 @@ from .sources import (
     BathySourceRecord,
     SOURCE_ID,
     load_bathy_source_index,
+    native_resolution_m,
     select_sources,
+    source_sort_key,
 )
 from .tiles import TileRecord, bbox_intersects
 
@@ -206,6 +208,7 @@ def selected_bathy_sources(
     bbox: Sequence[float],
     *,
     fallback_policy: str = "cudem-crm-etopo",
+    resolution_policy: str = "source-priority",
 ) -> list[BathySourceRecord]:
     """Return generic bathymetry fallback sources intersecting a mesh bbox."""
 
@@ -213,11 +216,21 @@ def selected_bathy_sources(
         "cudem-only": ("cudem",),
         "cudem-crm": ("cudem", "crm"),
         "cudem-crm-etopo": ("cudem", "crm", "etopo"),
+        "cudem-nbs-crm-etopo": ("cudem", "nbs_bluetopo", "crm", "etopo"),
+        "all": ("cudem", "nbs_bluetopo", "crm", "etopo"),
     }.get(fallback_policy)
     if policy is None:
-        raise ValueError("fallback_policy must be cudem-only, cudem-crm, or cudem-crm-etopo")
+        raise ValueError(
+            "fallback_policy must be cudem-only, cudem-crm, cudem-crm-etopo, "
+            "or cudem-nbs-crm-etopo"
+        )
     records = load_bathy_source_index(index_path)
-    return select_sources(records, tuple(float(x) for x in bbox), source_names=policy)
+    return select_sources(
+        records,
+        tuple(float(x) for x in bbox),
+        source_names=policy,
+        resolution_policy=resolution_policy,
+    )
 
 
 def sample_sources_to_mesh(
@@ -225,18 +238,22 @@ def sample_sources_to_mesh(
     sources: Sequence[BathySourceRecord],
     *,
     progress: bool = True,
+    resolution_policy: str = "source-priority",
 ) -> dict[str, np.ndarray]:
-    """Sample CUDEM, CRM, and ETOPO sources to mesh nodes by priority."""
+    """Sample CUDEM, NBS BlueTopo, CRM, and ETOPO sources to mesh nodes."""
 
     n = mesh.lon.size
     best_elevation = np.full(n, np.nan, dtype=np.float64)
+    best_uncertainty = np.full(n, np.nan, dtype=np.float64)
+    best_contributor = np.full(n, "", dtype=object)
     best_source = np.full(n, "", dtype=object)
     best_source_resolution = np.full(n, np.nan, dtype=np.float64)
+    best_source_resolution_m = np.full(n, np.nan, dtype=np.float64)
     source_dataset = np.full(n, "", dtype=object)
     coverage_status = np.full(n, "no_source_coverage", dtype=object)
     warnings: list[str] = []
 
-    ordered = sorted(sources, key=lambda s: (s.priority, s.resolution_arcsec, s.name))
+    ordered = sorted(sources, key=lambda s: source_sort_key(s, resolution_policy=resolution_policy))
     for i, source in enumerate(ordered, start=1):
         idx = _nodes_in_source(mesh, source, unfilled=np.isnan(best_elevation))
         if idx.size == 0:
@@ -248,19 +265,25 @@ def sample_sources_to_mesh(
                 flush=True,
             )
         try:
-            values = sample_source_at_points(source, mesh.lon[idx], mesh.lat[idx])
+            sampled = sample_source_at_points_full(source, mesh.lon[idx], mesh.lat[idx])
         except Exception as exc:
             warning = f"{source.source_name}:{source.name}: {type(exc).__name__}: {exc}"
             warnings.append(warning)
             if progress:
                 print(f"  warning: {warning}", flush=True)
             continue
+        values = sampled["elevation"]
         valid = np.isfinite(values)
         if valid.any():
             assigned = idx[valid]
             best_elevation[assigned] = values[valid]
+            if "uncertainty" in sampled:
+                best_uncertainty[assigned] = sampled["uncertainty"][valid]
+            if "contributor" in sampled:
+                best_contributor[assigned] = sampled["contributor"][valid]
             best_source[assigned] = source.source_name
             best_source_resolution[assigned] = source.resolution_arcsec
+            best_source_resolution_m[assigned] = native_resolution_m(source)
             source_dataset[assigned] = source.name
             coverage_status[assigned] = "ok"
 
@@ -277,8 +300,11 @@ def sample_sources_to_mesh(
         "best_elevation_m": best_elevation,
         "best_depth_m": best_depth.astype(np.float64),
         "depth_anomaly_m": anomaly,
+        "best_uncertainty_m": best_uncertainty,
+        "best_contributor": best_contributor,
         "best_source": best_source,
         "best_source_resolution": best_source_resolution,
+        "best_source_resolution_m": best_source_resolution_m,
         "source_dataset": source_dataset,
         "coverage_status": coverage_status,
         "warnings": np.asarray(warnings, dtype=object),
@@ -288,13 +314,129 @@ def sample_sources_to_mesh(
 def sample_source_at_points(source: BathySourceRecord, lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
     """Sample one generic source at lon/lat points."""
 
+    return sample_source_at_points_full(source, lon, lat)["elevation"]
+
+
+def sample_source_at_points_full(
+    source: BathySourceRecord, lon: np.ndarray, lat: np.ndarray
+) -> dict[str, np.ndarray]:
+    """Sample one generic source and preserve optional source-specific bands."""
+
     if lon.size == 0:
-        return np.empty(0, dtype=np.float64)
+        return {
+            "elevation": np.empty(0, dtype=np.float64),
+            "uncertainty": np.empty(0, dtype=np.float64),
+            "contributor": np.empty(0, dtype=object),
+        }
+    if source.source_mode == "nbs_bluetopo_geotiff":
+        return sample_nbs_bluetopo_at_points(source, lon, lat)
     if source.source_mode == "https_geotiff":
-        return sample_geotiff_at_points(source.url, lon, lat)
+        return {
+            "elevation": sample_geotiff_at_points(source.url, lon, lat),
+            "uncertainty": np.full(lon.size, np.nan, dtype=np.float64),
+            "contributor": np.full(lon.size, "", dtype=object),
+        }
     if source.source_mode == "opendap_netcdf":
-        return sample_opendap_at_points(source, lon, lat)
+        return {
+            "elevation": sample_opendap_at_points(source, lon, lat),
+            "uncertainty": np.full(lon.size, np.nan, dtype=np.float64),
+            "contributor": np.full(lon.size, "", dtype=object),
+        }
     raise ValueError(f"Unsupported source_mode: {source.source_mode}")
+
+
+def sample_nbs_bluetopo_at_points(
+    source: BathySourceRecord, lon: np.ndarray, lat: np.ndarray
+) -> dict[str, np.ndarray]:
+    """Sample NOAA NBS BlueTopo GeoTIFF elevation/uncertainty/contributor bands."""
+
+    import rasterio
+    from rasterio.warp import transform as rio_transform
+    from rasterio.windows import bounds as window_bounds
+    from rasterio.windows import from_bounds
+
+    n = lon.size
+    out = {
+        "elevation": np.full(n, np.nan, dtype=np.float64),
+        "uncertainty": np.full(n, np.nan, dtype=np.float64),
+        "contributor": np.full(n, "", dtype=object),
+    }
+    if n == 0:
+        return out
+    last_error: Exception | None = None
+    for path in (source.url, f"/vsicurl/{source.url}"):
+        try:
+            with rasterio.Env(
+                CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif,.tiff",
+                GDAL_HTTP_MAX_RETRY="3",
+                GDAL_HTTP_RETRY_DELAY="2",
+            ):
+                with rasterio.open(path) as src:
+                    if src.crs is None:
+                        raise ValueError("BlueTopo tile has no CRS.")
+                    x, y = rio_transform("EPSG:4326", src.crs, lon.tolist(), lat.tolist())
+                    x_arr = np.asarray(x, dtype=np.float64)
+                    y_arr = np.asarray(y, dtype=np.float64)
+                    dx = abs(src.transform.a)
+                    dy = abs(src.transform.e)
+                    west = float(np.nanmin(x_arr)) - 2.0 * dx
+                    east = float(np.nanmax(x_arr)) + 2.0 * dx
+                    south = float(np.nanmin(y_arr)) - 2.0 * dy
+                    north = float(np.nanmax(y_arr)) + 2.0 * dy
+                    window = from_bounds(west, south, east, north, src.transform)
+                    window = window.round_offsets().round_lengths()
+                    if window.width < 2 or window.height < 2:
+                        return out
+                    elevation = _read_projected_geotiff_band(src, 1, window, x_arr, y_arr)
+                    out["elevation"] = elevation
+                    if src.count >= 2:
+                        out["uncertainty"] = _read_projected_geotiff_band(src, 2, window, x_arr, y_arr)
+                    if src.count >= 3:
+                        contributor = _read_projected_geotiff_band(src, 3, window, x_arr, y_arr)
+                        contributor_text = np.full(n, "", dtype=object)
+                        valid_contributor = np.isfinite(contributor)
+                        if valid_contributor.any():
+                            contributor_text[valid_contributor] = (
+                                np.round(contributor[valid_contributor]).astype(np.int64).astype(str)
+                            )
+                        out["contributor"] = contributor_text
+                    return out
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"Could not sample BlueTopo GeoTIFF {source.url}: {last_error}")
+
+
+def _read_projected_geotiff_band(src, band: int, window, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    from rasterio.windows import bounds as window_bounds
+
+    data = src.read(band, window=window, masked=True).astype(np.float64)
+    values = np.asarray(data.filled(np.nan), dtype=np.float64)
+    if src.nodata is not None:
+        values = np.where(values == src.nodata, np.nan, values)
+    left, bottom, right, top = window_bounds(window, src.transform)
+    height, width = values.shape
+    if width < 2 or height < 2:
+        return np.full(x.size, np.nan, dtype=np.float64)
+    x_coords = np.linspace(
+        left + (right - left) / (2 * width),
+        right - (right - left) / (2 * width),
+        width,
+    )
+    y_desc = np.linspace(
+        top - (top - bottom) / (2 * height),
+        bottom + (top - bottom) / (2 * height),
+        height,
+    )
+    y_coords = y_desc[::-1]
+    values = values[::-1, :]
+    interp = RegularGridInterpolator(
+        (y_coords, x_coords),
+        values,
+        method="linear",
+        bounds_error=False,
+        fill_value=np.nan,
+    )
+    return interp(np.column_stack([y, x]))
 
 
 def sample_opendap_at_points(source: BathySourceRecord, lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
@@ -453,6 +595,9 @@ def write_bathy_node_csv(result: dict[str, np.ndarray], path: str | Path) -> Pat
         "depth_anomaly_m",
         "best_source",
         "best_source_resolution",
+        "best_source_resolution_m",
+        "best_uncertainty_m",
+        "best_contributor",
         "source_dataset",
         "coverage_status",
     ]

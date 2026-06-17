@@ -1,4 +1,4 @@
-"""CUDEM-first bathymetry fetching with CRM and ETOPO gap filling."""
+"""CUDEM/NBS-first bathymetry fetching with CRM and ETOPO gap filling."""
 
 from __future__ import annotations
 
@@ -42,6 +42,7 @@ def fetch_bathy_bbox(
     run_dir: str | Path,
     name: str,
     fallback_policy: str = "cudem-crm-etopo",
+    resolution_policy: str = "source-priority",
     target_spacing_arcsec: float | None = 3.0,
     max_sources: int = 256,
     make_plot: bool = True,
@@ -51,7 +52,7 @@ def fetch_bathy_bbox(
     bbox = normalize_bbox(bbox)
     records = _load_records(index)
     source_names = _policy_sources(fallback_policy)
-    selected = select_sources(records, bbox, source_names=source_names)
+    selected = select_sources(records, bbox, source_names=source_names, resolution_policy=resolution_policy)
     if len(selected) > max_sources:
         raise RuntimeError(
             f"{len(selected)} sources intersect bbox, exceeding max_sources={max_sources}. "
@@ -74,20 +75,30 @@ def fetch_bathy_bbox(
     for source in selected:
         before = int(np.isfinite(elevation).sum())
         try:
-            lon, lat, values = read_source_window(
-                source, bbox=bbox, target_spacing_arcsec=spacing_arcsec
-            )
-            filled = burn_source_into_target(
-                target_lon,
-                target_lat,
-                elevation,
-                source_id,
-                source_resolution,
-                lon,
-                lat,
-                values,
-                source=source,
-            )
+            if source.source_mode == "nbs_bluetopo_geotiff":
+                filled = burn_nbs_points_into_target(
+                    target_lon,
+                    target_lat,
+                    elevation,
+                    source_id,
+                    source_resolution,
+                    source=source,
+                )
+            else:
+                lon, lat, values = read_source_window(
+                    source, bbox=bbox, target_spacing_arcsec=spacing_arcsec
+                )
+                filled = burn_source_into_target(
+                    target_lon,
+                    target_lat,
+                    elevation,
+                    source_id,
+                    source_resolution,
+                    lon,
+                    lat,
+                    values,
+                    source=source,
+                )
         except Exception as exc:
             filled = 0
             warnings.append(f"{source.source_name}:{source.name}: {type(exc).__name__}: {exc}")
@@ -118,8 +129,9 @@ def fetch_bathy_bbox(
         coords={"lat": target_lat.astype(np.float64), "lon": target_lon.astype(np.float64)},
         attrs={
             "title": f"CUDEM-first bathymetry fallback mosaic for {name}",
-            "summary": "FVCOM positive-down bathymetry with CUDEM, CRM, and ETOPO fallback.",
-            "source_priority": "CUDEM -> NOAA Coastal Relief Model -> ETOPO 2022",
+            "summary": "FVCOM positive-down bathymetry with CUDEM, NBS BlueTopo, CRM, and ETOPO fallback.",
+            "source_priority": "CUDEM -> NOAA NBS BlueTopo -> NOAA Coastal Relief Model -> ETOPO 2022",
+            "resolution_policy": resolution_policy,
             "source_legend": json.dumps(SOURCE_LABELS, sort_keys=True),
             "bbox_wsen": json.dumps(list(bbox)),
             "target_spacing_arcsec": spacing_arcsec,
@@ -150,6 +162,7 @@ def fetch_bathy_bbox(
         name=name,
         bbox=bbox,
         fallback_policy=fallback_policy,
+        resolution_policy=resolution_policy,
         spacing_arcsec=spacing_arcsec,
         elevation=elevation,
         source_id=source_id,
@@ -179,6 +192,47 @@ def read_source_window(
     if source.source_mode == "opendap_netcdf":
         return _read_opendap_source(source, bbox=bbox, target_spacing_arcsec=target_spacing_arcsec)
     raise ValueError(f"Unsupported source mode: {source.source_mode}")
+
+
+def burn_nbs_points_into_target(
+    target_lon: np.ndarray,
+    target_lat: np.ndarray,
+    target_elevation: np.ndarray,
+    target_source_id: np.ndarray,
+    target_source_resolution: np.ndarray,
+    *,
+    source: BathySourceRecord,
+) -> int:
+    """Sample one BlueTopo tile at currently empty target-grid cells and burn values."""
+
+    from .mesh_compare import sample_nbs_bluetopo_at_points
+
+    lon_mask = (target_lon >= source.west) & (target_lon <= source.east)
+    lat_mask = (target_lat >= source.south) & (target_lat <= source.north)
+    if not lon_mask.any() or not lat_mask.any():
+        return 0
+    current = target_elevation[np.ix_(lat_mask, lon_mask)]
+    empty = ~np.isfinite(current)
+    if not empty.any():
+        return 0
+    yy, xx = np.meshgrid(target_lat[lat_mask], target_lon[lon_mask], indexing="ij")
+    idx = np.flatnonzero(empty.ravel())
+    sampled = sample_nbs_bluetopo_at_points(source, xx.ravel()[idx], yy.ravel()[idx])
+    values = sampled["elevation"]
+    valid = np.isfinite(values)
+    if not valid.any():
+        return 0
+    flat = current.ravel()
+    flat_idx = idx[valid]
+    flat[flat_idx] = values[valid]
+    target_elevation[np.ix_(lat_mask, lon_mask)] = flat.reshape(current.shape)
+    sid = target_source_id[np.ix_(lat_mask, lon_mask)].ravel()
+    sid[flat_idx] = source.source_id or SOURCE_ID.get(source.source_name, -1)
+    target_source_id[np.ix_(lat_mask, lon_mask)] = sid.reshape(current.shape)
+    res = target_source_resolution[np.ix_(lat_mask, lon_mask)].ravel()
+    res[flat_idx] = source.resolution_arcsec
+    target_source_resolution[np.ix_(lat_mask, lon_mask)] = res.reshape(current.shape)
+    return int(valid.sum())
 
 
 def _read_opendap_source(
@@ -262,6 +316,7 @@ def metadata_for_bathy_fetch(
     name: str,
     bbox: tuple[float, float, float, float],
     fallback_policy: str,
+    resolution_policy: str,
     spacing_arcsec: float,
     elevation: np.ndarray,
     source_id: np.ndarray,
@@ -282,6 +337,7 @@ def metadata_for_bathy_fetch(
         "case": name,
         "bbox_wsen": list(bbox),
         "fallback_policy": fallback_policy,
+        "resolution_policy": resolution_policy,
         "target_spacing_arcsec": spacing_arcsec,
         "finite_output_fraction": finite_coverage_fraction(elevation),
         "no_data_cells": int((source_id == 0).sum()),
@@ -289,7 +345,7 @@ def metadata_for_bathy_fetch(
         "source_legend": SOURCE_LABELS,
         "datum_notes": {
             "warning": (
-                "CUDEM, CRM, and ETOPO can use different vertical datums. "
+                "CUDEM, NBS BlueTopo, CRM, and ETOPO can use different vertical datums. "
                 "Values were gap-filled by priority without vertical-datum harmonization."
             ),
             "depth_conversion": "depth_m = max(-elevation_m, 0)",
@@ -312,11 +368,15 @@ def _policy_sources(policy: str) -> tuple[str, ...]:
         "cudem": ("cudem",),
         "cudem-crm": ("cudem", "crm"),
         "cudem-crm-etopo": ("cudem", "crm", "etopo"),
-        "all": ("cudem", "crm", "etopo"),
+        "cudem-nbs-crm-etopo": ("cudem", "nbs_bluetopo", "crm", "etopo"),
+        "all": ("cudem", "nbs_bluetopo", "crm", "etopo"),
     }
     key = policy.lower().strip()
     if key not in aliases:
-        raise ValueError("fallback_policy must be cudem-only, cudem-crm, or cudem-crm-etopo")
+        raise ValueError(
+            "fallback_policy must be cudem-only, cudem-crm, cudem-crm-etopo, "
+            "or cudem-nbs-crm-etopo"
+        )
     return aliases[key]
 
 

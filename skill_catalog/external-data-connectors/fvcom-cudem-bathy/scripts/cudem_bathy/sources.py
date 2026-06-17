@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
+import tempfile
 import xml.etree.ElementTree as ET
 
 import requests
@@ -25,6 +26,11 @@ THREDDS_ETOPO_15S_SURFACE = (
     "https://www.ngdc.noaa.gov/thredds/catalog/global/ETOPO2022/"
     "15s/15s_surface_elev_netcdf/catalog.xml"
 )
+NBS_BUCKET_ROOT = "https://noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com"
+NBS_BLUETOPO_SCHEME_PREFIX = "BlueTopo/_BlueTopo_Tile_Scheme/"
+NBS_BLUETOPO_SCHEME_LIST = (
+    f"{NBS_BUCKET_ROOT}/?list-type=2&prefix={NBS_BLUETOPO_SCHEME_PREFIX}"
+)
 
 CRM_CITATION = (
     "NOAA National Centers for Environmental Information. Coastal Relief Models "
@@ -34,9 +40,14 @@ ETOPO_CITATION = (
     "NOAA National Centers for Environmental Information. 2022: ETOPO 2022 "
     "15 Arc-Second Global Relief Model. DOI: 10.25921/fd45-gt74. Not for navigation."
 )
+NBS_BLUETOPO_CITATION = (
+    "NOAA Office of Coast Survey. National Bathymetric Source: BlueTopo. "
+    "Public AWS Open Data Registry bucket noaa-ocs-nationalbathymetry-pds. "
+    "Not for navigation."
+)
 
-SOURCE_PRIORITY = {"cudem": 1, "crm": 2, "etopo": 3}
-SOURCE_ID = {"none": 0, "cudem": 1, "crm": 2, "etopo": 3}
+SOURCE_PRIORITY = {"cudem": 1, "nbs_bluetopo": 2, "crm": 3, "etopo": 4}
+SOURCE_ID = {"none": 0, "cudem": 1, "nbs_bluetopo": 2, "crm": 3, "etopo": 4, "regional_candidate": 5}
 SOURCE_LABELS = {value: key for key, value in SOURCE_ID.items()}
 
 USER_AGENT = "fvcom-cudem-bathy/0.2 (+https://www.noaa.gov/)"
@@ -62,11 +73,17 @@ class BathySourceRecord:
     horizontal_datum: str
     vertical_datum: str
     units: str = "meters"
+    resolution_m: float | None = None
     size_mb: float | None = None
     modified: str | None = None
     catalog_url: str | None = None
     source_id: int | None = None
     notes: str | None = None
+    utm_zone: str | None = None
+    rat_url: str | None = None
+    checksum: str | None = None
+    rat_checksum: str | None = None
+    delivered_date: str | None = None
 
     @property
     def bbox(self) -> tuple[float, float, float, float]:
@@ -80,6 +97,8 @@ class BathySourceRecord:
     @classmethod
     def from_dict(cls, item: dict) -> "BathySourceRecord":
         data = dict(item)
+        allowed = {field.name for field in fields(cls)}
+        data = {key: value for key, value in data.items() if key in allowed}
         return cls(**data)
 
 
@@ -117,11 +136,12 @@ def cudem_tile_to_source(tile: TileRecord) -> BathySourceRecord:
 def build_bathy_source_index(
     *,
     include_cudem: bool = True,
+    include_nbs: bool = True,
     include_crm: bool = True,
     include_etopo: bool = True,
     timeout: int = 60,
 ) -> dict:
-    """Build a combined CUDEM, CRM, and ETOPO source index."""
+    """Build a combined CUDEM, NBS BlueTopo, CRM, and ETOPO source index."""
 
     records: list[BathySourceRecord] = []
     warnings: list[str] = []
@@ -133,6 +153,12 @@ def build_bathy_source_index(
             warnings.extend(f"CUDEM: {warning}" for warning in cudem.get("warnings", []))
         except Exception as exc:
             warnings.append(f"CUDEM index: {type(exc).__name__}: {exc}")
+
+    if include_nbs:
+        try:
+            records.extend(fetch_nbs_bluetopo_sources(timeout=timeout))
+        except Exception as exc:
+            warnings.append(f"NBS BlueTopo index: {type(exc).__name__}: {exc}")
 
     if include_crm:
         for catalog_url, selector in (
@@ -157,6 +183,8 @@ def build_bathy_source_index(
         "source_priority": SOURCE_PRIORITY,
         "source_ids": SOURCE_ID,
         "sources": {
+            "nbs_bluetopo_bucket": NBS_BUCKET_ROOT,
+            "nbs_bluetopo_tile_scheme_prefix": NBS_BLUETOPO_SCHEME_PREFIX,
             "crm_current_catalog": THREDDS_CRM_CURRENT,
             "crm_legacy_catalog": THREDDS_CRM_LEGACY,
             "etopo_15s_catalog": THREDDS_ETOPO_15S,
@@ -165,6 +193,71 @@ def build_bathy_source_index(
         "warnings": warnings,
         "records": [record.to_dict() for record in records],
     }
+
+
+def fetch_nbs_bluetopo_sources(*, timeout: int = 60) -> list[BathySourceRecord]:
+    """Read the current NOAA NBS BlueTopo tile-scheme GeoPackage from AWS."""
+
+    key, modified, size_mb = _latest_bluetopo_scheme(timeout=timeout)
+    url = f"{NBS_BUCKET_ROOT}/{key}"
+    with tempfile.TemporaryDirectory(prefix="fvcom_bluetopo_") as tmp:
+        gpkg_path = Path(tmp) / Path(key).name
+        resp = requests.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT})
+        resp.raise_for_status()
+        gpkg_path.write_bytes(resp.content)
+        try:
+            import geopandas as gpd
+
+            gdf = gpd.read_file(gpkg_path)
+        except Exception as exc:
+            raise RuntimeError(
+                "Could not read BlueTopo tile scheme GeoPackage. Install geopandas/pyogrio."
+            ) from exc
+
+    records: list[BathySourceRecord] = []
+    for row in gdf.itertuples(index=False):
+        geom = getattr(row, "geometry", None)
+        url_value = _row_value(row, "GeoTIFF_Link")
+        if geom is None or geom.is_empty or not url_value:
+            continue
+        url_value = _normalize_nbs_url(str(url_value))
+        west, south, east, north = (float(x) for x in geom.bounds)
+        resolution_m = _parse_resolution_m(_row_value(row, "Resolution"))
+        resolution_arcsec = _meters_to_arcsec_equivalent(resolution_m)
+        tile = str(_row_value(row, "tile") or Path(str(url_value)).stem)
+        records.append(
+            BathySourceRecord(
+                name=tile,
+                source_name="nbs_bluetopo",
+                source_mode="nbs_bluetopo_geotiff",
+                url=url_value,
+                west=west,
+                south=south,
+                east=east,
+                north=north,
+                resolution_arcsec=resolution_arcsec,
+                variable="Elevation",
+                priority=SOURCE_PRIORITY["nbs_bluetopo"],
+                citation=NBS_BLUETOPO_CITATION,
+                horizontal_datum="NAD83 / UTM zone provided by BlueTopo tile metadata",
+                vertical_datum="NAVD88 where provided by BlueTopo tile metadata",
+                resolution_m=resolution_m,
+                size_mb=None,
+                modified=modified,
+                catalog_url=url,
+                source_id=SOURCE_ID["nbs_bluetopo"],
+                notes=(
+                    "NOAA NBS BlueTopo GeoTIFF source. Bands commonly include "
+                    "Elevation, Uncertainty, and Contributor."
+                ),
+                utm_zone=str(_row_value(row, "UTM") or "") or None,
+                rat_url=_normalize_nbs_url(_row_value(row, "RAT_Link")),
+                checksum=_optional_text(_row_value(row, "GeoTIFF_SHA256_Checksum")),
+                rat_checksum=_optional_text(_row_value(row, "RAT_SHA256_Checksum")),
+                delivered_date=_optional_text(_row_value(row, "Delivered_Date")),
+            )
+        )
+    return records
 
 
 def fetch_crm_sources(
@@ -304,7 +397,8 @@ def select_sources(
     records: list[BathySourceRecord],
     bbox: tuple[float, float, float, float],
     *,
-    source_names: tuple[str, ...] = ("cudem", "crm", "etopo"),
+    source_names: tuple[str, ...] = ("cudem", "nbs_bluetopo", "crm", "etopo"),
+    resolution_policy: str = "source-priority",
 ) -> list[BathySourceRecord]:
     """Return records intersecting a bbox in priority/resolution order."""
 
@@ -315,8 +409,29 @@ def select_sources(
         for record in records
         if record.source_name in wanted and _record_intersects_bbox(record, bbox)
     ]
-    selected.sort(key=lambda r: (r.priority, r.resolution_arcsec, r.name))
+    selected.sort(key=lambda r: source_sort_key(r, resolution_policy=resolution_policy))
     return selected
+
+
+def native_resolution_m(record: BathySourceRecord) -> float:
+    """Return the best native spacing estimate in meters for source arbitration."""
+
+    if record.resolution_m is not None:
+        return float(record.resolution_m)
+    return float(record.resolution_arcsec) * 30.87
+
+
+def source_sort_key(
+    record: BathySourceRecord, *, resolution_policy: str = "source-priority"
+) -> tuple[float, float, int, str]:
+    """Sort source records for conservative or finest-available workflows."""
+
+    policy = resolution_policy.lower().strip()
+    if policy == "source-priority":
+        return (float(record.priority), native_resolution_m(record), 0, record.name)
+    if policy == "finest":
+        return (0.0, native_resolution_m(record), int(record.priority), record.name)
+    raise ValueError("resolution_policy must be source-priority or finest")
 
 
 def _record_intersects_bbox(
@@ -345,17 +460,91 @@ def summarize_bathy_index(index: dict | list[BathySourceRecord]) -> dict:
                 "count": 0,
                 "min_resolution_arcsec": None,
                 "max_resolution_arcsec": None,
+                "min_resolution_m": None,
+                "max_resolution_m": None,
             },
         )
         bucket["count"] += 1
         res = float(item["resolution_arcsec"])
+        res_m = item.get("resolution_m")
         bucket["min_resolution_arcsec"] = (
             res if bucket["min_resolution_arcsec"] is None else min(bucket["min_resolution_arcsec"], res)
         )
         bucket["max_resolution_arcsec"] = (
             res if bucket["max_resolution_arcsec"] is None else max(bucket["max_resolution_arcsec"], res)
         )
+        if res_m is not None:
+            res_m = float(res_m)
+            bucket["min_resolution_m"] = (
+                res_m if bucket["min_resolution_m"] is None else min(bucket["min_resolution_m"], res_m)
+            )
+            bucket["max_resolution_m"] = (
+                res_m if bucket["max_resolution_m"] is None else max(bucket["max_resolution_m"], res_m)
+            )
     return summary
+
+
+def _latest_bluetopo_scheme(*, timeout: int) -> tuple[str, str | None, float | None]:
+    text = _get_text(NBS_BLUETOPO_SCHEME_LIST, timeout=timeout)
+    root = ET.fromstring(text)
+    ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    candidates: list[tuple[str, str | None, float | None]] = []
+    for contents in root.findall("s3:Contents", ns):
+        key = _s3_child_text(contents, "Key", ns)
+        if not key or not key.lower().endswith(".gpkg"):
+            continue
+        modified = _s3_child_text(contents, "LastModified", ns)
+        size_text = _s3_child_text(contents, "Size", ns)
+        size_mb = float(size_text) / 1024.0 / 1024.0 if size_text else None
+        candidates.append((key, modified, size_mb))
+    if not candidates:
+        raise RuntimeError("No BlueTopo tile-scheme GeoPackage found in NOAA NBS AWS bucket.")
+    return sorted(candidates, key=lambda item: (item[1] or "", item[0]))[-1]
+
+
+def _s3_child_text(element: ET.Element, name: str, ns: dict[str, str]) -> str | None:
+    child = element.find(f"s3:{name}", ns)
+    if child is None or child.text is None:
+        return None
+    return child.text.strip()
+
+
+def _row_value(row, name: str):
+    return getattr(row, name, None)
+
+
+def _parse_resolution_m(value) -> float | None:
+    if value is None:
+        return None
+    match = re.search(r"([-+0-9.]+)", str(value))
+    if not match:
+        return None
+    return float(match.group(1))
+
+
+def _normalize_nbs_url(value) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.startswith("s3://noaa-ocs-nationalbathymetry-pds/"):
+        key = text.split("s3://noaa-ocs-nationalbathymetry-pds/", 1)[1]
+        return f"{NBS_BUCKET_ROOT}/{key}"
+    return text
+
+
+def _optional_text(value) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _meters_to_arcsec_equivalent(resolution_m: float | None) -> float:
+    if resolution_m is None:
+        return 1.0
+    return float(resolution_m) / 30.87
 
 
 def _opendap_grid_info(

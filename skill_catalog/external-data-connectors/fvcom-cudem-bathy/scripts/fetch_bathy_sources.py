@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Fetch CUDEM-first bathymetry with CRM and ETOPO fallback."""
+"""Fetch CUDEM/NBS-first bathymetry with CRM and ETOPO fallback."""
 
 from __future__ import annotations
 
@@ -22,8 +22,17 @@ def main() -> None:
     parser.add_argument("--index", required=True, help="Combined bathymetry source index JSON.")
     parser.add_argument(
         "--fallback-policy",
-        default="cudem-crm-etopo",
-        choices=("cudem-only", "cudem-crm", "cudem-crm-etopo"),
+        default="cudem-nbs-crm-etopo",
+        choices=("cudem-only", "cudem-crm", "cudem-crm-etopo", "cudem-nbs-crm-etopo"),
+    )
+    parser.add_argument(
+        "--resolution-policy",
+        default="source-priority",
+        choices=("source-priority", "finest"),
+        help=(
+            "source-priority keeps CUDEM/NBS/CRM/ETOPO family order; finest lets "
+            "the finest usable local native resolution win across sources."
+        ),
     )
     parser.add_argument(
         "--target-spacing-arcsec",
@@ -47,6 +56,7 @@ def main() -> None:
         run_dir=args.run_dir,
         name=args.name,
         fallback_policy=args.fallback_policy,
+        resolution_policy=args.resolution_policy,
         target_spacing_arcsec=None if args.target_spacing_arcsec == 0 else args.target_spacing_arcsec,
         max_sources=args.max_sources,
         make_plot=not args.no_plot,

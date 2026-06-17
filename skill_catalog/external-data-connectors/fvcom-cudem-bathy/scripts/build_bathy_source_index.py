@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Build a combined CUDEM, CRM, and ETOPO source index."""
+"""Build a combined CUDEM, NOAA NBS BlueTopo, CRM, and ETOPO source index."""
 
 from __future__ import annotations
 
@@ -22,12 +22,14 @@ def main() -> None:
     parser.add_argument("--output", required=True, help="Output JSON source index path.")
     parser.add_argument("--timeout", type=int, default=60, help="HTTP timeout in seconds.")
     parser.add_argument("--no-cudem", action="store_true", help="Skip CUDEM sources.")
+    parser.add_argument("--no-nbs", action="store_true", help="Skip NOAA NBS BlueTopo sources.")
     parser.add_argument("--no-crm", action="store_true", help="Skip NOAA CRM sources.")
     parser.add_argument("--no-etopo", action="store_true", help="Skip ETOPO 2022 sources.")
     args = parser.parse_args()
 
     index = build_bathy_source_index(
         include_cudem=not args.no_cudem,
+        include_nbs=not args.no_nbs,
         include_crm=not args.no_crm,
         include_etopo=not args.no_etopo,
         timeout=args.timeout,

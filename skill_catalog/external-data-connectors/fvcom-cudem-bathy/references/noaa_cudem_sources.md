@@ -4,7 +4,7 @@ Use this reference when updating `fvcom-cudem-bathy` source logic.
 
 ## CUDEM Scope
 
-NOAA CUDEM is a U.S. coastal and territory product, not a global bathymetry source. CUDEM-only commands intentionally fail with a no-coverage report when a bbox is outside the indexed CUDEM tiles. Fallback-enabled commands fill gaps by priority with NOAA Coastal Relief Models and then ETOPO 2022.
+NOAA CUDEM is a U.S. coastal and territory product, not a global bathymetry source. CUDEM-only commands intentionally fail with a no-coverage report when a bbox is outside the indexed CUDEM tiles. Fallback-enabled commands can fill gaps with NOAA NBS BlueTopo candidates, NOAA Coastal Relief Models, and then ETOPO 2022.
 
 NOAA describes CUDEM as 0.25-degree tiled coastal DEMs. The 1/9 arc-second product integrates topography and bathymetry; the coarser products are bathymetry/topobathymetry tiers used farther from the coast or in older regional products. CUDEM is distributed in NetCDF and GeoTIFF formats, with coordinates in decimal degrees, horizontal datum NAD83, vertical datum NAVD88 where provided, and vertical units in meters.
 
@@ -53,13 +53,69 @@ wash_pugetsound
 
 These folders expose HTTPS GeoTIFF tiles hosted under `noaa-nos-coastal-lidar-pds.s3.amazonaws.com`.
 
-## Fallback Sources
+## NBS And Fallback Sources
 
 Use this priority when the user requests fallback-enabled bathymetry:
 
 ```text
-CUDEM -> NOAA Coastal Relief Model -> ETOPO 2022
+CUDEM + NOAA NBS BlueTopo candidates -> NOAA Coastal Relief Model -> ETOPO 2022
 ```
+
+Conservative source-priority mode keeps CUDEM before BlueTopo:
+
+```text
+CUDEM -> NBS BlueTopo -> NOAA Coastal Relief Model -> ETOPO 2022
+```
+
+Finest mode lets every selected local source compete by native resolution:
+
+```text
+finest(CUDEM, NBS BlueTopo, NOAA Coastal Relief Model, ETOPO 2022)
+```
+
+This means ETOPO 2022 15 arc-second can outrank the legacy Southern Alaska CRM
+24 arc-second in gaps where no finer CUDEM/NBS source is available. Use
+`source-priority` when the scientific preference is source family before native
+grid spacing.
+
+NOAA NBS open-data registry:
+
+```text
+https://registry.opendata.aws/noaa-bathymetry/
+```
+
+NOAA NBS AWS bucket:
+
+```text
+s3://noaa-ocs-nationalbathymetry-pds
+https://noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com/
+```
+
+BlueTopo tile-scheme GeoPackages:
+
+```text
+https://noaa-ocs-nationalbathymetry-pds.s3.amazonaws.com/?list-type=2&prefix=BlueTopo/_BlueTopo_Tile_Scheme/
+```
+
+Important BlueTopo details:
+
+- The tile scheme advertises `GeoTIFF_Link`, `RAT_Link`, `Delivered_Date`, `Resolution`, `UTM`, checksums, and tile polygons.
+- BlueTopo GeoTIFFs are commonly projected UTM compound CRS rasters; do not sample them as lon/lat rasters.
+- BlueTopo bands commonly include `Elevation`, `Uncertainty`, and `Contributor`.
+- Use `/vsicurl` or HTTPS reads for selected tiles; do not download all BlueTopo tiles over a broad bbox.
+- The current implementation treats BlueTopo as a first-class `nbs_bluetopo` source and records uncertainty/contributor for mesh-node sampling where available.
+- Mixed CUDEM/BlueTopo vertical datums are not harmonized by this skill.
+
+NOAA NBS S-102 is documented as a future source because it is HDF5/S-102 rather
+than directly sampled GeoTIFF:
+
+```text
+https://noaa-s102-pds.s3.amazonaws.com/README.html
+s3://noaa-s102-pds
+```
+
+For SE Alaska, the S-102 bucket has an Alaska/Southeast folder, but it is not yet
+an automatic fetch source in this skill.
 
 NOAA CRM product page:
 
@@ -154,7 +210,25 @@ the CUDEM-covered patches. Instead:
 For fallback-enabled large-mesh comparisons:
 
 1. Sample CUDEM first.
-2. Sample CRM only for nodes still missing bathymetry.
-3. Sample ETOPO 2022 only for nodes still missing after CUDEM and CRM.
-4. Preserve `best_source`, `best_source_resolution`, and `source_dataset` for every node.
+2. Sample NOAA NBS BlueTopo for nodes still missing bathymetry in `source-priority` mode.
+3. In `finest` mode, order all selected source records by native resolution first, then source priority as a tie-breaker.
+4. Preserve `best_source`, `best_source_resolution`, `best_source_resolution_m`, `best_uncertainty_m`, `best_contributor`, and `source_dataset` for every node.
 5. Report mixed-datum warnings in the summary and plots.
+
+## Regional Discovery
+
+Use `research_bathy_sources.py` for an advisory, review-only regional source
+scan. It records official/high-confidence alternatives, access method, rough
+resolution, datum notes, endpoint status, and automation difficulty, but it does
+not inject unvalidated products into the production stack.
+
+Known SE-AK candidates to document:
+
+```text
+NOAA NBS BlueTopo
+NOAA NBS S-102
+NCEI BAG bathymetry ImageServer
+NCEI multibeam mosaic ImageServer
+NOAA Fisheries Alaska bathymetry service
+SE Alaska 8 arc-second Coastal DEM
+```
