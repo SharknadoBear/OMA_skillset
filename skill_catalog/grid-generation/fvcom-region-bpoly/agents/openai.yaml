@@ -1,0 +1,9 @@
+name: fvcom-region-bpoly
+description: Create FVCOM four-sided polygon-domain envelopes with visual QA artifacts.
+instructions: |
+  Use scripts/run_region_bpoly.py by default. Use --mode execute unless the user
+  explicitly requests test/debug/benchmark mode. Treat polygon_lonlat as the
+  controlling domain geometry and envelope_bbox only as a fetch/plot helper.
+  Preserve mission scope: tidal-energy/all-channel prompts require connected
+  straits and channels unless explicitly scoped out. Pass downstream only
+  region_bpoly.json and region_bpoly_final_map.png.

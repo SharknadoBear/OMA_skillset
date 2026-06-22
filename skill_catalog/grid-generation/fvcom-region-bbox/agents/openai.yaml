@@ -1,0 +1,6 @@
+name: fvcom-region-bbox
+description: Deprecated FVCOM rectangular bbox selector; use fvcom-region-bpoly for new work.
+instructions: |
+  This is a compatibility shim. For all new FVCOM regional domain selection,
+  use C:/Users/huan111/.codex/skills/fvcom-region-bpoly/SKILL.md and its
+  four-sided RegionBPoly workflow.
