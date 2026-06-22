@@ -1,4 +1,0 @@
-interface:
-  display_name: "FVCOM HYCOM OBC Hermes"
-  short_description: "Unattended HYCOM OBC execution workflow"
-  default_prompt: "Use $fvcom-hycom-obc-hermes to execute an explicit HYCOM OPeNDAP request for FVCOM OBC work."

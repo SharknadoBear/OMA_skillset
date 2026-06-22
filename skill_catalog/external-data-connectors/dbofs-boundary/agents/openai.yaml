@@ -1,0 +1,4 @@
+interface:
+  display_name: "DBOFS Boundary"
+  short_description: "Fetch and QA DBOFS fields."
+  default_prompt: "Use $dbofs-boundary to estimate, fetch, and health-check a small external-data request."

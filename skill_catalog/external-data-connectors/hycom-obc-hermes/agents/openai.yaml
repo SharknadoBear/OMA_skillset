@@ -1,0 +1,4 @@
+interface:
+  display_name: "HYCOM OBC Hermes"
+  short_description: "Run explicit HYCOM data pulls."
+  default_prompt: "Use $hycom-obc-hermes to estimate, fetch, and health-check a small external-data request."

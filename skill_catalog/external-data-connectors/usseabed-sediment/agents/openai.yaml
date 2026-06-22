@@ -1,0 +1,4 @@
+interface:
+  display_name: "usSEABED Sediment"
+  short_description: "Fetch and QA usSEABED sediment."
+  default_prompt: "Use $usseabed-sediment to estimate, fetch, and health-check a small external-data request."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "CBOFS Canal"
+  short_description: "Fetch and QA CBOFS canal fields."
+  default_prompt: "Use $cbofs-canal to estimate, fetch, and health-check a small external-data request."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "CUSP Coastline"
+  short_description: "Fetch and QA CUSP shoreline data."
+  default_prompt: "Use $cusp-coastline to estimate, fetch, and health-check a small external-data request."

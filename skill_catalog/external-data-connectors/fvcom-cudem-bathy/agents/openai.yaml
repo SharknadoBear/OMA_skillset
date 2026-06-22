@@ -1,4 +1,0 @@
-interface:
-  display_name: "FVCOM CUDEM Bathy"
-  short_description: "Fetch NOAA CUDEM bathymetry for FVCOM"
-  default_prompt: "Use $fvcom-cudem-bathy to fetch NOAA CUDEM bathymetry for an FVCOM grid bbox."
