@@ -1,0 +1,4 @@
+interface:
+  display_name: "NHD Flowline Fetcher"
+  short_description: "Fetch and map NHD/NHDFlowline vectors for a region."
+  default_prompt: "Fetch NHD flowlines for a bounding box, run health checks, and create reusable GIS outputs."
