@@ -1,0 +1,6 @@
+interface:
+  display_name: "NHM River Fetcher"
+  short_description: "Fetch NHM-PRMS river data safely"
+  default_prompt: "Use $nhm-river-fetcher to estimate, stage, download, and health-check USGS NHM-PRMS river discharge data."
+policy:
+  allow_implicit_invocation: true
