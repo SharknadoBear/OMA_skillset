@@ -1,6 +1,6 @@
 ---
 name: kestrel-hpc
-description: Use when working with Huan's NLR Kestrel HPC account for SSH/SCP/rsync access, uploading model source files, compiling on Kestrel, submitting or monitoring Slurm jobs, retrieving logs/results, or analyzing Kestrel-hosted outputs. Includes the required SSH MAC setting and credential handling rules, but never stores passwords or OTPs.
+description: Use when working with Bear's NLR Kestrel HPC account for SSH/SCP/rsync access, uploading model source files, compiling on Kestrel, submitting or monitoring Slurm jobs, retrieving logs/results, or generating compact model-output artifacts such as .mat files. Do not run Python analysis, plotting, or install Python analysis environments on the HPC server unless Bear explicitly overrides this; download compact outputs and do Python analysis locally. Includes the required SSH MAC setting and credential handling rules, but never stores passwords or OTPs.
 ---
 
 # Kestrel HPC
@@ -18,12 +18,12 @@ Plain SSH/SCP may fail with a "Corrupted MAC" error. Always include the MAC sett
 
 ## Credential Rules
 
-- Never store, write, commit, echo, or repeat Huan's Kestrel password.
+- Never store, write, commit, echo, or repeat Bear's Kestrel password.
 - Never put the password, OTP, or combined password+OTP in this skill, shell history, scripts, config files, logs, or command-line arguments.
-- Ask Huan for the current 6-digit OTP for each new authentication session; OTPs rotate about every 30 seconds.
-- Wait for the `Password+OTP` prompt to appear before asking Huan for the OTP to avoid timeout.
+- Ask Bear for the current 6-digit OTP for each new authentication session; OTPs rotate about every 30 seconds.
+- Wait for the `Password+OTP` prompt to appear before asking Bear for the OTP to avoid timeout.
 - If a password is needed and no key/agent/session is already available, ask for the password at runtime as a secret, not as durable context.
-- Huan prefers a direct secure prompt over a separate terminal window. When possible, use a local secure prompt or askpass-style flow for Password+OTP entry; do not ask Huan to paste password, OTP, or password+OTP into chat.
+- Bear prefers a direct secure prompt over a separate terminal window. When possible, use a local secure prompt or askpass-style flow for Password+OTP entry; do not ask Bear to paste password, OTP, or password+OTP into chat.
 - The Kestrel prompt is normally `(yhuang168@kestrel.nlr.gov) Password+OTP:`. Authentication expects password immediately followed by the 6-digit OTP, with no space or separator.
 - If the available terminal tool cannot securely answer an interactive password prompt, explain the limitation and use an SSH key, existing authenticated session, user-run command, or other secure workflow instead.
 
@@ -56,14 +56,16 @@ If an SSH config alias exists, prefer the alias only after verifying it includes
 ## Typical Workflow
 
 1. Confirm the local files to upload and inspect local changes before transfer.
-2. Ask Huan for the current OTP only when ready to connect.
+2. Ask Bear for the current OTP only when ready to connect.
 3. Connect with the required MAC setting.
 4. Verify the remote working directory with `pwd`, `hostname`, and `ls`.
 5. Upload only the intended changed files, preserving unrelated remote work.
 6. Compile using the project's existing Kestrel build scripts or Makefiles.
-7. Submit jobs with `sbatch` only after checking the Slurm script, account/partition/time settings, input paths, and output paths.
-8. Monitor with `squeue -u yhuang168`, inspect output/error logs, and summarize relevant failures or results.
-9. Retrieve only the needed logs/results back to the local workspace.
+7. For analysis workflows, prefer MATLAB/compiled tools or existing project tools on Kestrel to generate compact artifacts such as `.mat`, NetCDF summaries, logs, or tables.
+8. Do not install Python analysis dependencies or run Python plotting/analysis on Kestrel by default; download compact outputs and run Python analysis locally in the user's workspace.
+9. Submit jobs with `sbatch` only after checking the Slurm script, account/partition/time settings, input paths, and output paths.
+10. Monitor with `squeue -u yhuang168`, inspect output/error logs, and summarize relevant failures or results.
+11. Retrieve only the needed logs/results back to the local workspace.
 
 ## Local Bridge Workflow
 
@@ -86,23 +88,37 @@ C:\Users\huan111\.codex\skills\kestrel-hpc\hpc_bridge
 The earlier WaterPACT-local bridge folder is only historical fallback context,
 not the primary reusable bridge location.
 
-The bridge uses a local Python virtual environment with Paramiko. Huan enters
+The bridge uses a local Python virtual environment with Paramiko. Bear enters
 Password+OTP only in a visible PowerShell window; the bridge keeps one SSH
-session open and watches local JSON command files.  Codex writes commands to
-the local `commands/` folder, the bridge executes them on Kestrel, and results
-are written locally to `results/`.  The bridge supports `exec`, `upload`,
-`download`, and `stop` actions.
+session open and watches local JSON command files. Codex writes commands to a
+named session folder, the bridge executes them on Kestrel, and results are
+written to that session's `results/` folder. The bridge supports `exec`,
+`upload`, `download`, and `stop` actions.
 
-Start the bridge:
+Before starting or reusing a bridge, inspect the named bridge identity. Reuse
+an existing bridge only when its Japanese `bridge_name` is intended and its
+purpose/project root match the current task. If the purpose or project root is
+different, create a new bridge session.
+
+Create a named bridge session from the reusable helper folder:
 
 ```powershell
 Set-Location "C:\Users\huan111\.codex\skills\kestrel-hpc\hpc_bridge"
+python .\make_bridge_session.py --purpose "short purpose" --work-summary "1-3 sentence work summary" --project-root "C:\path\to\project"
+```
+
+The command prints a `session_dir`. Start the bridge from that session
+directory using the existing launcher:
+
+```powershell
+Set-Location "<session_dir>"
 .\start_bridge_window.ps1
 ```
 
 The first launch creates a local `.venv` and installs the bridge dependency
 from `requirements.txt`. Runtime folders such as `.venv/`, `commands/`, and
-`results/` are disposable session state and must not be committed.
+`results/` are disposable session state and must not be committed. Legacy
+bridge folders without `bridge_identity.json` are not reusable for new work.
 
 The checked-in staging copy lives at:
 
@@ -120,12 +136,14 @@ powershell.exe -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass',
 "Set-Location <path>; ..."` for OneDrive paths because `OneDrive - PNNL` can
 be parsed incorrectly if quotes are stripped.
 
-Queue commands from Codex/local shell:
+Inspect identity and queue commands from Codex/local shell:
 
 ```powershell
-.\.venv\Scripts\python.exe .\send_kestrel_command.py exec "hostname; whoami; pwd"
-.\.venv\Scripts\python.exe .\send_kestrel_command.py upload local_file /scratch/yhuang168/path/file
-.\.venv\Scripts\python.exe .\send_kestrel_command.py download /scratch/yhuang168/path/file local_file
+.\.venv\Scripts\python.exe .\send_kestrel_command.py identity
+.\.venv\Scripts\python.exe .\send_kestrel_command.py --bridge-name Akatsuki exec "hostname; whoami; pwd"
+.\.venv\Scripts\python.exe .\send_kestrel_command.py --purpose "short purpose" --project-root "C:\path\to\project" upload local_file /scratch/yhuang168/path/file
+.\.venv\Scripts\python.exe .\send_kestrel_command.py --bridge-name Akatsuki download /scratch/yhuang168/path/file local_file
+.\.venv\Scripts\python.exe .\send_kestrel_command.py --bridge-name Akatsuki stop
 ```
 
 Important bridge lessons from the 2026-05-26 setup:
@@ -151,18 +169,12 @@ scratch root: /scratch/yhuang168
 test scratch: /scratch/yhuang168/test_postprocessing
 default python: /usr/bin/python3 = Python 3.6.8
 usable module: python/3.12.5
-scratch Python deps: /scratch/yhuang168/test_postprocessing/pydeps
 ```
 
-For the postprocessing toolkit smoke test, `python/3.12.5` already had
-`numpy`, `matplotlib`, `PIL`, `scipy`, and `pandas`, but did not have
-`netCDF4`.  A scratch-local install worked:
-
-```bash
-module load python/3.12.5
-python -m pip install --no-cache-dir --target /scratch/yhuang168/test_postprocessing/pydeps netCDF4
-export PYTHONPATH=/scratch/yhuang168/test_postprocessing/pydeps:${PYTHONPATH:-}
-```
+Historical note only: a past postprocessing smoke test briefly used scratch-local
+Python dependencies. Do not repeat that pattern for new Kestrel work. Generate
+compact outputs on Kestrel with MATLAB/compiled tools when needed, download them,
+and run Python analysis, plotting, and reporting in the local workspace.
 
 ## Slurm Commands
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 import uuid
@@ -11,8 +12,60 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
+IDENTITY = ROOT / "bridge_identity.json"
 COMMANDS = ROOT / "commands"
 RESULTS = ROOT / "results"
+
+
+def normalize_purpose(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
+def normalize_project_root(value: str) -> str:
+    return str(Path(value).expanduser().resolve())
+
+
+def build_purpose_key(purpose: str, project_root: str) -> str:
+    payload = f"{normalize_purpose(purpose)}\n{normalize_project_root(project_root)}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def read_identity() -> dict:
+    if not IDENTITY.exists():
+        raise SystemExit(
+            f"Missing {IDENTITY}. Create a named bridge session with make_bridge_session.py first."
+        )
+    try:
+        return json.loads(IDENTITY.read_text(encoding="utf-8-sig"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid bridge identity file: {IDENTITY}: {exc}") from exc
+
+
+def print_identity() -> int:
+    print(json.dumps(read_identity(), indent=2))
+    return 0
+
+
+def validate_identity(args: argparse.Namespace) -> None:
+    has_purpose_pair = bool(args.purpose) and bool(args.project_root)
+    if bool(args.purpose) != bool(args.project_root):
+        raise SystemExit("--purpose and --project-root must be provided together")
+    if not args.bridge_name and not has_purpose_pair:
+        raise SystemExit("Provide --bridge-name or both --purpose and --project-root before queueing a command")
+
+    identity = read_identity()
+    if args.bridge_name and identity.get("bridge_name") != args.bridge_name:
+        raise SystemExit(
+            "Bridge name mismatch; refusing to queue command.\n"
+            + json.dumps(identity, indent=2)
+        )
+    if has_purpose_pair:
+        expected = build_purpose_key(args.purpose, args.project_root)
+        if identity.get("purpose_key") != expected:
+            raise SystemExit(
+                "Bridge purpose/project-root mismatch; refusing to queue command.\n"
+                + json.dumps(identity, indent=2)
+            )
 
 
 def write_command(payload: dict) -> Path:
@@ -50,7 +103,7 @@ def print_result(result: dict) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["exec", "upload", "download", "stop"])
+    parser.add_argument("action", choices=["identity", "exec", "upload", "download", "stop"])
     parser.add_argument("args", nargs="*")
     parser.add_argument(
         "--timeout",
@@ -58,11 +111,19 @@ def parse_args() -> argparse.Namespace:
         default=3600,
         help="Remote exec timeout in seconds, and base wait timeout for all actions.",
     )
+    parser.add_argument("--bridge-name", help="Expected Japanese bridge name for this session.")
+    parser.add_argument("--purpose", help="Expected bridge purpose text.")
+    parser.add_argument("--project-root", help="Expected local project root for this bridge.")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.action == "identity":
+        return print_identity()
+
+    validate_identity(args)
+
     if args.action == "exec":
         if not args.args:
             raise SystemExit("exec requires a command string")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Submit a JSON command to the local Kestrel bridge and wait for the result."""
+"""Submit a JSON command to the local Constance bridge and wait for the result."""
 
 from __future__ import annotations
 
@@ -103,7 +103,7 @@ def print_result(result: dict) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["identity", "exec", "upload", "download", "stop"])
+    parser.add_argument("action", choices=["identity", "exec", "download", "stop"])
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=3600)
     parser.add_argument("--bridge-name", help="Expected Japanese bridge name for this session.")
@@ -123,10 +123,6 @@ def main() -> int:
         if not args.args:
             raise SystemExit("exec requires a command string")
         payload = {"action": "exec", "command": " ".join(args.args)}
-    elif args.action == "upload":
-        if len(args.args) != 2:
-            raise SystemExit("upload requires local_path remote_path")
-        payload = {"action": "upload", "local_path": args.args[0], "remote_path": args.args[1]}
     elif args.action == "download":
         if len(args.args) != 2:
             raise SystemExit("download requires remote_path local_path")

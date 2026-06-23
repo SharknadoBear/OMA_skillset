@@ -2,6 +2,7 @@
 commands/
 results/
 __pycache__/
+bridge_sessions/
 *.py[cod]
 *.tmp
 *.log

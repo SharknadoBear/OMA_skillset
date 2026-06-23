@@ -10,12 +10,14 @@ import shutil
 import socket
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 import paramiko
 
 
 ROOT = Path(__file__).resolve().parent
+IDENTITY = ROOT / "bridge_identity.json"
 COMMANDS = ROOT / "commands"
 PROCESSED = COMMANDS / "processed"
 RESULTS = ROOT / "results"
@@ -29,7 +31,31 @@ def ensure_dirs() -> None:
     RESULTS.mkdir(parents=True, exist_ok=True)
 
 
+def load_identity() -> dict:
+    if not IDENTITY.exists():
+        raise FileNotFoundError(
+            f"Missing {IDENTITY.name}. Create a named bridge session with make_bridge_session.py first."
+        )
+    identity = json.loads(IDENTITY.read_text(encoding="utf-8-sig"))
+    identity["startup_datetime_local"] = datetime.now().astimezone().replace(microsecond=0).isoformat()
+    IDENTITY.write_text(json.dumps(identity, indent=2), encoding="utf-8", newline="\n")
+    return identity
+
+
+def print_identity(identity: dict) -> None:
+    print("")
+    print("Bridge identity")
+    print(f"  name: {identity.get('bridge_name', '')}")
+    print(f"  startup: {identity.get('startup_datetime_local', '')}")
+    print(f"  purpose: {identity.get('purpose', '')}")
+    print(f"  work_summary: {identity.get('work_summary', '')}")
+    print(f"  local_project_root: {identity.get('local_project_root', '')}")
+    print(f"  remote_target: {identity.get('remote_target', '')}")
+    print("")
+
+
 def connect() -> paramiko.SSHClient:
+    print_identity(load_identity())
     print(f"Connecting to {USER}@{HOST}")
     password = getpass.getpass("Password+OTP: ")
     client = paramiko.SSHClient()

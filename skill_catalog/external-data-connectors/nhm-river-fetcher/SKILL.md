@@ -116,7 +116,7 @@ Use `/scratch/yhuang168/skill_test` only for small smoke tests. A smoke test sho
 - download only one small metadata/dictionary file;
 - avoid `AK_byPOIobs_netcdf.zip`, `param.zip`, and all Molly production data.
 
-Do not run Python plotting or install Python analysis environments on Kestrel by default. Use Kestrel for storage, download, extraction, checks, and compact products; run richer Python inspection and mapping locally unless Huan explicitly overrides.
+Do not run Python plotting or install Python analysis environments on Kestrel by default. Use Kestrel for storage, download, extraction, checks, and compact products; run richer Python inspection and mapping locally unless Bear explicitly overrides.
 
 If a bundled Python script must run on Kestrel for metadata, download, or ZIP extraction, load the available Python module first:
 
@@ -124,7 +124,7 @@ If a bundled Python script must run on Kestrel for metadata, download, or ZIP ex
 module load python/3.12.5
 ```
 
-Do not install Python analysis packages on Kestrel for this skill unless Huan explicitly asks.
+Do not install Python analysis packages on Kestrel for this skill unless Bear explicitly asks.
 
 ## References
 

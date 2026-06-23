@@ -1,0 +1,4 @@
+interface:
+  display_name: "Constance HPC"
+  short_description: "Secure read-only Constance HPC access"
+  default_prompt: "Use $constance-hpc to inspect Constance project data safely."
