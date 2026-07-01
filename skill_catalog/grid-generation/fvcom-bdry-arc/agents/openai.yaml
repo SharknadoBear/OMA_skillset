@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM Boundary Arc"
+  short_description: "Prepare FVCOM coastline boundary arcs"
+  default_prompt: "Use $fvcom-bdry-arc to convert a passed RegionBPoly and GSHHS coastline into a QA-ready FVCOM boundary-arc package."

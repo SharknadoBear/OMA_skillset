@@ -1,0 +1,4 @@
+interface:
+  display_name: "GSHHS Coastline"
+  short_description: "Fetch and QA GSHHG shoreline polygons."
+  default_prompt: "Use $gshhs-coastline to estimate, fetch, and health-check a GSHHG coastline request."

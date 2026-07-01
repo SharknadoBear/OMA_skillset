@@ -1,9 +1,45 @@
 name: fvcom-region-bpoly
-description: Create FVCOM four-sided polygon-domain envelopes with visual QA artifacts.
+description: Create map-guided, feature-first FVCOM four-sided RegionBPoly envelopes with topo/road background maps, QA scoring, adjustment tools, and offshore-boundary artifacts.
 instructions: |
   Use scripts/run_region_bpoly.py by default. Use --mode execute unless the user
-  explicitly requests test/debug/benchmark mode. Treat polygon_lonlat as the
-  controlling domain geometry and envelope_bbox only as a fetch/plot helper.
-  Preserve mission scope: tidal-energy/all-channel prompts require connected
-  straits and channels unless explicitly scoped out. Pass downstream only
-  region_bpoly.json and region_bpoly_final_map.png.
+  explicitly requests retained test/debug/benchmark artifacts. Execute mode
+  outputs region_bpoly.json, region_bpoly_final_map.png, and
+  offshore_boundary_artifacts.json, then removes intermediate artifacts after a
+  pass. Test mode keeps intermediate/visual_review with initial guess maps,
+  target-region feature JSON, feature GeoJSON, candidate maps, side zoom maps,
+  coverage JSON, and score evidence.
+
+  Treat polygon_lonlat as the controlling model-domain geometry and envelope_bbox
+  only as a fetch/plot helper. The offshore point only identifies the intended
+  offshore side for downstream coastline-anchor snapping; boundary arc generation
+  is outside this skill.
+
+  Every initial, candidate, zoom, adjustment, and final map must include
+  background map context. Default --basemap-provider is auto: use road_detail
+  for small-estuary and creek-scale cases, topographic context for
+  regional/lake/island-chain cases, then local coastline/minimal fallback if
+  online tiles are unavailable. road_detail tries Esri World Street Map, CARTO
+  Voyager, then OpenStreetMap Mapnik with explicit small-estuary zoom policy.
+  none/off basemap requests mean offline fallback, never blank lat/lon-only
+  plots.
+
+  Preserve mission scope: tidal-energy/all-channel/connectivity prompts require
+  connected straits, island chains, river gates, lake connecting channels, and
+  forcing aprons unless explicitly scoped out. Use normalized place-name and
+  longitude-frame logic for Southeast Alaska, Hawaii/Hawaii Island, and
+  antimeridian regions so bad initial boxes do not contaminate corrected fits.
+
+  Apply v3 QA guards before pass: Cook Inlet wave/wave-current/SWAN/fetch
+  prompts use cook_inlet_wave_fetch and must include Kodiak, Augustine Island,
+  Ursus Cove/Kamishak, and a broad Gulf wave apron. Cook tidal-only/current-only
+  prompts use cook_inlet_tidal_mouth and keep Kodiak as an obstruction guard.
+  Hawaii Island / Big-Island-only domains must avoid Maui Nui / neighboring-
+  island obstruction guards; Hawaii State/island chain requests may include the
+  chain. Murderkill-style prompts are small-estuary scale and must satisfy
+  tighter area/width limits with road_detail map policy. If deterministic repair
+  candidates cannot both cover required features and avoid obstruction/tightness
+  failures, mark final_status=needs_review instead of a false pass.
+
+  Use scripts/adjust_region_bpoly.py for final-stage rotate, scale, or reshape
+  edits from map review. The adjustment map must show the old polygon dashed and
+  the adjusted polygon solid.

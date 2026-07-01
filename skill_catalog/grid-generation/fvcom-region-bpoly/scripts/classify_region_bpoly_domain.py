@@ -60,7 +60,7 @@ def main() -> None:
     }
     out = write_json(run_dir / f"{name}_domain_type_note.json", note)
     png = run_dir / f"{name}_domain_type_review.png"
-    plot_region_map(png, bpoly, [], title=f"{name} domain type: {args.domain_type}", basemap_provider="street")
+    plot_region_map(png, bpoly, [], title=f"{name} domain type: {args.domain_type}", basemap_provider="topo")
     md = run_dir / f"{name}_domain_type_review.md"
     md.write_text(f"# Domain Type Review\n\n- Domain type: `{args.domain_type}`\n- Boundary policy: `{POLICY[args.domain_type]}`\n- Note JSON: `{out}`\n", encoding="utf-8")
     print(f"Wrote domain-type note: {out}")
@@ -68,4 +68,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

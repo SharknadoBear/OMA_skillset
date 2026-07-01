@@ -69,7 +69,7 @@ def main() -> None:
     ap.add_argument("--width-km", type=float)
     ap.add_argument("--orientation-deg", type=float)
     ap.add_argument("--offshore-azimuth-deg", type=float)
-    ap.add_argument("--basemap-provider", default="street")
+    ap.add_argument("--basemap-provider", default="topo")
     ap.add_argument("--full-side-review", action="store_true")
     ap.add_argument("--iteration", type=int, default=1)
     ap.add_argument("--override-iteration-cap", action="store_true")

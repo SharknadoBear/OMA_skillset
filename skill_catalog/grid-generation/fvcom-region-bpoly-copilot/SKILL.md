@@ -1,96 +1,118 @@
 ---
 name: fvcom-region-bpoly-copilot
 harness: github-copilot
-description: GitHub Copilot variant for creating FVCOM four-sided polygon domain envelopes with visual QA. Use run_in_terminal for script execution, view_image for map QA, vscode_askQuestions for review decisions. Scripts shared with sibling fvcom-region-bpoly/ folder.
+description: GitHub Copilot variant for creating map-guided, feature-first FVCOM four-sided RegionBPoly envelopes with background-map QA, adjustment tools, and offshore-boundary artifacts. Scripts are shared with sibling fvcom-region-bpoly/.
 ---
 
-# FVCOM Region BPoly — GitHub Copilot Harness
+# FVCOM Region BPoly - GitHub Copilot Harness
 
 ## Purpose
 
-Turn a natural-language FVCOM modeling request into a QA-ready `RegionBPoly`: ordered four-corner polygon box with edge labels, domain type, open-boundary expectation, and visual QA artifacts.
+Turn a natural-language FVCOM modeling request into a QA-ready `RegionBPoly`: ordered four-corner polygon box, target-region feature coverage, domain type, offshore-side intent, final background map, and visual QA artifacts.
 
-## Scripts Location
+All scripts live in the sibling folder:
 
-All scripts in sibling folder:
-
-```
+```text
 Agent_skill_dev/skill_catalog/grid-generation/fvcom-region-bpoly/scripts/
 ```
 
-Key scripts:
-- `run_region_bpoly.py` — Primary streamlined workflow (prefer this)
-- `propose_region_bpoly.py` — Generate candidate maps
-- `classify_region_bpoly_domain.py` — Domain-type classification
-- `review_region_bpoly.py` — Visual QA gate → accepted output
-- `selftest_region_bpoly.py` — Static workflow checks
+Prefer `run_region_bpoly.py` for new work.
 
-## Core Rule
+## Core Rules
 
-The four-sided polygon (`polygon_lonlat`) is the controlling geometry. The `envelope_bbox` is only a fetch/plot helper.
+The four-sided `polygon_lonlat` is the controlling geometry. The `envelope_bbox` is only a fetch/plot helper.
 
-## Copilot Execution Workflow
+The offshore point only identifies the intended offshore side for downstream coastline-anchor snapping. Boundary arc generation is outside this skill.
 
-### Default: Execute Mode
+Every initial, candidate, zoom, adjustment, and final map must include background map context. `--basemap-provider auto` is the default: use `road_detail` for small-estuary and creek-scale cases, topographic context for regional/lake/island-chain cases, then local coastline/minimal fallback if online tiles are unavailable. `road_detail` tries Esri World Street Map, CARTO Voyager, then OpenStreetMap Mapnik with explicit small-estuary zoom policy. A `none/off/false` basemap request means offline fallback, not a blank lat/lon-only plot.
+
+Use `--offshore-azimuth-deg` only when map review requires an explicit offshore-side selector override after the normal candidate repair pass.
+
+## Execute Mode
 
 ```powershell
-# run_in_terminal (mode=sync)
 python "Agent_skill_dev\skill_catalog\grid-generation\fvcom-region-bpoly\scripts\run_region_bpoly.py" --request-text "Puget Sound tidal energy model" --run-dir Workspace/Preprocessing/fvcom-region-bpoly/runs/case --name case --mode execute
 ```
 
-On success: outputs `region_bpoly.json` + `region_bpoly_final_map.png`, deletes intermediates.
-On failure: keeps `intermediate/`, marks `final_status = needs_review`.
+On pass, execute mode outputs only:
 
-### Visual QA Gate (Copilot-Specific)
+- `region_bpoly.json`
+- `region_bpoly_final_map.png`
+- `offshore_boundary_artifacts.json`
 
-When the workflow produces candidate maps:
+It removes `intermediate/` after a successful pass.
 
-1. Use `view_image` to inspect `*_candidate_map.png` and `*_candidate_focus_map.png`
-2. Use `read_file` on `*_candidate_score.json` for coverage metrics
-3. Use `vscode_askQuestions` to ask the user for pass/revise/fail decision
-4. If manual review needed, run:
+## Test / Review Mode
 
 ```powershell
-python "...\scripts\review_region_bpoly.py" --candidate-json runs/case/intermediate/case_region_bpoly_candidate.json --decision pass --domain-type-note-json runs/case/intermediate/case_domain_type_note.json --side-review-all-pass --notes "Visually verified in Copilot"
+python "...\scripts\run_region_bpoly.py" --request-text "..." --run-dir runs/case --name case --mode test --review-depth auto
 ```
 
-### Test Mode (Keeps Intermediates)
+Test mode keeps `intermediate/visual_review/` with:
+
+- initial guess map and JSON;
+- `target_region_features.json`;
+- `target_region_feature_polygons.geojson`;
+- candidate and focus maps;
+- side zoom maps;
+- coverage and score JSON.
+
+## Review Depth
+
+- `--review-depth fast`: 4 zoom maps, one centered on each side.
+- `--review-depth full`: 12 zoom maps, start/middle/end on all sides.
+- `--review-depth auto`: full for complex archipelago, all-channel, connectivity, multiple river/channel, lake-connection, geopolitical, antimeridian, or failed-coverage cases.
+- `--full-side-review`: backward-compatible alias for full review.
+
+## Visual QA Gate
+
+When candidate maps are retained:
+
+1. Use `view_image` on initial guess, candidate, focus, final, and relevant side zoom maps.
+2. Use `read_file` on score JSON, `target_region_features.json`, `region_bpoly.json`, and `offshore_boundary_artifacts.json`.
+3. Use `vscode_askQuestions` for pass/revise/fail or targeted side-boundary decisions when needed.
+
+Reject or revise outputs whose map metadata shows no enabled background context. The plotting layer should report `enabled: true` and `required: true`, using Esri topo tiles, OSM road tiles, an offline coastline background, or the minimal geographic fallback.
+
+## QA Expectations
+
+- Required feature boxes must be scored.
+- The box should fit required features tightly and avoid wrong-region inclusion.
+- Non-required `offshore_boundary_exclusion` / `obstruction_guard` boxes must be used to prevent false passes when the offshore side is cut by blocker islands.
+- Cook Inlet wave, wave-current, SWAN, wave-climate, offshore-wave-forcing, or fetch prompts use `cook_inlet_wave_fetch` and must include Kodiak, Augustine Island, Ursus Cove/Kamishak, and a broad Gulf wave apron.
+- Cook Inlet tidal-only/current-only prompts use `cook_inlet_tidal_mouth` and must avoid Kodiak as an obstruction guard.
+- Murderkill-style prompts are `small_estuary` scale and must satisfy tighter area/width limits with `road_detail` map policy.
+- Hawaii Island / Big-Island-only domains must avoid Maui Nui / neighboring-island obstruction guards; Hawaii State/island-chain requests may include the island chain.
+- Southeast Alaska name variants must not fall back to a continent-scale box.
+- Puget/Salish connectivity missions are connected coastal/inland-sea domains, not island-domain policies.
+- Aleutian/antimeridian maps must be compact and reviewable.
+- Lake domains have no ocean open-boundary reference.
+- Hawaii Island means Big Island unless the prompt asks for all Hawaii state/island-chain context.
+
+## Adjustment Workflow
+
+Use `adjust_region_bpoly.py` when direct map-based polygon edits are needed.
+
+The workflow may also test deterministic four-sided repair candidates before final pass. Accept a repair only if it preserves required-feature coverage, avoids obstruction guards, improves tightness or removes blocking failures, and remains a valid RegionBPoly. Otherwise mark `final_status: needs_review`.
+
+Supported manifest operations:
+
+- `rotate`
+- `scale`
+- `reshape`
+
+The adjustment map must show old polygon dashed and adjusted polygon solid.
 
 ```powershell
-python "...\scripts\run_region_bpoly.py" --request-text "..." --run-dir runs/case --name case --mode test
+python "...\scripts\adjust_region_bpoly.py" --input-json runs/case/region_bpoly.json --adjustment-manifest runs/case/adjust.json --output-json runs/case/region_bpoly_adjusted.json --map-path runs/case/region_bpoly_adjustment_map.png
 ```
-
-## Domain Types
-
-- `coastal`: one ocean/open-boundary arc with two land anchors; needs open-boundary reference point
-- `island`: offshore loop without land anchors
-- `lake`: no ocean open boundary
-- `unresolved_autonomous_failure`: not accepted
-
-## Mission-Scope Gates
-
-- `all tidal channels`, `tidal energy`, `connectivity` → connected straits/channels required
-- Puget tidal-energy → Salish Sea scale (Puget Sound + Hood Canal + Admiralty Inlet + San Juan Islands + straits)
-- Aleutian chain → must include intended extent or name subregion
-
-## Place-Name Rules
-
-- `Hawaii Island` = Big Island only
-- `Hawaiian Islands`/`Hawaii state` = full chain
-- Final map must show whole bpoly; antimeridian cases warn downstream
 
 ## Output Contract
 
-Pass downstream only:
-- `region_bpoly.json` — vertices, bbox, domain type, boundary policy, QA summary
+Pass downstream:
+
+- `region_bpoly.json`
 - `region_bpoly_final_map.png`
+- `offshore_boundary_artifacts.json`
 
-## Copilot Tool Integration
-
-| Step | Tool |
-|------|------|
-| Run scripts | `run_in_terminal` (mode=sync) |
-| View candidate maps | `view_image` |
-| Read score/coverage JSON | `read_file` |
-| Ask user for QA decision | `vscode_askQuestions` |
-| View final map | `view_image` on `region_bpoly_final_map.png` |
+The final PNG must include background map geography, not only the polygon and grid.

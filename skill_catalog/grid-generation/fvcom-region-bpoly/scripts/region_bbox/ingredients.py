@@ -3,24 +3,13 @@ from __future__ import annotations
 import re
 from typing import Any
 
-
-def request_text(request: dict[str, Any] | str) -> str:
-    if isinstance(request, str):
-        return request
-    chunks = []
-    for key in ("region", "mission", "purpose", "description", "request", "text", "prompt"):
-        val = request.get(key)
-        if val:
-            chunks.append(str(val))
-    if not chunks:
-        chunks.append(" ".join(str(v) for v in request.values() if isinstance(v, (str, int, float))))
-    return " ".join(chunks)
+from .normalization import normalize_request_text, request_text
 
 
 def required_ingredients(request: dict[str, Any] | str) -> list[dict[str, Any]]:
     if isinstance(request, dict) and isinstance(request.get("required_ingredients"), list):
         return request["required_ingredients"]
-    text = request_text(request).lower()
+    text = normalize_request_text(request)
     items: list[dict[str, Any]] = []
 
     def bbox(i, label, role, geom, required=True, notes=""):
@@ -88,7 +77,7 @@ def required_ingredients(request: dict[str, Any] | str) -> list[dict[str, Any]]:
         bbox("gulf_of_alaska", "Gulf of Alaska forcing apron", "offshore_buffer", [-154.5, 57.0, -150.0, 59.5])
         return items
 
-    if "southeast alaska" in text or "se ak" in text:
+    if "southeast alaska" in text:
         bbox("se_alaska", "Southeast Alaska tidal channels", "target_region", [-139.8, 54.0, -128.0, 60.0])
         bbox("haida_gwaii_context", "Haida Gwaii context", "boundary_split_guard", [-133.5, 51.5, -130.0, 54.5])
         return items
@@ -112,7 +101,7 @@ def required_ingredients(request: dict[str, Any] | str) -> list[dict[str, Any]]:
 
 
 def mission_scope_notes(request: dict[str, Any] | str) -> list[dict[str, Any]]:
-    text = request_text(request).lower()
+    text = normalize_request_text(request)
     notes: list[dict[str, Any]] = []
     if "puget" in text and any(k in text for k in ["tidal energy", "all tidal", "all the tidal", "connect"]):
         notes.append(

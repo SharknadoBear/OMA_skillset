@@ -70,6 +70,7 @@ class RegionBox:
         for i in range(4):
             p0 = pts[i]
             p1 = pts[(i + 1) % 4]
+            mid_lon_a, mid_lon_b = _unwrap_pair(p0[0], p1[0])
             x0, y0 = self.local_xy_km(*p0)
             x1, y1 = self.local_xy_km(*p1)
             dx, dy = x1 - x0, y1 - y0
@@ -82,7 +83,7 @@ class RegionBox:
                     "side_name": f"side_{i}",
                     "start_lonlat": p0,
                     "end_lonlat": p1,
-                    "midpoint_lonlat": [(p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0],
+                    "midpoint_lonlat": [_wrap_lon((mid_lon_a + mid_lon_b) / 2.0), (p0[1] + p1[1]) / 2.0],
                     "outward_azimuth_deg": _vec_to_az(nx / norm, ny / norm),
                 }
             )
@@ -103,9 +104,13 @@ class RegionBox:
 
     def envelope_bbox(self) -> list[float]:
         pts = self.polygon_lonlat()[:-1]
-        lons = [p[0] for p in pts]
+        raw_lons = [p[0] for p in pts]
+        unwrapped_lons = _unwrap_lons(raw_lons)
+        raw_span = max(raw_lons) - min(raw_lons)
+        unwrapped_span = max(unwrapped_lons) - min(unwrapped_lons)
+        lons = unwrapped_lons if unwrapped_span < raw_span else raw_lons
         lats = [p[1] for p in pts]
-        return [min(lons), min(lats), max(lons), max(lats)]
+        return [_wrap_lon(min(lons)), min(lats), _wrap_lon(max(lons)), max(lats)]
 
     def crosses_antimeridian(self) -> bool:
         pts = self.polygon_lonlat()
@@ -237,11 +242,16 @@ class RegionBPoly:
     def from_dict(cls, data: dict) -> "RegionBPoly":
         if "polygon_lonlat" in data:
             pts = data["polygon_lonlat"]
+            offshore = data.get("offshore_azimuth_deg", 90.0)
+            edge_labels = data.get("edge_labels")
         elif "region_bpoly" in data:
-            pts = data["region_bpoly"]["polygon_lonlat"]
+            src = data["region_bpoly"]
+            pts = src["polygon_lonlat"]
+            offshore = data.get("offshore_azimuth_deg", src.get("offshore_azimuth_deg", 90.0))
+            edge_labels = data.get("edge_labels", src.get("edge_labels"))
         else:
             return cls.from_region_box(RegionBox.from_dict(data))
-        return cls(pts[:-1] if len(pts) == 5 and pts[0] == pts[-1] else pts, float(data.get("offshore_azimuth_deg", 90.0)), data.get("edge_labels"))
+        return cls(pts[:-1] if len(pts) == 5 and pts[0] == pts[-1] else pts, float(offshore), edge_labels)
 
     @property
     def center_lon(self) -> float:
@@ -270,6 +280,7 @@ class RegionBPoly:
         for i in range(4):
             p0 = pts[i]
             p1 = pts[(i + 1) % 4]
+            mid_lon_a, mid_lon_b = _unwrap_pair(p0[0], p1[0])
             x0, y0 = self.local_xy_km(*p0)
             x1, y1 = self.local_xy_km(*p1)
             dx, dy = x1 - x0, y1 - y0
@@ -281,7 +292,7 @@ class RegionBPoly:
                     "side_name": self.edge_labels[i] if self.edge_labels else f"side_{i}",
                     "start_lonlat": p0,
                     "end_lonlat": p1,
-                    "midpoint_lonlat": [_wrap_lon((p0[0] + p1[0]) / 2.0), (p0[1] + p1[1]) / 2.0],
+                    "midpoint_lonlat": [_wrap_lon((mid_lon_a + mid_lon_b) / 2.0), (p0[1] + p1[1]) / 2.0],
                     "outward_azimuth_deg": _vec_to_az(nx / norm, ny / norm),
                 }
             )
@@ -302,9 +313,13 @@ class RegionBPoly:
 
     def envelope_bbox(self) -> list[float]:
         pts = self.polygon_lonlat_points
-        lons = [p[0] for p in pts]
+        raw_lons = [p[0] for p in pts]
+        unwrapped_lons = _unwrap_lons(raw_lons)
+        raw_span = max(raw_lons) - min(raw_lons)
+        unwrapped_span = max(unwrapped_lons) - min(unwrapped_lons)
+        lons = unwrapped_lons if unwrapped_span < raw_span else raw_lons
         lats = [p[1] for p in pts]
-        return [min(lons), min(lats), max(lons), max(lats)]
+        return [_wrap_lon(min(lons)), min(lats), _wrap_lon(max(lons)), max(lats)]
 
     def crosses_antimeridian(self) -> bool:
         pts = self.polygon_lonlat()
