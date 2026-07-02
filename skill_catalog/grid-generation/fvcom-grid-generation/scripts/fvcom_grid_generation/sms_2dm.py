@@ -1,4 +1,4 @@
-"""SMS 2DM reader/writer for FVCOM triangular meshes."""
+"""Minimal SMS 2DM read/write helpers for FVCOM grids."""
 
 from __future__ import annotations
 
@@ -10,90 +10,78 @@ import numpy as np
 
 @dataclass(frozen=True)
 class Mesh2DM:
-    name: str
-    nodes: np.ndarray
+    nodes_lonlat: np.ndarray
     depths: np.ndarray
     triangles: np.ndarray
-    open_boundaries: list[np.ndarray]
-
-
-def read_2dm(path: str | Path) -> Mesh2DM:
-    """Read MESH2D, MESHNAME, E3T, ND, and NS records from an SMS 2DM file."""
-    path = Path(path)
-    name = path.stem
-    nodes_by_id: dict[int, tuple[float, float, float]] = {}
-    triangles: list[tuple[int, int, int]] = []
-    open_boundaries: list[np.ndarray] = []
-    current_ns: list[int] = []
-
-    for raw in path.read_text(errors="replace").splitlines():
-        parts = raw.split()
-        if not parts:
-            continue
-        rec = parts[0].upper()
-        if rec == "MESHNAME":
-            name = raw.split(" ", 1)[1].strip().strip('"') if " " in raw else name
-        elif rec == "E3T":
-            triangles.append((int(parts[2]), int(parts[3]), int(parts[4])))
-        elif rec == "ND":
-            nodes_by_id[int(parts[1])] = (float(parts[2]), float(parts[3]), float(parts[4]))
-        elif rec == "NS":
-            for token in parts[1:]:
-                value = int(float(token))
-                current_ns.append(abs(value))
-                if value < 0:
-                    open_boundaries.append(np.asarray(current_ns, dtype=int))
-                    current_ns = []
-            # SMS often appends the first node after a negative end marker.
-            if open_boundaries and current_ns and current_ns[-1] == open_boundaries[-1][0]:
-                current_ns = []
-
-    if current_ns:
-        open_boundaries.append(np.asarray(current_ns, dtype=int))
-    if not nodes_by_id:
-        raise ValueError(f"No ND records found in {path}")
-
-    max_id = max(nodes_by_id)
-    nodes = np.full((max_id, 2), np.nan, dtype=float)
-    depths = np.full(max_id, np.nan, dtype=float)
-    for node_id, (lon, lat, depth) in nodes_by_id.items():
-        nodes[node_id - 1] = (lon, lat)
-        depths[node_id - 1] = depth
-    return Mesh2DM(
-        name=name,
-        nodes=nodes,
-        depths=depths,
-        triangles=np.asarray(triangles, dtype=int),
-        open_boundaries=open_boundaries,
-    )
+    open_boundary_nodes: np.ndarray
+    mesh_name: str
 
 
 def write_2dm(
     path: str | Path,
-    nodes: np.ndarray,
+    nodes_lonlat: np.ndarray,
     depths: np.ndarray,
     triangles: np.ndarray,
-    open_boundary: np.ndarray | None = None,
+    open_boundary_nodes: np.ndarray,
     mesh_name: str = "fvcom_grid",
 ) -> Path:
-    """Write an SMS 2DM file with one optional open-boundary nodestring."""
+    """Write a FVCOM/SMS-style 2DM mesh."""
     path = Path(path)
-    nodes = np.asarray(nodes, dtype=float)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    nodes_lonlat = np.asarray(nodes_lonlat, dtype=float)
     depths = np.asarray(depths, dtype=float)
     triangles = np.asarray(triangles, dtype=int)
-
-    with path.open("w", encoding="utf-8", newline="\n") as handle:
+    open_boundary_nodes = np.asarray(open_boundary_nodes, dtype=int)
+    with path.open("w", encoding="utf-8") as handle:
         handle.write("MESH2D\n")
         handle.write(f'MESHNAME "{mesh_name}"\n')
-        for eid, tri in enumerate(triangles, start=1):
-            handle.write(f"E3T {eid} {int(tri[0])} {int(tri[1])} {int(tri[2])} 1\n")
-        for nid, ((lon, lat), depth) in enumerate(zip(nodes, depths), start=1):
-            handle.write(f"ND {nid} {lon:.8e} {lat:.8e} {depth:.8e}\n")
-        if open_boundary is not None and len(open_boundary) > 0:
-            tokens = [int(v) for v in open_boundary]
-            if len(tokens) >= 2:
-                tokens = tokens[:-1] + [-abs(tokens[-1]), tokens[0]]
-            for start in range(0, len(tokens), 10):
-                chunk = tokens[start : start + 10]
-                handle.write("NS  " + " ".join(str(v) for v in chunk) + "\n")
+        for idx, tri in enumerate(triangles, start=1):
+            handle.write(f"E3T {idx} {int(tri[0])} {int(tri[1])} {int(tri[2])} 1\n")
+        for idx, ((lon, lat), depth) in enumerate(zip(nodes_lonlat, depths), start=1):
+            handle.write(f"ND {idx} {lon:.10f} {lat:.10f} {float(depth):.4f}\n")
+        if open_boundary_nodes.size:
+            ids = [int(v) for v in open_boundary_nodes if int(v) > 0]
+            for start in range(0, len(ids), 10):
+                chunk = ids[start : start + 10]
+                if start + 10 >= len(ids):
+                    chunk = chunk[:-1] + [-chunk[-1], 1] if chunk else []
+                handle.write("NS " + " ".join(str(v) for v in chunk) + "\n")
     return path
+
+
+def read_2dm(path: str | Path) -> Mesh2DM:
+    """Read the subset of SMS 2DM records written by this skill."""
+    nodes: dict[int, tuple[float, float, float]] = {}
+    tris: list[tuple[int, int, int]] = []
+    ns: list[int] = []
+    mesh_name = "fvcom_grid"
+    ns_terminated = False
+    for raw in Path(path).read_text(encoding="utf-8", errors="ignore").splitlines():
+        parts = raw.strip().split()
+        if not parts:
+            continue
+        tag = parts[0].upper()
+        if tag == "MESHNAME" and len(parts) > 1:
+            mesh_name = " ".join(parts[1:]).strip('"')
+        elif tag == "E3T" and len(parts) >= 5:
+            tris.append((int(parts[2]), int(parts[3]), int(parts[4])))
+        elif tag == "ND" and len(parts) >= 5:
+            nodes[int(parts[1])] = (float(parts[2]), float(parts[3]), float(parts[4]))
+        elif tag == "NS":
+            for item in parts[1:]:
+                value = int(item)
+                if ns_terminated and value == 1:
+                    continue
+                if value < 0:
+                    ns_terminated = True
+                ns.append(abs(value))
+    ordered = [nodes[idx] for idx in sorted(nodes)]
+    arr = np.asarray([[lon, lat] for lon, lat, _depth in ordered], dtype=float)
+    depths = np.asarray([depth for _lon, _lat, depth in ordered], dtype=float)
+    return Mesh2DM(
+        nodes_lonlat=arr,
+        depths=depths,
+        triangles=np.asarray(tris, dtype=int),
+        open_boundary_nodes=np.asarray(ns, dtype=int),
+        mesh_name=mesh_name,
+    )
