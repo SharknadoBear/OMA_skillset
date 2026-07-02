@@ -55,6 +55,7 @@ def build_model_boundary_loops(
     open_gdf = _read_layer(bdry_arc_gpkg, "open_boundary_arc")
     land_gdf = _read_layer(bdry_arc_gpkg, "land_boundary_arcs")
     frame_gdf = _read_layer(bdry_arc_gpkg, "frame_clip_boundary_arcs")
+    land_patch_gdf = _read_layer(bdry_arc_gpkg, "land_patch_boundary_arcs")
     coast_gdf = _read_layer(bdry_arc_gpkg, "coastline_repaired")
     if coast_gdf.empty:
         coast_gdf = _read_layer(bdry_arc_gpkg, "coastline_raw")
@@ -62,6 +63,7 @@ def build_model_boundary_loops(
     open_xy = _line_union_xy(open_gdf, projection)
     land_xy = _line_union_xy(land_gdf, projection)
     frame_xy = _line_union_xy(frame_gdf, projection)
+    land_patch_xy = _line_union_xy(land_patch_gdf, projection)
     exterior_xy = LineString(domain_xy.exterior.coords)
     tolerance_m = max(2.0 * target_resolution_m, 50.0)
     segments_xy = _classify_exterior_segments(
@@ -69,6 +71,7 @@ def build_model_boundary_loops(
         open_xy,
         land_xy,
         frame_xy,
+        land_patch_xy,
         tolerance_m,
     )
     island_polygons_xy, island_lines_xy = _extract_islands(domain_xy, min_island_area_m2)
@@ -82,7 +85,11 @@ def build_model_boundary_loops(
         failures.append("upstream_bdry_arc_needs_review")
     if not outer_closed:
         failures.append("model_outer_boundary_not_closed")
-    if open_overlap_fraction < 0.98:
+    closure_method = source_manifest.get("wet_domain", {}).get("closure_method")
+    lake_no_open_boundary = closure_method == "lake_closed_boundary_no_open_arc" or bool(source_manifest.get("wet_domain", {}).get("no_ocean_open_boundary"))
+    land_patch_fraction = float(source_manifest.get("wet_domain", {}).get("land_patch_boundary_fraction", 0.0) or 0.0)
+    open_overlap_threshold = 0.0 if lake_no_open_boundary else (0.90 if closure_method == "island_archipelago_offshore_loop" and land_patch_fraction > 0.0 else 0.98)
+    if not lake_no_open_boundary and open_overlap_fraction < open_overlap_threshold:
         failures.append("open_boundary_not_sufficiently_on_model_exterior")
     if class_lengths.get("unclassified_outer_boundary", 0.0) > unclassified_threshold_m:
         failures.append("unclassified_outer_boundary_length_nontrivial")
@@ -121,12 +128,15 @@ def build_model_boundary_loops(
             "mode": mode,
             "classification_tolerance_m": float(tolerance_m),
             "unclassified_length_threshold_m": float(unclassified_threshold_m),
+            "open_boundary_overlap_threshold": float(open_overlap_threshold),
+            "lake_no_open_boundary": bool(lake_no_open_boundary),
         },
         "qa": {
             "outer_boundary_closed": outer_closed,
             "outer_boundary_length_m": float(exterior_xy.length),
             "open_boundary_exterior_overlap_fraction": float(open_overlap_fraction),
             "land_outer_boundary_length_m": float(class_lengths.get("land_outer_boundary", 0.0)),
+            "land_patch_boundary_length_m": float(class_lengths.get("land_patch_boundary", 0.0)),
             "frame_clip_boundary_length_m": float(class_lengths.get("frame_clip_boundary", 0.0)),
             "open_boundary_length_m": float(class_lengths.get("open_boundary", 0.0)),
             "unclassified_outer_boundary_length_m": float(class_lengths.get("unclassified_outer_boundary", 0.0)),
@@ -193,6 +203,7 @@ def _classify_exterior_segments(
     open_xy,
     land_xy,
     frame_xy,
+    land_patch_xy,
     tolerance_m: float,
 ) -> list[dict[str, Any]]:
     coords = list(exterior_xy.coords)
@@ -203,7 +214,9 @@ def _classify_exterior_segments(
             continue
         midpoint = segment.interpolate(0.5, normalized=True)
         segment_class = "unclassified_outer_boundary"
-        if _near(midpoint, open_xy, tolerance_m):
+        if _near(midpoint, land_patch_xy, tolerance_m):
+            segment_class = "land_patch_boundary"
+        elif _near(midpoint, open_xy, tolerance_m):
             segment_class = "open_boundary"
         elif _near(midpoint, land_xy, tolerance_m):
             segment_class = "land_outer_boundary"
@@ -394,6 +407,7 @@ def _plot_boundary_map(
         sample.plot(ax=ax, color="#8a8f98", linewidth=0.25, alpha=0.45)
     segments = layers["model_outer_boundary_segments"]
     _plot_class(segments, ax, "land_outer_boundary", "#005ea8", linewidth=1.6)
+    _plot_class(segments, ax, "land_patch_boundary", "#005ea8", linewidth=1.8, linestyle="--")
     _plot_class(segments, ax, "frame_clip_boundary", "#005ea8", linewidth=1.6, linestyle="--")
     _plot_class(segments, ax, "unclassified_outer_boundary", "#f28e2b", linewidth=1.2, linestyle=":")
     _plot_class(segments, ax, "open_boundary", "#d00000", linewidth=2.4)

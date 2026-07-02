@@ -118,6 +118,8 @@ def main() -> None:
                     name,
                     "--mode",
                     "test",
+                    "--heuristic-mode",
+                    "memory",
                     "--basemap-provider",
                     "none",
                 ]
@@ -175,6 +177,120 @@ def main() -> None:
         assert tight["approx_width_km"] <= tight["small_estuary_limits"]["max_width_km"], tight
         assert tight["region_area_km2"] <= tight["small_estuary_limits"]["max_region_area_km2"], tight
 
+        # Unknown or memory-disabled prompts must not pass through the old
+        # Delaware/NJ fallback box.
+        unknown_cases = {
+            "pws_unknown": "Prince William Sound tide/current/ocean-exchange modeling domain",
+            "galveston_unknown": "Galveston-Trinity Bay complex tide and salinity modeling domain",
+            "albemarle_unknown": "Albemarle-Pamlico Sound complex tide and salinity modeling domain",
+            "port_royal_unknown": "Port Royal Sound and St. Helena Sound estuarine complex",
+            "murderkill_memory_off": "Murderkill River DE small estuary salinity intrusion",
+        }
+        for name, text in unknown_cases.items():
+            out_dir = run_dir / name
+            run(
+                [
+                    "run_region_bpoly.py",
+                    "--request-text",
+                    text,
+                    "--run-dir",
+                    out_dir,
+                    "--name",
+                    name,
+                    "--mode",
+                    "test",
+                    "--basemap-provider",
+                    "none",
+                ]
+            )
+            unknown = load(out_dir / "region_bpoly.json")
+            assert unknown["final_status"] == "needs_review", unknown
+            assert unknown["domain_type"] == "unresolved_autonomous_failure", unknown
+            assert unknown["envelope_bbox"] is None, unknown
+            assert unknown["qa"]["bpoly_quality"]["canonical_region_key"] == "unknown"
+            assert "unknown_region_no_feature_plan" in {
+                item["code"] for item in unknown["qa"]["bpoly_quality"]["failure_taxonomy"]
+            }
+
+        execute_unknown_dir = run_dir / "execute_unknown_no_fallback"
+        run(
+            [
+                "run_region_bpoly.py",
+                "--request-text",
+                "Uncatalogued coastal embayment with no explicit feature boxes",
+                "--run-dir",
+                execute_unknown_dir,
+                "--name",
+                "execute_unknown_no_fallback",
+                "--mode",
+                "execute",
+                "--basemap-provider",
+                "none",
+            ]
+        )
+        execute_unknown = load(execute_unknown_dir / "region_bpoly.json")
+        assert execute_unknown["final_status"] == "needs_review", execute_unknown
+        assert execute_unknown["domain_type"] == "unresolved_autonomous_failure", execute_unknown
+        assert execute_unknown["envelope_bbox"] is None, execute_unknown
+        assert "unknown_region_no_feature_plan" in {
+            item["code"] for item in execute_unknown["qa"]["bpoly_quality"]["failure_taxonomy"]
+        }
+
+        explicit_dir = run_dir / "explicit_feature_test_mode"
+        explicit_request = {
+            "request": "Unknown named estuary supplied with explicit feature boxes",
+            "target_region_features": {
+                "schema_version": "target_region_features_v1",
+                "source": "selftest_explicit_features",
+                "request_text": "Unknown named estuary supplied with explicit feature boxes",
+                "domain_scale": "regional",
+                "domain_variant": None,
+                "considerations": {},
+                "features": [
+                    {
+                        "id": "test_estuary_core",
+                        "label": "Test estuary core",
+                        "role": "target_estuary",
+                        "category": "target_region",
+                        "type": "bbox",
+                        "geometry": [-95.2, 29.1, -94.6, 29.8],
+                        "required": True,
+                    },
+                    {
+                        "id": "test_offshore_gate",
+                        "label": "Test offshore gate",
+                        "role": "offshore_buffer",
+                        "category": "offshore_extension",
+                        "type": "bbox",
+                        "geometry": [-95.4, 28.7, -94.2, 29.2],
+                        "required": True,
+                    },
+                ],
+            },
+        }
+        explicit_json = run_dir / "explicit_request.json"
+        explicit_json.write_text(json.dumps(explicit_request, indent=2), encoding="utf-8")
+        run(
+            [
+                "run_region_bpoly.py",
+                "--request-json",
+                explicit_json,
+                "--run-dir",
+                explicit_dir,
+                "--name",
+                "explicit_feature_test_mode",
+                "--mode",
+                "test",
+                "--basemap-provider",
+                "none",
+            ]
+        )
+        explicit = load(explicit_dir / "region_bpoly.json")
+        assert explicit["final_status"] == "pass", explicit
+        assert explicit["heuristic_mode"] == "unknown"
+        assert explicit["place_memory_enabled"] is False
+        assert explicit["qa"]["ingredient_coverage"]["required_count"] == 2
+
         # Test mode keeps visual-review artifacts.
         test_dir = run_dir / "test_case"
         run(
@@ -188,6 +304,8 @@ def main() -> None:
                 "test_case",
                 "--mode",
                 "test",
+                "--heuristic-mode",
+                "memory",
             ]
         )
         test_final = load(test_dir / "region_bpoly.json")
@@ -222,6 +340,8 @@ def main() -> None:
                 "lake_case",
                 "--mode",
                 "test",
+                "--heuristic-mode",
+                "memory",
                 "--basemap-provider",
                 "none",
             ]
@@ -244,6 +364,8 @@ def main() -> None:
                 "cook_case",
                 "--mode",
                 "test",
+                "--heuristic-mode",
+                "memory",
                 "--basemap-provider",
                 "none",
             ]
@@ -255,6 +377,9 @@ def main() -> None:
         for feature_id in {"cook_inlet_full", "ursus_cove_kamishak", "augustine_island", "kodiak_island_context", "cook_inlet_broad_wave_apron"}:
             assert feature_id in cook_feature_ids, cook_feature_ids
         assert cook["envelope_bbox"][1] < 56.0, cook["envelope_bbox"]
+        assert cook["envelope_bbox"][2] <= -148.3, cook["envelope_bbox"]
+        cook_wrong_region = cook["qa"]["bpoly_quality"]["wrong_region_inclusion"]["warnings"]
+        assert not any("Prince William Sound" in warning for warning in cook_wrong_region), cook_wrong_region
 
         # Cook tidal-only domains keep the mouth-gate option and Kodiak guard.
         cook_tidal_dir = run_dir / "cook_tidal_case"
@@ -269,6 +394,8 @@ def main() -> None:
                 "cook_tidal_case",
                 "--mode",
                 "test",
+                "--heuristic-mode",
+                "memory",
                 "--basemap-provider",
                 "none",
             ]
@@ -279,6 +406,37 @@ def main() -> None:
         cook_guards = cook_tidal["qa"]["bpoly_quality"]["offshore_side_qa"]["obstruction_guards"]
         kodiak = [g for g in cook_guards if g["guard_id"] == "kodiak_island_obstruction"]
         assert kodiak and not kodiak[0]["blocks_final_pass"], kodiak
+
+        # Mobile Bay needs an open-gate landing west of Horn Island without
+        # unnecessary Perdido/Wolf Bay overreach.
+        mobile_dir = run_dir / "mobile_case"
+        run(
+            [
+                "run_region_bpoly.py",
+                "--request-text",
+                "Mobile Bay tide and salinity model with Mobile-Tensaw delta and Gulf of Mexico open boundary",
+                "--run-dir",
+                mobile_dir,
+                "--name",
+                "mobile_case",
+                "--mode",
+                "test",
+                "--heuristic-mode",
+                "memory",
+                "--basemap-provider",
+                "none",
+            ]
+        )
+        mobile = load(mobile_dir / "region_bpoly.json")
+        assert mobile["final_status"] == "pass"
+        assert mobile["domain_type"] == "coastal"
+        assert mobile["envelope_bbox"][0] <= -88.85, mobile["envelope_bbox"]
+        assert mobile["envelope_bbox"][2] <= -87.45, mobile["envelope_bbox"]
+        mobile_feature_ids = {f["id"] for f in mobile["target_region_features"]["features"]}
+        assert {"mobile_bay_core", "mobile_tensaw_delta", "mobile_gulf_gate", "horn_island_west_landing_context"}.issubset(mobile_feature_ids)
+        mobile_taxonomy = [item["code"] for item in mobile["qa"]["bpoly_quality"]["failure_taxonomy"]]
+        assert "open_gate_landing_blocked_by_horn_island" not in mobile_taxonomy
+        assert "perdido_wolf_bay_overreach_risk" not in mobile_taxonomy
 
         # Hawaii Island-only scope should stay cleanly around the Big Island.
         hawaii_dir = run_dir / "hawaii_case"
@@ -293,6 +451,8 @@ def main() -> None:
                 "hawaii_case",
                 "--mode",
                 "test",
+                "--heuristic-mode",
+                "memory",
                 "--basemap-provider",
                 "none",
             ]
@@ -318,6 +478,8 @@ def main() -> None:
                 "hawaii_state_case",
                 "--mode",
                 "test",
+                "--heuristic-mode",
+                "memory",
                 "--basemap-provider",
                 "none",
             ]

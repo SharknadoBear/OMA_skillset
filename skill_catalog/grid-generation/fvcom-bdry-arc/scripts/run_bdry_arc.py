@@ -33,11 +33,14 @@ def main() -> int:
     parser.add_argument("--gshhs-resolution", default="f", choices=("auto", "c", "l", "i", "h", "f"))
     parser.add_argument("--gshhs-levels", default="1")
     parser.add_argument("--fallback-policy", default="auto", choices=("none", "osm-overpass", "auto"))
-    parser.add_argument("--topology-mode", default="gshhs-vector", choices=("gshhs-vector", "iterative-raster", "vector-only"))
+    parser.add_argument("--topology-mode", default="gshhs-vector", choices=("gshhs-vector", "island-loop", "iterative-raster", "vector-only"))
     parser.add_argument("--raster-resolution-m", type=float)
     parser.add_argument("--max-topology-iterations", type=int, default=4)
     parser.add_argument("--convergence-area-frac", type=float, default=0.01)
     parser.add_argument("--convergence-anchor-m", type=float)
+    parser.add_argument("--progress-interval-s", type=float, default=30.0)
+    parser.add_argument("--heuristic-mode", default="auto", choices=("auto", "memory", "unknown"), help="auto uses text memory in execute and disables text-only routing in test.")
+    parser.add_argument("--topology-time-budget-s", type=float, default=900.0, help="Maximum seconds to spend evaluating full-resolution topology candidates before returning needs_review.")
     args = parser.parse_args()
 
     config = BdryArcConfig(
@@ -59,6 +62,9 @@ def main() -> int:
         max_topology_iterations=args.max_topology_iterations,
         convergence_area_frac=args.convergence_area_frac,
         convergence_anchor_m=args.convergence_anchor_m,
+        progress_interval_s=args.progress_interval_s,
+        heuristic_mode=args.heuristic_mode,
+        topology_time_budget_s=args.topology_time_budget_s,
     )
     manifest = run_bdry_arc(
         region_bpoly_json=args.region_bpoly_json,

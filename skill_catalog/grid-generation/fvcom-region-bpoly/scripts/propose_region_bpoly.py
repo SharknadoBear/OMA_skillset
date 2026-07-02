@@ -5,6 +5,7 @@ from pathlib import Path
 
 from region_bbox.geometry import RegionBPoly, RegionBox
 from region_bbox.features import (
+    bpoly_from_feature_boxes,
     cook_inlet_domain_variant,
     features_as_ingredients,
     features_to_geojson,
@@ -43,9 +44,19 @@ def guess_region_box(request: dict | str) -> RegionBox:
         return RegionBox(-88.4, 47.7, 650, 300, 82, 0)
     if key == "cook_inlet":
         return RegionBox(-151.7, 59.6, 460, 260, 25, 170)
+    if key == "mobile_bay":
+        return RegionBox(-88.25, 30.55, 180, 145, 5, 180)
     if key == "southeast_alaska":
         return RegionBox(-134.0, 55.5, 1050, 620, 130, 215)
-    return RegionBox(-75.0, 39.0, 200, 150, 0, 90)
+    raise ValueError("unknown_region_no_feature_plan")
+
+
+def _effective_request(request: dict | str, place_memory_enabled: bool) -> dict | str:
+    if isinstance(request, dict):
+        out = dict(request)
+        out["_place_memory_enabled"] = bool(place_memory_enabled)
+        return out
+    return {"request": request, "_place_memory_enabled": bool(place_memory_enabled)}
 
 
 def deform_bpoly(base: RegionBPoly, request: dict | str) -> tuple[RegionBPoly, list[str]]:
@@ -78,9 +89,9 @@ def deform_bpoly(base: RegionBPoly, request: dict | str) -> tuple[RegionBPoly, l
         notes.append("V2 Big-Island-only deformation keeps the northern edge below the Maui Nui neighboring-island guard.")
     elif key == "cook_inlet":
         if cook_inlet_domain_variant(request) == "cook_inlet_wave_fetch":
-            pts = [[-147.30, 55.25], [-157.30, 55.30], [-156.15, 62.05], [-148.15, 62.10]]
+            pts = [[-148.35, 55.25], [-157.30, 55.30], [-156.15, 62.05], [-148.65, 62.10]]
             offshore = 180.0
-            notes.append("V3 Cook Inlet wave-fetch deformation includes Kodiak, Augustine Island, Ursus Cove/Kamishak context, and a broad Gulf of Alaska wave apron.")
+            notes.append("V4 Cook Inlet wave-fetch deformation includes Kodiak, Augustine Island, Ursus Cove/Kamishak context, and a broad Gulf of Alaska wave apron while avoiding Prince William Sound overreach.")
         else:
             pts = [[-148.55, 58.88], [-153.35, 58.95], [-153.65, 61.75], [-148.75, 61.85]]
             offshore = 165.0
@@ -89,6 +100,10 @@ def deform_bpoly(base: RegionBPoly, request: dict | str) -> tuple[RegionBPoly, l
         pts = [[-84.0, 46.6], [-92.6, 46.1], [-92.4, 49.05], [-84.0, 49.35]]
         offshore = 0.0
         notes.append("Lake bpoly follows Lake Superior broad orientation; no ocean open boundary expected.")
+    elif key == "mobile_bay":
+        pts = [[-87.55, 29.92], [-88.95, 29.90], [-88.82, 31.25], [-87.70, 31.20]]
+        offshore = 180.0
+        notes.append("V4 Mobile Bay deformation keeps a Gulf-facing gate west enough to land beyond Horn Island while avoiding Perdido/Wolf Bay overreach.")
 
     labels = ["open_or_south", "west_or_left", "north_or_inner", "east_or_right"]
     if key.startswith("lake_"):
@@ -105,9 +120,9 @@ def known_repair_candidates(request: dict | str) -> list[dict]:
             specs.append(
                 (
                     "cook_inlet_wave_fetch_broad_repair",
-                    [[-147.30, 55.25], [-157.30, 55.30], [-156.15, 62.05], [-148.15, 62.10]],
+                    [[-148.35, 55.25], [-157.30, 55.30], [-156.15, 62.05], [-148.65, 62.10]],
                     180.0,
-                    "Includes Kodiak, Augustine Island, Ursus Cove/Kamishak west-side Cook Inlet, and a broad Gulf of Alaska wave-fetch apron.",
+                    "Includes Kodiak, Augustine Island, Ursus Cove/Kamishak west-side Cook Inlet, and a broad Gulf of Alaska wave-fetch apron without Prince William Sound overreach.",
                 )
             )
         else:
@@ -135,6 +150,15 @@ def known_repair_candidates(request: dict | str) -> list[dict]:
                 [[-154.05, 18.15], [-156.45, 18.15], [-156.45, 20.36], [-154.05, 20.36]],
                 225.0,
                 "Keeps a Big-Island-only bpoly below Maui Nui and neighboring-island obstruction guards.",
+            )
+        )
+    elif key == "mobile_bay":
+        specs.append(
+            (
+                "mobile_bay_gate_landing_repair",
+                [[-87.55, 29.92], [-88.95, 29.90], [-88.82, 31.25], [-87.70, 31.20]],
+                180.0,
+                "Extends the Gulf-facing gate west enough for a solid coastal landing while avoiding unnecessary Perdido/Wolf Bay inclusion.",
             )
         )
     return [
@@ -188,27 +212,35 @@ def main() -> None:
     ap.add_argument("--basemap-provider", default="auto", help="auto/topo/road/street/satellite/offline provider; none/off still uses the required offline background fallback.")
     ap.add_argument("--full-side-review", action="store_true")
     ap.add_argument("--review-depth", choices=["auto", "fast", "full"], default="auto")
+    ap.add_argument("--heuristic-mode", choices=["memory", "unknown"], default="memory", help="memory uses built-in place heuristics; unknown disables them and requires explicit geometry.")
     ap.add_argument("--iteration", type=int, default=1)
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     request = load_request(args)
+    place_memory_enabled = args.heuristic_mode == "memory"
+    effective_request = _effective_request(request, place_memory_enabled)
     req_path = write_json(run_dir / f"{args.name}_request.json", request)
 
+    features_doc = infer_target_region_features(effective_request, use_place_memory=place_memory_enabled)
+    ingredients = features_as_ingredients(features_doc) or required_ingredients(effective_request, use_place_memory=place_memory_enabled)
     if args.polygon_lonlat:
         import json
 
         bpoly = RegionBPoly(json.loads(args.polygon_lonlat), args.offshore_azimuth_deg or 90.0)
         deformation_notes = ["User supplied explicit four-corner polygon."]
+    elif not place_memory_enabled:
+        bpoly, feature_seed_note = bpoly_from_feature_boxes(ingredients, args.offshore_azimuth_deg or 90.0)
+        if bpoly is None:
+            raise ValueError("unknown_region_no_feature_plan: test/unknown heuristic mode requires explicit target_region_features, required_ingredients, or --polygon-lonlat")
+        deformation_notes = [feature_seed_note] if feature_seed_note else []
     else:
-        bpoly, deformation_notes = deform_bpoly(RegionBPoly.from_region_box(guess_region_box(request)), request)
+        bpoly, deformation_notes = deform_bpoly(RegionBPoly.from_region_box(guess_region_box(effective_request)), effective_request)
 
-    features_doc = infer_target_region_features(request)
-    ingredients = features_as_ingredients(features_doc) or required_ingredients(request)
-    basemap_provider, map_detail_policy = resolve_basemap_provider(request, args.basemap_provider, features_doc)
+    basemap_provider, map_detail_policy = resolve_basemap_provider(effective_request, args.basemap_provider, features_doc)
     basemap_zoom = map_detail_policy.get("target_zoom") if map_detail_policy else None
-    side_radius_km = side_focus_radius_km(request, features_doc)
+    side_radius_km = side_focus_radius_km(effective_request, features_doc)
     coverage = score_region_box(bpoly, ingredients)
     initial_guess_map = run_dir / f"{args.name}_initial_guess_map.png"
     initial_guess_basemap = plot_region_map(
@@ -239,9 +271,9 @@ def main() -> None:
         if refit_note:
             deformation_notes.append(refit_note)
             coverage = score_region_box(bpoly, ingredients)
-    notes = mission_scope_notes(request)
+    notes = mission_scope_notes(effective_request)
     review_depth_arg = "full" if args.full_side_review else args.review_depth
-    review_depth, review_reasons = select_review_depth(request, features_doc, coverage, bpoly, review_depth_arg, first_coverage_failed)
+    review_depth, review_reasons = select_review_depth(effective_request, features_doc, coverage, bpoly, review_depth_arg, first_coverage_failed)
     warnings = list(bpoly.map_visibility_warnings())
     for note in notes:
         if note.get("status") in {"requires_review", "requires_island_chain"}:
@@ -273,7 +305,7 @@ def main() -> None:
             "side_name": snap.get("side_name"),
             "notes": "Identifies intended offshore side for downstream coastline-anchor snapping only; boundary arc generation is outside this skill.",
         }
-    key = canonical_region_key(request)
+    key = canonical_region_key(effective_request)
     if key.startswith("lake_"):
         domain_type = "lake"
     elif key in {"aleutian", "hawaii_state", "hawaii_island"}:
@@ -281,7 +313,7 @@ def main() -> None:
     else:
         domain_type = "coastal"
     boundary_policy = {"coastal": "coastal_arc_with_land_anchors", "island": "offshore_loop_no_land_anchors", "lake": "no_open_boundary"}[domain_type]
-    quality_score = score_bpoly_quality(bpoly, ingredients, request, domain_type, boundary_policy, open_ref, basemap)
+    quality_score = score_bpoly_quality(bpoly, ingredients, effective_request, domain_type, boundary_policy, open_ref, basemap)
 
     score = {
         "ingredient_coverage": coverage,
@@ -291,6 +323,8 @@ def main() -> None:
         "target_region_features_path": str(feature_path),
         "target_region_feature_polygons_path": str(feature_geojson_path),
         "domain_variant": features_doc.get("domain_variant"),
+        "heuristic_mode": args.heuristic_mode,
+        "place_memory_enabled": place_memory_enabled,
         "review_depth": review_depth,
         "review_depth_reasons": review_reasons,
         "deformation_notes": deformation_notes,

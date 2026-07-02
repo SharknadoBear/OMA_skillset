@@ -80,7 +80,20 @@ def _considerations(text: str) -> dict[str, list[str]]:
     return notes
 
 
-def infer_target_region_features(request: dict[str, Any] | str) -> dict[str, Any]:
+def _empty_feature_doc(request: dict[str, Any] | str, source: str = "heuristic_prompt_decomposition") -> dict[str, Any]:
+    text = normalize_request_text(request)
+    return {
+        "schema_version": "target_region_features_v1",
+        "source": source,
+        "request_text": request_text(request),
+        "domain_scale": "regional",
+        "domain_variant": None,
+        "considerations": _considerations(text),
+        "features": [],
+    }
+
+
+def infer_target_region_features(request: dict[str, Any] | str, use_place_memory: bool = True) -> dict[str, Any]:
     """Infer feature boxes that the four-sided bpoly must encompass.
 
     The output intentionally mirrors the old RegionBox ingredient idea while
@@ -88,6 +101,8 @@ def infer_target_region_features(request: dict[str, Any] | str) -> dict[str, Any
     """
     if isinstance(request, dict) and isinstance(request.get("target_region_features"), dict):
         return request["target_region_features"]
+    if not use_place_memory:
+        return _empty_feature_doc(request, source="place_memory_disabled_unknown_region")
 
     text = normalize_request_text(request)
     key = canonical_region_key(request)
@@ -158,7 +173,18 @@ def infer_target_region_features(request: dict[str, Any] | str) -> dict[str, Any
             _bbox_feature(features, "ursus_cove_kamishak", "Ursus Cove / Kamishak west-side Cook Inlet context", "west_side_inlet_context", "target_region", [-154.05, 59.35, -153.35, 59.70])
             _bbox_feature(features, "augustine_island", "Augustine Island wave-generation context", "island_context", "island_archipelago_completeness", [-153.65, 59.22, -153.22, 59.50])
             _bbox_feature(features, "kodiak_island_context", "Kodiak Island included wave-fetch context", "island_context", "island_archipelago_completeness", [-154.9, 56.7, -151.0, 58.9])
-            _bbox_feature(features, "cook_inlet_broad_wave_apron", "Broad Gulf of Alaska wave-fetch apron", "offshore_buffer", "offshore_extension", [-156.5, 55.8, -147.8, 58.8])
+            _bbox_feature(features, "cook_inlet_broad_wave_apron", "Broad Gulf of Alaska wave-fetch apron west of Prince William Sound", "offshore_buffer", "offshore_extension", [-156.5, 55.8, -149.0, 58.8])
+            _bbox_feature(
+                features,
+                "prince_william_sound_overreach_guard",
+                "Prince William Sound wrong-region overreach guard",
+                "wrong_region_exclusion",
+                "wrong_region_exclusion",
+                [-148.3, 59.4, -145.0, 61.5],
+                required=False,
+                notes="Cook Inlet wave-fetch domains should not include Prince William Sound unless the prompt asks for it.",
+                extra={"blocks_final_pass": False},
+            )
         else:
             _bbox_feature(features, "cook_inlet", "Cook Inlet mouth-gate domain", "target_estuary", "target_region", [-153.3, 58.95, -149.0, 61.5])
             _bbox_feature(features, "gulf_of_alaska_open_gate", "Gulf of Alaska forcing apron north/east of Kodiak", "offshore_buffer", "offshore_extension", [-151.8, 58.95, -148.7, 59.3])
@@ -178,6 +204,22 @@ def infer_target_region_features(request: dict[str, Any] | str) -> dict[str, Any
         _bbox_feature(features, "se_alaska", "Southeast Alaska tidal channels", "target_region", "island_archipelago_completeness", [-139.8, 54.0, -128.0, 60.0])
         _bbox_feature(features, "haida_gwaii_context", "Haida Gwaii context", "boundary_split_guard", "geopolitical_separation", [-133.5, 51.5, -130.0, 54.5])
         _bbox_feature(features, "gulf_alaska_forcing", "Gulf of Alaska open-boundary apron", "offshore_buffer", "offshore_extension", [-140.2, 51.6, -128.0, 56.0])
+    elif key == "mobile_bay":
+        _bbox_feature(features, "mobile_bay_core", "Mobile Bay", "target_estuary", "target_region", [-88.25, 30.15, -87.70, 31.05])
+        _bbox_feature(features, "mobile_tensaw_delta", "Lower Mobile-Tensaw river delta context", "river_input_context", "upstream_river_extent", [-88.18, 30.65, -87.82, 31.20])
+        _bbox_feature(features, "mobile_gulf_gate", "Gulf of Mexico mouth and western landing corridor", "offshore_forcing_corridor", "offshore_extension", [-88.95, 29.85, -87.55, 30.35])
+        _bbox_feature(features, "horn_island_west_landing_context", "Horn Island west-side open-gate landing context", "barrier_island_gate_context", "channel_connectivity", [-88.95, 30.05, -88.45, 30.35])
+        _bbox_feature(
+            features,
+            "perdido_wolf_bay_overreach_guard",
+            "Perdido Bay / Wolf Bay wrong-region overreach guard",
+            "wrong_region_exclusion",
+            "wrong_region_exclusion",
+            [-87.55, 30.20, -86.60, 30.75],
+            required=False,
+            notes="Mobile Bay bpoly should avoid unnecessary Perdido Bay and Wolf Bay inclusion unless explicitly requested.",
+            extra={"blocks_final_pass": False},
+        )
     elif key == "columbia":
         _bbox_feature(features, "columbia_estuary", "Columbia River estuary", "target_estuary", "target_region", [-124.3, 45.8, -123.4, 46.45])
         _bbox_feature(features, "offshore_columbia", "Pacific forcing apron", "offshore_buffer", "offshore_extension", [-125.0, 45.5, -123.8, 46.7])
@@ -203,6 +245,56 @@ def infer_target_region_features(request: dict[str, Any] | str) -> dict[str, Any
 
 def features_as_ingredients(features_doc: dict[str, Any]) -> list[dict[str, Any]]:
     return [dict(feature) for feature in features_doc.get("features", [])]
+
+
+def bpoly_from_feature_boxes(
+    ingredients: list[dict[str, Any]],
+    offshore_azimuth_deg: float = 90.0,
+    padding_fraction: float = 0.05,
+    edge_labels: list[str] | None = None,
+) -> tuple[RegionBPoly | None, str | None]:
+    """Build a simple four-sided bpoly from explicit feature boxes.
+
+    This path is used when place-memory is disabled but the request already
+    supplies geometry. It avoids any hard-coded regional seed.
+    """
+    required = [item for item in ingredients if item.get("required", True)]
+    if not required:
+        required = list(ingredients)
+    if not required:
+        return None, None
+
+    raw_lons = [float(lon) for item in required for lon, _lat in ingredient_points(item)]
+    if not raw_lons:
+        return None, None
+    origin = raw_lons[0]
+    lons: list[float] = []
+    lats: list[float] = []
+    for item in required:
+        for lon, lat in ingredient_points(item):
+            lons.append(_unwrap_lon(float(lon), origin))
+            lats.append(float(lat))
+
+    west, east = min(lons), max(lons)
+    south, north = min(lats), max(lats)
+    lon_span = max(0.2, east - west)
+    lat_span = max(0.2, north - south)
+    pad_lon = max(0.08, lon_span * padding_fraction)
+    pad_lat = max(0.05, lat_span * padding_fraction)
+    west -= pad_lon
+    east += pad_lon
+    south -= pad_lat
+    north += pad_lat
+    pts = [
+        [_wrap_lon(east), south],
+        [_wrap_lon(west), south],
+        [_wrap_lon(west), north],
+        [_wrap_lon(east), north],
+    ]
+    return (
+        RegionBPoly(pts, offshore_azimuth_deg, edge_labels=edge_labels or ["open_or_south", "west_or_left", "north_or_inner", "east_or_right"]),
+        "Built initial bpoly directly from explicit feature boxes with place-memory disabled.",
+    )
 
 
 def _wrap_lon(lon: float) -> float:

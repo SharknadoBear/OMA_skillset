@@ -32,6 +32,8 @@ def normalize_request_text(request: dict[str, Any] | str) -> str:
 
 
 def canonical_region_key(request: dict[str, Any] | str) -> str:
+    if isinstance(request, dict) and request.get("_place_memory_enabled") is False:
+        return "unknown"
     text = normalize_request_text(request)
     if "puget" in text or "salish" in text:
         return "puget_salish"
@@ -57,6 +59,8 @@ def canonical_region_key(request: dict[str, Any] | str) -> str:
         return "lake_erie"
     if "cook inlet" in text:
         return "cook_inlet"
+    if "mobile bay" in text or "mobile-tensaw" in text or "mobile tensaw" in text:
+        return "mobile_bay"
     if "southeast alaska" in text:
         return "southeast_alaska"
     if "columbia" in text:
@@ -66,4 +70,3 @@ def canonical_region_key(request: dict[str, Any] | str) -> str:
     if "san francisco" in text:
         return "san_francisco"
     return "unknown"
-

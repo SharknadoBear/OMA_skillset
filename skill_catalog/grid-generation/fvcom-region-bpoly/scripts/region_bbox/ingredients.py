@@ -6,9 +6,11 @@ from typing import Any
 from .normalization import normalize_request_text, request_text
 
 
-def required_ingredients(request: dict[str, Any] | str) -> list[dict[str, Any]]:
+def required_ingredients(request: dict[str, Any] | str, use_place_memory: bool = True) -> list[dict[str, Any]]:
     if isinstance(request, dict) and isinstance(request.get("required_ingredients"), list):
         return request["required_ingredients"]
+    if not use_place_memory:
+        return []
     text = normalize_request_text(request)
     items: list[dict[str, Any]] = []
 
@@ -75,6 +77,12 @@ def required_ingredients(request: dict[str, Any] | str) -> list[dict[str, Any]]:
     if "cook inlet" in text:
         bbox("cook_inlet", "Cook Inlet", "target_estuary", [-153.2, 58.7, -149.0, 61.5])
         bbox("gulf_of_alaska", "Gulf of Alaska forcing apron", "offshore_buffer", [-154.5, 57.0, -150.0, 59.5])
+        return items
+
+    if "mobile bay" in text or "mobile-tensaw" in text or "mobile tensaw" in text:
+        bbox("mobile_bay_core", "Mobile Bay", "target_estuary", [-88.25, 30.15, -87.70, 31.05])
+        bbox("mobile_tensaw_delta", "Lower Mobile-Tensaw river delta context", "river_input_context", [-88.18, 30.65, -87.82, 31.20])
+        bbox("mobile_gulf_gate", "Gulf of Mexico mouth and western landing corridor", "offshore_forcing_corridor", [-88.95, 29.85, -87.55, 30.35])
         return items
 
     if "southeast alaska" in text:

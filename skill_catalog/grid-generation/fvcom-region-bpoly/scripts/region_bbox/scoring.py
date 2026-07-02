@@ -298,6 +298,35 @@ def score_bpoly_quality(
         if bbox["north"] > 20.75 or bbox["west"] < -157.0 or bbox["east"] > -153.8:
             wrong_region_warnings.append("Hawaii Island-only box may be stepping toward neighboring islands instead of staying cleanly around the Big Island.")
             taxonomy.append({"code": "hawaii_island_scope_ambiguity", "severity": "review", "message": "Hawaii Island-only scope needs visual confirmation against nearby islands."})
+    elif key == "cook_inlet":
+        if bbox["east"] > -148.3 and bbox["north"] > 59.0:
+            wrong_region_warnings.append("Cook Inlet wave-fetch bpoly risks including Prince William Sound on the east side.")
+            taxonomy.append(
+                {
+                    "code": "prince_william_sound_overreach_risk",
+                    "severity": "review",
+                    "message": "Cook Inlet bpoly should avoid Prince William Sound unless the prompt explicitly asks for it.",
+                }
+            )
+    elif key == "mobile_bay":
+        if bbox["east"] > -87.45:
+            wrong_region_warnings.append("Mobile Bay bpoly risks unnecessary Perdido Bay / Wolf Bay inclusion.")
+            taxonomy.append(
+                {
+                    "code": "perdido_wolf_bay_overreach_risk",
+                    "severity": "review",
+                    "message": "Mobile Bay bpoly should not include Perdido Bay or Wolf Bay unless explicitly requested.",
+                }
+            )
+        if bbox["west"] > -88.85:
+            wrong_region_warnings.append("Mobile Bay Gulf-facing gate may not extend far enough west to land beyond Horn Island.")
+            taxonomy.append(
+                {
+                    "code": "open_gate_landing_blocked_by_horn_island",
+                    "severity": "fail",
+                    "message": "Extend the Mobile Bay offshore gate west enough that the downstream arc can land on solid coast rather than being cut by Horn Island.",
+                }
+            )
 
     expected_domain = "lake" if key.startswith("lake_") else ("island" if key in {"aleutian", "hawaii_state", "hawaii_island"} else "coastal")
     domain_status = "good" if domain_type == expected_domain else "fail"

@@ -9,6 +9,15 @@ instructions: |
   target-region feature JSON, feature GeoJSON, candidate maps, side zoom maps,
   coverage JSON, and score evidence.
 
+  Heuristic mode is explicit. --heuristic-mode auto resolves to memory for
+  execute mode and unknown for test mode. In test/unknown mode, do not use
+  hard-coded known-region place guesses, feature-library inference, deformation
+  presets, deterministic repair candidates, or a Delaware/NJ fallback. If the
+  prompt lacks explicit target_region_features, required feature ingredients, or
+  an explicit polygon seed, write needs_review with
+  unknown_region_no_feature_plan. Explicit feature boxes are still valid in test
+  mode and may be used to build the bpoly.
+
   Treat polygon_lonlat as the controlling model-domain geometry and envelope_bbox
   only as a fetch/plot helper. The offshore point only identifies the intended
   offshore side for downstream coastline-anchor snapping; boundary arc generation
@@ -31,8 +40,11 @@ instructions: |
 
   Apply v3 QA guards before pass: Cook Inlet wave/wave-current/SWAN/fetch
   prompts use cook_inlet_wave_fetch and must include Kodiak, Augustine Island,
-  Ursus Cove/Kamishak, and a broad Gulf wave apron. Cook tidal-only/current-only
-  prompts use cook_inlet_tidal_mouth and keep Kodiak as an obstruction guard.
+  Ursus Cove/Kamishak, and a broad Gulf wave apron while avoiding unnecessary
+  Prince William Sound overreach. Cook tidal-only/current-only prompts use
+  cook_inlet_tidal_mouth and keep Kodiak as an obstruction guard. Mobile Bay
+  domains must keep the Gulf gate west enough to land beyond Horn Island while
+  avoiding unnecessary Perdido Bay / Wolf Bay inclusion.
   Hawaii Island / Big-Island-only domains must avoid Maui Nui / neighboring-
   island obstruction guards; Hawaii State/island chain requests may include the
   chain. Murderkill-style prompts are small-estuary scale and must satisfy

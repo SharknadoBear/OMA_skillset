@@ -57,6 +57,8 @@ Test mode keeps `intermediate/visual_review/` with:
 - side zoom maps;
 - coverage and score JSON.
 
+Use `--heuristic-mode auto|memory|unknown` for memory hygiene. `auto` resolves to memory-on in execute mode and memory-off `unknown` in test mode. In memory-off test mode, do not use hard-coded place guesses, feature-library inference, deformation presets, deterministic repair candidates, or Delaware/NJ fallback boxes. If no explicit `target_region_features`, required ingredients, or polygon seed are supplied, return `final_status: needs_review` with `unknown_region_no_feature_plan`. Explicit feature boxes remain valid in test mode.
+
 ## Review Depth
 
 - `--review-depth fast`: 4 zoom maps, one centered on each side.
@@ -79,8 +81,9 @@ Reject or revise outputs whose map metadata shows no enabled background context.
 - Required feature boxes must be scored.
 - The box should fit required features tightly and avoid wrong-region inclusion.
 - Non-required `offshore_boundary_exclusion` / `obstruction_guard` boxes must be used to prevent false passes when the offshore side is cut by blocker islands.
-- Cook Inlet wave, wave-current, SWAN, wave-climate, offshore-wave-forcing, or fetch prompts use `cook_inlet_wave_fetch` and must include Kodiak, Augustine Island, Ursus Cove/Kamishak, and a broad Gulf wave apron.
+- Cook Inlet wave, wave-current, SWAN, wave-climate, offshore-wave-forcing, or fetch prompts use `cook_inlet_wave_fetch` and must include Kodiak, Augustine Island, Ursus Cove/Kamishak, and a broad Gulf wave apron while avoiding unnecessary Prince William Sound overreach.
 - Cook Inlet tidal-only/current-only prompts use `cook_inlet_tidal_mouth` and must avoid Kodiak as an obstruction guard.
+- Mobile Bay domains must include the Mobile-Tensaw delta context and keep the Gulf gate west enough to land beyond Horn Island while avoiding unnecessary Perdido Bay / Wolf Bay inclusion.
 - Murderkill-style prompts are `small_estuary` scale and must satisfy tighter area/width limits with `road_detail` map policy.
 - Hawaii Island / Big-Island-only domains must avoid Maui Nui / neighboring-island obstruction guards; Hawaii State/island-chain requests may include the island chain.
 - Southeast Alaska name variants must not fall back to a continent-scale box.

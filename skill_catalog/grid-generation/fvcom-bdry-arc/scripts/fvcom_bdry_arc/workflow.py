@@ -11,6 +11,7 @@ import math
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,7 @@ from typing import Any, Iterable
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from affine import Affine
 from rasterio import features as rio_features
 from scipy import ndimage
@@ -27,7 +29,7 @@ from shapely.prepared import prep
 from shapely.ops import linemerge, nearest_points, polygonize, unary_union
 
 from .boundary_loops import build_model_boundary_loops
-from .projection import LocalProjection, local_utm_projection, project_geometry, unproject_geometry
+from .projection import LocalProjection, local_utm_projection, project_geometry, unproject_geometry, unwrap_geometry_longitudes, unwrap_longitude
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,17 @@ class BdryArcConfig:
     max_topology_iterations: int = 4
     convergence_area_frac: float = 0.01
     convergence_anchor_m: float | None = None
+    progress_interval_s: float = 30.0
+    heuristic_mode: str = "auto"
+    topology_time_budget_s: float = 900.0
+
+
+def _resolve_heuristic_mode(cli_mode: str, run_mode: str) -> tuple[str, bool]:
+    if cli_mode == "auto":
+        resolved = "memory" if run_mode == "execute" else "unknown"
+    else:
+        resolved = cli_mode
+    return resolved, resolved == "memory"
 
 
 def run_bdry_arc(
@@ -72,23 +85,51 @@ def run_bdry_arc(
         raise ValueError("--seed-mode must be auto or manual-json")
     if config.coastline_source not in {"gshhs", "generic-gpkg", "cusp-legacy"}:
         raise ValueError("--coastline-source must be gshhs, generic-gpkg, or cusp-legacy")
-    if config.topology_mode not in {"gshhs-vector", "iterative-raster", "vector-only"}:
-        raise ValueError("--topology-mode must be gshhs-vector, iterative-raster, or vector-only")
+    if config.topology_mode not in {"gshhs-vector", "island-loop", "iterative-raster", "vector-only"}:
+        raise ValueError("--topology-mode must be gshhs-vector, island-loop, iterative-raster, or vector-only")
+    if config.heuristic_mode not in {"auto", "memory", "unknown"}:
+        raise ValueError("--heuristic-mode must be auto, memory, or unknown")
     if config.topology_mode == "gshhs-vector" and config.coastline_source == "cusp-legacy":
         raise ValueError("--topology-mode gshhs-vector requires GSHHS/generic polygon-capable coastline input")
+    resolved_heuristic_mode, place_memory_enabled = _resolve_heuristic_mode(config.heuristic_mode, config.mode)
 
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    _write_progress(
+        run_dir,
+        "run",
+        "start",
+        {
+            "name": name,
+            "topology_mode": config.topology_mode,
+            "coastline_source": config.coastline_source,
+            "gshhs_resolution_requested": config.gshhs_resolution,
+            "heuristic_mode": resolved_heuristic_mode,
+            "resolution_policy": "use requested GSHHS resolution only; do not downshift unless explicitly requested",
+        },
+    )
     visual_dir = run_dir / "intermediate" / "visual_review"
     if config.mode == "test":
         visual_dir.mkdir(parents=True, exist_ok=True)
 
     region = _read_json(region_bpoly_json)
     offshore = _read_json(offshore_artifacts_json)
-    bpoly_lonlat = _load_bpoly_polygon(region)
-    bbox_wsen = tuple(float(v) for v in region.get("envelope_bbox") or bpoly_lonlat.bounds)
+    if _upstream_bpoly_unresolved(region):
+        return _write_unresolved_upstream_manifest(
+            region,
+            offshore,
+            run_dir,
+            name,
+            config,
+            resolved_heuristic_mode,
+            place_memory_enabled,
+        )
+    bpoly_lonlat_raw = _load_bpoly_polygon(region)
+    bbox_wsen = tuple(float(v) for v in region.get("envelope_bbox") or bpoly_lonlat_raw.bounds)
     buffered_bbox = _buffer_bbox_lonlat(bbox_wsen, config.coastline_buffer_km)
     projection = local_utm_projection(buffered_bbox)
+    longitude_origin = float(projection.longitude_origin or 0.0)
+    bpoly_lonlat = unwrap_geometry_longitudes(bpoly_lonlat_raw, longitude_origin)
     bpoly_xy = project_geometry(bpoly_lonlat, projection).buffer(0)
 
     fetch_metadata: dict[str, Any] = {}
@@ -110,6 +151,7 @@ def run_bdry_arc(
                 gshhs_skill_dir=config.gshhs_skill_dir,
                 resolution=config.gshhs_resolution,
                 levels=config.gshhs_levels,
+                progress_interval_s=config.progress_interval_s,
             )
     if coastline_gpkg is None:
         raise ValueError("Provide --coastline-gpkg or use --fetch-coastline")
@@ -124,6 +166,8 @@ def run_bdry_arc(
         coastline_load_meta["fetch"] = fetch_metadata
     _write_progress(run_dir, "load-coastline", "done", {"feature_count": int(len(coastline_raw)), **coastline_load_meta})
     _write_progress(run_dir, "project-coastline", "start", {"target_crs": str(projection.crs)})
+    coastline_raw = _unwrap_gdf_longitudes(coastline_raw, longitude_origin)
+    land_polygons_raw = _unwrap_gdf_longitudes(land_polygons_raw, longitude_origin)
     coastline_xy = coastline_raw.to_crs(projection.crs) if not coastline_raw.empty else coastline_raw
     land_polygons_xy_gdf = land_polygons_raw.to_crs(projection.crs) if not land_polygons_raw.empty else land_polygons_raw
     raw_lines_xy = _flatten_lines(coastline_xy.geometry)
@@ -138,14 +182,20 @@ def run_bdry_arc(
     )
     _write_progress(run_dir, "repair", "done", repair_meta)
 
-    selected_side = _selected_side_line(offshore, region)
+    selected_side = unwrap_geometry_longitudes(_selected_side_line(offshore, region), longitude_origin)
     selected_side_xy = project_geometry(selected_side, projection)
     offshore_unit = _offshore_unit_vector(offshore, selected_side_xy)
     seed_xy, seed_meta = _resolve_seed(region, config, projection, bpoly_xy)
     forbidden_regions_lonlat: list[dict[str, Any]] = []
     forbidden_regions_xy: list[Polygon] = []
+    lake_closed_branch = _uses_lake_closed_boundary(region, offshore)
+    island_loop_branch = False if lake_closed_branch else _uses_island_loop_branch(region, offshore, config, place_memory_enabled)
 
-    if config.topology_mode == "gshhs-vector":
+    if lake_closed_branch:
+        anchors = _lake_closed_boundary_reference_points(bpoly_xy, selected_side_xy, config.target_resolution_m)
+    elif island_loop_branch:
+        anchors = _island_loop_reference_points(selected_side_xy, bpoly_xy, config.target_resolution_m)
+    elif config.topology_mode == "gshhs-vector":
         land_boundary_xy = unary_union(land_polygons_xy).boundary if land_polygons_xy else GeometryCollection()
         if land_boundary_xy.is_empty and repaired_lines_xy:
             land_boundary_xy = unary_union(repaired_lines_xy)
@@ -157,26 +207,71 @@ def run_bdry_arc(
         )
     else:
         anchors = _select_anchor_points(repaired_lines_xy, selected_side_xy, bpoly_xy, config.target_resolution_m)
-    candidates = generate_offshore_arc_candidates(
-        anchors["start_xy"],
-        anchors["end_xy"],
-        offshore_unit,
-        selected_side_xy,
-        bpoly_xy,
-        config.target_resolution_m,
-        anchors=anchors,
-    )
+    if lake_closed_branch:
+        candidates = generate_lake_closed_boundary_candidates()
+    elif island_loop_branch:
+        candidates = generate_island_loop_candidates(
+            bpoly_xy,
+            selected_side_xy,
+            offshore_unit,
+            config.target_resolution_m,
+        )
+    else:
+        candidates = generate_offshore_arc_candidates(
+            anchors["start_xy"],
+            anchors["end_xy"],
+            offshore_unit,
+            selected_side_xy,
+            bpoly_xy,
+            config.target_resolution_m,
+            anchors=anchors,
+        )
     if len(repaired_lines_xy) <= 20_000:
         coast_union_xy = unary_union(repaired_lines_xy) if repaired_lines_xy else GeometryCollection()
     else:
         coast_union_xy = GeometryCollection()
-    scored = score_and_select_bdry_arc(candidates, coast_union_xy, bpoly_xy, config.target_resolution_m)
+    if lake_closed_branch:
+        scored = {"selected": candidates[0], "candidates": candidates}
+    else:
+        scored = (
+            score_island_loop_candidates(candidates, bpoly_xy, config.target_resolution_m)
+            if island_loop_branch
+            else score_and_select_bdry_arc(candidates, coast_union_xy, bpoly_xy, config.target_resolution_m)
+        )
     selected_arc_xy = scored["selected"]["geometry"]
     _write_progress(run_dir, "initial-arc", "done", {"candidate_count": len(scored["candidates"]), "selected": scored["selected"]["candidate_id"]})
 
     topology_mode_used = config.topology_mode
     topology_iterations: list[dict[str, Any]] = []
-    if config.topology_mode == "gshhs-vector":
+    if lake_closed_branch:
+        topology_mode_used = "lake-closed-boundary"
+        wet_result = extract_lake_closed_wet_domain(
+            land_polygons_xy,
+            bpoly_xy,
+            seed_xy,
+            config.target_resolution_m,
+        )
+        selected_arc_xy = wet_result.get("open_arc_xy", scored["selected"]["geometry"])
+        scored["selected"]["geometry"] = selected_arc_xy
+        _write_progress(run_dir, "lake-closed-boundary", "done", wet_result["metadata"])
+    elif island_loop_branch:
+        topology_mode_used = "island-loop"
+        topology_selection = select_island_loop_topology(
+            scored,
+            land_polygons_xy,
+            bpoly_xy,
+            seed_xy,
+            config.target_resolution_m,
+            run_dir=run_dir,
+            topology_time_budget_s=config.topology_time_budget_s,
+        )
+        scored = topology_selection["scored"]
+        wet_result = topology_selection["wet_result"]
+        selected_arc_xy = wet_result.get("open_arc_xy", scored["selected"]["geometry"])
+        scored["selected"]["geometry"] = selected_arc_xy
+        _write_progress(run_dir, "island-loop", "done", wet_result["metadata"])
+    elif config.topology_mode == "gshhs-vector":
+        _write_progress(run_dir, "gshhs-vector", "start", {"candidate_count": len(scored["candidates"])})
         topology_selection = select_gshhs_open_side_topology(
             scored,
             repaired_lines_xy,
@@ -185,6 +280,8 @@ def run_bdry_arc(
             seed_xy,
             config.target_resolution_m,
             anchors,
+            run_dir=run_dir,
+            topology_time_budget_s=config.topology_time_budget_s,
         )
         scored = topology_selection["scored"]
         wet_result = topology_selection["wet_result"]
@@ -225,6 +322,11 @@ def run_bdry_arc(
             config.target_resolution_m,
         )
     final_status, failure_taxonomy = _final_status(scored, wet_result, anchors, forbidden_regions_xy)
+    resolution_policy = _gshhs_resolution_policy(config, coastline_load_meta)
+    if resolution_policy["downgraded_without_explicit_request"]:
+        final_status = "needs_review"
+        if "gshhs_resolution_downgraded_without_explicit_request" not in failure_taxonomy:
+            failure_taxonomy.append("gshhs_resolution_downgraded_without_explicit_request")
 
     selected_arc_lonlat = unproject_geometry(selected_arc_xy, projection)
     wet_domain_lonlat = unproject_geometry(wet_result["wet_domain_xy"], projection)
@@ -289,10 +391,16 @@ def run_bdry_arc(
             "gshhs_levels": config.gshhs_levels,
             "topology_mode": config.topology_mode,
             "topology_mode_used": topology_mode_used,
+            "heuristic_mode": resolved_heuristic_mode,
+            "place_memory_enabled": place_memory_enabled,
+            "lake_closed_boundary_branch": lake_closed_branch,
+            "island_loop_branch": island_loop_branch,
             "raster_resolution_m": config.raster_resolution_m,
             "max_topology_iterations": int(config.max_topology_iterations),
             "convergence_area_frac": float(config.convergence_area_frac),
             "convergence_anchor_m": float(config.convergence_anchor_m or 2.0 * config.target_resolution_m),
+            "progress_interval_s": float(config.progress_interval_s),
+            "topology_time_budget_s": float(config.topology_time_budget_s),
         },
         "region_bpoly": {
             "domain_type": region.get("domain_type"),
@@ -314,6 +422,7 @@ def run_bdry_arc(
         "projection": {
             "crs": str(projection.crs),
             "epsg": projection.epsg,
+            "longitude_origin": projection.longitude_origin,
         },
         "coastline_audit": audit,
         "repair": repair_meta,
@@ -357,6 +466,7 @@ def run_bdry_arc(
             "forbidden_region_count": int(len(forbidden_regions_xy)),
             "forbidden_region_overlap": wet_result["metadata"].get("forbidden_overlap", []),
             "status_rule": "pass only when anchors, selected arc, seeded polygon/raster connectivity, and component classification checks are clean",
+            "gshhs_resolution_policy": resolution_policy,
         },
         "outputs": {
             **outputs,
@@ -369,6 +479,7 @@ def run_bdry_arc(
 
     loop_run_dir = run_dir / "model_boundary_loops"
     try:
+        _write_progress(run_dir, "model-boundary-loops", "start", {"run_dir": str(loop_run_dir)})
         loop_manifest = build_model_boundary_loops(
             outputs["bdry_arc_package_gpkg"],
             manifest_path,
@@ -378,7 +489,9 @@ def run_bdry_arc(
             min_island_area_m2=0.0,
             mode=config.mode,
         )
+        _write_progress(run_dir, "model-boundary-loops", "done", {"final_status": loop_manifest.get("final_status")})
     except Exception as exc:
+        _write_progress(run_dir, "model-boundary-loops", "failed", {"error": str(exc)})
         loop_run_dir.mkdir(parents=True, exist_ok=True)
         loop_manifest = {
             "schema_version": "fvcom_model_boundary_loops_v1",
@@ -421,6 +534,7 @@ def run_bdry_arc(
         "the main manifest needs review when the loop package needs review"
     )
     manifest_path.write_text(json.dumps(_json_safe(manifest), indent=2), encoding="utf-8")
+    _write_progress(run_dir, "complete", "done", {"final_status": manifest["final_status"]})
     return manifest
 
 
@@ -585,6 +699,101 @@ def generate_offshore_arc_candidates(
     return candidates
 
 
+def generate_island_loop_candidates(
+    bpoly_xy: Polygon,
+    selected_side_xy: LineString,
+    offshore_unit: np.ndarray,
+    target_resolution_m: float,
+) -> list[dict[str, Any]]:
+    """Generate smooth closed offshore loops for island and archipelago domains."""
+    coords = [(float(x), float(y)) for x, y in list(bpoly_xy.exterior.coords)[:-1]]
+    if len(coords) < 3:
+        raise ValueError("Island-loop topology requires a valid bpoly polygon")
+    centroid = np.asarray([bpoly_xy.centroid.x, bpoly_xy.centroid.y], dtype=float)
+    factors = [1.0, 1.04, 1.08, 1.14, 1.22]
+    side_mid = np.asarray(selected_side_xy.interpolate(0.5, normalized=True).coords[0], dtype=float)
+    max_span = max(bpoly_xy.bounds[2] - bpoly_xy.bounds[0], bpoly_xy.bounds[3] - bpoly_xy.bounds[1], 1.0)
+    bow_base = max(4.0 * target_resolution_m, 0.04 * max_span)
+    candidates: list[dict[str, Any]] = []
+    for idx, factor in enumerate(factors, start=1):
+        ring: list[tuple[float, float]] = []
+        bow = bow_base * max(factor - 1.0, 0.0) * 3.0
+        for coord in coords:
+            vec = np.asarray(coord, dtype=float) - centroid
+            pt = centroid + vec * factor
+            distance_to_side = Point(float(pt[0]), float(pt[1])).distance(selected_side_xy)
+            influence = max(0.0, 1.0 - distance_to_side / max(0.35 * max_span, 1.0))
+            if influence > 0.0:
+                side_vec = pt - side_mid
+                along = float(np.dot(side_vec, offshore_unit))
+                if along >= -0.25 * max_span:
+                    pt = pt + offshore_unit * bow * influence
+            ring.append((float(pt[0]), float(pt[1])))
+        smooth_ring = _chaikin_closed_ring(ring, iterations=3)
+        if smooth_ring[0] != smooth_ring[-1]:
+            smooth_ring.append(smooth_ring[0])
+        line = LineString(smooth_ring)
+        candidates.append(
+            {
+                "candidate_id": f"island_loop_{idx:02d}",
+                "family": "island_archipelago_closed_loop",
+                "bow_distance_m": float(bow),
+                "geometry": line,
+            }
+        )
+    return candidates
+
+
+def generate_lake_closed_boundary_candidates() -> list[dict[str, Any]]:
+    """Return the no-open-boundary sentinel candidate for lake domains."""
+    return [
+        {
+            "candidate_id": "lake_closed_boundary_no_open_arc",
+            "family": "lake_closed_boundary",
+            "bow_distance_m": 0.0,
+            "geometry": LineString(),
+            "score": 100.0,
+            "metrics": {
+                "extra_coastline_intersection": False,
+                "closure_method": "lake_closed_boundary_no_open_arc",
+                "open_arc_boundary_overlap_fraction": None,
+            },
+        }
+    ]
+
+
+def score_island_loop_candidates(
+    candidates: list[dict[str, Any]],
+    bpoly_xy: Polygon,
+    target_resolution_m: float,
+) -> dict[str, Any]:
+    """Score island-loop candidates without coastline anchor assumptions."""
+    scored: list[dict[str, Any]] = []
+    for candidate in candidates:
+        line = candidate["geometry"]
+        frame = Polygon(line.coords).buffer(0)
+        frame_valid = isinstance(frame, Polygon) and not frame.is_empty and frame.is_valid
+        samples = _sample_line_points(line, max(line.length / 80.0, target_resolution_m))
+        inside_fraction = sum(1 for pt in samples if bpoly_xy.buffer(4.0 * target_resolution_m).contains(pt)) / max(len(samples), 1)
+        area_ratio = float(frame.area / max(bpoly_xy.area, 1.0)) if frame_valid else 0.0
+        score = 100.0 * inside_fraction
+        score += 50.0 if frame_valid else -200.0
+        score -= abs(area_ratio - 1.15) * 25.0
+        item = dict(candidate)
+        item["score"] = float(score)
+        item["metrics"] = {
+            "inside_bpoly_buffer_fraction": float(inside_fraction),
+            "frame_valid": bool(frame_valid),
+            "frame_area_ratio_to_bpoly": float(area_ratio),
+            "length_ratio": 1.0,
+            "extra_coastline_intersection": False,
+            "extra_intersection_length_m": 0.0,
+        }
+        scored.append(item)
+    scored.sort(key=lambda obj: obj["score"], reverse=True)
+    return {"selected": scored[0], "candidates": scored}
+
+
 def score_and_select_bdry_arc(
     candidates: list[dict[str, Any]],
     coast_union_xy,
@@ -709,10 +918,26 @@ def select_gshhs_open_side_topology(
     seed_xy: Point,
     target_resolution_m: float,
     anchors: dict[str, Any] | None = None,
+    run_dir: Path | None = None,
+    topology_time_budget_s: float | None = None,
 ) -> dict[str, Any]:
     """Select the coastline-anchor seaward-chain deformation that creates the best domain."""
     evaluated: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    for candidate in scored["candidates"]:
+    start_time = time.monotonic()
+    budget_exceeded = False
+    if run_dir is not None:
+        _write_progress(run_dir, "gshhs-vector", "land-union-start", {"land_polygon_count": len(land_polygons_xy)})
+    land_union_xy = unary_union(land_polygons_xy).buffer(0) if land_polygons_xy else GeometryCollection()
+    if run_dir is not None:
+        _write_progress(run_dir, "gshhs-vector", "land-union-done", {"land_union_empty": land_union_xy.is_empty})
+    for idx, candidate in enumerate(scored["candidates"], start=1):
+        if run_dir is not None:
+            _write_progress(
+                run_dir,
+                "gshhs-vector",
+                "candidate-start",
+                {"candidate_id": candidate.get("candidate_id"), "candidate_index": idx, "candidate_count": len(scored["candidates"])},
+            )
         result = extract_gshhs_vector_wet_domain(
             coastline_lines_xy,
             land_polygons_xy,
@@ -721,6 +946,7 @@ def select_gshhs_open_side_topology(
             seed_xy,
             target_resolution_m,
             anchors=anchors,
+            land_union_xy=land_union_xy,
         )
         metadata = result["metadata"]
         metrics = dict(candidate.get("metrics", {}))
@@ -757,11 +983,217 @@ def select_gshhs_open_side_topology(
         item["score"] = float(topology_score)
         result["metadata"]["candidate_id"] = candidate.get("candidate_id")
         evaluated.append((item, result))
+        if run_dir is not None:
+            _write_progress(
+                run_dir,
+                "gshhs-vector",
+                "candidate-done",
+                {
+                    "candidate_id": candidate.get("candidate_id"),
+                    "candidate_index": idx,
+                    "candidate_count": len(scored["candidates"]),
+                    "open_arc_boundary_overlap_fraction": metadata.get("open_arc_boundary_overlap_fraction", 0.0),
+                    "seed_inside": metadata.get("seed_inside"),
+                },
+            )
+        if topology_time_budget_s and topology_time_budget_s > 0 and time.monotonic() - start_time > topology_time_budget_s and evaluated:
+            budget_exceeded = True
+            if run_dir is not None:
+                _write_progress(
+                    run_dir,
+                    "gshhs-vector",
+                    "budget-exceeded",
+                    {
+                        "elapsed_seconds": time.monotonic() - start_time,
+                        "topology_time_budget_s": topology_time_budget_s,
+                        "evaluated_candidate_count": len(evaluated),
+                    },
+                )
+            break
 
     evaluated.sort(key=lambda pair: pair[0]["score"], reverse=True)
     selected, wet_result = evaluated[0]
+    if budget_exceeded:
+        wet_result["metadata"]["topology_budget_exceeded"] = True
+        wet_result["metadata"]["topology_time_budget_s"] = float(topology_time_budget_s or 0.0)
     candidates = [item for item, _result in evaluated]
     return {"scored": {"selected": selected, "candidates": candidates}, "wet_result": wet_result}
+
+
+def select_island_loop_topology(
+    scored: dict[str, Any],
+    land_polygons_xy: list[Polygon],
+    bpoly_xy: Polygon,
+    seed_xy: Point,
+    target_resolution_m: float,
+    run_dir: Path | None = None,
+    topology_time_budget_s: float | None = None,
+) -> dict[str, Any]:
+    """Select a closed island/archipelago offshore loop and water component."""
+    evaluated: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    start_time = time.monotonic()
+    budget_exceeded = False
+    if run_dir is not None:
+        _write_progress(run_dir, "island-loop", "land-union-start", {"land_polygon_count": len(land_polygons_xy)})
+    land_union_xy = unary_union(land_polygons_xy).buffer(0) if land_polygons_xy else GeometryCollection()
+    if run_dir is not None:
+        _write_progress(run_dir, "island-loop", "land-union-done", {"land_union_empty": land_union_xy.is_empty})
+    for idx, candidate in enumerate(scored["candidates"], start=1):
+        if run_dir is not None:
+            _write_progress(
+                run_dir,
+                "island-loop",
+                "candidate-start",
+                {"candidate_id": candidate.get("candidate_id"), "candidate_index": idx, "candidate_count": len(scored["candidates"])},
+            )
+        result = extract_island_loop_wet_domain(
+            land_polygons_xy,
+            candidate["geometry"],
+            bpoly_xy,
+            seed_xy,
+            target_resolution_m,
+            land_union_xy=land_union_xy,
+        )
+        metadata = result["metadata"]
+        metrics = dict(candidate.get("metrics", {}))
+        metrics.update(
+            {
+                "closure_method": metadata.get("closure_method"),
+                "open_arc_boundary_overlap_fraction": metadata.get("open_arc_boundary_overlap_fraction", 0.0),
+                "land_patch_boundary_length_m": metadata.get("land_patch_boundary_length_m", 0.0),
+                "frame_area_m2": metadata.get("deformed_frame_area_m2", 0.0),
+            }
+        )
+        topology_score = float(candidate.get("score", 0.0))
+        topology_score += 160.0 * float(metadata.get("open_arc_boundary_overlap_fraction", 0.0))
+        if metadata.get("seed_inside"):
+            topology_score += 140.0
+        if metadata.get("deformed_frame_valid"):
+            topology_score += 80.0
+        patch_ratio = float(metadata.get("land_patch_boundary_fraction", 0.0))
+        topology_score -= min(patch_ratio * 180.0, 120.0)
+        if metadata.get("gshhs_missing_land_polygons"):
+            topology_score -= 120.0
+        item = dict(candidate)
+        item["metrics"] = metrics
+        item["score"] = float(topology_score)
+        result["metadata"]["candidate_id"] = candidate.get("candidate_id")
+        evaluated.append((item, result))
+        if run_dir is not None:
+            _write_progress(
+                run_dir,
+                "island-loop",
+                "candidate-done",
+                {
+                    "candidate_id": candidate.get("candidate_id"),
+                    "candidate_index": idx,
+                    "candidate_count": len(scored["candidates"]),
+                    "open_arc_boundary_overlap_fraction": metadata.get("open_arc_boundary_overlap_fraction", 0.0),
+                    "land_patch_boundary_length_m": metadata.get("land_patch_boundary_length_m", 0.0),
+                    "seed_inside": metadata.get("seed_inside"),
+                },
+            )
+        if topology_time_budget_s and topology_time_budget_s > 0 and time.monotonic() - start_time > topology_time_budget_s and evaluated:
+            budget_exceeded = True
+            if run_dir is not None:
+                _write_progress(
+                    run_dir,
+                    "island-loop",
+                    "budget-exceeded",
+                    {
+                        "elapsed_seconds": time.monotonic() - start_time,
+                        "topology_time_budget_s": topology_time_budget_s,
+                        "evaluated_candidate_count": len(evaluated),
+                    },
+                )
+            break
+    evaluated.sort(key=lambda pair: pair[0]["score"], reverse=True)
+    selected, wet_result = evaluated[0]
+    if budget_exceeded:
+        wet_result["metadata"]["topology_budget_exceeded"] = True
+        wet_result["metadata"]["topology_time_budget_s"] = float(topology_time_budget_s or 0.0)
+    candidates = [item for item, _result in evaluated]
+    return {"scored": {"selected": selected, "candidates": candidates}, "wet_result": wet_result}
+
+
+def extract_lake_closed_wet_domain(
+    land_polygons_xy: list[Polygon],
+    bpoly_xy: Polygon,
+    seed_xy: Point,
+    target_resolution_m: float,
+) -> dict[str, Any]:
+    """Build a closed lake-domain water component without any ocean open arc."""
+    land_union = unary_union(land_polygons_xy).buffer(0) if land_polygons_xy else GeometryCollection()
+    land_boundary = land_union.boundary if not land_union.is_empty else GeometryCollection()
+    base_water = bpoly_xy.difference(land_union).buffer(0) if not land_union.is_empty else bpoly_xy.buffer(0)
+    if not base_water.is_valid:
+        base_water = base_water.buffer(0)
+    water_seed_xy = seed_xy
+    seed_snap_distance_m = 0.0
+    seed_snapped = False
+    if not base_water.is_empty and not base_water.buffer(1.0).contains(seed_xy):
+        try:
+            water_seed_xy = nearest_points(seed_xy, base_water)[1]
+            seed_snap_distance_m = float(seed_xy.distance(water_seed_xy))
+            seed_snapped = seed_snap_distance_m > 0.0
+        except Exception:
+            water_seed_xy = seed_xy
+    domain = _choose_seed_component(base_water, water_seed_xy)
+    fallback_reason: str | None = None
+    if domain is None or domain.is_empty:
+        fallback_reason = "seed_water_component_not_found"
+        domain = bpoly_xy.buffer(0)
+    if not domain.is_valid:
+        domain = domain.buffer(0)
+    if getattr(domain, "geom_type", "") != "Polygon":
+        selected = _choose_seed_component(domain, water_seed_xy)
+        domain = selected if selected is not None else bpoly_xy.buffer(0)
+
+    open_arc = LineString()
+    boundary_segments = _classify_domain_boundary_segments(
+        domain,
+        open_arc,
+        land_boundary,
+        bpoly_xy,
+        target_resolution_m,
+    )
+    metadata = {
+        "target_resolution_m": float(target_resolution_m),
+        "source": "lake_closed_boundary_no_open_arc",
+        "closure_method": "lake_closed_boundary_no_open_arc",
+        "method": "lake_bpoly_minus_gshhs_land_union",
+        "boundary_policy": "no_open_boundary",
+        "no_ocean_open_boundary": True,
+        "deformed_frame_valid": bool(bpoly_xy.is_valid and not bpoly_xy.is_empty),
+        "deformed_frame_area_m2": float(bpoly_xy.area),
+        "land_polygon_count": int(len(land_polygons_xy)),
+        "coastline_line_count": 0,
+        "gshhs_missing_land_polygons": bool(len(land_polygons_xy) == 0),
+        "gshhs_missing_coastline_lines": False,
+        "gshhs_polygonize_fallback_used": False,
+        "fallback_reason": fallback_reason,
+        "arc_land_intersection": False,
+        "arc_land_intersection_length_m": 0.0,
+        "open_arc_boundary_overlap_fraction": None,
+        "land_boundary_overlap_fraction": float(boundary_segments["land_boundary_overlap_fraction"]),
+        "frame_clip_boundary_length_m": float(boundary_segments["frame_clip_boundary_length_m"]),
+        "area_m2": float(domain.area),
+        "perimeter_m": float(domain.length),
+        "hole_count": int(len(getattr(domain, "interiors", []))),
+        "seed_inside": bool(domain.buffer(max(1.0, 0.1 * target_resolution_m)).contains(water_seed_xy)),
+        "original_seed_inside": bool(domain.buffer(max(1.0, 0.1 * target_resolution_m)).contains(seed_xy)),
+        "seed_snapped_to_gshhs_water": bool(seed_snapped),
+        "seed_snap_distance_m": float(seed_snap_distance_m),
+        "forbidden_overlap": [],
+        "face_count": int(_polygon_count(base_water)),
+    }
+    return {
+        "wet_domain_xy": domain,
+        "open_arc_xy": open_arc,
+        "deformed_frame_xy": bpoly_xy,
+        "boundary_segments_xy": boundary_segments,
+        "metadata": metadata,
+    }
 
 
 def extract_gshhs_vector_wet_domain(
@@ -772,9 +1204,10 @@ def extract_gshhs_vector_wet_domain(
     seed_xy: Point,
     target_resolution_m: float,
     anchors: dict[str, Any] | None = None,
+    land_union_xy=None,
 ) -> dict[str, Any]:
     """Build a GSHHS-first wet domain from a coastline-anchor deformed frame."""
-    land_union = unary_union(land_polygons_xy).buffer(0) if land_polygons_xy else GeometryCollection()
+    land_union = land_union_xy if land_union_xy is not None else (unary_union(land_polygons_xy).buffer(0) if land_polygons_xy else GeometryCollection())
     land_boundary = land_union.boundary if not land_union.is_empty else GeometryCollection()
     deformed_frame, frame_meta = _deformed_bpoly_frame(bpoly_xy, offshore_arc_xy, anchors)
     base_water = deformed_frame.difference(land_union).buffer(0) if not land_union.is_empty else deformed_frame.buffer(0)
@@ -864,6 +1297,111 @@ def extract_gshhs_vector_wet_domain(
         "wet_domain_xy": domain,
         "open_arc_xy": offshore_arc_xy,
         "deformed_frame_xy": deformed_frame,
+        "boundary_segments_xy": boundary_segments,
+        "metadata": metadata,
+    }
+
+
+def extract_island_loop_wet_domain(
+    land_polygons_xy: list[Polygon],
+    offshore_loop_xy: LineString,
+    bpoly_xy: Polygon,
+    seed_xy: Point,
+    target_resolution_m: float,
+    land_union_xy=None,
+) -> dict[str, Any]:
+    """Build an island/archipelago water domain from a closed offshore loop."""
+    loop_xy = _ensure_closed_line(offshore_loop_xy)
+    frame = Polygon(loop_xy.coords).buffer(0)
+    frame_valid = isinstance(frame, Polygon) and not frame.is_empty and frame.is_valid
+    if not frame_valid:
+        frame = bpoly_xy.buffer(0)
+    land_union = land_union_xy if land_union_xy is not None else (unary_union(land_polygons_xy).buffer(0) if land_polygons_xy else GeometryCollection())
+    land_boundary = land_union.boundary if not land_union.is_empty else GeometryCollection()
+    base_water = frame.difference(land_union).buffer(0) if not land_union.is_empty else frame.buffer(0)
+    if not base_water.is_valid:
+        base_water = base_water.buffer(0)
+
+    water_seed_xy = seed_xy
+    seed_snap_distance_m = 0.0
+    seed_snapped = False
+    if not base_water.is_empty and not base_water.buffer(1.0).contains(seed_xy):
+        try:
+            water_seed_xy = nearest_points(seed_xy, base_water)[1]
+            seed_snap_distance_m = float(seed_xy.distance(water_seed_xy))
+            seed_snapped = seed_snap_distance_m > 0.0
+        except Exception:
+            water_seed_xy = seed_xy
+
+    domain = _choose_seed_component(base_water, water_seed_xy)
+    fallback_reason: str | None = None
+    if domain is None or domain.is_empty:
+        fallback_reason = "seed_water_component_not_found"
+        domain = frame.buffer(0)
+    if not domain.is_valid:
+        domain = domain.buffer(0)
+    if getattr(domain, "geom_type", "") != "Polygon":
+        selected = _choose_seed_component(domain, water_seed_xy)
+        domain = selected if selected is not None else frame.buffer(0)
+
+    tolerance = max(2.0, 0.02 * target_resolution_m)
+    land_patch_geom = GeometryCollection()
+    land_patch_lines: list[LineString] = []
+    if not land_union.is_empty:
+        try:
+            land_patch_geom = loop_xy.intersection(land_union.buffer(tolerance))
+            land_patch_lines = _line_parts(land_patch_geom)
+        except Exception:
+            land_patch_geom = GeometryCollection()
+            land_patch_lines = []
+    land_patch_length = _sum_line_length(land_patch_lines)
+    loop_length = max(float(loop_xy.length), 1.0)
+    boundary_segments = _classify_domain_boundary_segments(
+        domain,
+        loop_xy,
+        land_boundary,
+        frame,
+        target_resolution_m,
+    )
+    boundary_segments["land_patch_boundary_arcs_xy"] = land_patch_lines
+    boundary_segments["land_patch_boundary_length_m"] = float(land_patch_length)
+    open_overlap_fraction = _line_fraction_near_boundary(loop_xy, domain.boundary, max(tolerance, 0.1 * target_resolution_m))
+    metadata = {
+        "target_resolution_m": float(target_resolution_m),
+        "face_count": int(_polygon_count(base_water)),
+        "source": "island_archipelago_offshore_loop",
+        "closure_method": "island_archipelago_offshore_loop",
+        "method": "closed_offshore_loop_minus_gshhs_land_union",
+        "deformed_frame_valid": bool(frame_valid),
+        "deformed_frame_area_m2": float(frame.area),
+        "land_polygon_count": int(len(land_polygons_xy)),
+        "coastline_line_count": 0,
+        "gshhs_missing_land_polygons": bool(len(land_polygons_xy) == 0),
+        "gshhs_missing_coastline_lines": False,
+        "gshhs_polygonize_fallback_used": False,
+        "fallback_reason": fallback_reason,
+        "arc_land_intersection": bool(land_patch_length > 0.0),
+        "arc_land_intersection_length_m": float(land_patch_length),
+        "land_patch_policy": "land_patch",
+        "island_blocker_land_patch_used": bool(land_patch_length > 0.0),
+        "land_patch_boundary_length_m": float(land_patch_length),
+        "land_patch_boundary_fraction": float(land_patch_length / loop_length),
+        "open_arc_boundary_overlap_fraction": float(open_overlap_fraction),
+        "land_boundary_overlap_fraction": float(boundary_segments["land_boundary_overlap_fraction"]),
+        "frame_clip_boundary_length_m": float(boundary_segments["frame_clip_boundary_length_m"]),
+        "area_m2": float(domain.area),
+        "perimeter_m": float(domain.length),
+        "hole_count": int(len(getattr(domain, "interiors", []))),
+        "seed_inside": bool(domain.buffer(max(1.0, 0.1 * target_resolution_m)).contains(water_seed_xy)),
+        "original_seed_inside": bool(domain.buffer(max(1.0, 0.1 * target_resolution_m)).contains(seed_xy)),
+        "seed_snapped_to_gshhs_water": bool(seed_snapped),
+        "seed_snap_distance_m": float(seed_snap_distance_m),
+        "forbidden_overlap": [],
+    }
+    return {
+        "wet_domain_xy": domain,
+        "open_arc_xy": loop_xy,
+        "deformed_frame_xy": frame,
         "boundary_segments_xy": boundary_segments,
         "metadata": metadata,
     }
@@ -1032,6 +1570,33 @@ def _dedupe_consecutive_coords(coords: list[tuple[float, float]], tolerance: flo
     if len(out) > 1 and math.hypot(out[0][0] - out[-1][0], out[0][1] - out[-1][1]) <= tolerance:
         out.pop()
     return out
+
+
+def _ensure_closed_line(line: LineString) -> LineString:
+    coords = [(float(x), float(y)) for x, y in line.coords]
+    if not coords:
+        return line
+    if Point(coords[0]).distance(Point(coords[-1])) > 1.0e-9:
+        coords.append(coords[0])
+    return LineString(coords)
+
+
+def _chaikin_closed_ring(coords: list[tuple[float, float]], iterations: int = 2) -> list[tuple[float, float]]:
+    ring = [(float(x), float(y)) for x, y in coords]
+    if len(ring) < 3:
+        return ring
+    if ring[0] == ring[-1]:
+        ring = ring[:-1]
+    for _ in range(max(0, int(iterations))):
+        new_ring: list[tuple[float, float]] = []
+        for idx, p0 in enumerate(ring):
+            p1 = ring[(idx + 1) % len(ring)]
+            q = (0.75 * p0[0] + 0.25 * p1[0], 0.75 * p0[1] + 0.25 * p1[1])
+            r = (0.25 * p0[0] + 0.75 * p1[0], 0.25 * p0[1] + 0.75 * p1[1])
+            new_ring.extend([q, r])
+        ring = new_ring
+    ring.append(ring[0])
+    return ring
 
 
 def _polygon_count(geom) -> int:
@@ -1564,6 +2129,7 @@ def _fetch_gshhs_coastline(
     gshhs_skill_dir: str | None,
     resolution: str,
     levels: str,
+    progress_interval_s: float = 30.0,
 ) -> tuple[Path, dict[str, Any]]:
     """Run the installed gshhs-coastline fetch script for a buffered bbox."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1582,7 +2148,7 @@ def _fetch_gshhs_coastline(
     estimate_script = skill_dir / "scripts" / "estimate_data_request.py"
     fetch_script = skill_dir / "scripts" / "fetch_gshhs_coastline.py"
     if estimate_script.exists():
-        subprocess.run(
+        _run_subprocess_with_progress(
             [
                 sys.executable,
                 str(estimate_script),
@@ -1597,9 +2163,11 @@ def _fetch_gshhs_coastline(
                 "--run-id",
                 name,
             ],
-            check=True,
+            run_dir,
+            "fetch-gshhs-estimate",
+            progress_interval_s,
         )
-    subprocess.run(
+    _run_subprocess_with_progress(
         [
             sys.executable,
             str(fetch_script),
@@ -1618,7 +2186,9 @@ def _fetch_gshhs_coastline(
             "--allow-no-basemap",
             "--quiet",
         ],
-        check=True,
+        run_dir,
+        "fetch-gshhs",
+        progress_interval_s,
     )
     gpkg = run_dir / f"{name}_gshhs_land.gpkg"
     manifest = run_dir / f"{name}_gshhs_manifest.json"
@@ -1736,15 +2306,168 @@ def _read_json(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
 
 
+def _upstream_bpoly_unresolved(region: dict[str, Any]) -> bool:
+    status = str(region.get("final_status") or "").lower()
+    domain_type = str(region.get("domain_type") or region.get("region_bpoly", {}).get("domain_type") or "").lower()
+    coords = region.get("polygon_lonlat") or region.get("region_bpoly", {}).get("polygon_lonlat")
+    return domain_type == "unresolved_autonomous_failure" or (status == "needs_review" and not coords)
+
+
+def _write_unresolved_upstream_manifest(
+    region: dict[str, Any],
+    offshore: dict[str, Any],
+    run_dir: Path,
+    name: str,
+    config: BdryArcConfig,
+    resolved_heuristic_mode: str,
+    place_memory_enabled: bool,
+) -> dict[str, Any]:
+    failure_taxonomy = ["upstream_region_bpoly_unresolved"]
+    upstream_failures = (
+        region.get("qa", {})
+        .get("bpoly_quality", {})
+        .get("failure_taxonomy", [])
+    )
+    for item in upstream_failures:
+        code = item.get("code") if isinstance(item, dict) else str(item)
+        if code and code not in failure_taxonomy:
+            failure_taxonomy.append(str(code))
+    manifest_path = run_dir / "bdry_arc_manifest.json"
+    manifest = {
+        "schema_version": "fvcom_bdry_arc_manifest_v1",
+        "name": name,
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "created_by": "fvcom-bdry-arc run_bdry_arc.py",
+        "final_status": "needs_review",
+        "failure_taxonomy": failure_taxonomy,
+        "settings": {
+            "mode": config.mode,
+            "target_resolution_m": float(config.target_resolution_m),
+            "review_depth": config.review_depth,
+            "coastline_source": config.coastline_source,
+            "topology_mode_requested": config.topology_mode,
+            "topology_mode_used": "upstream-unresolved",
+            "gshhs_resolution_requested": config.gshhs_resolution,
+            "gshhs_levels": config.gshhs_levels,
+            "heuristic_mode": resolved_heuristic_mode,
+            "place_memory_enabled": bool(place_memory_enabled),
+        },
+        "inputs": {
+            "region_name": region.get("name"),
+            "region_final_status": region.get("final_status"),
+            "region_domain_type": region.get("domain_type"),
+            "offshore_boundary_policy": offshore.get("boundary_policy"),
+        },
+        "wet_domain": {
+            "closure_method": "upstream_region_bpoly_unresolved",
+            "area_m2": 0.0,
+            "seed_inside": False,
+        },
+        "model_boundary_loops": {
+            "final_status": "needs_review",
+            "failure_taxonomy": ["upstream_region_bpoly_unresolved"],
+        },
+        "outputs": {
+            "bdry_arc_manifest": str(manifest_path),
+            "progress_state": str(run_dir / "bdry_arc_progress_state.json"),
+            "progress_jsonl": str(run_dir / "bdry_arc_progress.jsonl"),
+        },
+    }
+    manifest_path.write_text(json.dumps(_json_safe(manifest), indent=2), encoding="utf-8")
+    _write_progress(run_dir, "complete", "failed", {"failure_taxonomy": failure_taxonomy})
+    return manifest
+
+
 def _write_progress(run_dir: Path, stage: str, message: str, details: dict[str, Any] | None = None) -> None:
+    now = datetime.now(timezone.utc)
+    state_path = run_dir / "bdry_arc_progress_state.json"
+    state: dict[str, Any] = {}
+    if state_path.exists():
+        try:
+            state = _read_json(state_path)
+        except Exception:
+            state = {}
+    started_unix = float(state.get("started_unix", now.timestamp()))
+    elapsed = max(0.0, now.timestamp() - started_unix)
+    percent = _progress_percent(stage, message)
     record = {
-        "time_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "time_utc": now.isoformat(timespec="seconds"),
         "stage": stage,
         "message": message,
+        "progress_percent": percent,
+        "elapsed_seconds": elapsed,
         "details": _json_safe(details or {}),
     }
     with (run_dir / "bdry_arc_progress.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record) + "\n")
+    state_doc = {
+        "schema_version": "fvcom_bdry_arc_progress_state_v1",
+        "started_utc": state.get("started_utc", now.isoformat(timespec="seconds")),
+        "started_unix": started_unix,
+        "updated_utc": now.isoformat(timespec="seconds"),
+        "elapsed_seconds": elapsed,
+        "current_stage": stage,
+        "current_message": message,
+        "progress_percent": percent,
+        "last_details": _json_safe(details or {}),
+        "health_policy": "Progress is reported for slow stages; do not downshift GSHHS resolution unless the prompt or CLI explicitly requested it.",
+    }
+    state_path.write_text(json.dumps(_json_safe(state_doc), indent=2), encoding="utf-8")
+
+
+def _run_subprocess_with_progress(
+    cmd: list[str],
+    run_dir: Path,
+    stage: str,
+    progress_interval_s: float,
+) -> None:
+    interval = max(float(progress_interval_s), 1.0)
+    _write_progress(run_dir, stage, "start", {"command": _redacted_command(cmd)})
+    proc = subprocess.Popen(cmd)
+    last = time.monotonic()
+    heartbeat_count = 0
+    while proc.poll() is None:
+        time.sleep(min(interval, 1.0))
+        now = time.monotonic()
+        if now - last >= interval:
+            heartbeat_count += 1
+            _write_progress(run_dir, stage, "running", {"heartbeat_count": heartbeat_count, "pid": proc.pid})
+            last = now
+    if proc.returncode != 0:
+        _write_progress(run_dir, stage, "failed", {"returncode": proc.returncode})
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+    _write_progress(run_dir, stage, "done", {"returncode": proc.returncode, "heartbeat_count": heartbeat_count})
+
+
+def _redacted_command(cmd: list[str]) -> list[str]:
+    return [str(part) for part in cmd]
+
+
+def _progress_percent(stage: str, message: str) -> float:
+    stage_points = {
+        "run": 1.0,
+        "fetch-gshhs-estimate": 5.0,
+        "fetch-gshhs": 12.0,
+        "load-coastline": 20.0,
+        "project-coastline": 30.0,
+        "audit": 36.0,
+        "repair": 42.0,
+        "initial-arc": 50.0,
+        "gshhs-vector": 66.0,
+        "island-loop": 66.0,
+        "iterative-raster": 66.0,
+        "write-outputs": 82.0,
+        "model-boundary-loops": 92.0,
+        "complete": 100.0,
+    }
+    base = stage_points.get(stage, 50.0)
+    if message in {"done", "candidate-done"}:
+        return min(base + 8.0, 99.0)
+    if message in {"failed"}:
+        return base
+    if message in {"running"}:
+        return min(base + 3.0, 98.0)
+    return base
 
 
 def _load_bpoly_polygon(region: dict[str, Any]) -> Polygon:
@@ -1764,7 +2487,12 @@ def _buffer_bbox_lonlat(bbox_wsen: tuple[float, float, float, float], buffer_km:
     lat0 = 0.5 * (south + north)
     dlat = buffer_km / 110.54
     dlon = buffer_km / max(111.32 * math.cos(math.radians(lat0)), 20.0)
-    return (west - dlon, south - dlat, east + dlon, north + dlat)
+    buffered_west = west - dlon
+    buffered_east = east + dlon
+    crosses = east < west
+    if crosses:
+        return (_wrap_lon(buffered_west), south - dlat, _wrap_lon(buffered_east), north + dlat)
+    return (max(-180.0, buffered_west), south - dlat, min(180.0, buffered_east), north + dlat)
 
 
 def _load_coastline_product(
@@ -1782,6 +2510,7 @@ def _load_coastline_product(
     land = _read_vector_layer(path, bbox_wsen, land_layer) if land_layer else gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
     if coastline.empty and not land.empty:
         coastline = gpd.GeoDataFrame(land.drop(columns="geometry", errors="ignore"), geometry=land.geometry.boundary, crs=land.crs)
+    manifest_path = _discover_gshhs_manifest(path)
     metadata = {
         "available_layers": layers,
         "selected_coastline_layer": coastline_layer,
@@ -1789,8 +2518,15 @@ def _load_coastline_product(
         "coastline_feature_count": int(len(coastline)),
         "land_polygon_feature_count": int(len(land)),
         "coastline_source": coastline_source,
-        "gshhs_manifest_path": str(_discover_gshhs_manifest(path)) if _discover_gshhs_manifest(path) else None,
+        "gshhs_manifest_path": str(manifest_path) if manifest_path else None,
     }
+    if manifest_path:
+        try:
+            gshhs_manifest = _read_json(manifest_path)
+            metadata["gshhs_selected_resolution"] = gshhs_manifest.get("source", {}).get("selected_resolution")
+            metadata["gshhs_selected_levels"] = gshhs_manifest.get("source", {}).get("selected_levels")
+        except Exception:
+            pass
     return coastline, land, metadata
 
 
@@ -1819,7 +2555,21 @@ def _choose_layer(layers: list[str], preferred: tuple[str, ...]) -> str | None:
 def _read_vector_layer(path: Path, bbox_wsen: tuple[float, float, float, float], layer: str | None) -> gpd.GeoDataFrame:
     path = Path(path)
     try:
-        if layer:
+        if _bbox_crosses_antimeridian(bbox_wsen):
+            pieces = []
+            west, south, east, north = bbox_wsen
+            for split_bbox in ((west, south, 180.0, north), (-180.0, south, east, north)):
+                if layer:
+                    pieces.append(gpd.read_file(path, layer=layer, bbox=split_bbox))
+                else:
+                    pieces.append(gpd.read_file(path, bbox=split_bbox))
+            pieces = [piece for piece in pieces if not piece.empty]
+            gdf = gpd.GeoDataFrame(
+                pd.concat(pieces, ignore_index=True),
+                geometry="geometry",
+                crs=pieces[0].crs if pieces else "EPSG:4326",
+            ) if pieces else gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        elif layer:
             gdf = gpd.read_file(path, layer=layer, bbox=bbox_wsen)
         else:
             gdf = gpd.read_file(path, bbox=bbox_wsen)
@@ -1834,7 +2584,7 @@ def _read_vector_layer(path: Path, bbox_wsen: tuple[float, float, float, float],
         gdf = gdf.set_crs("EPSG:4326")
     else:
         gdf = gdf.to_crs("EPSG:4326")
-    if len(gdf) <= 20_000:
+    if len(gdf) <= 20_000 and not _bbox_crosses_antimeridian(bbox_wsen):
         try:
             gdf = gpd.clip(gdf, gpd.GeoSeries([box(*bbox_wsen)], crs="EPSG:4326")).reset_index(drop=True)
         except Exception:
@@ -1842,9 +2592,51 @@ def _read_vector_layer(path: Path, bbox_wsen: tuple[float, float, float, float],
     return gdf
 
 
+def _bbox_crosses_antimeridian(bbox_wsen: tuple[float, float, float, float]) -> bool:
+    west, _south, east, _north = bbox_wsen
+    return float(east) < float(west)
+
+
+def _wrap_lon(lon: float) -> float:
+    x = float(lon)
+    while x > 180.0:
+        x -= 360.0
+    while x < -180.0:
+        x += 360.0
+    return x
+
+
+def _unwrap_gdf_longitudes(gdf: gpd.GeoDataFrame, origin: float) -> gpd.GeoDataFrame:
+    if gdf.empty:
+        return gdf
+    out = gdf.copy()
+    out = out.to_crs("EPSG:4326") if out.crs is not None else out.set_crs("EPSG:4326")
+    out["geometry"] = [unwrap_geometry_longitudes(geom, origin) if geom is not None and not geom.is_empty else geom for geom in out.geometry]
+    return out.set_crs("EPSG:4326", allow_override=True)
+
+
 def _discover_gshhs_manifest(path: Path) -> Path | None:
     candidates = sorted(path.parent.glob("*_gshhs_manifest.json"))
     return candidates[0] if candidates else None
+
+
+def _gshhs_resolution_policy(config: BdryArcConfig, coastline_load_meta: dict[str, Any]) -> dict[str, Any]:
+    requested = str(config.gshhs_resolution or "f").lower()
+    selected = str(
+        coastline_load_meta.get("gshhs_selected_resolution")
+        or coastline_load_meta.get("fetch", {}).get("gshhs_selected_resolution")
+        or requested
+    ).lower()
+    explicit_lower_requested = requested not in {"auto", "f"}
+    downgraded_without_request = requested == "f" and selected not in {"f", "full", ""}
+    return {
+        "requested_resolution": requested,
+        "selected_resolution": selected,
+        "default_resolution": "f",
+        "explicit_lower_resolution_requested": bool(explicit_lower_requested),
+        "downgraded_without_explicit_request": bool(downgraded_without_request),
+        "policy": "default to GSHHS full resolution and never downshift to h/i/l/c unless the prompt or CLI explicitly requests it",
+    }
 
 
 def _flatten_lines(geometries: Iterable[Any]) -> list[LineString]:
@@ -2022,6 +2814,106 @@ def _select_anchor_points(
         "end_line_index": int(selected[1][1]),
         "start_distance_m": float(selected[0][0].distance(targets[0])),
         "end_distance_m": float(selected[1][0].distance(targets[1])),
+    }
+
+
+def _uses_lake_closed_boundary(region: dict[str, Any], offshore: dict[str, Any]) -> bool:
+    domain_type = str(region.get("domain_type") or region.get("region_bpoly", {}).get("domain_type") or "").lower()
+    boundary_policies = {
+        str(region.get("boundary_policy") or "").lower(),
+        str(offshore.get("boundary_policy") or "").lower(),
+    }
+    return domain_type == "lake" or "no_open_boundary" in boundary_policies
+
+
+def _uses_island_loop_branch(region: dict[str, Any], offshore: dict[str, Any], config: BdryArcConfig, place_memory_enabled: bool = True) -> bool:
+    if config.topology_mode == "island-loop":
+        return True
+    if config.topology_mode != "gshhs-vector":
+        return False
+    domain_type = str(region.get("domain_type") or region.get("region_bpoly", {}).get("domain_type") or "").lower()
+    boundary_policies = {
+        str(region.get("boundary_policy") or "").lower(),
+        str(offshore.get("boundary_policy") or "").lower(),
+    }
+    canonical = str(
+        region.get("qa", {})
+        .get("bpoly_quality", {})
+        .get("canonical_region_key", "")
+    ).lower()
+    return (
+        domain_type == "island"
+        or "offshore_loop_no_land_anchors" in boundary_policies
+        or (place_memory_enabled and canonical in {"hawaii_state", "hawaii_island", "aleutian"})
+    )
+
+
+def _lake_closed_boundary_reference_points(bpoly_xy: Polygon, selected_side_xy: LineString, target_resolution_m: float) -> dict[str, Any]:
+    coords = list(selected_side_xy.coords)
+    if len(coords) < 2:
+        coords = list(bpoly_xy.exterior.coords)[:2]
+    start = (float(coords[0][0]), float(coords[0][1]))
+    end = (float(coords[-1][0]), float(coords[-1][1]))
+    context = _selected_side_context(bpoly_xy, selected_side_xy)
+    return {
+        "source": "lake_closed_boundary_no_open_arc",
+        "start_role": "lake_boundary_reference_start",
+        "end_role": "lake_boundary_reference_end",
+        "start_xy": start,
+        "end_xy": end,
+        "start_line_index": None,
+        "end_line_index": None,
+        "start_distance_m": 0.0,
+        "end_distance_m": 0.0,
+        "start_snap_distance_m": 0.0,
+        "end_snap_distance_m": 0.0,
+        "start_anchor_found": True,
+        "end_anchor_found": True,
+        "start_anchor_method": "lake_closed_boundary_no_open_arc",
+        "end_anchor_method": "lake_closed_boundary_no_open_arc",
+        "anchor_tolerance_m": float(max(target_resolution_m, 250.0)),
+        "selected_side_index": int(context["selected_side_index"]),
+        "start_adjacent_side_index": int(context["start_adjacent_side_index"]),
+        "end_adjacent_side_index": int(context["end_adjacent_side_index"]),
+        "selected_side_start_corner_xy": context["selected_side_start_corner_xy"],
+        "selected_side_end_corner_xy": context["selected_side_end_corner_xy"],
+        "selected_side_xy": selected_side_xy,
+        "seaward_chain_xy": [],
+        "closed_boundary": True,
+        "no_ocean_open_boundary": True,
+    }
+
+
+def _island_loop_reference_points(selected_side_xy: LineString, bpoly_xy: Polygon, target_resolution_m: float) -> dict[str, Any]:
+    coords = list(selected_side_xy.coords)
+    start = (float(coords[0][0]), float(coords[0][1]))
+    end = (float(coords[-1][0]), float(coords[-1][1]))
+    context = _selected_side_context(bpoly_xy, selected_side_xy)
+    return {
+        "source": "offshore_loop_no_land_anchors",
+        "start_role": "island_loop_reference_start",
+        "end_role": "island_loop_reference_end",
+        "start_xy": start,
+        "end_xy": end,
+        "start_line_index": None,
+        "end_line_index": None,
+        "start_distance_m": 0.0,
+        "end_distance_m": 0.0,
+        "start_snap_distance_m": 0.0,
+        "end_snap_distance_m": 0.0,
+        "start_anchor_found": True,
+        "end_anchor_found": True,
+        "start_anchor_method": "selected_bpoly_side_reference",
+        "end_anchor_method": "selected_bpoly_side_reference",
+        "anchor_tolerance_m": float(max(target_resolution_m, 250.0)),
+        "selected_side_index": int(context["selected_side_index"]),
+        "start_adjacent_side_index": int(context["start_adjacent_side_index"]),
+        "end_adjacent_side_index": int(context["end_adjacent_side_index"]),
+        "selected_side_start_corner_xy": context["selected_side_start_corner_xy"],
+        "selected_side_end_corner_xy": context["selected_side_end_corner_xy"],
+        "selected_side_xy": selected_side_xy,
+        "seaward_chain_xy": [],
+        "closed_loop": True,
     }
 
 
@@ -2328,6 +3220,8 @@ def _choose_seed_face(faces: list[Polygon], seed_xy: Point, bpoly_xy: Polygon) -
 def _candidate_gdf(candidates: list[dict[str, Any]], projection: LocalProjection) -> gpd.GeoDataFrame:
     records = []
     for rank, item in enumerate(candidates, start=1):
+        if item.get("geometry") is None or item["geometry"].is_empty:
+            continue
         records.append(
             {
                 "candidate_id": item["candidate_id"],
@@ -2339,6 +3233,8 @@ def _candidate_gdf(candidates: list[dict[str, Any]], projection: LocalProjection
                 "geometry": unproject_geometry(item["geometry"], projection),
             }
         )
+    if not records:
+        return gpd.GeoDataFrame({"candidate_id": [], "family": [], "rank": [], "score": [], "selected": [], "extra_intersection": []}, geometry=[], crs="EPSG:4326")
     return gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
 
 
@@ -2374,14 +3270,18 @@ def _build_output_layers(
         geometry="geometry",
         crs="EPSG:4326",
     )
-    open_gdf = gpd.GeoDataFrame(
-        [{"segment_class": "open_boundary", "geometry": selected_arc_lonlat}],
-        geometry="geometry",
-        crs="EPSG:4326",
-    )
+    if selected_arc_lonlat is None or selected_arc_lonlat.is_empty:
+        open_gdf = gpd.GeoDataFrame({"segment_class": []}, geometry=[], crs="EPSG:4326")
+    else:
+        open_gdf = gpd.GeoDataFrame(
+            [{"segment_class": "open_boundary", "geometry": selected_arc_lonlat}],
+            geometry="geometry",
+            crs="EPSG:4326",
+        )
     boundary_segments = wet_result.get("boundary_segments_xy", {})
     land_lines_xy = boundary_segments.get("land_boundary_arcs_xy", [])
     frame_lines_xy = boundary_segments.get("frame_clip_boundary_arcs_xy", [])
+    land_patch_lines_xy = boundary_segments.get("land_patch_boundary_arcs_xy", [])
     if land_lines_xy:
         land_gdf = _lines_gdf(land_lines_xy, projection, "land_boundary")
     elif wet_result["metadata"].get("closure_method") in {"deformed_bpoly_frame_minus_gshhs_land", "coastline_anchor_seaward_bpoly_chain"}:
@@ -2395,6 +3295,11 @@ def _build_output_layers(
     frame_gdf = (
         _lines_gdf(frame_lines_xy, projection, "frame_clip_boundary")
         if frame_lines_xy
+        else gpd.GeoDataFrame({"segment_class": [], "line_id": []}, geometry=[], crs="EPSG:4326")
+    )
+    land_patch_gdf = (
+        _lines_gdf(land_patch_lines_xy, projection, "land_patch_boundary")
+        if land_patch_lines_xy
         else gpd.GeoDataFrame({"segment_class": [], "line_id": []}, geometry=[], crs="EPSG:4326")
     )
     island_records = [
@@ -2411,9 +3316,17 @@ def _build_output_layers(
                 "anchor_role": "coastline_bpoly_start_anchor"
                 if wet_result["metadata"].get("closure_method") == "coastline_anchor_seaward_bpoly_chain"
                 else (
-                    "bpoly_open_side_start"
-                    if wet_result["metadata"].get("closure_method") == "deformed_bpoly_frame_minus_gshhs_land"
-                    else "start"
+                    "island_loop_reference_start"
+                    if wet_result["metadata"].get("closure_method") == "island_archipelago_offshore_loop"
+                    else (
+                        "lake_boundary_reference_start"
+                        if wet_result["metadata"].get("closure_method") == "lake_closed_boundary_no_open_arc"
+                        else (
+                            "bpoly_open_side_start"
+                            if wet_result["metadata"].get("closure_method") == "deformed_bpoly_frame_minus_gshhs_land"
+                            else "start"
+                        )
+                    )
                 ),
                 "geometry": anchors_lonlat[0],
             },
@@ -2421,9 +3334,17 @@ def _build_output_layers(
                 "anchor_role": "coastline_bpoly_end_anchor"
                 if wet_result["metadata"].get("closure_method") == "coastline_anchor_seaward_bpoly_chain"
                 else (
-                    "bpoly_open_side_end"
-                    if wet_result["metadata"].get("closure_method") == "deformed_bpoly_frame_minus_gshhs_land"
-                    else "end"
+                    "island_loop_reference_end"
+                    if wet_result["metadata"].get("closure_method") == "island_archipelago_offshore_loop"
+                    else (
+                        "lake_boundary_reference_end"
+                        if wet_result["metadata"].get("closure_method") == "lake_closed_boundary_no_open_arc"
+                        else (
+                            "bpoly_open_side_end"
+                            if wet_result["metadata"].get("closure_method") == "deformed_bpoly_frame_minus_gshhs_land"
+                            else "end"
+                        )
+                    )
                 ),
                 "geometry": anchors_lonlat[1],
             },
@@ -2448,6 +3369,7 @@ def _build_output_layers(
         "open_boundary_arc": open_gdf,
         "land_boundary_arcs": land_gdf,
         "frame_clip_boundary_arcs": frame_gdf,
+        "land_patch_boundary_arcs": land_patch_gdf,
         "island_holes": island_gdf,
         "anchor_points": anchor_gdf,
         "candidate_arcs": candidates_gdf,
@@ -2465,7 +3387,7 @@ def _write_outputs(run_dir: Path, layers: dict[str, gpd.GeoDataFrame], name: str
     for layer_name, gdf in layers.items():
         _write_layer(gpkg, layer_name, gdf)
     segments = []
-    for layer_name in ("open_boundary_arc", "land_boundary_arcs", "frame_clip_boundary_arcs", "island_holes"):
+    for layer_name in ("open_boundary_arc", "land_boundary_arcs", "frame_clip_boundary_arcs", "land_patch_boundary_arcs", "island_holes"):
         gdf = layers[layer_name]
         if gdf.empty:
             continue
@@ -2508,7 +3430,8 @@ def _write_review_maps(
         candidates_gdf.plot(ax=ax, color="#9c7a00", linewidth=0.8, alpha=0.35)
         candidates_gdf[candidates_gdf["selected"] == True].plot(ax=ax, color="#c81d25", linewidth=2.0)
     gpd.GeoSeries([bpoly_lonlat], crs="EPSG:4326").boundary.plot(ax=ax, color="#111111", linewidth=1.4, linestyle="--")
-    gpd.GeoSeries([selected_arc_lonlat], crs="EPSG:4326").plot(ax=ax, color="#c81d25", linewidth=2.2)
+    if selected_arc_lonlat is not None and not selected_arc_lonlat.is_empty:
+        gpd.GeoSeries([selected_arc_lonlat], crs="EPSG:4326").plot(ax=ax, color="#c81d25", linewidth=2.2)
     layers["anchor_points"].plot(ax=ax, color="#ffdd57", edgecolor="#111111", markersize=36)
     ax.set_title(f"{name} arc candidate contact sheet")
     ax.set_xlabel("Longitude")
@@ -2531,7 +3454,10 @@ def _write_gshhs_review_maps(
         layers["wet_domain"].plot(ax=ax, facecolor="#7cc6fe", edgecolor="#0b4f6c", linewidth=1.1, alpha=0.28)
     _plot_sampled(layers["coastline_raw"], ax, color="#4d4d4d", linewidth=0.35, alpha=0.65)
     gpd.GeoSeries([bpoly_lonlat], crs="EPSG:4326").boundary.plot(ax=ax, color="#111111", linewidth=1.2, linestyle="--")
-    layers["open_boundary_arc"].plot(ax=ax, color="#d00000", linewidth=2.2)
+    if not layers["open_boundary_arc"].empty:
+        layers["open_boundary_arc"].plot(ax=ax, color="#d00000", linewidth=2.2)
+    if "land_patch_boundary_arcs" in layers and not layers["land_patch_boundary_arcs"].empty:
+        layers["land_patch_boundary_arcs"].plot(ax=ax, color="#005ea8", linewidth=2.0, linestyle="--")
     layers["anchor_points"].plot(ax=ax, color="#ffdd57", edgecolor="#111111", markersize=40)
     ax.set_title(f"{name} GSHHS polygon topology - {final_status}")
     ax.set_xlabel("Longitude")
@@ -2543,7 +3469,10 @@ def _write_gshhs_review_maps(
 
     fig, ax = plt.subplots(figsize=(11, 9))
     _plot_sampled(layers["coastline_repaired"], ax, color="#202020", linewidth=0.45, alpha=0.75)
-    layers["open_boundary_arc"].plot(ax=ax, color="#d00000", linewidth=2.2)
+    if not layers["open_boundary_arc"].empty:
+        layers["open_boundary_arc"].plot(ax=ax, color="#d00000", linewidth=2.2)
+    if "land_patch_boundary_arcs" in layers and not layers["land_patch_boundary_arcs"].empty:
+        layers["land_patch_boundary_arcs"].plot(ax=ax, color="#005ea8", linewidth=2.0, linestyle="--")
     layers["anchor_points"].plot(ax=ax, color="#ffdd57", edgecolor="#111111", markersize=52)
     gpd.GeoSeries([bpoly_lonlat], crs="EPSG:4326").boundary.plot(ax=ax, color="#111111", linewidth=1.2, linestyle="--")
     ax.set_title(f"{name} GSHHS anchors and offshore arc")
@@ -2562,7 +3491,10 @@ def _plot_final_map(path: Path, layers: dict[str, gpd.GeoDataFrame], bpoly_lonla
     _plot_sampled(layers["coastline_raw"], ax, color="#4d4d4d", linewidth=0.25, alpha=0.45)
     _plot_sampled(layers["coastline_repaired"], ax, color="#202020", linewidth=0.45, alpha=0.8)
     gpd.GeoSeries([bpoly_lonlat], crs="EPSG:4326").boundary.plot(ax=ax, color="#111111", linewidth=1.2, linestyle="--")
-    layers["open_boundary_arc"].plot(ax=ax, color="#d00000", linewidth=2.2)
+    if not layers["open_boundary_arc"].empty:
+        layers["open_boundary_arc"].plot(ax=ax, color="#d00000", linewidth=2.2)
+    if "land_patch_boundary_arcs" in layers and not layers["land_patch_boundary_arcs"].empty:
+        layers["land_patch_boundary_arcs"].plot(ax=ax, color="#005ea8", linewidth=2.0, linestyle="--")
     layers["anchor_points"].plot(ax=ax, color="#ffdd57", edgecolor="#111111", markersize=40)
     ax.set_title(f"fvcom-bdry-arc review map - {final_status}")
     ax.set_xlabel("Longitude")
@@ -2680,15 +3612,28 @@ def _final_status(
         failures.append("open_arc_intersects_extra_coastline")
     if metadata.get("source") == "fallback_bpoly_polygon":
         failures.append("seeded_wet_domain_polygonize_failed")
+    if metadata.get("topology_budget_exceeded"):
+        failures.append("large_gshhs_topology_budget_exceeded")
     if metadata.get("gshhs_missing_land_polygons"):
         failures.append("gshhs_missing_land_polygons")
-    if metadata.get("arc_land_intersection"):
+    closure_method = metadata.get("closure_method")
+    if closure_method == "lake_closed_boundary_no_open_arc":
+        if not metadata.get("deformed_frame_valid"):
+            failures.append("lake_closed_boundary_frame_invalid")
+        if not metadata.get("seed_inside"):
+            failures.append("seed_not_inside_wet_domain")
+        status = "pass" if not failures else "needs_review"
+        return status, failures
+    if metadata.get("arc_land_intersection") and closure_method != "island_archipelago_offshore_loop":
         failures.append("gshhs_open_arc_crosses_land")
-    if metadata.get("closure_method") in {"deformed_bpoly_frame_minus_gshhs_land", "coastline_anchor_seaward_bpoly_chain"}:
+    if closure_method in {"deformed_bpoly_frame_minus_gshhs_land", "coastline_anchor_seaward_bpoly_chain", "island_archipelago_offshore_loop"}:
         if not metadata.get("deformed_frame_valid"):
             failures.append("deformed_bpoly_frame_invalid")
-        if float(metadata.get("open_arc_boundary_overlap_fraction", 0.0)) < 0.98:
-            failures.append("open_arc_not_on_final_boundary")
+        threshold = 0.90 if closure_method == "island_archipelago_offshore_loop" and metadata.get("island_blocker_land_patch_used") else 0.98
+        if float(metadata.get("open_arc_boundary_overlap_fraction", 0.0)) < threshold:
+            failures.append("island_loop_not_on_final_boundary" if closure_method == "island_archipelago_offshore_loop" else "open_arc_not_on_final_boundary")
+        if closure_method == "island_archipelago_offshore_loop" and float(metadata.get("land_patch_boundary_fraction", 0.0)) > 0.35:
+            failures.append("island_loop_land_patch_too_large")
     if anchors.get("source") == "coastline_bpoly_intersection":
         if not anchors.get("start_anchor_found", False):
             failures.append("start_coastline_bpoly_anchor_missing")

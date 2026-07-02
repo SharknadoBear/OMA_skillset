@@ -19,7 +19,9 @@ from fvcom_bdry_arc.workflow import (  # noqa: E402
     _classify_relevant_lines,
     _coastline_bpoly_anchor_points,
     _final_status,
+    _gshhs_resolution_policy,
     _raster_connectivity_fill,
+    _uses_island_loop_branch,
     extract_gshhs_vector_wet_domain,
     repair_coastline_graph,
 )
@@ -112,6 +114,90 @@ def _synthetic_gshhs_inputs(root: Path) -> tuple[Path, Path, Path]:
     return region_path, offshore_path, gpkg
 
 
+def _synthetic_lake_gshhs_inputs(root: Path) -> tuple[Path, Path, Path]:
+    bpoly = {
+        "name": "synthetic_lake",
+        "domain_type": "lake",
+        "boundary_policy": "no_open_boundary",
+        "envelope_bbox": [0.0, 0.0, 4.0, 4.0],
+        "polygon_lonlat": [[4.0, 0.0], [0.0, 0.0], [0.0, 4.0], [4.0, 4.0], [4.0, 0.0]],
+        "qa": {"bpoly_quality": {"canonical_region_key": "synthetic_lake"}},
+        "target_region_features": {
+            "features": [
+                {"id": "lake_seed", "required": True, "geometry": [2.0, 1.6, 2.3, 2.0]},
+            ]
+        },
+    }
+    offshore = {
+        "selected_side_index": 3,
+        "selected_side_name": "east_or_right",
+        "selected_side_start_lonlat": [4.0, 4.0],
+        "selected_side_end_lonlat": [4.0, 0.0],
+        "offshore_azimuth_deg": 90.0,
+        "boundary_policy": "no_open_boundary",
+    }
+    region_path = root / "region_bpoly.json"
+    offshore_path = root / "offshore_boundary_artifacts.json"
+    _write_json(region_path, bpoly)
+    _write_json(offshore_path, offshore)
+
+    land = gpd.GeoDataFrame(
+        [
+            {"kind": "shore", "geometry": Polygon([(0.0, 0.0), (0.7, 0.0), (0.7, 4.0), (0.0, 4.0)])},
+            {"kind": "island", "geometry": Polygon([(2.6, 2.2), (2.9, 2.2), (2.9, 1.9), (2.6, 1.9)])},
+        ],
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    coast = gpd.GeoDataFrame(land.drop(columns="geometry"), geometry=land.geometry.boundary, crs="EPSG:4326")
+    gpkg = root / "synthetic_lake_gshhs_land.gpkg"
+    land.to_file(gpkg, layer="land_polygons", driver="GPKG")
+    coast.to_file(gpkg, layer="coastline_lines", driver="GPKG")
+    return region_path, offshore_path, gpkg
+
+
+def _synthetic_island_gshhs_inputs(root: Path) -> tuple[Path, Path, Path]:
+    bpoly = {
+        "name": "synthetic_island_chain",
+        "domain_type": "island",
+        "boundary_policy": "offshore_loop_no_land_anchors",
+        "envelope_bbox": [0.0, 0.0, 4.0, 4.0],
+        "polygon_lonlat": [[4.0, 0.0], [0.0, 0.0], [0.0, 4.0], [4.0, 4.0], [4.0, 0.0]],
+        "qa": {"bpoly_quality": {"canonical_region_key": "hawaii_state"}},
+        "target_region_features": {
+            "features": [
+                {"id": "island_seed", "required": True, "geometry": [1.8, 1.8, 2.2, 2.2]},
+            ]
+        },
+    }
+    offshore = {
+        "selected_side_index": 3,
+        "selected_side_name": "east_or_right",
+        "selected_side_start_lonlat": [4.0, 4.0],
+        "selected_side_end_lonlat": [4.0, 0.0],
+        "offshore_azimuth_deg": 90.0,
+        "boundary_policy": "offshore_loop_no_land_anchors",
+    }
+    region_path = root / "region_bpoly.json"
+    offshore_path = root / "offshore_boundary_artifacts.json"
+    _write_json(region_path, bpoly)
+    _write_json(offshore_path, offshore)
+
+    land = gpd.GeoDataFrame(
+        [
+            {"kind": "island", "geometry": Polygon([(1.7, 1.7), (2.3, 1.7), (2.3, 2.3), (1.7, 2.3)])},
+            {"kind": "edge_blocker", "geometry": Polygon([(3.85, 1.7), (4.25, 1.7), (4.25, 2.3), (3.85, 2.3)])},
+        ],
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    coast = gpd.GeoDataFrame(land.drop(columns="geometry"), geometry=land.geometry.boundary, crs="EPSG:4326")
+    gpkg = root / "synthetic_island_gshhs_land.gpkg"
+    land.to_file(gpkg, layer="land_polygons", driver="GPKG")
+    coast.to_file(gpkg, layer="coastline_lines", driver="GPKG")
+    return region_path, offshore_path, gpkg
+
+
 def _synthetic_loop_package(root: Path, include_boundary_refs: bool = True) -> tuple[Path, Path]:
     exterior = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0), (0.0, 0.0)]
     holes = [
@@ -187,6 +273,7 @@ def test_synthetic_package() -> None:
             "open_boundary_arc",
             "land_boundary_arcs",
             "frame_clip_boundary_arcs",
+            "land_patch_boundary_arcs",
             "island_holes",
             "anchor_points",
             "candidate_arcs",
@@ -236,9 +323,128 @@ def test_gshhs_vector_package_prefers_coastline_lines() -> None:
         assert Path(manifest["outputs"]["model_boundary_segments_geojson"]).exists()
         assert Path(manifest["outputs"]["model_boundary_colored_map"]).exists()
         assert manifest["model_boundary_loops"]["qa"]["outer_boundary_closed"] is True
+        assert Path(root / "run" / "bdry_arc_progress_state.json").exists()
         assert (visual_dir / "gshhs_polygon_topology_map.png").exists()
         assert (visual_dir / "gshhs_anchor_arc_map.png").exists()
         assert not list(visual_dir.glob("raster_connectivity_iter_*.png"))
+
+
+def test_island_loop_branch_avoids_coastline_anchor_failures() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        region, offshore, gpkg = _synthetic_island_gshhs_inputs(root)
+        manifest = run_bdry_arc(
+            region,
+            offshore,
+            root / "run",
+            "synthetic_island",
+            coastline_gpkg=gpkg,
+            config=BdryArcConfig(mode="test", target_resolution_m=5000.0, coastline_source="gshhs", topology_mode="gshhs-vector"),
+        )
+        assert manifest["settings"]["topology_mode_used"] == "island-loop"
+        assert manifest["wet_domain"]["closure_method"] == "island_archipelago_offshore_loop"
+        assert manifest["anchors"]["source"] == "offshore_loop_no_land_anchors"
+        assert "start_coastline_bpoly_anchor_missing" not in manifest["failure_taxonomy"]
+        assert "end_coastline_bpoly_anchor_missing" not in manifest["failure_taxonomy"]
+        assert manifest["wet_domain"]["land_patch_policy"] == "land_patch"
+        layers = set(gpd.list_layers(manifest["outputs"]["bdry_arc_package_gpkg"])["name"])
+        assert "land_patch_boundary_arcs" in layers
+        open_arc = gpd.read_file(manifest["outputs"]["bdry_arc_package_gpkg"], layer="open_boundary_arc").geometry.iloc[0]
+        assert Point(open_arc.coords[0]).distance(Point(open_arc.coords[-1])) < 1.0e-8
+
+
+def test_gshhs_resolution_policy_no_silent_downgrade() -> None:
+    policy = _gshhs_resolution_policy(BdryArcConfig(gshhs_resolution="f"), {"gshhs_selected_resolution": "h"})
+    assert policy["downgraded_without_explicit_request"] is True
+    policy = _gshhs_resolution_policy(BdryArcConfig(gshhs_resolution="h"), {"gshhs_selected_resolution": "h"})
+    assert policy["downgraded_without_explicit_request"] is False
+    assert policy["explicit_lower_resolution_requested"] is True
+
+
+def test_memory_off_disables_canonical_only_island_routing() -> None:
+    region = {
+        "domain_type": "coastal",
+        "boundary_policy": "coastal_arc_with_land_anchors",
+        "qa": {"bpoly_quality": {"canonical_region_key": "hawaii_state"}},
+    }
+    offshore = {"boundary_policy": "coastal_arc_with_land_anchors"}
+    config = BdryArcConfig(mode="test", coastline_source="gshhs", topology_mode="gshhs-vector")
+    assert _uses_island_loop_branch(region, offshore, config, place_memory_enabled=False) is False
+    assert _uses_island_loop_branch(region, offshore, config, place_memory_enabled=True) is True
+    explicit_region = {**region, "domain_type": "island"}
+    assert _uses_island_loop_branch(explicit_region, offshore, config, place_memory_enabled=False) is True
+    explicit_offshore = {"boundary_policy": "offshore_loop_no_land_anchors"}
+    assert _uses_island_loop_branch(region, explicit_offshore, config, place_memory_enabled=False) is True
+
+
+def test_antimeridian_projection_uses_compact_longitude_frame() -> None:
+    projection = local_utm_projection((172.0, 48.0, -158.0, 58.0))
+    assert projection.longitude_origin is not None
+    assert projection.epsg != 32632
+    assert projection.longitude_origin > 150.0 or projection.longitude_origin < -150.0
+
+
+def test_lake_closed_boundary_no_false_open_arc() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        region, offshore, gpkg = _synthetic_lake_gshhs_inputs(root)
+        manifest = run_bdry_arc(
+            region,
+            offshore,
+            root / "run",
+            "synthetic_lake",
+            coastline_gpkg=gpkg,
+            config=BdryArcConfig(mode="test", target_resolution_m=5000.0, coastline_source="gshhs", topology_mode="gshhs-vector"),
+        )
+        assert manifest["settings"]["topology_mode_used"] == "lake-closed-boundary"
+        assert manifest["settings"]["lake_closed_boundary_branch"] is True
+        assert manifest["wet_domain"]["closure_method"] == "lake_closed_boundary_no_open_arc"
+        assert manifest["wet_domain"]["no_ocean_open_boundary"] is True
+        assert "open_arc_not_on_final_boundary" not in manifest["failure_taxonomy"]
+        open_arc = gpd.read_file(manifest["outputs"]["bdry_arc_package_gpkg"], layer="open_boundary_arc")
+        usable_open_arcs = [geom for geom in open_arc.geometry if geom is not None and not geom.is_empty]
+        assert not usable_open_arcs
+        loop_manifest = json.loads(Path(manifest["outputs"]["model_boundary_loop_manifest"]).read_text(encoding="utf-8"))
+        assert loop_manifest["settings"]["lake_no_open_boundary"] is True
+        assert "open_boundary_not_sufficiently_on_model_exterior" not in loop_manifest["failure_taxonomy"]
+
+
+def test_unresolved_upstream_bpoly_stops_before_coastline_load() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        region_path = root / "region_bpoly.json"
+        offshore_path = root / "offshore_boundary_artifacts.json"
+        _write_json(
+            region_path,
+            {
+                "name": "unknown_case",
+                "final_status": "needs_review",
+                "domain_type": "unresolved_autonomous_failure",
+                "polygon_lonlat": [],
+                "qa": {
+                    "bpoly_quality": {
+                        "failure_taxonomy": [
+                            {"code": "unknown_region_no_feature_plan", "severity": "fail"},
+                        ]
+                    }
+                },
+            },
+        )
+        _write_json(offshore_path, {"boundary_policy": "unresolved_autonomous_failure"})
+        manifest = run_bdry_arc(
+            region_path,
+            offshore_path,
+            root / "run",
+            "unknown_case",
+            coastline_gpkg=None,
+            config=BdryArcConfig(mode="test", coastline_source="gshhs", topology_mode="gshhs-vector"),
+        )
+        assert manifest["final_status"] == "needs_review"
+        assert manifest["settings"]["topology_mode_used"] == "upstream-unresolved"
+        assert "upstream_region_bpoly_unresolved" in manifest["failure_taxonomy"]
+        assert "unknown_region_no_feature_plan" in manifest["failure_taxonomy"]
+        assert Path(manifest["outputs"]["bdry_arc_manifest"]).exists()
+        assert Path(manifest["outputs"]["progress_state"]).exists()
 
 
 def test_coastline_anchor_seaward_chain_closes_boundary() -> None:
@@ -407,6 +613,12 @@ def test_model_boundary_loop_unclassified_needs_review() -> None:
 def main() -> int:
     test_synthetic_package()
     test_gshhs_vector_package_prefers_coastline_lines()
+    test_island_loop_branch_avoids_coastline_anchor_failures()
+    test_gshhs_resolution_policy_no_silent_downgrade()
+    test_memory_off_disables_canonical_only_island_routing()
+    test_antimeridian_projection_uses_compact_longitude_frame()
+    test_lake_closed_boundary_no_false_open_arc()
+    test_unresolved_upstream_bpoly_stops_before_coastline_load()
     test_coastline_anchor_seaward_chain_closes_boundary()
     test_open_arc_crossing_land_needs_review()
     test_endpoint_repair_is_conservative()

@@ -40,6 +40,12 @@ For `fvcom-bdry-arc`, translate that idea into a Python postprocessor:
 - keep island holes if they are resolved at the target resolution;
 - mark `needs_review` when topology is ambiguous.
 
+## Island / Archipelago Branch
+
+Do not apply the coastline-on-bpoly mainland-anchor rule to bpoly products whose `domain_type` is `island` or whose boundary policy is `offshore_loop_no_land_anchors`. For island-chain domains, the bpoly frame is the offshore-boundary intent. Generate a smooth closed offshore loop, subtract GSHHS land polygons, keep island holes/boundaries inside the accepted water domain, and classify any loop-blocking island contact as a `land_patch_boundary` under Bear's land-patch rule. This branch protects Hawaii State, Aleutian, and similar archipelago cases from false `start/end coastline anchor missing` failures.
+
+GSHHS full resolution (`f`) is the default topology source for this branch and for the coastal/estuary branch. Lower-resolution GSHHS products should be used only when the prompt or CLI explicitly requests them. Slow vector stages should emit progress/heartbeat artifacts rather than silently downshifting.
+
 ## CUSP Compatibility
 
 The installed `cusp-coastline` skill writes useful EPSG:4326 `LineString` and `MultiLineString` shoreline vectors, usually in a `coastline` layer. It does not create OceanMesh2D-style `outer/mainland/inner` topology. Keep CUSP as explicit legacy/debug input or future local-detail refinement after the GSHHS topology component is known.

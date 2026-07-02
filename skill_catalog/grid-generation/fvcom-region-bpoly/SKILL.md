@@ -27,12 +27,23 @@ Run `scripts/run_region_bpoly.py` by default:
 - `--mode test`: writes the same final outputs and retains `intermediate/visual_review/` with initial guess maps, feature plans, feature GeoJSON, candidate maps, side zoom maps, score JSON, and coverage JSON.
 - `--review-depth auto|fast|full` defaults to `auto`.
 - `--full-side-review` remains a backward-compatible alias for `--review-depth full`.
+- `--heuristic-mode auto|memory|unknown` defaults to `auto`: execute resolves to `memory`; test resolves to `unknown`.
 - `--basemap-provider auto` is the default. Every initial, candidate, zoom, adjustment, and final map must include background map context.
 - `--offshore-azimuth-deg` can override the selected offshore side after candidate repair when map review requires a different side selector.
 
 If execute mode cannot pass, it keeps `intermediate/` and marks `final_status` as `needs_review`.
 
 Prefer `--mode test` for benchmarks, subagent tests, debugging, or retained VLM/agent-review evidence.
+
+## Memory And Unknown-Region Policy
+
+Heuristics are practical workflow memory, not a scientific guarantee. In execute mode, place-memory heuristics, known-region feature libraries, deformation presets, and deterministic repair candidates remain enabled so the skill can handle known domains efficiently.
+
+In test mode, `--heuristic-mode auto` resolves to memory-off `unknown` mode. This disables hard-coded place guesses, deformation presets, repair candidates, and feature-library inference unless the request supplies explicit `target_region_features`, explicit required ingredients, or an explicit polygon seed. The purpose is to expose the real uncertainty of a raw prompt during subagent screening.
+
+Unknown regions must never fall back to Delaware/NJ or any other accepted default box. If a memory-off run lacks explicit feature geometry, write final artifacts with `final_status: needs_review`, `domain_type: unresolved_autonomous_failure`, and failure code `unknown_region_no_feature_plan`.
+
+Explicit feature boxes remain valid in test mode. When the request supplies `target_region_features` or required feature ingredients, build the bpoly from those boxes without using place-memory shortcuts.
 
 ## Feature-First Planning
 
@@ -94,13 +105,15 @@ Final JSON must include QA for:
 - offshore-side quality;
 - offshore-obstruction guards, including whether the selected side or domain intersects guard boxes;
 - broad-region island crossing risk along the offshore side;
+- coastal/estuary open-gate landing quality, including whether adjacent sides give downstream `fvcom-bdry-arc` a practical solid-coast landing;
 - antimeridian safety and map display span;
 - practical map usability.
 
 Known scope rules:
 
-- Cook Inlet wave, wave-current, SWAN, wave-climate, offshore-wave-forcing, or fetch prompts use `domain_variant: cook_inlet_wave_fetch`: include Kodiak Island as required context, include Augustine Island and Ursus Cove/Kamishak west-side Cook Inlet context, and push the offshore side well south/offshore for wave fetch.
+- Cook Inlet wave, wave-current, SWAN, wave-climate, offshore-wave-forcing, or fetch prompts use `domain_variant: cook_inlet_wave_fetch`: include Kodiak Island as required context, include Augustine Island and Ursus Cove/Kamishak west-side Cook Inlet context, push the offshore side well south/offshore for wave fetch, and avoid unnecessary Prince William Sound overreach on the east side.
 - Cook Inlet tidal-only/current-only/residual-transport prompts use `domain_variant: cook_inlet_tidal_mouth`: keep the tighter mouth-gate domain and avoid routing the offshore side through Kodiak Island, represented as an obstruction guard.
+- Mobile Bay prompts must include Mobile Bay, the lower Mobile-Tensaw river/delta context, a Gulf-facing gate, and enough westward landing context beyond Horn Island for the downstream boundary arc. Avoid unnecessary Perdido Bay and Wolf Bay inclusion unless explicitly requested.
 - Murderkill-style requests are `small_estuary` scale and must pass tighter area/width limits rather than broad Delaware-Bay-scale coverage.
 - Hawaii Island / Big Island-only domains must avoid Maui Nui and neighboring-island obstruction guards; Hawaii State/island-chain domains may include the island chain.
 - `Hawaii Island` means Big Island unless the prompt says `Hawaiian Islands`, `Hawaii islands`, or `Hawaii state`.

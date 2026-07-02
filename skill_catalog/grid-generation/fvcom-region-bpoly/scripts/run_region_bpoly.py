@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 
 from region_bbox.features import (
+    bpoly_from_feature_boxes,
     features_as_ingredients,
     features_to_geojson,
     fit_bpoly_to_feature_boxes,
@@ -27,6 +28,134 @@ POLICY = {
     "lake": "no_open_boundary",
     "unresolved_autonomous_failure": "unresolved",
 }
+
+
+def _resolve_heuristic_mode(cli_mode: str, run_mode: str) -> tuple[str, bool]:
+    if cli_mode == "auto":
+        resolved = "memory" if run_mode == "execute" else "unknown"
+    else:
+        resolved = cli_mode
+    return resolved, resolved == "memory"
+
+
+def _effective_request(request: dict | str, place_memory_enabled: bool) -> dict | str:
+    if isinstance(request, dict):
+        out = dict(request)
+        out["_place_memory_enabled"] = bool(place_memory_enabled)
+        return out
+    return {"request": request, "_place_memory_enabled": bool(place_memory_enabled)}
+
+
+def _write_unresolved_region(
+    case_dir: Path,
+    intermediate: Path,
+    name: str,
+    request: dict,
+    mode: str,
+    heuristic_mode: str,
+    features_doc: dict,
+    ingredients: list[dict],
+    reason: str,
+) -> Path:
+    retained_intermediate = mode == "test"
+    if retained_intermediate:
+        visual_dir = intermediate / "visual_review"
+        visual_dir.mkdir(parents=True, exist_ok=True)
+        write_json(visual_dir / f"{name}_request.json", request)
+        write_json(visual_dir / "target_region_features.json", features_doc)
+        write_json(visual_dir / "target_region_feature_polygons.geojson", features_to_geojson(features_doc))
+        write_json(
+            visual_dir / f"{name}_ingredient_coverage.json",
+            {
+                "all_required_inside": False,
+                "required_count": sum(1 for item in ingredients if item.get("required", True)),
+                "ingredient_count": len(ingredients),
+                "missing_required_ids": [item.get("id", "unknown") for item in ingredients if item.get("required", True)],
+                "ingredients": ingredients,
+            },
+        )
+    offshore_path = case_dir / "offshore_boundary_artifacts.json"
+    offshore = {
+        "schema_version": "offshore_boundary_artifacts_v1",
+        "name": name,
+        "domain_type": "unresolved_autonomous_failure",
+        "boundary_policy": POLICY["unresolved_autonomous_failure"],
+        "selected_side_index": None,
+        "selected_side_name": None,
+        "open_boundary_reference": None,
+        "review_depth": None,
+        "side_focus_count": 0,
+        "warnings": [reason],
+        "failure_taxonomy": [
+            {
+                "code": "unknown_region_no_feature_plan",
+                "severity": "fail",
+                "message": reason,
+            }
+        ],
+    }
+    write_json(offshore_path, offshore)
+    final = {
+        "schema_version": "region_bpoly_final_v1",
+        "object_type": "RegionBPolyFinal",
+        "name": name,
+        "created_at_utc": utc_now(),
+        "mode": mode,
+        "heuristic_mode": heuristic_mode,
+        "place_memory_enabled": False,
+        "final_status": "needs_review",
+        "status_reasons": [reason],
+        "region_bpoly": None,
+        "polygon_lonlat": [],
+        "envelope_bbox": None,
+        "target_region_features": features_doc,
+        "domain_variant": features_doc.get("domain_variant"),
+        "domain_type": "unresolved_autonomous_failure",
+        "boundary_policy": POLICY["unresolved_autonomous_failure"],
+        "open_boundary_reference": None,
+        "offshore_boundary_artifacts_path": str(offshore_path),
+        "final_map_path": None,
+        "final_map_basemap": None,
+        "map_detail_policy": None,
+        "intermediate_dir": str(intermediate) if retained_intermediate else None,
+        "qa": {
+            "ingredient_coverage": {
+                "all_required_inside": False,
+                "missing_required_ids": [item.get("id", "unknown") for item in ingredients if item.get("required", True)],
+                "required_count": sum(1 for item in ingredients if item.get("required", True)),
+                "ingredient_count": len(ingredients),
+            },
+            "target_region_features": {
+                "feature_count": len(features_doc.get("features", [])),
+                "categories": sorted({f.get("category") for f in features_doc.get("features", []) if f.get("category")}),
+                "retained_path": str(intermediate / "visual_review" / "target_region_features.json") if retained_intermediate else None,
+                "retained_geojson_path": str(intermediate / "visual_review" / "target_region_feature_polygons.geojson") if retained_intermediate else None,
+            },
+            "bpoly_quality": {
+                "schema_version": "bpoly_quality_score_v1",
+                "canonical_region_key": "unknown",
+                "blocking_failure": True,
+                "failure_taxonomy": offshore["failure_taxonomy"],
+            },
+            "review_depth": None,
+            "side_focus_count": 0,
+        },
+        "offshore_boundary_artifacts": {
+            "selected_side_index": None,
+            "selected_side_name": None,
+            "review_depth": None,
+            "side_focus_count": 0,
+        },
+        "deformation_notes": [],
+        "downstream_contract": {
+            "bathymetry_and_coastline_fetch": "No bbox emitted because the autonomous region was unresolved.",
+            "domain_and_grid_generation": "Do not use this unresolved output for downstream gridding.",
+            "offshore_point": "No offshore point emitted.",
+        },
+    }
+    if mode == "execute" and intermediate.exists():
+        shutil.rmtree(intermediate)
+    return write_json(case_dir / "region_bpoly.json", final)
 
 
 def infer_domain_type(request: dict | str) -> str:
@@ -381,6 +510,7 @@ def main() -> None:
     ap.add_argument("--run-dir", required=True, help="Final case output folder.")
     ap.add_argument("--name", required=True)
     ap.add_argument("--mode", choices=["execute", "test"], default="execute")
+    ap.add_argument("--heuristic-mode", choices=["auto", "memory", "unknown"], default="auto", help="auto uses place memory in execute and disables it in test; memory keeps known-region heuristics; unknown requires explicit geometry.")
     ap.add_argument("--review-depth", choices=["auto", "fast", "full"], default="auto")
     ap.add_argument("--domain-type", choices=list(POLICY))
     ap.add_argument("--open-boundary-reference", nargs=2, type=float, metavar=("LON", "LAT"))
@@ -396,12 +526,33 @@ def main() -> None:
         shutil.rmtree(intermediate)
 
     request = load_request(args)
-    bpoly, deformation_notes = deform_bpoly(RegionBPoly.from_region_box(guess_region_box(request)), request)
-    features_doc = infer_target_region_features(request)
-    ingredients = features_as_ingredients(features_doc) or required_ingredients(request)
-    basemap_provider, map_detail_policy = resolve_basemap_provider(request, args.basemap_provider, features_doc)
+    heuristic_mode, place_memory_enabled = _resolve_heuristic_mode(args.heuristic_mode, args.mode)
+    effective_request = _effective_request(request, place_memory_enabled)
+    features_doc = infer_target_region_features(effective_request, use_place_memory=place_memory_enabled)
+    ingredients = features_as_ingredients(features_doc) or required_ingredients(effective_request, use_place_memory=place_memory_enabled)
+    bpoly: RegionBPoly | None = None
+    deformation_notes: list[str] = []
+    if place_memory_enabled:
+        try:
+            bpoly, deformation_notes = deform_bpoly(RegionBPoly.from_region_box(guess_region_box(effective_request)), effective_request)
+        except ValueError:
+            bpoly = None
+    if bpoly is None:
+        bpoly, feature_seed_note = bpoly_from_feature_boxes(ingredients, args.offshore_azimuth_deg or 90.0)
+        if feature_seed_note:
+            deformation_notes.append(feature_seed_note)
+    if bpoly is None:
+        reason = (
+            "Unknown or memory-disabled region has no explicit target_region_features, "
+            "required_ingredients, or polygon seed; refusing Delaware/NJ fallback."
+        )
+        out = _write_unresolved_region(case_dir, intermediate, args.name, request, args.mode, heuristic_mode, features_doc, ingredients, reason)
+        print(f"Wrote unresolved RegionBPoly: {out}")
+        print("Final status needs review: " + reason)
+        return
+    basemap_provider, map_detail_policy = resolve_basemap_provider(effective_request, args.basemap_provider, features_doc)
     basemap_zoom = map_detail_policy.get("target_zoom") if map_detail_policy else None
-    side_radius_km = side_focus_radius_km(request, features_doc)
+    side_radius_km = side_focus_radius_km(effective_request, features_doc)
     coverage = score_region_box(bpoly, ingredients)
     initial_guess_artifacts = write_initial_guess_artifacts(
         intermediate / "visual_review",
@@ -421,11 +572,11 @@ def main() -> None:
         if refit_note:
             deformation_notes.append(refit_note)
             coverage = score_region_box(bpoly, ingredients)
-    mission_notes = mission_scope_notes(request)
-    domain_type = args.domain_type or infer_domain_type(request)
+    mission_notes = mission_scope_notes(effective_request)
+    domain_type = args.domain_type or infer_domain_type(effective_request)
     bpoly, coverage, repair_notes = apply_candidate_repairs(
         args.name,
-        request,
+        effective_request,
         bpoly,
         ingredients,
         coverage,
@@ -442,7 +593,7 @@ def main() -> None:
         )
         deformation_notes.append(f"Set offshore azimuth to {float(args.offshore_azimuth_deg):g} degrees from CLI override.")
     requested_review_depth = "full" if args.full_side_review else args.review_depth
-    review_depth, review_depth_reasons = select_review_depth(request, features_doc, coverage, bpoly, requested_review_depth, first_coverage_failed)
+    review_depth, review_depth_reasons = select_review_depth(effective_request, features_doc, coverage, bpoly, requested_review_depth, first_coverage_failed)
 
     ref_guess = args.open_boundary_reference
     if not ref_guess and domain_type in {"coastal", "island"}:
@@ -464,7 +615,7 @@ def main() -> None:
     candidate = write_intermediate(
         intermediate,
         args.name,
-        request,
+        effective_request,
         bpoly,
         features_doc,
         ingredients,
@@ -543,6 +694,8 @@ def main() -> None:
         "name": args.name,
         "created_at_utc": utc_now(),
         "mode": args.mode,
+        "heuristic_mode": heuristic_mode,
+        "place_memory_enabled": place_memory_enabled,
         "final_status": final_status,
         "status_reasons": blocks,
         "region_bpoly": bpoly.to_dict(),

@@ -16,6 +16,7 @@ class LocalProjection:
     crs: CRS
     to_xy: Transformer
     to_lonlat: Transformer
+    longitude_origin: float | None = None
 
     @property
     def epsg(self) -> int | None:
@@ -25,7 +26,9 @@ class LocalProjection:
 def local_utm_projection(bbox_wsen: tuple[float, float, float, float]) -> LocalProjection:
     """Choose a local UTM CRS for a lon/lat bbox."""
     west, south, east, north = bbox_wsen
-    lon0 = 0.5 * (west + east)
+    east_for_center = east + 360.0 if east < west else east
+    lon0_unwrapped = 0.5 * (west + east_for_center)
+    lon0 = ((lon0_unwrapped + 180.0) % 360.0) - 180.0
     lat0 = 0.5 * (south + north)
     zone = int(np.floor((lon0 + 180.0) / 6.0) + 1)
     zone = min(max(zone, 1), 60)
@@ -35,6 +38,7 @@ def local_utm_projection(bbox_wsen: tuple[float, float, float, float]) -> LocalP
         crs=crs,
         to_xy=Transformer.from_crs("EPSG:4326", crs, always_xy=True),
         to_lonlat=Transformer.from_crs(crs, "EPSG:4326", always_xy=True),
+        longitude_origin=lon0,
     )
 
 
@@ -60,3 +64,27 @@ def unproject_xy(points_xy: np.ndarray, projection: LocalProjection) -> np.ndarr
     points_xy = np.asarray(points_xy, dtype=float)
     lon, lat = projection.to_lonlat.transform(points_xy[:, 0], points_xy[:, 1])
     return np.column_stack([lon, lat])
+
+
+def unwrap_longitude(lon: float, origin: float) -> float:
+    x = float(lon)
+    while x - origin > 180.0:
+        x -= 360.0
+    while origin - x > 180.0:
+        x += 360.0
+    return x
+
+
+def unwrap_geometry_longitudes(geometry, origin: float):
+    """Unwrap lon coordinates around origin so antimeridian edges stay local."""
+
+    def _transform(x, y, z=None):
+        arr = np.asarray(x, dtype=float)
+        out = arr.copy()
+        out = np.where(out - origin > 180.0, out - 360.0, out)
+        out = np.where(origin - out > 180.0, out + 360.0, out)
+        if z is None:
+            return out, y
+        return out, y, z
+
+    return shapely_transform(_transform, geometry)
