@@ -29,11 +29,14 @@ For `fvcom-bdry-arc`, translate that idea into a Python postprocessor:
 - keep derived GSHHS coastline lines as anchor and arc-contact evidence;
 - project to a local CRS before distance, tangent, and area decisions;
 - bridge dangling endpoints only under strict geometric rules;
-- use the bpoly offshore side to find two coastline anchors;
-- create a smooth open-boundary arc between anchors;
-- polygonize GSHHS coastline boundaries plus the selected arc and bpoly frame where feasible;
-- subtract GSHHS land polygons from the selected water face;
+- use the selected bpoly offshore side to identify the two adjacent bpoly sides;
+- find the open-boundary anchors where those adjacent bpoly sides intersect the GSHHS coastline/land boundary, choosing the crossing closest to each offshore-side corner;
+- use the selected bpoly offshore-side endpoints as control corners, not final anchors;
+- create a smooth open-boundary arc by deforming the full seaward chain from one coastline/bpoly anchor through the offshore side to the other coastline/bpoly anchor;
+- combine the smooth arc with the non-seaward bpoly path between anchors to form a closed deformed frame;
+- subtract GSHHS land polygons from the deformed bpoly frame;
 - choose the seeded wet-domain face rather than the largest arbitrary polygon;
+- classify remaining non-open frame edges separately from GSHHS land-boundary arcs;
 - keep island holes if they are resolved at the target resolution;
 - mark `needs_review` when topology is ambiguous.
 

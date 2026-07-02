@@ -1,17 +1,21 @@
 ---
 name: fvcom-bdry-arc
-description: Create QA-ready FVCOM boundary-arc packages from fvcom-region-bpoly RegionBPoly outputs and GSHHG/GSHHS coastline polygons. Use when Codex needs to convert a regional polygon, offshore-side artifact, and robust shoreline topology into classified wet-domain, land-boundary, island-hole, anchor-point, and smooth offshore open-boundary arc artifacts before fvcom-grid-generation.
+description: Create QA-ready FVCOM boundary-arc and continuous model-boundary-loop packages from fvcom-region-bpoly RegionBPoly outputs and GSHHG/GSHHS coastline polygons. Use when Codex needs to convert a regional polygon, offshore-side artifact, and robust shoreline topology into a gridding-ready model-domain polygon, classified land/model outer boundary, island boundaries, and smooth offshore open-boundary arc artifacts before fvcom-grid-generation.
 ---
 
 # fvcom-bdry-arc
 
 Use this skill as the second OMA gridding step after `fvcom-region-bpoly` and before `fvcom-grid-generation`.
 
-`fvcom-region-bpoly` chooses the broad four-sided modeling envelope and offshore-side intent. `fvcom-bdry-arc` turns that intent plus GSHHS/GSHHG coastline topology into an explicit boundary package. Mesh generation and SMS `.2dm` writing remain downstream in `fvcom-grid-generation`.
+`fvcom-region-bpoly` chooses the broad four-sided modeling envelope and offshore-side intent. `fvcom-bdry-arc` turns that intent plus GSHHS/GSHHG coastline topology into an explicit boundary package and continuous model-boundary loop package. Mesh generation and SMS `.2dm` writing remain downstream in `fvcom-grid-generation`.
 
 ## Core Rule
 
 The bpoly offshore point is a side selector and anchor-search seed. It is not a final boundary endpoint.
+
+The two open-boundary anchors are coastline-on-bpoly points. For the selected offshore bpoly side, find the two adjacent bpoly sides, intersect each adjacent side with the GSHHS coastline/land boundary, and choose the crossing closest to the adjacent offshore corner. If GSHHS does not intersect exactly because of projection or resolution, snap/node only within the target-resolution tolerance; otherwise mark `needs_review`.
+
+The selected offshore side's original two corners are control points, not final anchors. The default GSHHS workflow splits the adjacent bpoly sides at the coastline anchors, builds the seaward chain `start_coast_anchor -> start_offshore_corner -> offshore_side -> end_offshore_corner -> end_coast_anchor`, and deforms that chain into a smooth open boundary.
 
 Use GSHHS/GSHHG land polygons as the default topology base. CUSP is not the default boundary topology source; use it only through the explicit legacy/debug path when Bear asks for CUSP linework testing.
 
@@ -43,12 +47,16 @@ Important options:
 
 ## Outputs
 
-Final outputs:
+Final outputs from every normal `run_bdry_arc.py` run:
 
 - `bdry_arc_manifest.json`
 - `bdry_arc_package.gpkg`
 - `bdry_arc_segments.geojson`
 - `bdry_arc_review_map.png`
+- `model_boundary_loop_manifest.json`
+- `model_boundary_loops.gpkg`
+- `model_boundary_segments.geojson`
+- `model_boundary_colored_map.png`
 
 Test-mode visual outputs:
 
@@ -64,6 +72,7 @@ GeoPackage layers:
 - `wet_domain`
 - `open_boundary_arc`
 - `land_boundary_arcs`
+- `frame_clip_boundary_arcs`
 - `island_holes`
 - `anchor_points`
 - `candidate_arcs`
@@ -72,17 +81,28 @@ GeoPackage layers:
 - `topology_diagnostics`
 - `forbidden_regions`
 
+`run_bdry_arc.py` automatically calls the model-boundary loop builder after `bdry_arc_package.gpkg` is written. Keep `scripts/build_model_boundary_loops.py` as a standalone debug/rebuild utility when an existing package must be reclassified without rerunning coastline fetch or arc selection.
+
+The loop package writes these layers:
+
+- `model_domain_polygon`
+- `model_outer_boundary`
+- `model_outer_boundary_segments`
+- `island_boundary_polygons`
+- `island_boundary_lines`
+- `source_open_boundary_arc`
+
 ## QA Behavior
 
-Mark `final_status: pass` only when the selected arc has valid anchors, avoids extra coastline/land intersections, and creates a seed-containing wet-domain polygon. A recorded `bpoly minus land_union` fallback can pass only when seed, anchor, and open-arc QA remain clean.
+Mark `final_status: pass` only when the selected arc keeps the coastline/bpoly anchor endpoints, avoids extra coastline/land intersections, is present on the final wet-domain boundary, and creates a seed-containing wet-domain polygon.
 
 Mark `final_status: needs_review` rather than forcing a false pass when:
 
-- GSHHS land polygons or coastline lines are missing;
-- the GSHHS vector path falls back to `bpoly minus land_union` and anchors, seed, or open arc QA are not otherwise clean;
+- GSHHS land polygons are missing;
+- the coastline-on-bpoly anchors are missing or beyond snap tolerance;
+- the deformed seaward-chain frame cannot create a seed-containing water component;
 - the offshore arc crosses GSHHS land away from its endpoints;
-- polygonization cannot close a seed-containing wet-domain face;
-- anchors are implausibly far from the intended offshore side;
+- the open arc is not present on the accepted wet-domain exterior;
 - the seed is not inside the accepted wet domain.
 
 ## Topology Method
@@ -91,13 +111,15 @@ The default workflow is GSHHS-first:
 
 1. Load `region_bpoly.json` and `offshore_boundary_artifacts.json`.
 2. Fetch or load GSHHS `land_polygons` and `coastline_lines`.
-3. Project bpoly, coastline, anchors, arcs, and land polygons to a local UTM CRS.
-4. Select coastline anchors nearest the selected bpoly offshore-side endpoints.
-5. Generate Bezier and bowed offshore arc candidates using the bpoly offshore azimuth.
-6. Polygonize GSHHS coastline lines plus the selected offshore arc and bpoly frame.
-7. Choose the seed-containing wet face and subtract GSHHS land polygons.
-8. If vector polygonization cannot produce a clean seed-containing face, fall back to `bpoly minus land_union`, record the fallback, and pass only if seed, anchor, and open-arc QA remain clean.
-9. Write classified boundary layers and visual-review artifacts.
+3. Project bpoly, coastline, arcs, and land polygons to a local UTM CRS.
+4. Find coastline/bpoly intersection anchors on the two bpoly sides adjacent to the selected offshore side.
+5. Split the adjacent bpoly sides at those anchors and build the seaward control chain through the two offshore-side corners.
+6. Generate smooth fixed-endpoint arc candidates by bowing/deforming that full seaward chain along the offshore azimuth.
+7. Build a closed deformed bpoly frame from the selected open arc plus the non-seaward bpoly path between anchors.
+8. Compute `deformed_frame - GSHHS land_union`, then choose the seed-containing water component.
+9. Classify `open_boundary_arc`, GSHHS-overlapping `land_boundary_arcs`, remaining `frame_clip_boundary_arcs`, and `island_holes`.
+10. Write classified boundary layers and visual-review artifacts.
+11. Automatically build the continuous model exterior loop, classify exterior segments as open/land/frame/unclassified boundary, and convert wet-domain interior rings into island polygons.
 
 Use `--topology-mode iterative-raster --coastline-source cusp-legacy` only for legacy CUSP/debug cases. Do not make CUSP the normal topology source until a later refinement workflow explicitly controls it as a local-detail overlay.
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "GloFAS Data Fetcher"
+  short_description: "Fetch and validate CEMS GloFAS data"
+  default_prompt: "Use $glofas-data-fetcher to fetch and validate a small CEMS GloFAS discharge subset."

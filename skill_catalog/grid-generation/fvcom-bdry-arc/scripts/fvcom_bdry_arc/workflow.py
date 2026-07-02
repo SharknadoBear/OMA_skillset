@@ -26,6 +26,7 @@ from shapely.geometry import GeometryCollection, LineString, MultiLineString, Po
 from shapely.prepared import prep
 from shapely.ops import linemerge, nearest_points, polygonize, unary_union
 
+from .boundary_loops import build_model_boundary_loops
 from .projection import LocalProjection, local_utm_projection, project_geometry, unproject_geometry
 
 
@@ -144,7 +145,18 @@ def run_bdry_arc(
     forbidden_regions_lonlat: list[dict[str, Any]] = []
     forbidden_regions_xy: list[Polygon] = []
 
-    anchors = _select_anchor_points(repaired_lines_xy, selected_side_xy, bpoly_xy, config.target_resolution_m)
+    if config.topology_mode == "gshhs-vector":
+        land_boundary_xy = unary_union(land_polygons_xy).boundary if land_polygons_xy else GeometryCollection()
+        if land_boundary_xy.is_empty and repaired_lines_xy:
+            land_boundary_xy = unary_union(repaired_lines_xy)
+        anchors = _coastline_bpoly_anchor_points(
+            land_boundary_xy,
+            selected_side_xy,
+            bpoly_xy,
+            config.target_resolution_m,
+        )
+    else:
+        anchors = _select_anchor_points(repaired_lines_xy, selected_side_xy, bpoly_xy, config.target_resolution_m)
     candidates = generate_offshore_arc_candidates(
         anchors["start_xy"],
         anchors["end_xy"],
@@ -152,6 +164,7 @@ def run_bdry_arc(
         selected_side_xy,
         bpoly_xy,
         config.target_resolution_m,
+        anchors=anchors,
     )
     if len(repaired_lines_xy) <= 20_000:
         coast_union_xy = unary_union(repaired_lines_xy) if repaired_lines_xy else GeometryCollection()
@@ -164,14 +177,19 @@ def run_bdry_arc(
     topology_mode_used = config.topology_mode
     topology_iterations: list[dict[str, Any]] = []
     if config.topology_mode == "gshhs-vector":
-        wet_result = extract_gshhs_vector_wet_domain(
+        topology_selection = select_gshhs_open_side_topology(
+            scored,
             repaired_lines_xy,
             land_polygons_xy,
-            selected_arc_xy,
             bpoly_xy,
             seed_xy,
             config.target_resolution_m,
+            anchors,
         )
+        scored = topology_selection["scored"]
+        wet_result = topology_selection["wet_result"]
+        selected_arc_xy = wet_result.get("open_arc_xy", scored["selected"]["geometry"])
+        scored["selected"]["geometry"] = selected_arc_xy
         _write_progress(run_dir, "gshhs-vector", "done", wet_result["metadata"])
     elif config.topology_mode == "iterative-raster":
         topology = iterative_raster_topology(
@@ -301,11 +319,31 @@ def run_bdry_arc(
         "repair": repair_meta,
         "seed": seed_meta,
         "anchors": {
+            "source": anchors.get("source", "coastline"),
+            "start_role": anchors.get("start_role", "start"),
+            "end_role": anchors.get("end_role", "end"),
             "start_lonlat": [float(anchors_lonlat[0].x), float(anchors_lonlat[0].y)],
             "end_lonlat": [float(anchors_lonlat[1].x), float(anchors_lonlat[1].y)],
             "start_distance_to_side_endpoint_m": float(anchors["start_distance_m"]),
             "end_distance_to_side_endpoint_m": float(anchors["end_distance_m"]),
             "anchor_distance_m": float(Point(anchors["start_xy"]).distance(Point(anchors["end_xy"]))),
+            "start_adjacent_side_index": anchors.get("start_adjacent_side_index"),
+            "end_adjacent_side_index": anchors.get("end_adjacent_side_index"),
+            "selected_side_index": anchors.get("selected_side_index"),
+            "start_anchor_method": anchors.get("start_anchor_method"),
+            "end_anchor_method": anchors.get("end_anchor_method"),
+            "start_anchor_found": anchors.get("start_anchor_found"),
+            "end_anchor_found": anchors.get("end_anchor_found"),
+            "start_snap_distance_m": anchors.get("start_snap_distance_m"),
+            "end_snap_distance_m": anchors.get("end_snap_distance_m"),
+            "anchor_tolerance_m": anchors.get("anchor_tolerance_m"),
+            "seaward_chain_lonlat": [
+                [float(pt.x), float(pt.y)]
+                for pt in (
+                    unproject_geometry(Point(xy), projection)
+                    for xy in anchors.get("seaward_chain_xy", [])
+                )
+            ],
         },
         "offshore_arc": {
             "selected_candidate_id": scored["selected"]["candidate_id"],
@@ -327,6 +365,61 @@ def run_bdry_arc(
         },
     }
     manifest_path = run_dir / "bdry_arc_manifest.json"
+    manifest_path.write_text(json.dumps(_json_safe(manifest), indent=2), encoding="utf-8")
+
+    loop_run_dir = run_dir / "model_boundary_loops"
+    try:
+        loop_manifest = build_model_boundary_loops(
+            outputs["bdry_arc_package_gpkg"],
+            manifest_path,
+            loop_run_dir,
+            name,
+            target_resolution_m=config.target_resolution_m,
+            min_island_area_m2=0.0,
+            mode=config.mode,
+        )
+    except Exception as exc:
+        loop_run_dir.mkdir(parents=True, exist_ok=True)
+        loop_manifest = {
+            "schema_version": "fvcom_model_boundary_loops_v1",
+            "name": name,
+            "created_by": "fvcom-bdry-arc automatic loop builder",
+            "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "final_status": "needs_review",
+            "failure_taxonomy": ["model_boundary_loop_build_failed"],
+            "error": str(exc),
+            "inputs": {
+                "bdry_arc_gpkg": str(outputs["bdry_arc_package_gpkg"]),
+                "manifest_json": str(manifest_path),
+            },
+            "outputs": {},
+            "qa": {},
+        }
+        (loop_run_dir / "model_boundary_loop_manifest.json").write_text(
+            json.dumps(_json_safe(loop_manifest), indent=2),
+            encoding="utf-8",
+        )
+
+    loop_manifest_path = loop_run_dir / "model_boundary_loop_manifest.json"
+    loop_outputs = dict(loop_manifest.get("outputs", {}))
+    loop_outputs["model_boundary_loop_manifest"] = str(loop_manifest_path)
+    loop_outputs["model_boundary_loop_dir"] = str(loop_run_dir)
+    manifest["outputs"].update(loop_outputs)
+    manifest["model_boundary_loops"] = {
+        "final_status": loop_manifest.get("final_status"),
+        "failure_taxonomy": loop_manifest.get("failure_taxonomy", []),
+        "qa": loop_manifest.get("qa", {}),
+        "outputs": loop_outputs,
+    }
+    if loop_manifest.get("final_status") != "pass":
+        if manifest["final_status"] == "pass":
+            manifest["final_status"] = "needs_review"
+        if "model_boundary_loop_needs_review" not in manifest["failure_taxonomy"]:
+            manifest["failure_taxonomy"].append("model_boundary_loop_needs_review")
+    manifest["qa"]["model_boundary_loop_status_rule"] = (
+        "run_bdry_arc automatically builds continuous model-boundary loops; "
+        "the main manifest needs review when the loop package needs review"
+    )
     manifest_path.write_text(json.dumps(_json_safe(manifest), indent=2), encoding="utf-8")
     return manifest
 
@@ -450,32 +543,43 @@ def generate_offshore_arc_candidates(
     selected_side_xy: LineString,
     bpoly_xy: Polygon,
     target_resolution_m: float,
+    anchors: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Generate Bezier and bowed offshore arc candidates."""
+    """Generate open arcs by smoothly deforming the selected bpoly intent chain."""
     p0 = np.asarray(start_xy, dtype=float)
     p1 = np.asarray(end_xy, dtype=float)
+    side_coords = list(selected_side_xy.coords)
+    side0 = np.asarray(side_coords[0], dtype=float)
+    side1 = np.asarray(side_coords[-1], dtype=float)
+    if anchors and anchors.get("seaward_chain_xy"):
+        chain = [np.asarray(xy, dtype=float) for xy in anchors["seaward_chain_xy"]]
+        if len(chain) >= 4:
+            side0 = chain[1]
+            side1 = chain[-2]
     chord = p1 - p0
     chord_len = max(float(np.linalg.norm(chord)), 1.0)
     side_dist = 0.5 * (Point(p0).distance(selected_side_xy) + Point(p1).distance(selected_side_xy))
-    base_bow = max(8.0 * target_resolution_m, 0.30 * chord_len, side_dist + 0.10 * chord_len)
-    factors = [0.55, 0.8, 1.1, 1.45]
+    chain_len = float(Point(p0).distance(Point(side0)) + Point(side0).distance(Point(side1)) + Point(side1).distance(Point(p1)))
+    base_bow = max(4.0 * target_resolution_m, 0.08 * max(chain_len, chord_len), 0.35 * side_dist)
+    factors = [0.0, 0.2, 0.4, 0.65, 0.9, 1.2]
     candidates: list[dict[str, Any]] = []
     for idx, factor in enumerate(factors, start=1):
         bow = base_bow * factor
+        if anchors and anchors.get("seaward_chain_xy"):
+            geometry = _seaward_chain_arc(p0, side0, side1, p1, offshore_unit, bow, n=160)
+            family = "coastline_anchor_seaward_bpoly_chain"
+            candidate_id = f"seaward_chain_{idx:02d}"
+        else:
+            geometry = _deformed_side_arc(side0, side1, p0, p1, offshore_unit, bow, n=128)
+            family = "deformed_bpoly_side"
+            candidate_id = f"side_warp_{idx:02d}"
         candidates.append(
             {
-                "candidate_id": f"bezier_{idx:02d}",
-                "family": "bezier",
+                "candidate_id": candidate_id,
+                "family": family,
                 "bow_distance_m": float(bow),
-                "geometry": _bezier_arc(p0, p1, offshore_unit, bow, n=96),
-            }
-        )
-        candidates.append(
-            {
-                "candidate_id": f"bowed_{idx:02d}",
-                "family": "bowed",
-                "bow_distance_m": float(bow),
-                "geometry": _bowed_arc(p0, p1, offshore_unit, bow, n=96),
+                "control_chain_xy": anchors.get("seaward_chain_xy") if anchors else None,
+                "geometry": geometry,
             }
         )
     return candidates
@@ -597,6 +701,69 @@ def extract_seeded_wet_domain(
     return {"wet_domain_xy": domain, "metadata": metadata}
 
 
+def select_gshhs_open_side_topology(
+    scored: dict[str, Any],
+    coastline_lines_xy: list[LineString],
+    land_polygons_xy: list[Polygon],
+    bpoly_xy: Polygon,
+    seed_xy: Point,
+    target_resolution_m: float,
+    anchors: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Select the coastline-anchor seaward-chain deformation that creates the best domain."""
+    evaluated: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for candidate in scored["candidates"]:
+        result = extract_gshhs_vector_wet_domain(
+            coastline_lines_xy,
+            land_polygons_xy,
+            candidate["geometry"],
+            bpoly_xy,
+            seed_xy,
+            target_resolution_m,
+            anchors=anchors,
+        )
+        metadata = result["metadata"]
+        metrics = dict(candidate.get("metrics", {}))
+        metrics.update(
+            {
+                "closure_method": metadata.get("closure_method"),
+                "open_arc_boundary_overlap_fraction": metadata.get("open_arc_boundary_overlap_fraction", 0.0),
+                "land_boundary_overlap_fraction": metadata.get("land_boundary_overlap_fraction", 0.0),
+                "frame_clip_boundary_length_m": metadata.get("frame_clip_boundary_length_m", 0.0),
+                "deformed_frame_area_m2": metadata.get("deformed_frame_area_m2", 0.0),
+            }
+        )
+        coords = list(candidate["geometry"].coords)
+        chord = max(Point(coords[0]).distance(Point(coords[-1])), 1.0)
+        bow_ratio = float(candidate.get("bow_distance_m", 0.0)) / chord
+        topology_score = 0.0
+        topology_score += 160.0 * float(metadata.get("open_arc_boundary_overlap_fraction", 0.0))
+        if metadata.get("seed_inside"):
+            topology_score += 140.0
+        if metadata.get("deformed_frame_valid"):
+            topology_score += 80.0
+        topology_score += 35.0 * min(max(bow_ratio, 0.0) / 0.20, 1.0)
+        topology_score -= max(0.98 - float(metadata.get("open_arc_boundary_overlap_fraction", 0.0)), 0.0) * 600.0
+        topology_score -= max(float(metrics.get("length_ratio", 1.0)) - 1.25, 0.0) * 100.0
+        if metadata.get("arc_land_intersection"):
+            topology_score -= 180.0
+            topology_score -= min(float(metadata.get("arc_land_intersection_length_m", 0.0)) / max(target_resolution_m, 1.0), 100.0) * 5.0
+        if metadata.get("gshhs_missing_land_polygons"):
+            topology_score -= 120.0
+
+        item = dict(candidate)
+        item["geometry"] = result.get("open_arc_xy", candidate["geometry"])
+        item["metrics"] = metrics
+        item["score"] = float(topology_score)
+        result["metadata"]["candidate_id"] = candidate.get("candidate_id")
+        evaluated.append((item, result))
+
+    evaluated.sort(key=lambda pair: pair[0]["score"], reverse=True)
+    selected, wet_result = evaluated[0]
+    candidates = [item for item, _result in evaluated]
+    return {"scored": {"selected": selected, "candidates": candidates}, "wet_result": wet_result}
+
+
 def extract_gshhs_vector_wet_domain(
     coastline_lines_xy: list[LineString],
     land_polygons_xy: list[Polygon],
@@ -604,62 +771,48 @@ def extract_gshhs_vector_wet_domain(
     bpoly_xy: Polygon,
     seed_xy: Point,
     target_resolution_m: float,
+    anchors: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a GSHHS-first wet domain from stable land polygons and the open arc."""
+    """Build a GSHHS-first wet domain from a coastline-anchor deformed frame."""
     land_union = unary_union(land_polygons_xy).buffer(0) if land_polygons_xy else GeometryCollection()
+    land_boundary = land_union.boundary if not land_union.is_empty else GeometryCollection()
+    deformed_frame, frame_meta = _deformed_bpoly_frame(bpoly_xy, offshore_arc_xy, anchors)
+    base_water = deformed_frame.difference(land_union).buffer(0) if not land_union.is_empty else deformed_frame.buffer(0)
+    if not base_water.is_valid:
+        base_water = base_water.buffer(0)
+
     water_seed_xy = seed_xy
     seed_snap_distance_m = 0.0
     seed_snapped = False
-    if not land_union.is_empty:
-        water_geom_for_seed = bpoly_xy.difference(land_union).buffer(0)
-        if not water_geom_for_seed.is_empty and not water_geom_for_seed.buffer(1.0).contains(seed_xy):
+    if not base_water.is_empty:
+        if not base_water.buffer(1.0).contains(seed_xy):
             try:
-                water_seed_xy = nearest_points(seed_xy, water_geom_for_seed)[1]
+                water_seed_xy = nearest_points(seed_xy, base_water)[1]
                 seed_snap_distance_m = float(seed_xy.distance(water_seed_xy))
                 seed_snapped = seed_snap_distance_m > 0.0
             except Exception:
                 water_seed_xy = seed_xy
-    result = extract_seeded_wet_domain(
-        coastline_lines_xy,
-        offshore_arc_xy,
-        bpoly_xy,
-        water_seed_xy,
-        [],
-        target_resolution_m,
-    )
-    domain = result["wet_domain_xy"]
-    metadata = dict(result["metadata"])
-    source = metadata.get("source")
-    used_fallback = source == "fallback_bpoly_polygon" or not metadata.get("seed_inside") or not coastline_lines_xy or not land_polygons_xy
-    fallback_reason = metadata.get("fallback_reason")
 
-    if not land_union.is_empty and not domain.is_empty:
-        clipped = _choose_seed_component(domain.difference(land_union).buffer(0), water_seed_xy)
-        if clipped is not None and not clipped.is_empty:
-            domain = clipped
-        else:
-            used_fallback = True
-            fallback_reason = fallback_reason or "seed_component_lost_after_land_difference"
-
-    if used_fallback:
-        water_geom = bpoly_xy.difference(land_union).buffer(0) if not land_union.is_empty else bpoly_xy.buffer(0)
-        fallback_domain = _choose_seed_component(water_geom, water_seed_xy)
-        if fallback_domain is not None and not fallback_domain.is_empty:
-            domain = fallback_domain
-            source = "gshhs_bpoly_minus_land_fallback"
-        else:
-            source = "gshhs_seed_water_component_not_found"
-            fallback_reason = fallback_reason or "seed_water_component_not_found"
-            domain = bpoly_xy.buffer(0)
+    domain = _choose_seed_component(base_water, water_seed_xy)
+    fallback_reason: str | None = None
+    source = "coastline_anchor_seaward_bpoly_chain"
+    if domain is None or domain.is_empty:
+        source = "coastline_anchor_seed_water_component_not_found"
+        fallback_reason = "seed_water_component_not_found"
+        domain = deformed_frame.buffer(0)
 
     if not domain.is_valid:
         domain = domain.buffer(0)
     if getattr(domain, "geom_type", "") != "Polygon":
-        selected = _choose_seed_component(domain, seed_xy)
-        domain = selected if selected is not None else bpoly_xy.buffer(0)
+        selected = _choose_seed_component(domain, water_seed_xy)
+        domain = selected if selected is not None else deformed_frame.buffer(0)
 
     tolerance = max(2.0, 0.02 * target_resolution_m)
-    arc_land = offshore_arc_xy.difference(Point(offshore_arc_xy.coords[0]).buffer(max(500.0, 3.0 * target_resolution_m)).union(Point(offshore_arc_xy.coords[-1]).buffer(max(500.0, 3.0 * target_resolution_m))))
+    arc_land = offshore_arc_xy.difference(
+        Point(offshore_arc_xy.coords[0]).buffer(max(500.0, 3.0 * target_resolution_m)).union(
+            Point(offshore_arc_xy.coords[-1]).buffer(max(500.0, 3.0 * target_resolution_m))
+        )
+    )
     arc_land_intersection = False
     arc_land_intersection_length_m = 0.0
     if not land_union.is_empty and not arc_land.is_empty:
@@ -667,18 +820,36 @@ def extract_gshhs_vector_wet_domain(
         arc_land_intersection = not inter.is_empty
         arc_land_intersection_length_m = float(getattr(inter, "length", 0.0))
 
+    boundary_segments = _classify_domain_boundary_segments(
+        domain,
+        offshore_arc_xy,
+        land_boundary,
+        deformed_frame,
+        target_resolution_m,
+    )
+    open_overlap_fraction = _line_fraction_near_boundary(offshore_arc_xy, domain.boundary, max(tolerance, 0.1 * target_resolution_m))
+
+    metadata: dict[str, Any] = {
+        "target_resolution_m": float(target_resolution_m),
+        "face_count": int(_polygon_count(base_water)),
+    }
     metadata.update(
         {
-            "source": source if str(source).startswith("gshhs") else "gshhs_vector_polygonize",
-            "method": "gshhs_vector_polygonize_with_land_union",
+            "source": source,
+            "closure_method": "coastline_anchor_seaward_bpoly_chain",
+            "method": "coastline_anchor_seaward_bpoly_chain_minus_gshhs_land_union",
+            **frame_meta,
             "land_polygon_count": int(len(land_polygons_xy)),
             "coastline_line_count": int(len(coastline_lines_xy)),
             "gshhs_missing_land_polygons": bool(len(land_polygons_xy) == 0),
             "gshhs_missing_coastline_lines": bool(len(coastline_lines_xy) == 0),
-            "gshhs_polygonize_fallback_used": bool(used_fallback or str(source).endswith("_fallback")),
+            "gshhs_polygonize_fallback_used": False,
             "fallback_reason": fallback_reason,
             "arc_land_intersection": bool(arc_land_intersection),
             "arc_land_intersection_length_m": float(arc_land_intersection_length_m),
+            "open_arc_boundary_overlap_fraction": float(open_overlap_fraction),
+            "land_boundary_overlap_fraction": float(boundary_segments["land_boundary_overlap_fraction"]),
+            "frame_clip_boundary_length_m": float(boundary_segments["frame_clip_boundary_length_m"]),
             "area_m2": float(domain.area),
             "perimeter_m": float(domain.length),
             "hole_count": int(len(getattr(domain, "interiors", []))),
@@ -689,7 +860,259 @@ def extract_gshhs_vector_wet_domain(
             "forbidden_overlap": [],
         }
     )
-    return {"wet_domain_xy": domain, "metadata": metadata}
+    return {
+        "wet_domain_xy": domain,
+        "open_arc_xy": offshore_arc_xy,
+        "deformed_frame_xy": deformed_frame,
+        "boundary_segments_xy": boundary_segments,
+        "metadata": metadata,
+    }
+
+
+def _deformed_bpoly_frame(
+    bpoly_xy: Polygon,
+    open_arc_xy: LineString,
+    anchors: dict[str, Any] | None = None,
+) -> tuple[Polygon, dict[str, Any]]:
+    coords = list(bpoly_xy.exterior.coords)[:-1]
+    arc_coords = [(float(x), float(y)) for x, y in open_arc_xy.coords]
+    start = Point(arc_coords[0])
+    end = Point(arc_coords[-1])
+    if anchors and anchors.get("source") == "coastline_bpoly_intersection":
+        selected_side_xy = anchors.get("selected_side_xy")
+        frame, meta = _coastline_anchor_deformed_frame(
+            coords,
+            arc_coords,
+            start,
+            end,
+            anchors,
+            selected_side_xy if isinstance(selected_side_xy, LineString) else None,
+        )
+        if frame is not None:
+            return frame, meta
+
+    n = len(coords)
+    start_idx = min(range(n), key=lambda idx: Point(coords[idx]).distance(start))
+    end_idx = min(range(n), key=lambda idx: Point(coords[idx]).distance(end))
+    start_distance = float(Point(coords[start_idx]).distance(start))
+    end_distance = float(Point(coords[end_idx]).distance(end))
+    orientation = "unresolved"
+    ring: list[tuple[float, float]]
+    if (start_idx + 1) % n == end_idx:
+        orientation = "forward"
+        ring = list(arc_coords)
+        idx = end_idx
+        while True:
+            idx = (idx + 1) % n
+            if idx == start_idx:
+                break
+            ring.append(tuple(coords[idx]))
+    elif (end_idx + 1) % n == start_idx:
+        orientation = "reverse"
+        ring = list(reversed(arc_coords))
+        idx = start_idx
+        while True:
+            idx = (idx + 1) % n
+            if idx == end_idx:
+                break
+            ring.append(tuple(coords[idx]))
+    else:
+        ring = list(arc_coords) + [tuple(coord) for coord in coords if Point(coord).distance(start) > 1.0 and Point(coord).distance(end) > 1.0]
+
+    frame = Polygon(ring)
+    if not frame.is_valid:
+        frame = frame.buffer(0)
+    if getattr(frame, "geom_type", "") != "Polygon":
+        frame = bpoly_xy.buffer(0)
+        orientation = "fallback_original_bpoly"
+    return frame, {
+        "deformed_frame_valid": bool(frame.is_valid and not frame.is_empty),
+        "deformed_frame_area_m2": float(frame.area),
+        "deformed_frame_side_orientation": orientation,
+        "open_arc_start_to_bpoly_vertex_m": start_distance,
+        "open_arc_end_to_bpoly_vertex_m": end_distance,
+    }
+
+
+def _coastline_anchor_deformed_frame(
+    coords: list[tuple[float, float]],
+    arc_coords: list[tuple[float, float]],
+    start: Point,
+    end: Point,
+    anchors: dict[str, Any],
+    selected_side_xy: LineString | None,
+) -> tuple[Polygon, dict[str, Any]] | tuple[None, dict[str, Any]]:
+    records = _boundary_records_with_anchors(coords, anchors)
+    if not records:
+        return None, {}
+    start_idx = next((idx for idx, item in enumerate(records) if item.get("label") == "start_anchor"), None)
+    end_idx = next((idx for idx, item in enumerate(records) if item.get("label") == "end_anchor"), None)
+    if start_idx is None or end_idx is None:
+        return None, {}
+
+    path_a = _boundary_path(records, start_idx, end_idx)
+    path_b = _boundary_path(records, end_idx, start_idx)
+    path_b_start_to_end = LineString(list(reversed(path_b.coords))) if len(path_b.coords) >= 2 else path_b
+    selected_side = selected_side_xy or LineString([anchors["selected_side_start_corner_xy"], anchors["selected_side_end_corner_xy"]])
+    tolerance = max(1.0, float(anchors.get("anchor_tolerance_m", 1.0)))
+    overlap_a = _line_fraction_near_boundary(selected_side, path_a, tolerance)
+    overlap_b = _line_fraction_near_boundary(selected_side, path_b_start_to_end, tolerance)
+    if overlap_a <= overlap_b:
+        landward_path_start_to_end = path_a
+        orientation = "forward_landward_path"
+        selected_side_overlap = overlap_a
+    else:
+        landward_path_start_to_end = path_b_start_to_end
+        orientation = "reverse_landward_path"
+        selected_side_overlap = overlap_b
+
+    landward_end_to_start = list(reversed(list(landward_path_start_to_end.coords)))
+    ring = _dedupe_consecutive_coords(list(arc_coords) + landward_end_to_start[1:])
+    frame = Polygon(ring)
+    if not frame.is_valid:
+        frame = frame.buffer(0)
+    if getattr(frame, "geom_type", "") != "Polygon" or frame.is_empty:
+        return None, {}
+
+    start_corner = Point(anchors["selected_side_start_corner_xy"])
+    end_corner = Point(anchors["selected_side_end_corner_xy"])
+    return frame, {
+        "deformed_frame_valid": bool(frame.is_valid and not frame.is_empty),
+        "deformed_frame_area_m2": float(frame.area),
+        "deformed_frame_side_orientation": orientation,
+        "landward_path_selected_side_overlap_fraction": float(selected_side_overlap),
+        "open_arc_start_to_bpoly_vertex_m": float(start.distance(start_corner)),
+        "open_arc_end_to_bpoly_vertex_m": float(end.distance(end_corner)),
+        "seaward_chain_vertex_count": int(len(anchors.get("seaward_chain_xy", []))),
+    }
+
+
+def _boundary_records_with_anchors(
+    coords: list[tuple[float, float]],
+    anchors: dict[str, Any],
+) -> list[dict[str, Any]]:
+    n = len(coords)
+    inserts: dict[int, list[dict[str, Any]]] = {}
+    for label, side_key, xy_key in (
+        ("start_anchor", "start_adjacent_side_index", "start_xy"),
+        ("end_anchor", "end_adjacent_side_index", "end_xy"),
+    ):
+        side_idx = anchors.get(side_key)
+        if side_idx is None:
+            continue
+        side_idx = int(side_idx) % n
+        xy = tuple(float(v) for v in anchors[xy_key])
+        seg = LineString([coords[side_idx], coords[(side_idx + 1) % n]])
+        fraction = float(seg.project(Point(xy)) / max(seg.length, 1.0))
+        inserts.setdefault(side_idx, []).append({"label": label, "coord": xy, "fraction": fraction})
+
+    records: list[dict[str, Any]] = []
+    for idx, coord in enumerate(coords):
+        records.append({"label": f"vertex_{idx}", "coord": (float(coord[0]), float(coord[1]))})
+        for item in sorted(inserts.get(idx, []), key=lambda obj: obj["fraction"]):
+            records.append({"label": item["label"], "coord": item["coord"]})
+    return records
+
+
+def _boundary_path(records: list[dict[str, Any]], start_idx: int, end_idx: int) -> LineString:
+    coords = [records[start_idx]["coord"]]
+    idx = start_idx
+    while idx != end_idx:
+        idx = (idx + 1) % len(records)
+        coords.append(records[idx]["coord"])
+    return LineString(_dedupe_consecutive_coords(coords))
+
+
+def _dedupe_consecutive_coords(coords: list[tuple[float, float]], tolerance: float = 1.0e-9) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for coord in coords:
+        xy = (float(coord[0]), float(coord[1]))
+        if not out or math.hypot(out[-1][0] - xy[0], out[-1][1] - xy[1]) > tolerance:
+            out.append(xy)
+    if len(out) > 1 and math.hypot(out[0][0] - out[-1][0], out[0][1] - out[-1][1]) <= tolerance:
+        out.pop()
+    return out
+
+
+def _polygon_count(geom) -> int:
+    if geom is None or geom.is_empty:
+        return 0
+    if isinstance(geom, Polygon):
+        return 1
+    if hasattr(geom, "geoms"):
+        return sum(1 for part in geom.geoms if isinstance(part, Polygon) and not part.is_empty)
+    return 0
+
+
+def _line_fraction_near_boundary(line: LineString, boundary, tolerance_m: float) -> float:
+    if line is None or line.is_empty or float(line.length) <= 0.0 or boundary is None or boundary.is_empty:
+        return 0.0
+    try:
+        near = line.intersection(boundary.buffer(max(tolerance_m, 1.0)))
+        return float(min(1.0, max(0.0, getattr(near, "length", 0.0) / max(line.length, 1.0))))
+    except Exception:
+        return 0.0
+
+
+def _classify_domain_boundary_segments(
+    domain: Polygon,
+    open_arc: LineString,
+    land_boundary,
+    frame_xy: Polygon,
+    target_resolution_m: float,
+) -> dict[str, Any]:
+    tolerance = max(2.0, 0.02 * target_resolution_m)
+    exterior = LineString(domain.exterior.coords) if isinstance(domain, Polygon) and not domain.is_empty else LineString()
+    land_geom = GeometryCollection()
+    if land_boundary is not None and not land_boundary.is_empty and not exterior.is_empty:
+        land_geom = exterior.intersection(land_boundary.buffer(tolerance))
+    frame_geom = GeometryCollection()
+    if not exterior.is_empty and frame_xy is not None and not frame_xy.is_empty:
+        frame_geom = exterior.intersection(frame_xy.boundary.buffer(tolerance))
+        remove_near = GeometryCollection()
+        if open_arc is not None and not open_arc.is_empty:
+            remove_near = open_arc.buffer(max(2.0 * tolerance, 0.1 * target_resolution_m))
+        if land_boundary is not None and not land_boundary.is_empty:
+            land_near = land_boundary.buffer(max(2.0 * tolerance, 0.1 * target_resolution_m))
+            remove_near = land_near if remove_near.is_empty else remove_near.union(land_near)
+        if not remove_near.is_empty:
+            try:
+                frame_geom = frame_geom.difference(remove_near)
+            except Exception:
+                pass
+
+    land_parts = _line_parts(land_geom)
+    frame_parts = _line_parts(frame_geom)
+    land_length = _sum_line_length(land_parts)
+    frame_length = _sum_line_length(frame_parts)
+    open_length = float(open_arc.length) if open_arc is not None and not open_arc.is_empty else 0.0
+    denominator = max(float(exterior.length) - open_length, 1.0)
+    return {
+        "land_boundary_arcs_xy": land_parts,
+        "frame_clip_boundary_arcs_xy": frame_parts,
+        "land_boundary_length_m": float(land_length),
+        "frame_clip_boundary_length_m": float(frame_length),
+        "land_boundary_overlap_fraction": float(min(1.0, land_length / denominator)),
+    }
+
+
+def _line_parts(geom) -> list[LineString]:
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, LineString):
+        return [geom] if len(geom.coords) >= 2 and geom.length > 0.0 else []
+    if isinstance(geom, MultiLineString):
+        return [part for part in geom.geoms if len(part.coords) >= 2 and part.length > 0.0]
+    if hasattr(geom, "geoms"):
+        parts: list[LineString] = []
+        for part in geom.geoms:
+            parts.extend(_line_parts(part))
+        return parts
+    return []
+
+
+def _sum_line_length(lines: list[LineString]) -> float:
+    return float(sum(line.length for line in lines if line is not None and not line.is_empty))
 
 
 def _choose_seed_component(geom, seed_xy: Point) -> Polygon | None:
@@ -1602,6 +2025,196 @@ def _select_anchor_points(
     }
 
 
+def _coastline_bpoly_anchor_points(
+    coastline_boundary_xy,
+    selected_side_xy: LineString,
+    bpoly_xy: Polygon,
+    target_resolution_m: float,
+) -> dict[str, Any]:
+    """Find open-boundary anchors where coastline intersects the two adjacent bpoly sides."""
+    context = _selected_side_context(bpoly_xy, selected_side_xy)
+    tolerance = max(float(target_resolution_m), 250.0)
+    start_anchor = _find_side_coastline_anchor(
+        context["start_adjacent_side_xy"],
+        coastline_boundary_xy,
+        Point(context["selected_side_start_corner_xy"]),
+        tolerance,
+    )
+    end_anchor = _find_side_coastline_anchor(
+        context["end_adjacent_side_xy"],
+        coastline_boundary_xy,
+        Point(context["selected_side_end_corner_xy"]),
+        tolerance,
+    )
+    seaward_chain_xy = [
+        start_anchor["xy"],
+        context["selected_side_start_corner_xy"],
+        context["selected_side_end_corner_xy"],
+        end_anchor["xy"],
+    ]
+    return {
+        "source": "coastline_bpoly_intersection",
+        "start_role": "coastline_bpoly_start_anchor",
+        "end_role": "coastline_bpoly_end_anchor",
+        "start_xy": start_anchor["xy"],
+        "end_xy": end_anchor["xy"],
+        "start_line_index": None,
+        "end_line_index": None,
+        "start_distance_m": float(start_anchor["distance_to_corner_m"]),
+        "end_distance_m": float(end_anchor["distance_to_corner_m"]),
+        "start_snap_distance_m": float(start_anchor["snap_distance_m"]),
+        "end_snap_distance_m": float(end_anchor["snap_distance_m"]),
+        "start_anchor_found": bool(start_anchor["found"]),
+        "end_anchor_found": bool(end_anchor["found"]),
+        "start_anchor_method": start_anchor["method"],
+        "end_anchor_method": end_anchor["method"],
+        "anchor_tolerance_m": float(tolerance),
+        "selected_side_index": int(context["selected_side_index"]),
+        "start_adjacent_side_index": int(context["start_adjacent_side_index"]),
+        "end_adjacent_side_index": int(context["end_adjacent_side_index"]),
+        "selected_side_start_corner_xy": context["selected_side_start_corner_xy"],
+        "selected_side_end_corner_xy": context["selected_side_end_corner_xy"],
+        "selected_side_xy": selected_side_xy,
+        "seaward_chain_xy": seaward_chain_xy,
+    }
+
+
+def _selected_side_context(bpoly_xy: Polygon, selected_side_xy: LineString) -> dict[str, Any]:
+    coords = [(float(x), float(y)) for x, y in list(bpoly_xy.exterior.coords)[:-1]]
+    if len(coords) < 3:
+        raise ValueError("Region bpoly must contain at least three unique vertices")
+    selected_coords = list(selected_side_xy.coords)
+    start = (float(selected_coords[0][0]), float(selected_coords[0][1]))
+    end = (float(selected_coords[-1][0]), float(selected_coords[-1][1]))
+    start_pt = Point(start)
+    end_pt = Point(end)
+    n = len(coords)
+    best_idx = 0
+    best_distance = float("inf")
+    best_reversed = False
+    for idx in range(n):
+        a = Point(coords[idx])
+        b = Point(coords[(idx + 1) % n])
+        forward = a.distance(start_pt) + b.distance(end_pt)
+        reverse = a.distance(end_pt) + b.distance(start_pt)
+        if min(forward, reverse) < best_distance:
+            best_distance = min(forward, reverse)
+            best_idx = idx
+            best_reversed = reverse < forward
+    ring_start_idx = best_idx
+    ring_end_idx = (best_idx + 1) % n
+    if best_reversed:
+        start_adjacent_idx = (best_idx + 1) % n
+        end_adjacent_idx = (best_idx - 1) % n
+    else:
+        start_adjacent_idx = (best_idx - 1) % n
+        end_adjacent_idx = (best_idx + 1) % n
+    return {
+        "selected_side_index": best_idx,
+        "selected_side_reversed_from_ring": bool(best_reversed),
+        "selected_side_start_corner_xy": start,
+        "selected_side_end_corner_xy": end,
+        "selected_side_ring_start_index": ring_start_idx,
+        "selected_side_ring_end_index": ring_end_idx,
+        "start_adjacent_side_index": start_adjacent_idx,
+        "end_adjacent_side_index": end_adjacent_idx,
+        "start_adjacent_side_xy": LineString([coords[start_adjacent_idx], coords[(start_adjacent_idx + 1) % n]]),
+        "end_adjacent_side_xy": LineString([coords[end_adjacent_idx], coords[(end_adjacent_idx + 1) % n]]),
+        "selected_side_match_distance_m": float(best_distance),
+    }
+
+
+def _find_side_coastline_anchor(
+    adjacent_side_xy: LineString,
+    coastline_boundary_xy,
+    offshore_corner_xy: Point,
+    tolerance_m: float,
+) -> dict[str, Any]:
+    if coastline_boundary_xy is None or coastline_boundary_xy.is_empty:
+        fallback = adjacent_side_xy.interpolate(adjacent_side_xy.project(offshore_corner_xy))
+        return {
+            "xy": (float(fallback.x), float(fallback.y)),
+            "found": False,
+            "method": "missing_coastline_boundary",
+            "snap_distance_m": float("inf"),
+            "distance_to_corner_m": float(fallback.distance(offshore_corner_xy)),
+        }
+
+    intersection = adjacent_side_xy.intersection(coastline_boundary_xy)
+    candidates: list[dict[str, Any]] = []
+    for point in _points_from_intersection(intersection, offshore_corner_xy):
+        candidates.append(
+            {
+                "point": point,
+                "found": True,
+                "method": "exact_intersection",
+                "snap_distance_m": 0.0,
+                "distance_to_corner_m": float(point.distance(offshore_corner_xy)),
+            }
+        )
+    try:
+        near_geom = coastline_boundary_xy.intersection(adjacent_side_xy.buffer(tolerance_m))
+    except Exception:
+        near_geom = GeometryCollection()
+    for coast_point in _points_from_intersection(near_geom, offshore_corner_xy):
+        side_point = adjacent_side_xy.interpolate(adjacent_side_xy.project(coast_point))
+        snap_distance = float(side_point.distance(coast_point))
+        if snap_distance <= tolerance_m:
+            candidates.append(
+                {
+                    "point": side_point,
+                    "found": True,
+                    "method": "snapped_within_tolerance" if snap_distance > 0.0 else "exact_intersection",
+                    "snap_distance_m": snap_distance,
+                    "distance_to_corner_m": float(side_point.distance(offshore_corner_xy)),
+                }
+            )
+    if candidates:
+        chosen_item = min(candidates, key=lambda item: (item["distance_to_corner_m"], item["snap_distance_m"]))
+        chosen = chosen_item["point"]
+        return {
+            "xy": (float(chosen.x), float(chosen.y)),
+            "found": bool(chosen_item["found"]),
+            "method": chosen_item["method"],
+            "snap_distance_m": float(chosen_item["snap_distance_m"]),
+            "distance_to_corner_m": float(chosen_item["distance_to_corner_m"]),
+        }
+
+    try:
+        side_point, coast_point = nearest_points(adjacent_side_xy, coastline_boundary_xy)
+        snap_distance = float(side_point.distance(coast_point))
+    except Exception:
+        side_point = adjacent_side_xy.interpolate(adjacent_side_xy.project(offshore_corner_xy))
+        snap_distance = float("inf")
+    found = bool(snap_distance <= tolerance_m)
+    return {
+        "xy": (float(side_point.x), float(side_point.y)),
+        "found": found,
+        "method": "snapped_within_tolerance" if found else "nearest_exceeds_tolerance",
+        "snap_distance_m": float(snap_distance),
+        "distance_to_corner_m": float(side_point.distance(offshore_corner_xy)),
+    }
+
+
+def _points_from_intersection(geom, reference: Point) -> list[Point]:
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, Point):
+        return [geom]
+    if isinstance(geom, LineString):
+        try:
+            return [nearest_points(reference, geom)[1]]
+        except Exception:
+            coords = list(geom.coords)
+            return [Point(coords[0]), Point(coords[-1])] if coords else []
+    if hasattr(geom, "geoms"):
+        points: list[Point] = []
+        for part in geom.geoms:
+            points.extend(_points_from_intersection(part, reference))
+        return points
+    return []
+
+
 def _bounds_distance_to_point(bounds: tuple[float, float, float, float], point: Point) -> float:
     minx, miny, maxx, maxy = bounds
     dx = max(minx - point.x, 0.0, point.x - maxx)
@@ -1631,6 +2244,53 @@ def _tangent_compatible(a: np.ndarray, b: np.ndarray) -> bool:
     if na <= 0 or nb <= 0:
         return False
     return abs(float(np.dot(a / na, b / nb))) > 0.35
+
+
+def _deformed_side_arc(
+    side0: np.ndarray,
+    side1: np.ndarray,
+    anchor0: np.ndarray,
+    anchor1: np.ndarray,
+    offshore_unit: np.ndarray,
+    bow: float,
+    n: int,
+) -> LineString:
+    coords: list[tuple[float, float]] = []
+    start_offset = anchor0 - side0
+    end_offset = anchor1 - side1
+    for t in np.linspace(0.0, 1.0, n):
+        side_point = side0 + t * (side1 - side0)
+        endpoint_blend = (1.0 - t) * start_offset + t * end_offset
+        offshore_bow = offshore_unit * bow * math.sin(math.pi * t)
+        pt = side_point + endpoint_blend + offshore_bow
+        coords.append((float(pt[0]), float(pt[1])))
+    return LineString(coords)
+
+
+def _seaward_chain_arc(
+    anchor0: np.ndarray,
+    side0: np.ndarray,
+    side1: np.ndarray,
+    anchor1: np.ndarray,
+    offshore_unit: np.ndarray,
+    bow: float,
+    n: int,
+) -> LineString:
+    """Smooth the split-side plus offshore-side bpoly chain with fixed coastline anchors."""
+    control0 = side0 + offshore_unit * bow
+    control1 = side1 + offshore_unit * bow
+    pts = []
+    for t in np.linspace(0.0, 1.0, n):
+        pt = (
+            (1.0 - t) ** 3 * anchor0
+            + 3.0 * (1.0 - t) ** 2 * t * control0
+            + 3.0 * (1.0 - t) * t**2 * control1
+            + t**3 * anchor1
+        )
+        pts.append(tuple(float(v) for v in pt))
+    pts[0] = tuple(float(v) for v in anchor0)
+    pts[-1] = tuple(float(v) for v in anchor1)
+    return LineString(pts)
 
 
 def _bezier_arc(p0: np.ndarray, p1: np.ndarray, offshore_unit: np.ndarray, bow: float, n: int) -> LineString:
@@ -1719,10 +2379,23 @@ def _build_output_layers(
         geometry="geometry",
         crs="EPSG:4326",
     )
-    land_gdf = gpd.GeoDataFrame(
-        [{"segment_class": "land_boundary_candidate", "geometry": LineString(wet_domain_lonlat.exterior.coords)}],
-        geometry="geometry",
-        crs="EPSG:4326",
+    boundary_segments = wet_result.get("boundary_segments_xy", {})
+    land_lines_xy = boundary_segments.get("land_boundary_arcs_xy", [])
+    frame_lines_xy = boundary_segments.get("frame_clip_boundary_arcs_xy", [])
+    if land_lines_xy:
+        land_gdf = _lines_gdf(land_lines_xy, projection, "land_boundary")
+    elif wet_result["metadata"].get("closure_method") in {"deformed_bpoly_frame_minus_gshhs_land", "coastline_anchor_seaward_bpoly_chain"}:
+        land_gdf = gpd.GeoDataFrame({"segment_class": [], "line_id": []}, geometry=[], crs="EPSG:4326")
+    else:
+        land_gdf = gpd.GeoDataFrame(
+            [{"segment_class": "land_boundary_candidate", "geometry": LineString(wet_domain_lonlat.exterior.coords)}],
+            geometry="geometry",
+            crs="EPSG:4326",
+        )
+    frame_gdf = (
+        _lines_gdf(frame_lines_xy, projection, "frame_clip_boundary")
+        if frame_lines_xy
+        else gpd.GeoDataFrame({"segment_class": [], "line_id": []}, geometry=[], crs="EPSG:4326")
     )
     island_records = [
         {"segment_class": "island_hole", "hole_id": idx, "geometry": LineString(ring.coords)}
@@ -1734,8 +2407,26 @@ def _build_output_layers(
         island_gdf = gpd.GeoDataFrame({"segment_class": [], "hole_id": []}, geometry=[], crs="EPSG:4326")
     anchor_gdf = gpd.GeoDataFrame(
         [
-            {"anchor_role": "start", "geometry": anchors_lonlat[0]},
-            {"anchor_role": "end", "geometry": anchors_lonlat[1]},
+            {
+                "anchor_role": "coastline_bpoly_start_anchor"
+                if wet_result["metadata"].get("closure_method") == "coastline_anchor_seaward_bpoly_chain"
+                else (
+                    "bpoly_open_side_start"
+                    if wet_result["metadata"].get("closure_method") == "deformed_bpoly_frame_minus_gshhs_land"
+                    else "start"
+                ),
+                "geometry": anchors_lonlat[0],
+            },
+            {
+                "anchor_role": "coastline_bpoly_end_anchor"
+                if wet_result["metadata"].get("closure_method") == "coastline_anchor_seaward_bpoly_chain"
+                else (
+                    "bpoly_open_side_end"
+                    if wet_result["metadata"].get("closure_method") == "deformed_bpoly_frame_minus_gshhs_land"
+                    else "end"
+                ),
+                "geometry": anchors_lonlat[1],
+            },
         ],
         geometry="geometry",
         crs="EPSG:4326",
@@ -1756,6 +2447,7 @@ def _build_output_layers(
         "wet_domain": wet_gdf,
         "open_boundary_arc": open_gdf,
         "land_boundary_arcs": land_gdf,
+        "frame_clip_boundary_arcs": frame_gdf,
         "island_holes": island_gdf,
         "anchor_points": anchor_gdf,
         "candidate_arcs": candidates_gdf,
@@ -1773,7 +2465,7 @@ def _write_outputs(run_dir: Path, layers: dict[str, gpd.GeoDataFrame], name: str
     for layer_name, gdf in layers.items():
         _write_layer(gpkg, layer_name, gdf)
     segments = []
-    for layer_name in ("open_boundary_arc", "land_boundary_arcs", "island_holes"):
+    for layer_name in ("open_boundary_arc", "land_boundary_arcs", "frame_clip_boundary_arcs", "island_holes"):
         gdf = layers[layer_name]
         if gdf.empty:
             continue
@@ -1983,19 +2675,33 @@ def _final_status(
 ) -> tuple[str, list[str]]:
     failures: list[str] = []
     metrics = scored["selected"]["metrics"]
+    metadata = wet_result["metadata"]
     if metrics.get("extra_coastline_intersection"):
         failures.append("open_arc_intersects_extra_coastline")
-    if wet_result["metadata"].get("source") == "fallback_bpoly_polygon":
+    if metadata.get("source") == "fallback_bpoly_polygon":
         failures.append("seeded_wet_domain_polygonize_failed")
-    if wet_result["metadata"].get("gshhs_missing_land_polygons"):
+    if metadata.get("gshhs_missing_land_polygons"):
         failures.append("gshhs_missing_land_polygons")
-    if wet_result["metadata"].get("gshhs_missing_coastline_lines"):
-        failures.append("gshhs_missing_coastline_lines")
-    if wet_result["metadata"].get("arc_land_intersection"):
+    if metadata.get("arc_land_intersection"):
         failures.append("gshhs_open_arc_crosses_land")
-    if not wet_result["metadata"].get("seed_inside"):
+    if metadata.get("closure_method") in {"deformed_bpoly_frame_minus_gshhs_land", "coastline_anchor_seaward_bpoly_chain"}:
+        if not metadata.get("deformed_frame_valid"):
+            failures.append("deformed_bpoly_frame_invalid")
+        if float(metadata.get("open_arc_boundary_overlap_fraction", 0.0)) < 0.98:
+            failures.append("open_arc_not_on_final_boundary")
+    if anchors.get("source") == "coastline_bpoly_intersection":
+        if not anchors.get("start_anchor_found", False):
+            failures.append("start_coastline_bpoly_anchor_missing")
+        if not anchors.get("end_anchor_found", False):
+            failures.append("end_coastline_bpoly_anchor_missing")
+        tolerance = float(anchors.get("anchor_tolerance_m", 0.0))
+        if float(anchors.get("start_snap_distance_m", 0.0)) > tolerance:
+            failures.append("start_coastline_bpoly_anchor_snap_exceeds_tolerance")
+        if float(anchors.get("end_snap_distance_m", 0.0)) > tolerance:
+            failures.append("end_coastline_bpoly_anchor_snap_exceeds_tolerance")
+    if not metadata.get("seed_inside"):
         failures.append("seed_not_inside_wet_domain")
-    if wet_result["metadata"].get("forbidden_overlap"):
+    if metadata.get("forbidden_overlap"):
         failures.append("forbidden_wrong_region_overlap")
     if anchors.get("start_distance_m", 0.0) > 300_000 or anchors.get("end_distance_m", 0.0) > 300_000:
         failures.append("anchor_far_from_offshore_side_endpoint")

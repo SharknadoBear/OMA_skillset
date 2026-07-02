@@ -13,10 +13,12 @@ from shapely.geometry import LineString, Point, Polygon, box
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fvcom_bdry_arc import BdryArcConfig, run_bdry_arc  # noqa: E402
+from fvcom_bdry_arc import BdryArcConfig, build_model_boundary_loops, run_bdry_arc  # noqa: E402
 from fvcom_bdry_arc.projection import local_utm_projection, project_geometry  # noqa: E402
 from fvcom_bdry_arc.workflow import (  # noqa: E402
     _classify_relevant_lines,
+    _coastline_bpoly_anchor_points,
+    _final_status,
     _raster_connectivity_fill,
     extract_gshhs_vector_wet_domain,
     repair_coastline_graph,
@@ -110,6 +112,51 @@ def _synthetic_gshhs_inputs(root: Path) -> tuple[Path, Path, Path]:
     return region_path, offshore_path, gpkg
 
 
+def _synthetic_loop_package(root: Path, include_boundary_refs: bool = True) -> tuple[Path, Path]:
+    exterior = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0), (0.0, 0.0)]
+    holes = [
+        [(3.0, 3.0), (4.0, 3.0), (4.0, 4.0), (3.0, 4.0), (3.0, 3.0)],
+        [(6.0, 6.0), (7.0, 6.0), (7.0, 7.0), (6.0, 7.0), (6.0, 6.0)],
+    ]
+    domain = Polygon(exterior, holes)
+    gpkg = root / "synthetic_bdry_arc_package.gpkg"
+    gpd.GeoDataFrame([{"geometry": domain}], geometry="geometry", crs="EPSG:4326").to_file(gpkg, layer="wet_domain", driver="GPKG")
+    gpd.GeoDataFrame(
+        [{"geometry": LineString([(10.0, 10.0), (0.0, 10.0)])}],
+        geometry="geometry",
+        crs="EPSG:4326",
+    ).to_file(gpkg, layer="open_boundary_arc", driver="GPKG")
+    if include_boundary_refs:
+        gpd.GeoDataFrame(
+            [
+                {"geometry": LineString([(10.0, 0.0), (10.0, 10.0)])},
+                {"geometry": LineString([(0.0, 10.0), (0.0, 0.0)])},
+            ],
+            geometry="geometry",
+            crs="EPSG:4326",
+        ).to_file(gpkg, layer="land_boundary_arcs", driver="GPKG")
+        gpd.GeoDataFrame(
+            [{"geometry": LineString([(0.0, 0.0), (10.0, 0.0)])}],
+            geometry="geometry",
+            crs="EPSG:4326",
+        ).to_file(gpkg, layer="frame_clip_boundary_arcs", driver="GPKG")
+    gpd.GeoDataFrame(
+        [{"geometry": LineString(exterior)}],
+        geometry="geometry",
+        crs="EPSG:4326",
+    ).to_file(gpkg, layer="coastline_repaired", driver="GPKG")
+    manifest = root / "bdry_arc_manifest.json"
+    _write_json(
+        manifest,
+        {
+            "final_status": "pass",
+            "failure_taxonomy": [],
+            "settings": {"target_resolution_m": 1000.0},
+        },
+    )
+    return gpkg, manifest
+
+
 def test_synthetic_package() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -125,6 +172,11 @@ def test_synthetic_package() -> None:
         assert Path(manifest["outputs"]["bdry_arc_package_gpkg"]).exists()
         assert Path(manifest["outputs"]["bdry_arc_segments_geojson"]).exists()
         assert Path(manifest["outputs"]["bdry_arc_review_map"]).exists()
+        assert Path(manifest["outputs"]["model_boundary_loop_manifest"]).exists()
+        assert Path(manifest["outputs"]["model_boundary_loops_gpkg"]).exists()
+        assert Path(manifest["outputs"]["model_boundary_segments_geojson"]).exists()
+        assert Path(manifest["outputs"]["model_boundary_colored_map"]).exists()
+        assert manifest["model_boundary_loops"]["final_status"] in {"pass", "needs_review"}
         assert Path(manifest["outputs"]["visual_review_dir"], "preliminary_arc_map.png").exists()
         assert Path(manifest["outputs"]["visual_review_dir"], "arc_candidate_contact_sheet.png").exists()
         assert manifest["wet_domain"]["area_m2"] > 0
@@ -134,6 +186,7 @@ def test_synthetic_package() -> None:
             "wet_domain",
             "open_boundary_arc",
             "land_boundary_arcs",
+            "frame_clip_boundary_arcs",
             "island_holes",
             "anchor_points",
             "candidate_arcs",
@@ -163,22 +216,70 @@ def test_gshhs_vector_package_prefers_coastline_lines() -> None:
         assert manifest["inputs"]["coastline_load"]["selected_land_layer"] == "land_polygons"
         assert manifest["wet_domain"]["land_polygon_count"] == 2
         assert manifest["wet_domain"]["coastline_line_count"] >= 2
+        assert manifest["wet_domain"]["closure_method"] == "coastline_anchor_seaward_bpoly_chain"
+        assert manifest["anchors"]["source"] == "coastline_bpoly_intersection"
+        assert manifest["anchors"]["start_role"] == "coastline_bpoly_start_anchor"
+        assert manifest["anchors"]["end_role"] == "coastline_bpoly_end_anchor"
+        assert manifest["anchors"]["start_anchor_found"] is True
+        assert manifest["anchors"]["end_anchor_found"] is True
+        assert abs(manifest["anchors"]["start_lonlat"][0] - 1.0) < 0.01
+        assert abs(manifest["anchors"]["start_lonlat"][1] - 4.0) < 0.01
+        assert abs(manifest["anchors"]["end_lonlat"][0] - 1.0) < 0.01
+        assert abs(manifest["anchors"]["end_lonlat"][1] - 0.0) < 0.01
+        assert len(manifest["anchors"]["seaward_chain_lonlat"]) == 4
+        open_arc = gpd.read_file(manifest["outputs"]["bdry_arc_package_gpkg"], layer="open_boundary_arc").geometry.iloc[0]
+        assert Point(open_arc.coords[0]).distance(Point(manifest["anchors"]["start_lonlat"])) < 1.0e-8
+        assert Point(open_arc.coords[-1]).distance(Point(manifest["anchors"]["end_lonlat"])) < 1.0e-8
         assert Path(manifest["outputs"]["bdry_arc_package_gpkg"]).exists()
+        assert Path(manifest["outputs"]["model_boundary_loop_manifest"]).exists()
+        assert Path(manifest["outputs"]["model_boundary_loops_gpkg"]).exists()
+        assert Path(manifest["outputs"]["model_boundary_segments_geojson"]).exists()
+        assert Path(manifest["outputs"]["model_boundary_colored_map"]).exists()
+        assert manifest["model_boundary_loops"]["qa"]["outer_boundary_closed"] is True
         assert (visual_dir / "gshhs_polygon_topology_map.png").exists()
         assert (visual_dir / "gshhs_anchor_arc_map.png").exists()
         assert not list(visual_dir.glob("raster_connectivity_iter_*.png"))
 
 
-def test_gshhs_land_union_fallback_preserves_seed_water() -> None:
+def test_coastline_anchor_seaward_chain_closes_boundary() -> None:
     bpoly = box(0.0, 0.0, 10_000.0, 10_000.0)
-    land = [box(0.0, 0.0, 4_000.0, 10_000.0)]
-    arc = LineString([(4_000.0, 0.0), (4_000.0, 10_000.0)])
-    result = extract_gshhs_vector_wet_domain([], land, arc, bpoly, Point(7_000.0, 5_000.0), 250.0)
+    land = [
+        box(0.0, 0.0, 2_000.0, 10_000.0),
+        box(4_000.0, 4_000.0, 4_800.0, 4_800.0),
+    ]
+    coast = [poly.boundary for poly in land]
+    selected_side = LineString([(10_000.0, 10_000.0), (10_000.0, 0.0)])
+    anchors = _coastline_bpoly_anchor_points(coast[0], selected_side, bpoly, 250.0)
+    arc = LineString([(2_000.0, 10_000.0), (11_000.0, 8_000.0), (11_000.0, 2_000.0), (2_000.0, 0.0)])
+    result = extract_gshhs_vector_wet_domain(coast, land, arc, bpoly, Point(4_000.0, 5_000.0), 250.0, anchors=anchors)
     wet = result["wet_domain_xy"]
-    assert wet.contains(Point(7_000.0, 5_000.0))
-    assert not wet.contains(Point(2_000.0, 5_000.0))
-    assert result["metadata"]["gshhs_missing_coastline_lines"] is True
-    assert result["metadata"]["gshhs_polygonize_fallback_used"] is True
+    metadata = result["metadata"]
+    assert wet.contains(Point(4_000.0, 5_000.0))
+    assert not wet.contains(Point(1_000.0, 5_000.0))
+    assert metadata["source"] == "coastline_anchor_seaward_bpoly_chain"
+    assert metadata["closure_method"] == "coastline_anchor_seaward_bpoly_chain"
+    assert metadata["deformed_frame_valid"] is True
+    assert metadata["open_arc_boundary_overlap_fraction"] >= 0.98
+    assert metadata["frame_clip_boundary_length_m"] >= 0.0
+
+
+def test_open_arc_crossing_land_needs_review() -> None:
+    bpoly = box(0.0, 0.0, 10_000.0, 10_000.0)
+    land = [box(9_500.0, 3_000.0, 10_500.0, 7_000.0)]
+    coast = [box(0.0, 0.0, 2_000.0, 10_000.0).boundary]
+    selected_side = LineString([(10_000.0, 10_000.0), (10_000.0, 0.0)])
+    anchors = _coastline_bpoly_anchor_points(coast[0], selected_side, bpoly, 250.0)
+    arc = LineString([(2_000.0, 10_000.0), (10_700.0, 5_000.0), (2_000.0, 0.0)])
+    result = extract_gshhs_vector_wet_domain([], land, arc, bpoly, Point(7_000.0, 5_000.0), 250.0, anchors=anchors)
+    assert result["metadata"]["arc_land_intersection"] is True
+    status, failures = _final_status(
+        {"selected": {"metrics": {"extra_coastline_intersection": False}}},
+        result,
+        {**anchors, "start_distance_m": 0.0, "end_distance_m": 0.0},
+        [],
+    )
+    assert status == "needs_review"
+    assert "gshhs_open_arc_crosses_land" in failures
 
 
 def test_endpoint_repair_is_conservative() -> None:
@@ -211,13 +312,110 @@ def test_component_classification_drops_disconnected_lines() -> None:
     assert classified["dropped_count"] == 1
 
 
+def test_coastline_bpoly_anchor_selection_rules() -> None:
+    bpoly = box(0.0, 0.0, 10_000.0, 10_000.0)
+    selected_side = LineString([(10_000.0, 10_000.0), (10_000.0, 0.0)])
+    coastline = LineString([(2_000.0, 10_000.0), (3_000.0, 10_000.0), (3_000.0, 0.0), (2_000.0, 0.0)])
+    anchors = _coastline_bpoly_anchor_points(coastline, selected_side, bpoly, 250.0)
+    assert anchors["source"] == "coastline_bpoly_intersection"
+    assert anchors["start_anchor_method"] == "exact_intersection"
+    assert anchors["end_anchor_method"] == "exact_intersection"
+    assert Point(anchors["start_xy"]).distance(Point(3_000.0, 10_000.0)) < 1.0e-8
+    assert Point(anchors["end_xy"]).distance(Point(3_000.0, 0.0)) < 1.0e-8
+    assert anchors["seaward_chain_xy"][1] == (10_000.0, 10_000.0)
+    assert anchors["seaward_chain_xy"][2] == (10_000.0, 0.0)
+
+
+def test_missing_coastline_bpoly_anchor_needs_review() -> None:
+    bpoly = box(0.0, 0.0, 10_000.0, 10_000.0)
+    selected_side = LineString([(10_000.0, 10_000.0), (10_000.0, 0.0)])
+    coastline = LineString([(-10_000.0, -10_000.0), (-9_000.0, -9_000.0)])
+    anchors = _coastline_bpoly_anchor_points(coastline, selected_side, bpoly, 250.0)
+    assert anchors["start_anchor_found"] is False
+    assert anchors["end_anchor_found"] is False
+    status, failures = _final_status(
+        {"selected": {"metrics": {"extra_coastline_intersection": False}}},
+        {
+            "metadata": {
+                "closure_method": "coastline_anchor_seaward_bpoly_chain",
+                "deformed_frame_valid": True,
+                "open_arc_boundary_overlap_fraction": 1.0,
+                "seed_inside": True,
+                "forbidden_overlap": [],
+            }
+        },
+        anchors,
+        [],
+    )
+    assert status == "needs_review"
+    assert "start_coastline_bpoly_anchor_missing" in failures
+    assert "end_coastline_bpoly_anchor_missing" in failures
+
+
+def test_model_boundary_loop_package() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        gpkg, source_manifest = _synthetic_loop_package(root, include_boundary_refs=True)
+        manifest = build_model_boundary_loops(
+            gpkg,
+            source_manifest,
+            root / "loops",
+            "synthetic_loop",
+            mode="test",
+        )
+        assert manifest["final_status"] == "pass"
+        assert manifest["qa"]["outer_boundary_closed"] is True
+        assert manifest["qa"]["island_count"] == 2
+        assert manifest["qa"]["open_boundary_exterior_overlap_fraction"] >= 0.98
+        out_gpkg = Path(manifest["outputs"]["model_boundary_loops_gpkg"])
+        assert out_gpkg.exists()
+        assert Path(manifest["outputs"]["model_boundary_segments_geojson"]).exists()
+        assert Path(manifest["outputs"]["model_boundary_colored_map"]).exists()
+        layers = set(gpd.list_layers(out_gpkg)["name"])
+        required = {
+            "model_domain_polygon",
+            "model_outer_boundary",
+            "model_outer_boundary_segments",
+            "island_boundary_polygons",
+            "island_boundary_lines",
+            "source_open_boundary_arc",
+        }
+        assert required.issubset(layers), sorted(required - layers)
+        segments = gpd.read_file(out_gpkg, layer="model_outer_boundary_segments")
+        classes = set(segments["segment_class"])
+        assert {"open_boundary", "land_outer_boundary", "frame_clip_boundary"}.issubset(classes)
+        islands = gpd.read_file(out_gpkg, layer="island_boundary_polygons")
+        assert len(islands) == 2
+
+
+def test_model_boundary_loop_unclassified_needs_review() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        gpkg, source_manifest = _synthetic_loop_package(root, include_boundary_refs=False)
+        manifest = build_model_boundary_loops(
+            gpkg,
+            source_manifest,
+            root / "loops",
+            "synthetic_loop_unclassified",
+            mode="test",
+        )
+        assert manifest["final_status"] == "needs_review"
+        assert "unclassified_outer_boundary_length_nontrivial" in manifest["failure_taxonomy"]
+        assert manifest["qa"]["unclassified_outer_boundary_length_m"] > manifest["settings"]["unclassified_length_threshold_m"]
+
+
 def main() -> int:
     test_synthetic_package()
     test_gshhs_vector_package_prefers_coastline_lines()
-    test_gshhs_land_union_fallback_preserves_seed_water()
+    test_coastline_anchor_seaward_chain_closes_boundary()
+    test_open_arc_crossing_land_needs_review()
     test_endpoint_repair_is_conservative()
     test_raster_fill_respects_connectivity_barrier()
     test_component_classification_drops_disconnected_lines()
+    test_coastline_bpoly_anchor_selection_rules()
+    test_missing_coastline_bpoly_anchor_needs_review()
+    test_model_boundary_loop_package()
+    test_model_boundary_loop_unclassified_needs_review()
     print("fvcom-bdry-arc selftests passed")
     return 0
 
