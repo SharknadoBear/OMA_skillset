@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM River Forcing"
+  short_description: "Generate FVCOM river forcing files"
+  default_prompt: "Use $fvcom-river-forcing to assemble FVCOM river NetCDF/NML forcing from discharge, tracer, and microplastic helper scripts."

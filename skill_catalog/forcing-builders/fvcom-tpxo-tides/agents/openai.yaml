@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM TPXO Tides"
+  short_description: "Build FVCOM TPXO tide forcing"
+  default_prompt: "Use $fvcom-tpxo-tides to interpolate TPXO harmonic elevations to FVCOM open-boundary nodes and prepare tidal elevation forcing."

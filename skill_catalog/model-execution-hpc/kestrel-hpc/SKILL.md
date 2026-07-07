@@ -100,6 +100,17 @@ an existing bridge only when its Japanese `bridge_name` is intended and its
 purpose/project root match the current task. If the purpose or project root is
 different, create a new bridge session.
 
+Bridge lifecycle protocol:
+
+- Close the bridge when the work is finished and no more Kestrel commands are
+  needed for the active workplan.
+- Close the bridge when the same task still needs Kestrel access but the bridge
+  is malfunctioning, stale, or stuck, and a replacement bridge must be built.
+  Clear stale lock/queued command state before starting the replacement.
+- Do not close a healthy bridge merely because time has passed. If it is
+  reusable for future work within the same active `plan.md`/workplan, keep it
+  available and reuse it after rechecking the bridge identity.
+
 Create a named bridge session from the reusable helper folder:
 
 ```powershell

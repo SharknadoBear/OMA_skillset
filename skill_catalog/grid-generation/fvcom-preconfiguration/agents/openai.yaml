@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM Preconfiguration"
+  short_description: "Generate FVCOM ASCII DAT and sigma files from SMS 2DM meshes"
+  default_prompt: "Use $fvcom-preconfiguration to convert a boundary-defined SMS 2DM mesh into FVCOM _grd.dat, _dep.dat, _cor.dat, _obc.dat, _spg.dat, and _sig.dat files, estimate initial sponge-layer parameters, write manifests, and run pre-run QA checks before FVCOM forcing or execution."

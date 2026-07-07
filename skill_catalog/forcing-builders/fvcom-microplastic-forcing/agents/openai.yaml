@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM Microplastic Forcing"
+  short_description: "Prepare FVCOM microplastic tracers"
+  default_prompt: "Use $fvcom-microplastic-forcing to compute microplastic boundary concentrations and river tracer arrays for FVCOM forcing setup."
