@@ -22,13 +22,6 @@ by capability family rather than by the older broad project-stage folders.
 - `model-analysis/`: reserved for future post-processing and scientific
   analysis skills.
 
-The previous reserved `quality-control/` and `memory-governance/` catalog
-families have been removed. Quality checks should live inside each reviewed
-skill's own scripts and acceptance rules. Project/lab protocol also does not
-allow agents to proactively modify deployed skills during screening or
-deployment; skill edits must be explicit development work, validated, and
-committed through the catalog workflow.
-
 ## Installing Skills
 
 This catalog is organized for Codex-style skill systems where each installable
