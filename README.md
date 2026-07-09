@@ -14,6 +14,8 @@ by capability family rather than by the older broad project-stage folders.
   source data or local inputs.
 - `grid-generation/`: regional-domain, boundary-arc, coastline-topology, and
   future mesh/refinement skills for FVCOM preprocessing.
+- `memory-control/`: project-memory workflow skills, currently
+  `brain-dumping` and `brain-refreshing`.
 - `model-execution-hpc/`: execution and HPC bridge skills for Kestrel,
   Constance, and the PNNL cloud VM, including Codex and Copilot-facing variants
   where staged.
@@ -53,6 +55,9 @@ usable skill families at different maturity levels:
   domain selector, and `fvcom-bdry-arc` is the second-stage boundary-arc and
   continuous model-boundary-loop package builder. `fvcom-grid-generation`
   remains the downstream mesh-generation skill area.
+- `memory-control/` now contains the two active HTML project-memory workflow
+  skills: `brain-dumping` for durable session memos and `brain-refreshing` for
+  workspace reorientation before continuing work.
 - `common-core/`, `forcing-builders/`, and `model-analysis/` remain less mature
   catalog families and should be expanded only through explicit skill
   development work.

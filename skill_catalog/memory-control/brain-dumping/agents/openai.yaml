@@ -1,0 +1,4 @@
+interface:
+  display_name: "Brain Dumping"
+  short_description: "Create versioned LaTeX project memos"
+  default_prompt: "Use $brain-dumping to create a versioned LaTeX memo for this session."
