@@ -13,7 +13,14 @@ from shapely.geometry import LineString, Point, Polygon, box
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fvcom_bdry_arc import BdryArcConfig, build_model_boundary_loops, run_bdry_arc  # noqa: E402
+from fvcom_bdry_arc import (  # noqa: E402
+    BdryArcConfig,
+    BoundaryResolutionConfig,
+    analyze_boundary_resolution,
+    build_boundary_resolution,
+    build_model_boundary_loops,
+    run_bdry_arc,
+)
 from fvcom_bdry_arc.projection import local_utm_projection, project_geometry  # noqa: E402
 from fvcom_bdry_arc.workflow import (  # noqa: E402
     _classify_relevant_lines,
@@ -610,6 +617,73 @@ def test_model_boundary_loop_unclassified_needs_review() -> None:
         assert manifest["qa"]["unclassified_outer_boundary_length_m"] > manifest["settings"]["unclassified_length_threshold_m"]
 
 
+def test_adaptive_boundary_resolution_package() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        exterior = [(-75.0, 39.0), (-74.9, 39.0), (-74.9, 39.1), (-75.0, 39.1), (-75.0, 39.0)]
+        holes = [
+            [(-74.970, 39.040), (-74.965, 39.040), (-74.965, 39.045), (-74.970, 39.045), (-74.970, 39.040)],
+            [(-74.930, 39.060), (-74.925, 39.060), (-74.925, 39.063), (-74.930, 39.063), (-74.930, 39.060)],
+        ]
+        domain = Polygon(exterior, holes)
+        loops = root / "loops.gpkg"
+        gpd.GeoDataFrame([{"geometry": domain}], geometry="geometry", crs="EPSG:4326").to_file(loops, layer="model_domain_polygon", driver="GPKG")
+        records = []
+        for index, (start, end) in enumerate(zip(exterior[:-1], exterior[1:])):
+            records.append(
+                {
+                    "sequence_id": index,
+                    "segment_class": "open_boundary" if index == 1 else "land_outer_boundary",
+                    "geometry": LineString([start, end]),
+                }
+            )
+        gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326").to_file(loops, layer="model_outer_boundary_segments", driver="GPKG")
+        gpd.GeoDataFrame(
+            [{"island_id": index, "area_m2": 1.0, "geometry": Polygon(hole)} for index, hole in enumerate(holes)],
+            geometry="geometry",
+            crs="EPSG:4326",
+        ).to_file(loops, layer="island_boundary_polygons", driver="GPKG")
+        region = root / "region.json"
+        _write_json(
+            region,
+            {
+                "target_region_features": {
+                    "features": [
+                        {"role": "target_water_body", "geometry": [-75.0, 39.0, -74.95, 39.08]},
+                    ]
+                }
+            },
+        )
+        coast = root / "coast.gpkg"
+        gpd.GeoDataFrame([{"geometry": box(-74.89, 39.0, -74.88, 39.1)}], geometry="geometry", crs="EPSG:4326").to_file(coast, layer="land_polygons", driver="GPKG")
+        analysis = analyze_boundary_resolution(loops, region)
+        assert analysis["island_count"] == 2
+        assert analysis["protected_count"] >= 1
+        manifest = build_boundary_resolution(
+            loops,
+            None,
+            region,
+            coast,
+            root / "resolution",
+            "synthetic_adaptive",
+            BoundaryResolutionConfig(),
+        )
+        assert manifest["profile"] == "adaptive-coastal-v1"
+        assert manifest["final_status"] == "pass"
+        assert manifest["qa"]["open_boundary_node_count"] >= 2
+        assert manifest["qa"]["open_arc_land_intersection_m"] <= 1.0e-6
+        assert manifest["qa"]["open_arc_exterior_overlap_fraction"] >= 1.0 - 1.0e-9
+        assert manifest["qa"]["topology_absolute_area_change_fraction"] <= 0.005 + 1.0e-12
+        diagnostics = json.loads(Path(manifest["outputs"]["boundary_resolution_diagnostics_json"]).read_text(encoding="utf-8"))
+        protected = [item for item in diagnostics["resolved_islands"] if item["protected_mission"]]
+        assert protected
+        assert all(item["generalized_area_error_fraction"] <= 1.0e-12 for item in protected)
+        assert all(item["principal_orientation_change_deg"] <= 1.0e-9 for item in protected)
+        assert all(item["target_spacing_m"] <= 150.0 for item in protected)
+        layers = set(gpd.list_layers(manifest["outputs"]["boundary_resolution_gpkg"])["name"])
+        assert {"resolved_domain_polygon", "resolved_open_boundary", "resolved_island_polygons", "boundary_nodes", "island_diagnostics"}.issubset(layers)
+
+
 def main() -> int:
     test_synthetic_package()
     test_gshhs_vector_package_prefers_coastline_lines()
@@ -628,6 +702,7 @@ def main() -> int:
     test_missing_coastline_bpoly_anchor_needs_review()
     test_model_boundary_loop_package()
     test_model_boundary_loop_unclassified_needs_review()
+    test_adaptive_boundary_resolution_package()
     print("fvcom-bdry-arc selftests passed")
     return 0
 

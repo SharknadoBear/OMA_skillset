@@ -1,4 +1,4 @@
-"""FVCOM mesh-quality checks."""
+"""FVCOM and OceanMesh-style mesh-quality checks."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+
+from .metrics import compute_mesh_metrics
 
 
 @dataclass(frozen=True)
@@ -24,40 +26,32 @@ def evaluate_mesh_quality(
     open_boundary_nodes: np.ndarray,
     constraint_report: dict[str, Any],
     thresholds: QualityThresholds | None = None,
+    *,
+    constraint_chains: list[list[int]] | None = None,
+    target_size_by_triangle: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Evaluate FVCOM-oriented mesh quality gates."""
+    """Evaluate final FVCOM gates plus OceanMesh and topology diagnostics."""
     thresholds = thresholds or QualityThresholds()
-    tris = np.asarray(triangles_1based, dtype=int) - 1
-    angles = []
-    areas = []
-    slopes = []
-    valence = np.zeros(len(nodes_xy), dtype=int)
-    edge_to_tri: dict[tuple[int, int], list[int]] = {}
-    for tidx, tri in enumerate(tris):
-        coords = nodes_xy[tri]
-        tri_angles = _triangle_angles(coords)
-        angles.extend(tri_angles.tolist())
-        area = abs(float(np.cross(coords[1] - coords[0], coords[2] - coords[0]))) / 2.0
-        areas.append(area)
-        for node in tri:
-            valence[int(node)] += 1
-        for a, b in ((tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])):
-            edge_to_tri.setdefault(tuple(sorted((int(a), int(b)))), []).append(tidx)
-            dz = abs(float(depths[a] - depths[b]))
-            dist = max(float(np.linalg.norm(nodes_xy[a] - nodes_xy[b])), 1.0)
-            slopes.append(dz / dist)
-    area_changes = []
-    for tids in edge_to_tri.values():
-        if len(tids) == 2:
-            a1 = areas[tids[0]]
-            a2 = areas[tids[1]]
-            area_changes.append(abs(a1 - a2) / max(a1, a2, 1.0e-12))
-    failures = []
-    min_angle = float(np.nanmin(angles)) if angles else 0.0
-    max_angle = float(np.nanmax(angles)) if angles else 0.0
-    max_slope = float(np.nanmax(slopes)) if slopes else 0.0
-    max_area_change = float(np.nanmax(area_changes)) if area_changes else 0.0
-    max_valence = int(np.nanmax(valence)) if valence.size else 0
+    triangles = np.asarray(triangles_1based, dtype=int) - 1
+    open_zero = (np.asarray(open_boundary_nodes, dtype=int) - 1).tolist()
+    metrics = compute_mesh_metrics(
+        np.asarray(nodes_xy, dtype=float),
+        triangles,
+        depths=np.asarray(depths, dtype=float),
+        constraint_chains=constraint_chains,
+        open_boundary_nodes_zero_based=open_zero,
+        target_size_by_triangle=target_size_by_triangle,
+    )
+    min_angle = float(metrics["angles"]["min_angle_deg"])
+    max_angle = float(metrics["angles"]["max_angle_deg"])
+    max_slope = float(metrics["max_bathymetric_slope"] or 0.0)
+    max_area_change = float(metrics["max_adjacent_area_change"])
+    max_valence = int(metrics["valence"]["max_node_valence"])
+    topology = metrics["topology"]
+    integrity = metrics["constraint_integrity"]
+    depth_report = metrics["depths"]
+
+    failures: list[str] = []
     if min_angle < thresholds.min_angle_deg:
         failures.append("min_angle_below_threshold")
     if max_angle > thresholds.max_angle_deg:
@@ -68,17 +62,32 @@ def evaluate_mesh_quality(
         failures.append("adjacent_area_change_above_threshold")
     if max_valence > thresholds.max_node_valence:
         failures.append("node_valence_above_threshold")
-    if not np.all(np.isfinite(depths)) or float(np.nanmin(depths)) <= 0.0:
+    if not depth_report["finite"] or not depth_report["positive"]:
         failures.append("nonpositive_or_nan_depth")
-    if open_boundary_nodes.size == 0:
+    if len(open_zero) == 0:
         failures.append("missing_open_boundary_nodestring")
+    elif not integrity["open_boundary_ordered"]:
+        failures.append("open_boundary_nodestring_not_ordered_on_mesh")
     if not constraint_report.get("boundary_constraint_recovered", False):
         failures.append("boundary_constraint_not_recovered")
+    if not integrity["all_protected_edges_present"]:
+        failures.append("protected_boundary_constraint_missing")
+    if topology["connected_component_count"] != 1:
+        failures.append("multiple_mesh_components")
+    if topology["nonmanifold_edge_count"]:
+        failures.append("nonmanifold_edges_present")
+    if topology["boundary_degree_anomaly_count"]:
+        failures.append("boundary_not_traversable")
+    if topology["singly_connected_triangle_count"]:
+        failures.append("singly_connected_elements_present")
+    if topology["nonpositive_signed_area_count"]:
+        failures.append("nonpositive_triangle_area")
+
     return {
-        "schema_version": "fvcom_mesh_quality_v1",
-        "node_count": int(len(nodes_xy)),
-        "triangle_count": int(len(tris)),
-        "open_boundary_node_count": int(open_boundary_nodes.size),
+        "schema_version": "fvcom_mesh_quality_v2",
+        "node_count": int(metrics["node_count"]),
+        "triangle_count": int(metrics["triangle_count"]),
+        "open_boundary_node_count": int(len(open_zero)),
         "min_angle_deg": min_angle,
         "max_angle_deg": max_angle,
         "max_bathymetric_slope": max_slope,
@@ -86,23 +95,13 @@ def evaluate_mesh_quality(
         "max_node_valence": max_valence,
         "thresholds": thresholds.__dict__,
         "constraint_recovery": constraint_report,
+        "oceanmesh_quality": metrics["oceanmesh_quality"],
+        "angle_statistics": metrics["angles"],
+        "topology": topology,
+        "valence": metrics["valence"],
+        "constraint_integrity": integrity,
+        "size_error_l_over_h": metrics.get("size_error_l_over_h"),
+        "depths": depth_report,
         "failure_taxonomy": failures,
         "accepted": not failures,
     }
-
-
-def _triangle_angles(coords: np.ndarray) -> np.ndarray:
-    lengths = np.asarray([
-        np.linalg.norm(coords[1] - coords[2]),
-        np.linalg.norm(coords[0] - coords[2]),
-        np.linalg.norm(coords[0] - coords[1]),
-    ])
-    angles = []
-    for i in range(3):
-        a = lengths[i]
-        b = lengths[(i + 1) % 3]
-        c = lengths[(i + 2) % 3]
-        denom = max(2.0 * b * c, 1.0e-12)
-        val = np.clip((b * b + c * c - a * a) / denom, -1.0, 1.0)
-        angles.append(np.degrees(np.arccos(val)))
-    return np.asarray(angles, dtype=float)

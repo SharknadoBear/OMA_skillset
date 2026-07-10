@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,7 @@ class BoundaryNodes:
     xy: np.ndarray
     lonlat: np.ndarray
     kinds: list[str]
+    target_spacing_m: np.ndarray
     exterior_indices: list[int]
     open_boundary_indices: list[int]
     constraint_chains: list[list[int]]
@@ -45,6 +47,8 @@ class BoundaryNodes:
     land_boundary_xy: LineString | MultiLineString
     island_polygons_xy: list[Polygon]
     projection: LocalProjection
+    adaptive_resolution: bool = False
+    source_resolution_manifest: str | None = None
 
 
 def load_boundary_package(path: str | Path) -> BoundaryPackage:
@@ -143,6 +147,10 @@ def prepare_boundary_nodes(package: BoundaryPackage, config: BoundaryConfig) -> 
         xy=xy_arr,
         lonlat=lonlat,
         kinds=kinds,
+        target_spacing_m=np.asarray(
+            [config.open_spacing_m if kind == "open" else config.island_spacing_m if kind == "island" else config.land_spacing_m for kind in kinds],
+            dtype=float,
+        ),
         exterior_indices=exterior_indices,
         open_boundary_indices=_ordered_unique(open_indices),
         constraint_chains=constraint_chains,
@@ -152,6 +160,68 @@ def prepare_boundary_nodes(package: BoundaryPackage, config: BoundaryConfig) -> 
         island_polygons_xy=islands_xy,
         projection=projection,
     )
+
+
+def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage, BoundaryNodes, dict[str, Any]]:
+    """Load an explicit adaptive boundary package emitted by fvcom-bdry-arc."""
+    manifest_path = Path(manifest_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    if manifest.get("profile") != "adaptive-coastal-v1":
+        raise ValueError("Boundary resolution manifest must use profile adaptive-coastal-v1")
+    gpkg = Path(manifest["outputs"]["boundary_resolution_gpkg"])
+    layers = set(gpd.list_layers(gpkg)["name"])
+    required = {"resolved_domain_polygon", "resolved_open_boundary", "boundary_nodes"}
+    missing = required - layers
+    if missing:
+        raise ValueError(f"Boundary resolution package is missing layers: {sorted(missing)}")
+    domain_gdf = gpd.read_file(gpkg, layer="resolved_domain_polygon").to_crs("EPSG:4326")
+    domain = next(geom for geom in domain_gdf.geometry if isinstance(geom, Polygon) and not geom.is_empty)
+    open_gdf = gpd.read_file(gpkg, layer="resolved_open_boundary").to_crs("EPSG:4326")
+    open_boundary = unary_union([geom for geom in open_gdf.geometry if geom is not None and not geom.is_empty])
+    islands = []
+    if "resolved_island_polygons" in layers:
+        island_gdf = gpd.read_file(gpkg, layer="resolved_island_polygons").to_crs("EPSG:4326")
+        islands = [geom for geom in island_gdf.geometry if isinstance(geom, Polygon) and not geom.is_empty]
+    projection = local_utm_projection(tuple(float(v) for v in domain.bounds))
+    package = BoundaryPackage(
+        domain_polygon_lonlat=domain,
+        open_boundary_lonlat=open_boundary,
+        land_boundary_lonlat=LineString(domain.exterior.coords),
+        frame_boundary_lonlat=LineString(),
+        island_polygons_lonlat=islands,
+        source_gpkg=str(gpkg),
+        projection=projection,
+    )
+    nodes_gdf = gpd.read_file(gpkg, layer="boundary_nodes").to_crs("EPSG:4326")
+    nodes_gdf = nodes_gdf.sort_values(["chain_id", "chain_position"]).reset_index(drop=True)
+    lonlat = np.asarray([[float(point.x), float(point.y)] for point in nodes_gdf.geometry], dtype=float)
+    xy = project_points(lonlat, projection)
+    kinds = [str(value) for value in nodes_gdf["boundary_kind"]]
+    targets = np.asarray(nodes_gdf["target_spacing_m"], dtype=float)
+    chains: list[list[int]] = []
+    for _, group in nodes_gdf.groupby("chain_id", sort=True):
+        chains.append([int(value) for value in group.index])
+    exterior = chains[0] if chains else []
+    open_indices = [idx for idx in exterior if kinds[idx] == "open"]
+    domain_xy = project_geometry(domain, projection).buffer(0)
+    islands_xy = [project_geometry(poly, projection).buffer(0) for poly in islands]
+    nodes = BoundaryNodes(
+        xy=xy,
+        lonlat=lonlat,
+        kinds=kinds,
+        target_spacing_m=targets,
+        exterior_indices=list(exterior),
+        open_boundary_indices=_ordered_unique(open_indices),
+        constraint_chains=chains,
+        domain_polygon_xy=domain_xy,
+        open_boundary_xy=project_geometry(open_boundary, projection),
+        land_boundary_xy=LineString(domain_xy.exterior.coords),
+        island_polygons_xy=islands_xy,
+        projection=projection,
+        adaptive_resolution=True,
+        source_resolution_manifest=str(manifest_path),
+    )
+    return package, nodes, manifest
 
 
 def boundary_nodes_geojson(nodes: BoundaryNodes) -> dict[str, Any]:
@@ -165,6 +235,7 @@ def boundary_nodes_geojson(nodes: BoundaryNodes) -> dict[str, Any]:
                 "properties": {
                     "node_index_zero_based": int(idx),
                     "boundary_kind": kind,
+                    "target_spacing_m": float(nodes.target_spacing_m[idx]),
                     "is_open_boundary": bool(idx in open_set),
                 },
                 "geometry": {"type": "Point", "coordinates": [float(lon), float(lat)]},

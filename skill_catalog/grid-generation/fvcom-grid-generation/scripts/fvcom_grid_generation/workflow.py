@@ -15,10 +15,11 @@ from typing import Any
 import numpy as np
 
 from .bathymetry import coarsen_for_size_field, load_bathymetry
-from .boundary import BoundaryConfig, boundary_nodes_geojson, load_boundary_package, prepare_boundary_nodes
+from .boundary import BoundaryConfig, boundary_nodes_geojson, load_boundary_package, load_boundary_resolution, prepare_boundary_nodes
 from .mesh import MeshConfig, generate_mesh
-from .plotting import write_mesh_gpkg, write_mesh_review_map
+from .plotting import write_mesh_gpkg, write_mesh_quality_gpkg, write_mesh_review_map
 from .progress import ProgressTracker
+from .projection import unproject_points
 from .quality import evaluate_mesh_quality
 from .size_field import SizeFieldConfig, build_size_field, write_size_field
 from .sms_2dm import read_2dm, write_2dm
@@ -44,6 +45,11 @@ class GridConfig:
     bathy_max_sources: int = 256
     progress_interval_s: float = 10.0
     size_field_max_cells: int = 1_500_000
+    boundary_resolution_profile: str = "legacy"
+    postprocess_profile: str = "none"
+    postprocess_boundary_policy: str = "protect-all"
+    postprocess_max_passes: int = 8
+    postprocess_connectivity_limit: int | None = None
 
 
 def run_fvcom_grid(
@@ -55,10 +61,15 @@ def run_fvcom_grid(
     offshore_artifacts_json: str | Path | None = None,
     bdry_arc_manifest: str | Path | None = None,
     boundary_loops_gpkg: str | Path | None = None,
+    boundary_resolution_manifest: str | Path | None = None,
     bathy_nc: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run the complete mesh workflow and write artifacts."""
     config = config or GridConfig()
+    if str(config.postprocess_profile) != "none":
+        raise ValueError("Integrated post-generation cleanup is disabled; run postprocess_fvcom_mesh.py explicitly on the finished .2dm")
+    if config.boundary_resolution_profile not in {"legacy", "adaptive-coastal-v1"}:
+        raise ValueError("boundary_resolution_profile must be legacy or adaptive-coastal-v1")
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     progress = ProgressTracker(run_dir=run_dir, name=name, interval_s=float(config.progress_interval_s))
@@ -74,22 +85,31 @@ def run_fvcom_grid(
         offshore_artifacts_json,
         bdry_arc_manifest,
         boundary_loops_gpkg,
+        boundary_resolution_manifest,
         bathy_nc,
         land_spacing,
         config,
         progress,
     )
     boundary_loops_gpkg = upstream["boundary_loops_gpkg"]
+    boundary_resolution_manifest = upstream.get("boundary_resolution_manifest")
     bathy_nc = upstream["bathy_nc"]
     bdry_arc_manifest = upstream.get("bdry_arc_manifest")
+    if config.boundary_resolution_profile == "adaptive-coastal-v1" and not boundary_resolution_manifest:
+        raise ValueError("adaptive-coastal-v1 requires --boundary-resolution-manifest or an upstream adaptive boundary run")
 
-    progress.update("load_boundary_loops", 18.0, message="Loading model boundary-loop package.", artifact=boundary_loops_gpkg)
-    boundary_package = load_boundary_package(boundary_loops_gpkg)
-    progress.update("prepare_boundary_nodes", 22.0, message="Densifying classified boundary nodes.")
-    boundary_nodes = prepare_boundary_nodes(
-        boundary_package,
-        BoundaryConfig(land_spacing_m=land_spacing, open_spacing_m=open_spacing, island_spacing_m=land_spacing),
-    )
+    if boundary_resolution_manifest:
+        progress.update("load_boundary_resolution", 18.0, message="Loading explicit adaptive boundary chains.", artifact=boundary_resolution_manifest)
+        boundary_package, boundary_nodes, resolution_doc = load_boundary_resolution(boundary_resolution_manifest)
+    else:
+        progress.update("load_boundary_loops", 18.0, message="Loading model boundary-loop package.", artifact=boundary_loops_gpkg)
+        boundary_package = load_boundary_package(boundary_loops_gpkg)
+        progress.update("prepare_boundary_nodes", 22.0, message="Densifying classified boundary nodes.")
+        boundary_nodes = prepare_boundary_nodes(
+            boundary_package,
+            BoundaryConfig(land_spacing_m=land_spacing, open_spacing_m=open_spacing, island_spacing_m=land_spacing),
+        )
+        resolution_doc = None
     boundary_nodes_path = run_dir / "boundary_nodes.geojson"
     boundary_nodes_path.write_text(json.dumps(boundary_nodes_geojson(boundary_nodes), indent=2), encoding="utf-8")
 
@@ -105,8 +125,10 @@ def run_fvcom_grid(
     size_config = SizeFieldConfig(
         land_spacing_m=land_spacing,
         open_spacing_m=open_spacing,
+        max_size_m=8000.0 if boundary_nodes.adaptive_resolution else 20_000.0,
         gradation=float(config.gradation),
         target_timestep_s=str(config.target_timestep_s),
+        adaptive_boundary=bool(boundary_nodes.adaptive_resolution),
     )
     progress.update("build_size_field", 34.0, message="Building bathymetry and shoreline-based mesh-size field.")
     size_field = build_size_field(size_bathy, boundary_nodes, size_config)
@@ -117,6 +139,7 @@ def run_fvcom_grid(
         refine_iterations=int(config.refine_iterations),
         smooth_iterations=int(config.smooth_iterations),
         max_interior_points=int(config.max_interior_points),
+        adaptive_seed=bool(boundary_nodes.adaptive_resolution),
     )
     def _mesh_progress(message: str, fraction: float, extra: dict[str, Any] | None = None) -> None:
         progress.update(
@@ -127,20 +150,35 @@ def run_fvcom_grid(
         )
 
     mesh = generate_mesh(boundary_nodes, size_field, mesh_config, progress_callback=_mesh_progress)
-    progress.update("sample_bathymetry_to_mesh", 80.0, message="Sampling bathymetry to mesh nodes.")
+    progress.update("sample_bathymetry_to_mesh", 80.0, message="Sampling bathymetry to the generation-time smoothed mesh.")
     depths = bathy.sample(mesh.nodes_lonlat[:, 0], mesh.nodes_lonlat[:, 1], fill_value=float(np.nanmedian(bathy.depth)))
     depths = np.maximum(np.where(np.isfinite(depths), depths, 2.0), 0.5)
-    progress.update("mesh_quality", 84.0, message="Evaluating FVCOM mesh quality gates.")
+    target_sizes = _element_target_sizes(mesh.nodes_xy, mesh.triangles, boundary_nodes, size_field)
+    progress.update("mesh_quality", 86.0, message="Evaluating final FVCOM, topology, and size-compatibility gates.")
     quality = evaluate_mesh_quality(
         mesh.nodes_xy,
         depths,
         mesh.triangles,
         mesh.open_boundary_nodes,
         mesh.report.get("constraint_recovery", {}),
+        constraint_chains=mesh.constraint_chains,
+        target_size_by_triangle=target_sizes,
     )
+    quality["open_boundary_size_error"] = _open_boundary_size_error(mesh.nodes_xy, mesh.open_boundary_nodes, mesh.target_spacing_m)
+    if quality["open_boundary_size_error"]["p95_l_over_h"] > 1.55 or quality["open_boundary_size_error"]["maximum_l_over_h"] > 2.0:
+        if "open_boundary_size_mismatch" not in quality["failure_taxonomy"]:
+            quality["failure_taxonomy"].append("open_boundary_size_mismatch")
+        quality["accepted"] = False
 
-    progress.update("write_outputs", 88.0, message="Writing FVCOM .2dm and QA artifacts.")
-    output_2dm = write_2dm(run_dir / "fvcom_grid.2dm", mesh.nodes_lonlat, depths, mesh.triangles, mesh.open_boundary_nodes, mesh_name=name)
+    progress.update("write_outputs", 90.0, message="Writing the generation-time smoothed FVCOM mesh and QA artifacts.")
+    output_2dm = write_2dm(
+        run_dir / "fvcom_grid.2dm",
+        mesh.nodes_lonlat,
+        depths,
+        mesh.triangles,
+        mesh.open_boundary_nodes,
+        mesh_name=name,
+    )
     roundtrip = read_2dm(output_2dm)
     quality["roundtrip"] = {
         "node_count": int(len(roundtrip.nodes_lonlat)),
@@ -159,6 +197,13 @@ def run_fvcom_grid(
     quality_json = run_dir / "mesh_quality.json"
     quality_json.write_text(json.dumps(_json_safe(quality), indent=2), encoding="utf-8")
     mesh_gpkg = write_mesh_gpkg(run_dir / "mesh_nodes_elements.gpkg", mesh.nodes_lonlat, mesh.triangles, depths)
+    mesh_quality_gpkg = write_mesh_quality_gpkg(
+        run_dir / "mesh_quality_elements.gpkg",
+        mesh.nodes_lonlat,
+        mesh.triangles,
+        mesh.nodes_lonlat,
+        mesh.triangles,
+    )
     review_map = write_mesh_review_map(
         run_dir / "mesh_review_map.png",
         mesh.nodes_lonlat,
@@ -170,7 +215,7 @@ def run_fvcom_grid(
     )
     final_status = "pass" if quality.get("accepted") else "needs_review"
     manifest = {
-        "schema_version": "fvcom_grid_generation_manifest_v1",
+        "schema_version": "fvcom_grid_generation_manifest_v3",
         "name": name,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "created_by": "fvcom-grid-generation run_fvcom_grid.py",
@@ -190,11 +235,14 @@ def run_fvcom_grid(
             "bathy_target_spacing_arcsec": float(config.bathy_target_spacing_arcsec),
             "bathy_max_sources": int(config.bathy_max_sources),
             "size_field_max_cells": int(config.size_field_max_cells),
+            "boundary_resolution_profile": config.boundary_resolution_profile,
+            "postprocess_profile": "none",
         },
         "inputs": {
             "request_text": request_text,
             "bdry_arc_manifest": str(bdry_arc_manifest) if bdry_arc_manifest else None,
             "boundary_loops_gpkg": str(boundary_loops_gpkg),
+            "boundary_resolution_manifest": str(boundary_resolution_manifest) if boundary_resolution_manifest else None,
             "bathy_nc": str(bathy_nc),
             "upstream": upstream,
         },
@@ -210,6 +258,13 @@ def run_fvcom_grid(
             "health_check_json": upstream.get("bathy_health_check_json"),
         },
         "mesh": mesh.report,
+        "boundary_resolution": resolution_doc,
+        "postprocess": {
+            "enabled": False,
+            "profile": "none",
+            "reason": "normal_workflow_ends_at_generation_time_smoothed_mesh",
+            "standalone_tool": "scripts/postprocess_fvcom_mesh.py",
+        },
         "size_field": size_field.report,
         "quality": quality,
         "outputs": {
@@ -221,6 +276,7 @@ def run_fvcom_grid(
             "size_field_png": str(size_png),
             "boundary_nodes_geojson": str(boundary_nodes_path),
             "mesh_nodes_elements_gpkg": str(mesh_gpkg),
+            "mesh_quality_elements_gpkg": str(mesh_quality_gpkg),
             "progress_json": str(progress.json_path),
             "progress_jsonl": str(progress.jsonl_path),
         },
@@ -239,12 +295,16 @@ def _resolve_upstream_artifacts(
     offshore_artifacts_json: str | Path | None,
     bdry_arc_manifest: str | Path | None,
     boundary_loops_gpkg: str | Path | None,
+    boundary_resolution_manifest: str | Path | None,
     bathy_nc: str | Path | None,
     land_spacing: float,
     config: GridConfig,
     progress: ProgressTracker,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
+    if boundary_resolution_manifest and not boundary_loops_gpkg:
+        resolution_doc = json.loads(Path(boundary_resolution_manifest).read_text(encoding="utf-8-sig"))
+        boundary_loops_gpkg = resolution_doc.get("inputs", {}).get("model_boundary_loops_gpkg")
     if boundary_loops_gpkg and bathy_nc:
         result.update(
             {
@@ -252,6 +312,7 @@ def _resolve_upstream_artifacts(
                 "offshore_artifacts_json": str(offshore_artifacts_json) if offshore_artifacts_json else None,
                 "bdry_arc_manifest": str(bdry_arc_manifest) if bdry_arc_manifest else None,
                 "boundary_loops_gpkg": str(boundary_loops_gpkg),
+                "boundary_resolution_manifest": str(boundary_resolution_manifest) if boundary_resolution_manifest else None,
                 "bathy_nc": str(bathy_nc),
                 "source": "supplied_artifacts",
             }
@@ -339,6 +400,8 @@ def _resolve_upstream_artifacts(
                 str(max(land_spacing, 250.0)),
                 "--gshhs-resolution",
                 "f",
+                "--boundary-resolution-profile",
+                str(config.boundary_resolution_profile),
             ],
             progress=progress,
             stage="run_bdry_arc",
@@ -346,6 +409,9 @@ def _resolve_upstream_artifacts(
         )
     bdry_doc = json.loads(Path(bdry_arc_manifest).read_text(encoding="utf-8-sig"))
     boundary_loops_gpkg = Path(boundary_loops_gpkg or bdry_doc["outputs"]["model_boundary_loops_gpkg"])
+    boundary_resolution_manifest = boundary_resolution_manifest or bdry_doc.get("outputs", {}).get("boundary_resolution_manifest")
+    if config.boundary_resolution_profile == "adaptive-coastal-v1" and not boundary_resolution_manifest:
+        raise ValueError("adaptive-coastal-v1 requires a passing boundary_resolution_manifest")
 
     if bathy_nc is None:
         bathy_info = _fetch_bathy_sources(cudem_skill, Path(region_bpoly_json), bathy_dir, name, config, progress)
@@ -358,6 +424,7 @@ def _resolve_upstream_artifacts(
             "offshore_artifacts_json": str(offshore_artifacts_json),
             "bdry_arc_manifest": str(bdry_arc_manifest),
             "boundary_loops_gpkg": str(boundary_loops_gpkg),
+            "boundary_resolution_manifest": str(boundary_resolution_manifest) if boundary_resolution_manifest else None,
             "source": "generated_upstream_chain",
             **bathy_info,
         }
@@ -560,6 +627,79 @@ def _read_json_if_exists(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def _element_target_sizes(
+    nodes_xy: np.ndarray,
+    triangles_1based: np.ndarray,
+    boundary_nodes: Any,
+    size_field: Any,
+) -> np.ndarray:
+    triangles = np.asarray(triangles_1based, dtype=int) - 1
+    if not len(triangles):
+        return np.empty(0, dtype=float)
+    centroids_xy = np.mean(np.asarray(nodes_xy, dtype=float)[triangles], axis=1)
+    centroids_lonlat = unproject_points(centroids_xy, boundary_nodes.projection)
+    return size_field.sample(centroids_lonlat[:, 0], centroids_lonlat[:, 1])
+
+
+def _open_boundary_size_error(nodes_xy: np.ndarray, open_nodes_one_based: np.ndarray, node_targets: np.ndarray) -> dict[str, Any]:
+    indices = np.asarray(open_nodes_one_based, dtype=int) - 1
+    indices = indices[(indices >= 0) & (indices < len(nodes_xy))]
+    if len(indices) < 2:
+        return {
+            "definition": "consecutive_open_boundary_edge_length_over_mean_endpoint_target",
+            "edge_count": 0,
+            "p95_l_over_h": 0.0,
+            "maximum_l_over_h": 0.0,
+            "count_above_1_55": 0,
+            "count_above_2_0": 0,
+        }
+    lengths = np.linalg.norm(np.diff(np.asarray(nodes_xy, dtype=float)[indices], axis=0), axis=1)
+    targets = np.asarray(node_targets, dtype=float)
+    endpoint_h = 0.5 * (targets[indices[:-1]] + targets[indices[1:]])
+    fallback = float(np.nanmedian(endpoint_h[np.isfinite(endpoint_h)])) if np.isfinite(endpoint_h).any() else 1.0
+    endpoint_h = np.where(np.isfinite(endpoint_h) & (endpoint_h > 0.0), endpoint_h, fallback)
+    ratio = lengths / np.maximum(endpoint_h, 1.0)
+    return {
+        "definition": "consecutive_open_boundary_edge_length_over_mean_endpoint_target",
+        "edge_count": int(len(ratio)),
+        "p95_l_over_h": float(np.quantile(ratio, 0.95)),
+        "maximum_l_over_h": float(np.max(ratio)),
+        "median_l_over_h": float(np.median(ratio)),
+        "count_above_1_55": int(np.count_nonzero(ratio > 1.55)),
+        "count_above_2_0": int(np.count_nonzero(ratio > 2.0)),
+    }
+
+
+def _postclean_boundary_nodes_geojson(
+    nodes_lonlat: np.ndarray,
+    constraint_chains: list[list[int]],
+    open_boundary_nodes_1based: np.ndarray,
+) -> dict[str, Any]:
+    open_set = set((np.asarray(open_boundary_nodes_1based, dtype=int) - 1).tolist())
+    features: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for chain_id, chain in enumerate(constraint_chains):
+        for position, node in enumerate(chain):
+            if int(node) in seen:
+                continue
+            seen.add(int(node))
+            lon, lat = nodes_lonlat[int(node)]
+            features.append(
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "node_index_zero_based": int(node),
+                        "node_id_1based": int(node) + 1,
+                        "constraint_chain_id": int(chain_id),
+                        "constraint_chain_position": int(position),
+                        "is_open_boundary": bool(int(node) in open_set),
+                    },
+                    "geometry": {"type": "Point", "coordinates": [float(lon), float(lat)]},
+                }
+            )
+    return {"type": "FeatureCollection", "features": features}
 
 
 def _json_safe(value: Any) -> Any:

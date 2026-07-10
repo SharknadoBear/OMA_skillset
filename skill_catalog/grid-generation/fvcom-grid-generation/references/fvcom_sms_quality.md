@@ -1,22 +1,26 @@
 # FVCOM SMS 2DM Quality Reference
 
-Use this note when changing `.2dm`, `NS`, depth, or quality behavior.
+Use this note when changing `.2dm`, OBC nodestring, depth, constraint, or acceptance behavior.
 
-FVCOM/SMS output requirements:
+## Output Invariants
 
 - Write `MESH2D`, `MESHNAME`, `E3T`, `ND`, and `NS` records.
 - Keep node depths finite and positive down.
 - Keep triangles counterclockwise with positive projected area.
-- Write an ordered `NS` nodestring for the open boundary unless upstream metadata explicitly says the domain has no ocean open boundary.
-- Preserve the open boundary in review maps.
+- Write one ordered `NS` nodestring unless upstream metadata explicitly defines no ocean boundary.
+- Require every consecutive OBC node pair to be an actual mesh boundary edge.
+- Preserve every constraint selected by the postprocessing boundary policy.
 
-Default quality gates:
+## Default Gates
 
 - minimum triangle angle: `30 deg`;
 - maximum triangle angle: `130 deg`;
 - maximum bathymetric slope: `0.1`;
 - maximum adjacent element area-change metric: `0.5`;
-- maximum node valence: `8`;
-- boundary constraints recovered: required.
+- maximum true vertex-neighbor valence: `8`;
+- one manifold, traversable component;
+- no missing protected constraints or nonpositive elements.
 
-When gates fail, write all artifacts and set `final_status: needs_review`.
+When any gate fails, retain all artifacts and set `final_status: needs_review`. Normal generation writes one quality document for the generation-time smoothed mesh. Cleanup comparisons belong to the standalone postprocessor.
+
+Adaptive boundary packages additionally require ordered explicit chains, per-node target spacing, and OBC size compatibility: 95th-percentile `L/h <= 1.55` and maximum `L/h <= 2.0`.

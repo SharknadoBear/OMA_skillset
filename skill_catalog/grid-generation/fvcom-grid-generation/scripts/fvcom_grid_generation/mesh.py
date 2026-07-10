@@ -23,6 +23,7 @@ class MeshConfig:
     max_refine_insertions_per_iter: int = 1500
     size_overrun_factor: float = 1.55
     min_angle_refine_deg: float = 24.0
+    adaptive_seed: bool = False
 
 
 @dataclass
@@ -33,6 +34,8 @@ class MeshResult:
     open_boundary_nodes: np.ndarray
     boundary_node_count: int
     fixed_node_mask: np.ndarray
+    target_spacing_m: np.ndarray
+    constraint_chains: list[list[int]]
     report: dict[str, Any]
 
 
@@ -49,14 +52,15 @@ def generate_mesh(
     _progress(progress_callback, "seed_boundary_nodes", 0.0, {"boundary_node_count": int(len(boundary.xy))})
     points = [tuple(xy) for xy in boundary.xy]
     kinds = list(boundary.kinds)
+    point_targets = [float(value) for value in boundary.target_spacing_m]
     chains = [list(chain) for chain in boundary.constraint_chains]
-    open_nodes = list(boundary.open_boundary_indices)
 
     interior = _interior_seed_points(boundary, size_field, config)
     _progress(progress_callback, "seed_interior_points", 0.08, {"interior_seed_count": int(len(interior))})
     for xy in interior:
         points.append((float(xy[0]), float(xy[1])))
         kinds.append("interior")
+        point_targets.append(float("nan"))
 
     constraint_report: dict[str, Any] = {}
     triangles = np.empty((0, 3), dtype=int)
@@ -87,12 +91,9 @@ def generate_mesh(
             new_idx = len(points)
             points.append((float(midpoint[0]), float(midpoint[1])))
             kinds.append(kind)
+            point_targets.append(float(0.5 * (point_targets[a] + point_targets[b])))
             chain.insert(edge_pos + 1, new_idx)
-            if kind == "open":
-                _insert_open_node(open_nodes, a, b, new_idx)
-
     points_arr = np.asarray(points, dtype=float)
-    boundary_count = len([kind for kind in kinds if kind != "interior"])
     fixed_mask = np.asarray([kind != "interior" for kind in kinds], dtype=bool)
 
     for refine_iter in range(config.refine_iterations):
@@ -114,12 +115,52 @@ def generate_mesh(
         points_arr = np.vstack([points_arr, additions])
         fixed_mask = np.concatenate([fixed_mask, np.zeros(len(additions), dtype=bool)])
         kinds.extend(["interior"] * len(additions))
+        point_targets.extend([float("nan")] * len(additions))
 
     triangles = _triangulate_filtered(points_arr, boundary)
     _progress(progress_callback, "smooth_interior_nodes", 0.82, {"node_count": int(len(points_arr)), "triangle_count": int(len(triangles))})
     points_arr = _smooth_interior(points_arr, triangles, fixed_mask, boundary, iterations=config.smooth_iterations)
+    # Refinement insertions and the final Delaunay rebuild can invalidate a
+    # previously recovered concave-boundary edge.  Re-run midpoint recovery
+    # after smoothing so the quality report describes the delivered mesh, not
+    # the pre-refinement triangulation.
+    initial_constraint_report = dict(constraint_report)
+    points = [tuple(xy) for xy in points_arr]
+    final_iteration = 0
+    for final_iteration in range(config.max_constraint_iterations + 1):
+        points_arr = np.asarray(points, dtype=float)
+        triangles = _triangulate_filtered(points_arr, boundary)
+        missing = _missing_constraint_edges(triangles, chains)
+        if not missing:
+            break
+        pending = sorted(missing[: max(1, 2_000)], key=lambda item: (item[0], item[1]), reverse=True)
+        for chain_idx, edge_pos in pending:
+            chain = chains[chain_idx]
+            a = chain[edge_pos]
+            b = chain[(edge_pos + 1) % len(chain)]
+            midpoint = 0.5 * (points_arr[a] + points_arr[b])
+            kind = kinds[a] if kinds[a] == kinds[b] else "land"
+            new_idx = len(points)
+            points.append((float(midpoint[0]), float(midpoint[1])))
+            kinds.append(kind)
+            point_targets.append(float(0.5 * (point_targets[a] + point_targets[b])))
+            chain.insert(edge_pos + 1, new_idx)
+    points_arr = np.asarray(points, dtype=float)
     triangles = _triangulate_filtered(points_arr, boundary)
+    final_missing = _missing_constraint_edges(triangles, chains)
+    constraint_report = {
+        "iterations": int(initial_constraint_report.get("iterations", 0)) + int(final_iteration),
+        "initial_iterations": int(initial_constraint_report.get("iterations", 0)),
+        "final_iterations": int(final_iteration),
+        "missing_constraint_edge_count": int(len(final_missing)),
+        "boundary_constraint_recovered": bool(len(final_missing) == 0),
+        "final_recovery_applied": True,
+    }
+    _progress(progress_callback, "finalize_boundary_constraints", 0.90, constraint_report)
     triangles = _orient_ccw(points_arr, triangles)
+    fixed_mask = np.asarray([kind != "interior" for kind in kinds], dtype=bool)
+    boundary_count = int(np.count_nonzero(fixed_mask))
+    open_nodes = _ordered_boundary_kind_group(chains[0] if chains else [], kinds, "open")
     lonlat = unproject_points(points_arr, boundary.projection)
     open_boundary_nodes = np.asarray([idx + 1 for idx in open_nodes if idx < len(points_arr)], dtype=int)
     report = {
@@ -129,6 +170,8 @@ def generate_mesh(
         "triangle_count": int(len(triangles)),
         "boundary_node_count": int(boundary_count),
         "open_boundary_node_count": int(len(open_boundary_nodes)),
+        "constraint_chain_count": int(len(chains)),
+        "open_boundary_rebuilt_from_exterior_chain": True,
         "constraint_recovery": constraint_report,
         "refine_iterations": int(config.refine_iterations),
         "smooth_iterations": int(config.smooth_iterations),
@@ -141,6 +184,8 @@ def generate_mesh(
         open_boundary_nodes=open_boundary_nodes,
         boundary_node_count=boundary_count,
         fixed_node_mask=fixed_mask,
+        target_spacing_m=np.asarray(point_targets, dtype=float),
+        constraint_chains=chains,
         report=report,
     )
 
@@ -151,6 +196,8 @@ def _progress(callback: ProgressCallback | None, message: str, fraction: float, 
 
 
 def _interior_seed_points(boundary: BoundaryNodes, size_field: SizeField, config: MeshConfig) -> np.ndarray:
+    if config.adaptive_seed or boundary.adaptive_resolution:
+        return _adaptive_quadtree_seed_points(boundary, size_field, config)
     domain = boundary.domain_polygon_xy
     minx, miny, maxx, maxy = domain.bounds
     area = max(float(domain.area), 1.0)
@@ -170,6 +217,59 @@ def _interior_seed_points(boundary: BoundaryNodes, size_field: SizeField, config
         if len(pts) >= config.max_interior_points:
             break
     return np.asarray(pts, dtype=float)
+
+
+def _adaptive_quadtree_seed_points(boundary: BoundaryNodes, size_field: SizeField, config: MeshConfig) -> np.ndarray:
+    """Create deterministic variable-density seeds from local target size."""
+    domain = boundary.domain_polygon_xy
+    minx, miny, maxx, maxy = domain.bounds
+    span = max(maxx - minx, maxy - miny)
+    cx = 0.5 * (minx + maxx)
+    cy = 0.5 * (miny + maxy)
+    stack: list[tuple[float, float, float, int]] = [(cx, cy, span, 0)]
+    leaves: list[tuple[float, float, float]] = []
+    max_depth = 18
+    while stack:
+        x, y, width, depth = stack.pop()
+        half = 0.5 * width
+        cell = Point(float(x), float(y)).buffer(0.5 * width, cap_style=3)
+        if not domain.intersects(cell):
+            continue
+        sample_xy = np.asarray(
+            [
+                [x, y],
+                [x - 0.4 * width, y - 0.4 * width],
+                [x + 0.4 * width, y - 0.4 * width],
+                [x - 0.4 * width, y + 0.4 * width],
+                [x + 0.4 * width, y + 0.4 * width],
+            ],
+            dtype=float,
+        )
+        lonlat = unproject_points(sample_xy, boundary.projection)
+        targets = size_field.sample(lonlat[:, 0], lonlat[:, 1])
+        target = max(10.0, float(np.nanmin(targets)))
+        if width > 1.25 * target and depth < max_depth:
+            quarter = 0.25 * width
+            child = 0.5 * width
+            # Reverse push order preserves deterministic southwest-to-northeast traversal.
+            for dx, dy in ((quarter, quarter), (-quarter, quarter), (quarter, -quarter), (-quarter, -quarter)):
+                stack.append((x + dx, y + dy, child, depth + 1))
+            continue
+        leaves.append((x, y, target))
+        if len(leaves) > int(config.max_interior_points) * 3:
+            raise ValueError("Adaptive quadtree seed estimate exceeds --max-interior-points")
+    boundary_tree = cKDTree(boundary.xy) if len(boundary.xy) else None
+    accepted: list[tuple[float, float]] = []
+    for x, y, target in sorted(leaves, key=lambda item: (item[1], item[0])):
+        point = Point(float(x), float(y))
+        if not domain.contains(point):
+            continue
+        if boundary_tree is not None and float(boundary_tree.query([x, y])[0]) < 0.35 * target:
+            continue
+        accepted.append((float(x), float(y)))
+        if len(accepted) > int(config.max_interior_points):
+            raise ValueError("Adaptive quadtree seeds exceed --max-interior-points; raise the cap or coarsen the profile")
+    return np.asarray(accepted, dtype=float)
 
 
 def _triangulate_filtered(points: np.ndarray, boundary: BoundaryNodes) -> np.ndarray:
@@ -207,12 +307,28 @@ def _missing_constraint_edges(triangles: np.ndarray, chains: list[list[int]]) ->
     return missing
 
 
-def _insert_open_node(open_nodes: list[int], a: int, b: int, new_idx: int) -> None:
-    for i in range(len(open_nodes) - 1):
-        if open_nodes[i] == a and open_nodes[i + 1] == b:
-            open_nodes.insert(i + 1, new_idx)
-            return
-    open_nodes.append(new_idx)
+def _ordered_boundary_kind_group(chain: list[int], kinds: list[str], target_kind: str) -> list[int]:
+    """Return the longest cyclic contiguous kind group in chain order."""
+    if not chain:
+        return []
+    flags = [kinds[index] == target_kind for index in chain]
+    if all(flags):
+        return list(chain)
+    if not any(flags):
+        return []
+    pivot = next(index for index, flag in enumerate(flags) if not flag)
+    ordered = chain[pivot + 1 :] + chain[: pivot + 1]
+    groups: list[list[int]] = []
+    current: list[int] = []
+    for node in ordered:
+        if kinds[node] == target_kind:
+            current.append(node)
+        elif current:
+            groups.append(current)
+            current = []
+    if current:
+        groups.append(current)
+    return max(groups, key=lambda values: (len(values), -values[0])) if groups else []
 
 
 def _refinement_points(points: np.ndarray, triangles: np.ndarray, boundary: BoundaryNodes, size_field: SizeField, config: MeshConfig) -> np.ndarray:
@@ -220,14 +336,18 @@ def _refinement_points(points: np.ndarray, triangles: np.ndarray, boundary: Boun
     if not len(triangles):
         return np.empty((0, 2), dtype=float)
     tree = cKDTree(points)
-    for tri in triangles:
-        coords = points[tri]
+    triangle_coords = points[triangles]
+    centroids = triangle_coords.mean(axis=1)
+    centroid_lonlat = unproject_points(centroids, boundary.projection)
+    targets = size_field.sample(centroid_lonlat[:, 0], centroid_lonlat[:, 1])
+    for tri, coords, centroid, sampled_target in zip(triangles, triangle_coords, centroids, targets, strict=True):
         max_edge = _max_edge_length(coords)
         min_angle = _triangle_angles(coords).min()
-        centroid = coords.mean(axis=0)
-        lonlat = unproject_points(np.asarray([centroid]), boundary.projection)[0]
-        target = float(size_field.sample(np.asarray([lonlat[0]]), np.asarray([lonlat[1]]))[0])
+        target = float(sampled_target)
         if max_edge <= config.size_overrun_factor * target and min_angle >= config.min_angle_refine_deg:
+            continue
+        if boundary.adaptive_resolution and max_edge <= 0.95 * target:
+            # Do not chase a low angle by adding already-undersized nodes.
             continue
         candidate = _circumcenter(coords)
         if candidate is None or not boundary.domain_polygon_xy.contains(Point(float(candidate[0]), float(candidate[1]))):

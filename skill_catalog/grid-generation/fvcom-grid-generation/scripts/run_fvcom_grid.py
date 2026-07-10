@@ -20,6 +20,7 @@ def main() -> int:
     parser.add_argument("--offshore-artifacts-json")
     parser.add_argument("--bdry-arc-manifest")
     parser.add_argument("--boundary-loops-gpkg")
+    parser.add_argument("--boundary-resolution-manifest")
     parser.add_argument("--bathy-nc")
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--name", required=True)
@@ -46,7 +47,27 @@ def main() -> int:
     parser.add_argument("--bathy-max-sources", type=int, default=256)
     parser.add_argument("--progress-interval-s", type=float, default=10.0)
     parser.add_argument("--size-field-max-cells", type=int, default=1_500_000)
+    parser.add_argument("--boundary-resolution-profile", choices=("legacy", "adaptive-coastal-v1"), default="legacy")
+    parser.add_argument(
+        "--postprocess-profile",
+        choices=("none", "rpw2019", "projection-medium"),
+        default="none",
+    )
+    parser.add_argument(
+        "--postprocess-boundary-policy",
+        choices=("protect-all", "protect-open"),
+        default="protect-all",
+    )
+    parser.add_argument("--postprocess-max-passes", type=int, default=8)
+    parser.add_argument("--postprocess-connectivity-limit", default="auto")
     args = parser.parse_args()
+    if args.postprocess_profile != "none":
+        parser.error("Integrated cleanup is disabled; run scripts/postprocess_fvcom_mesh.py on the completed .2dm")
+    connectivity_limit = (
+        None
+        if str(args.postprocess_connectivity_limit).lower() == "auto"
+        else int(args.postprocess_connectivity_limit)
+    )
 
     manifest = run_fvcom_grid(
         run_dir=args.run_dir,
@@ -67,12 +88,18 @@ def main() -> int:
             bathy_max_sources=args.bathy_max_sources,
             progress_interval_s=args.progress_interval_s,
             size_field_max_cells=args.size_field_max_cells,
+            boundary_resolution_profile=args.boundary_resolution_profile,
+            postprocess_profile=args.postprocess_profile,
+            postprocess_boundary_policy=args.postprocess_boundary_policy,
+            postprocess_max_passes=args.postprocess_max_passes,
+            postprocess_connectivity_limit=connectivity_limit,
         ),
         request_text=args.request_text,
         region_bpoly_json=args.region_bpoly_json,
         offshore_artifacts_json=args.offshore_artifacts_json,
         bdry_arc_manifest=args.bdry_arc_manifest,
         boundary_loops_gpkg=args.boundary_loops_gpkg,
+        boundary_resolution_manifest=args.boundary_resolution_manifest,
         bathy_nc=args.bathy_nc,
     )
     print(json.dumps({"final_status": manifest["final_status"], "outputs": manifest["outputs"]}, indent=2))

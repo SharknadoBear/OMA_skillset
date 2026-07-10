@@ -37,6 +37,7 @@ class SizeFieldConfig:
     min_gradient: float = 1.0e-5
     target_timestep_s: str = "auto"
     cfl: float = 0.5
+    adaptive_boundary: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,8 +65,9 @@ def build_size_field(bathy: BathymetryGrid, boundary: BoundaryNodes, config: Siz
     depth = np.asarray(bathy.depth, dtype=float)
     slope = bathymetric_gradient(bathy)
     raw = np.full(depth.shape, config.max_size_m, dtype=float)
-    raw = np.where(depth <= config.shelf_depth_m, np.minimum(raw, config.shelf_max_size_m), raw)
-    raw = np.where(depth <= config.nearshore_depth_m, np.minimum(raw, config.nearshore_max_size_m), raw)
+    if not config.adaptive_boundary:
+        raw = np.where(depth <= config.shelf_depth_m, np.minimum(raw, config.shelf_max_size_m), raw)
+        raw = np.where(depth <= config.nearshore_depth_m, np.minimum(raw, config.nearshore_max_size_m), raw)
 
     topo_length = depth / np.maximum(slope, config.min_gradient)
     slope_size = (2.0 * np.pi / max(config.slope_elements, 1.0)) * topo_length
@@ -91,6 +93,7 @@ def build_size_field(bathy: BathymetryGrid, boundary: BoundaryNodes, config: Siz
         "max_size_m": float(np.nanmax(limited)),
         "land_spacing_m": float(config.land_spacing_m),
         "open_spacing_m": float(config.open_spacing_m),
+        "adaptive_boundary": bool(config.adaptive_boundary),
     }
     return SizeField(lon=bathy.lon, lat=bathy.lat, size=limited, raw_size=raw, depth=depth, slope=slope, report=report)
 
@@ -100,6 +103,16 @@ def shoreline_distance_size(bathy: BathymetryGrid, boundary: BoundaryNodes, conf
     lon2, lat2 = np.meshgrid(bathy.lon, bathy.lat)
     lonlat = np.column_stack([lon2.ravel(), lat2.ravel()])
     xy = project_points(lonlat, boundary.projection)
+    if config.adaptive_boundary or boundary.adaptive_resolution:
+        if not len(boundary.xy):
+            return np.full(lon2.shape, config.max_size_m, dtype=float)
+        distance, nearest = cKDTree(boundary.xy).query(xy, workers=-1)
+        target = np.asarray(boundary.target_spacing_m, dtype=float)[np.asarray(nearest, dtype=int)]
+        return np.clip(
+            (target + float(config.gradation) * np.asarray(distance, dtype=float)).reshape(lon2.shape),
+            float(np.nanmin(boundary.target_spacing_m)),
+            config.max_size_m,
+        )
     land_points = np.asarray([pt for pt, kind in zip(boundary.xy, boundary.kinds) if kind != "open"], dtype=float)
     if land_points.size == 0:
         land_points = boundary.xy

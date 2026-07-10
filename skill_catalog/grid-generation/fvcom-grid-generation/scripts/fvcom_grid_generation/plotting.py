@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from shapely.geometry import LineString, Point, Polygon
 
+from .metrics import element_metric_arrays
+
 
 def write_mesh_review_map(
     path: str | Path,
@@ -67,3 +69,51 @@ def write_mesh_gpkg(
         elem_records.append({"element_id": idx, "n1": int(tri[0]), "n2": int(tri[1]), "n3": int(tri[2]), "geometry": Polygon(coords)})
     gpd.GeoDataFrame(elem_records, geometry="geometry", crs="EPSG:4326").to_file(path, layer="elements", driver="GPKG")
     return path
+
+
+def write_mesh_quality_gpkg(
+    path: str | Path,
+    preclean_nodes_lonlat: np.ndarray,
+    preclean_triangles_1based: np.ndarray,
+    postclean_nodes_lonlat: np.ndarray,
+    postclean_triangles_1based: np.ndarray,
+) -> Path:
+    """Write preclean and postclean per-element geometric QA layers."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.unlink()
+    _write_quality_layer(path, "preclean_elements", preclean_nodes_lonlat, preclean_triangles_1based)
+    _write_quality_layer(path, "postclean_elements", postclean_nodes_lonlat, postclean_triangles_1based)
+    return path
+
+
+def _write_quality_layer(path: Path, layer: str, nodes_lonlat: np.ndarray, triangles_1based: np.ndarray) -> None:
+    triangles = np.asarray(triangles_1based, dtype=int) - 1
+    # The quality metric needs projected coordinates, but this layer is a
+    # visualization artifact. Use a local equirectangular projection only for
+    # element-shape scalars while retaining WGS84 geometries in the output.
+    lonlat = np.asarray(nodes_lonlat, dtype=float)
+    lat0 = float(np.nanmean(lonlat[:, 1])) if len(lonlat) else 0.0
+    radius = 6_371_000.0
+    xy = np.column_stack(
+        [
+            np.radians(lonlat[:, 0] - np.nanmean(lonlat[:, 0])) * radius * np.cos(np.radians(lat0)),
+            np.radians(lonlat[:, 1] - lat0) * radius,
+        ]
+    )
+    metrics = element_metric_arrays(xy, triangles)
+    records = []
+    for index, tri in enumerate(triangles):
+        coords = [tuple(lonlat[node]) for node in tri]
+        records.append(
+            {
+                "element_id": index + 1,
+                "quality_q": float(metrics["quality_q"][index]),
+                "min_angle_deg": float(metrics["min_angle_deg"][index]),
+                "max_angle_deg": float(metrics["max_angle_deg"][index]),
+                "area_m2": float(metrics["area_m2"][index]),
+                "geometry": Polygon(coords),
+            }
+        )
+    gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326").to_file(path, layer=layer, driver="GPKG")

@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM Boundary Arc"
-  short_description: "Prepare FVCOM open arcs and model boundary loops"
-  default_prompt: "Use $fvcom-bdry-arc to create the gridding-ready boundary package from a RegionBPoly. For coastal/estuary domains, find coastline-on-bpoly anchors and deform the seaward bpoly chain. For island/archipelago domains, use explicit bpoly metadata to select the offshore-loop branch with classified land patches for blocker islands. For lake/no-open-boundary domains, do not create a false ocean open boundary; use the closed lake-domain branch. In test mode, heuristic memory is off, so do not route from text or canonical names alone, but preserve explicit upstream domain_type and boundary_policy artifacts. Default to GSHHS full resolution, use antimeridian-safe projection, and audit slow stages through bdry_arc_progress_state.json instead of downshifting."
+  short_description: "Build adaptive FVCOM boundary chains"
+  default_prompt: "Use $fvcom-bdry-arc to build legacy or adaptive mission-protected FVCOM boundary loops, island treatments, and graded open-boundary chains."
