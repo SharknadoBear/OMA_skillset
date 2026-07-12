@@ -10,7 +10,16 @@ from scipy.spatial import Delaunay, cKDTree
 from shapely.geometry import Point
 
 from .boundary import BoundaryNodes
+from .metrics import build_edge_topology, constraint_integrity, triangle_geometry
 from .projection import unproject_points
+from .regional_conditioning import (
+    AreaTransitionRelaxConfig,
+    SpringRelaxConfig,
+    ThinTriangleRepairConfig,
+    relax_mesh_area_transitions,
+    relax_mesh_spring,
+    repair_thin_triangles,
+)
 from .size_field import SizeField
 
 
@@ -24,6 +33,22 @@ class MeshConfig:
     size_overrun_factor: float = 1.55
     min_angle_refine_deg: float = 24.0
     adaptive_seed: bool = False
+    regional_spring_relaxation: bool = True
+    spring_relax_iterations: int = 20
+    spring_relax_quality_threshold: float = 0.40
+    spring_relax_min_angle_deg: float = 28.0
+    spring_relax_ring_layers: int = 3
+    spring_relax_shape_weight: float = 0.20
+    thin_triangle_repair: bool = True
+    thin_triangle_quality_threshold: float = 0.25
+    thin_triangle_min_angle_deg: float = 20.0
+    thin_triangle_max_passes: int = 2
+    thin_triangle_max_flips: int = 200
+    thin_triangle_max_insertions: int = 50
+    area_transition_relaxation: bool = True
+    area_transition_max_patches: int = 12
+    area_transition_area_change_threshold: float = 0.50
+    area_transition_target_gradient_threshold: float = 0.10
 
 
 @dataclass
@@ -156,15 +181,179 @@ def generate_mesh(
         "boundary_constraint_recovered": bool(len(final_missing) == 0),
         "final_recovery_applied": True,
     }
-    _progress(progress_callback, "finalize_boundary_constraints", 0.90, constraint_report)
+    _progress(progress_callback, "finalize_boundary_constraints", 0.88, constraint_report)
     triangles = _orient_ccw(points_arr, triangles)
     fixed_mask = np.asarray([kind != "interior" for kind in kinds], dtype=bool)
-    boundary_count = int(np.count_nonzero(fixed_mask))
     open_nodes = _ordered_boundary_kind_group(chains[0] if chains else [], kinds, "open")
+
+    # Guarded generation-time conditioning starts only after protected-edge
+    # recovery.  Neither stage is allowed to invoke a global retriangulation.
+    preconditioning = {
+        "points": points_arr.copy(),
+        "triangles": triangles.copy(),
+        "fixed": fixed_mask.copy(),
+        "chains": [chain.copy() for chain in chains],
+        "open_nodes": np.asarray(open_nodes, dtype=int),
+        "kinds": kinds.copy(),
+        "point_targets": np.asarray(point_targets, dtype=float).copy(),
+    }
+    def _sample_size_field_targets(sample_points_xy: np.ndarray) -> np.ndarray:
+        sampled_lonlat = unproject_points(np.asarray(sample_points_xy, dtype=float), boundary.projection)
+        return size_field.sample(sampled_lonlat[:, 0], sampled_lonlat[:, 1])
+
+    sampled_targets = _sample_size_field_targets(points_arr)
+    stored_targets = np.asarray(point_targets, dtype=float)
+    conditioning_targets = np.where(np.isfinite(stored_targets) & (stored_targets > 0.0), stored_targets, sampled_targets)
+
+    def _sample_conditioning_targets(sample_points_xy: np.ndarray) -> np.ndarray:
+        """Sample Eulerian interior targets while retaining explicit fixed-boundary targets."""
+        sample_points_xy = np.asarray(sample_points_xy, dtype=float)
+        values = _sample_size_field_targets(sample_points_xy)
+        node_aligned = bool(
+            len(values) == len(fixed_mask)
+            and len(conditioning_targets) == len(fixed_mask)
+            and np.allclose(sample_points_xy[fixed_mask], points_arr[fixed_mask], rtol=0.0, atol=1.0e-10)
+        )
+        if node_aligned:
+            values = np.asarray(values, dtype=float).copy()
+            values[fixed_mask] = np.asarray(conditioning_targets, dtype=float)[fixed_mask]
+        return values
+    spring_config = SpringRelaxConfig(
+        enabled=bool(config.regional_spring_relaxation),
+        quality_threshold=float(config.spring_relax_quality_threshold),
+        min_angle_deg=float(config.spring_relax_min_angle_deg),
+        ring_layers=int(config.spring_relax_ring_layers),
+        iterations=int(config.spring_relax_iterations),
+        shape_weight=float(config.spring_relax_shape_weight),
+    )
+    _progress(progress_callback, "regional_spring_relaxation", 0.91, {"enabled": spring_config.enabled})
+    spring_result = relax_mesh_spring(
+        points_arr,
+        triangles,
+        fixed_mask,
+        target_spacing_m=conditioning_targets,
+        constraint_chains=chains,
+        open_boundary_nodes_zero_based=np.asarray(open_nodes, dtype=int),
+        config=spring_config,
+    )
+    points_arr = spring_result.nodes_xy
+
+    thin_config = ThinTriangleRepairConfig(
+        enabled=bool(config.thin_triangle_repair),
+        quality_threshold=float(config.thin_triangle_quality_threshold),
+        min_angle_deg=float(config.thin_triangle_min_angle_deg),
+        max_passes=int(config.thin_triangle_max_passes),
+        max_flips=int(config.thin_triangle_max_flips),
+        max_insertions=int(config.thin_triangle_max_insertions),
+        relaxation_config=SpringRelaxConfig(
+            enabled=bool(config.regional_spring_relaxation),
+            quality_threshold=float(config.spring_relax_quality_threshold),
+            min_angle_deg=float(config.spring_relax_min_angle_deg),
+            ring_layers=int(config.spring_relax_ring_layers),
+            iterations=min(max(int(config.spring_relax_iterations), 0), 15),
+            shape_weight=float(config.spring_relax_shape_weight),
+        ),
+    )
+    _progress(progress_callback, "thin_triangle_repair", 0.95, {"enabled": thin_config.enabled})
+    thin_result = repair_thin_triangles(
+        points_arr,
+        triangles,
+        fixed_mask,
+        chains,
+        np.asarray(open_nodes, dtype=int),
+        target_spacing_m=conditioning_targets,
+        config=thin_config,
+    )
+    points_arr = thin_result.nodes_xy
+    triangles = _orient_ccw(points_arr, thin_result.triangles)
+    fixed_mask = thin_result.fixed_node_mask
+    chains = [chain.copy() for chain in thin_result.constraint_chains]
+    open_nodes = thin_result.open_boundary_nodes_zero_based.tolist()
+    conditioning_targets = thin_result.target_spacing_m
+    if len(points_arr) > len(kinds):
+        kinds.extend(["interior"] * (len(points_arr) - len(kinds)))
+    point_targets = conditioning_targets.tolist()
+
+    area_transition_config = AreaTransitionRelaxConfig(
+        enabled=bool(config.area_transition_relaxation),
+        max_patches=int(config.area_transition_max_patches),
+        raw_area_change_threshold=float(config.area_transition_area_change_threshold),
+        target_gradient_threshold=float(config.area_transition_target_gradient_threshold),
+    )
+    _progress(
+        progress_callback,
+        "area_transition_relaxation",
+        0.97,
+        {"enabled": area_transition_config.enabled, "max_patches": int(area_transition_config.max_patches)},
+    )
+    area_transition_result = relax_mesh_area_transitions(
+        points_arr,
+        triangles,
+        fixed_mask,
+        target_spacing_sampler=_sample_conditioning_targets,
+        constraint_chains=chains,
+        open_boundary_nodes_zero_based=np.asarray(open_nodes, dtype=int),
+        config=area_transition_config,
+    )
+    points_arr = area_transition_result.nodes_xy
+    conditioning_targets = area_transition_result.target_spacing_m
+    point_targets = conditioning_targets.tolist()
+
+    terminal_audit = _conditioning_terminal_audit(
+        points_arr,
+        triangles,
+        fixed_mask,
+        chains,
+        np.asarray(open_nodes, dtype=int),
+        preconditioning["points"],
+        preconditioning["fixed"],
+    )
+    baseline_audit = _conditioning_terminal_audit(
+        preconditioning["points"],
+        preconditioning["triangles"],
+        preconditioning["fixed"],
+        preconditioning["chains"],
+        preconditioning["open_nodes"],
+        preconditioning["points"],
+        preconditioning["fixed"],
+    )
+    terminal_rollback = bool(baseline_audit["passed"] and not terminal_audit["passed"])
+    if terminal_rollback:
+        points_arr = preconditioning["points"]
+        triangles = preconditioning["triangles"]
+        fixed_mask = preconditioning["fixed"]
+        chains = preconditioning["chains"]
+        open_nodes = preconditioning["open_nodes"].tolist()
+        kinds = preconditioning["kinds"]
+        point_targets = preconditioning["point_targets"].tolist()
+        conditioning_targets = preconditioning["point_targets"]
+        terminal_audit = baseline_audit
+    conditioning_report = {
+        "schema_version": "fvcom_generation_conditioning_v2",
+        "stage_order": [
+            "spring-relax-v1",
+            "thin-repair-v1",
+            "area-transition-relax-v1",
+            "terminal-constraint-audit",
+        ],
+        "spring_relaxation": spring_result.report,
+        "thin_triangle_repair": thin_result.report,
+        "area_transition_relaxation": area_transition_result.report,
+        "baseline_terminal_audit": baseline_audit,
+        "terminal_audit": terminal_audit,
+        "terminal_rollback_applied": terminal_rollback,
+    }
+    final_missing = _missing_constraint_edges(triangles, chains)
+    constraint_report["missing_constraint_edge_count"] = int(len(final_missing))
+    constraint_report["boundary_constraint_recovered"] = bool(len(final_missing) == 0)
+    constraint_report["conditioning_terminal_audit"] = terminal_audit
+    _progress(progress_callback, "terminal_constraint_audit", 0.98, terminal_audit)
+
+    boundary_count = int(np.count_nonzero(fixed_mask))
     lonlat = unproject_points(points_arr, boundary.projection)
     open_boundary_nodes = np.asarray([idx + 1 for idx in open_nodes if idx < len(points_arr)], dtype=int)
     report = {
-        "schema_version": "fvcom_python_oceanmesh_mesh_v1",
+        "schema_version": "fvcom_python_oceanmesh_mesh_v3",
         "backend": "scipy_delaunay_clean_room",
         "node_count": int(len(points_arr)),
         "triangle_count": int(len(triangles)),
@@ -175,6 +364,7 @@ def generate_mesh(
         "constraint_recovery": constraint_report,
         "refine_iterations": int(config.refine_iterations),
         "smooth_iterations": int(config.smooth_iterations),
+        "conditioning": conditioning_report,
     }
     _progress(progress_callback, "mesh_complete", 1.0, report)
     return MeshResult(
@@ -188,6 +378,44 @@ def generate_mesh(
         constraint_chains=chains,
         report=report,
     )
+
+
+def _conditioning_terminal_audit(
+    points: np.ndarray,
+    triangles: np.ndarray,
+    fixed: np.ndarray,
+    chains: list[list[int]],
+    open_nodes_zero_based: np.ndarray,
+    original_points: np.ndarray,
+    original_fixed: np.ndarray,
+) -> dict[str, Any]:
+    """Audit the delivered conditioned mesh without changing connectivity."""
+    geometry = triangle_geometry(points, triangles)
+    topology = build_edge_topology(len(points), triangles)
+    integrity = constraint_integrity(topology, chains, np.asarray(open_nodes_zero_based, dtype=int).tolist())
+    original_count = len(original_points)
+    original_mask = np.asarray(original_fixed, dtype=bool)
+    boundary_shift = (
+        float(np.max(np.linalg.norm(points[:original_count][original_mask] - original_points[original_mask], axis=1)))
+        if np.any(original_mask)
+        else 0.0
+    )
+    positive = bool(len(triangles) and np.all(geometry["signed_area"] > 0.0))
+    constraints_ok = bool(not chains or integrity["all_protected_edges_present"])
+    obc_ok = bool(not len(open_nodes_zero_based) or integrity["open_boundary_ordered"])
+    one_component = bool(len(topology.connected_component_sizes) == 1)
+    manifold = bool(not topology.nonmanifold_edges)
+    passed = bool(positive and constraints_ok and obc_ok and one_component and manifold and boundary_shift <= 1.0e-10)
+    return {
+        "passed": passed,
+        "positive_signed_areas": positive,
+        "all_protected_edges_present": constraints_ok,
+        "open_boundary_ordered": obc_ok,
+        "connected_component_count": int(len(topology.connected_component_sizes)),
+        "nonmanifold_edge_count": int(len(topology.nonmanifold_edges)),
+        "original_boundary_coordinate_max_shift_m": boundary_shift,
+        "constraint_integrity": integrity,
+    }
 
 
 def _progress(callback: ProgressCallback | None, message: str, fraction: float, extra: dict[str, Any] | None = None) -> None:

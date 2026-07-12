@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -21,9 +22,17 @@ def main() -> int:
     parser.add_argument("--plot")
     parser.add_argument("--title", default="FVCOM mesh post-generation quality comparison")
     args = parser.parse_args()
-    before = json.loads(Path(args.before).read_text(encoding="utf-8-sig"))
-    after = json.loads(Path(args.after).read_text(encoding="utf-8-sig"))
+    before_path = Path(args.before).resolve()
+    after_path = Path(args.after).resolve()
+    before = json.loads(before_path.read_text(encoding="utf-8-sig"))
+    after = json.loads(after_path.read_text(encoding="utf-8-sig"))
     comparison = compare_quality_documents(before, after)
+    comparison["inputs"] = {
+        "before": str(before_path),
+        "before_sha256": hashlib.sha256(before_path.read_bytes()).hexdigest(),
+        "after": str(after_path),
+        "after_sha256": hashlib.sha256(after_path.read_bytes()).hexdigest(),
+    }
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(comparison, indent=2), encoding="utf-8")

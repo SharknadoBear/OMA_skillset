@@ -49,6 +49,34 @@ def main() -> int:
     parser.add_argument("--size-field-max-cells", type=int, default=1_500_000)
     parser.add_argument("--boundary-resolution-profile", choices=("legacy", "adaptive-coastal-v1"), default="legacy")
     parser.add_argument(
+        "--bathy-gradient-policy",
+        choices=("auto", "global", "coastal", "off"),
+        default="auto",
+        help="Bathymetric-gradient sizing policy; auto uses coastal gating for adaptive boundaries and global behavior for legacy grids.",
+    )
+    parser.add_argument("--coastal-gradient-distance-m", type=float, default=25_000.0)
+    parser.add_argument("--regional-spring-relaxation", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--spring-relax-iterations", type=int, default=20)
+    parser.add_argument("--spring-relax-quality-threshold", type=float, default=0.40)
+    parser.add_argument("--spring-relax-min-angle-deg", type=float, default=28.0)
+    parser.add_argument("--spring-relax-ring-layers", type=int, default=3)
+    parser.add_argument("--spring-relax-shape-weight", type=float, default=0.20)
+    parser.add_argument("--thin-triangle-repair", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--thin-triangle-quality-threshold", type=float, default=0.25)
+    parser.add_argument("--thin-triangle-min-angle-deg", type=float, default=20.0)
+    parser.add_argument("--thin-triangle-max-passes", type=int, default=2)
+    parser.add_argument("--thin-triangle-max-flips", type=int, default=200)
+    parser.add_argument("--thin-triangle-max-insertions", type=int, default=50)
+    parser.add_argument(
+        "--area-transition-relaxation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply guarded local spring patches to excessive adjacent-area transitions after thin repair.",
+    )
+    parser.add_argument("--area-transition-max-patches", type=int, default=12)
+    parser.add_argument("--area-transition-area-change-threshold", type=float, default=0.50)
+    parser.add_argument("--area-transition-target-gradient-threshold", type=float, default=0.10)
+    parser.add_argument(
         "--postprocess-profile",
         choices=("none", "rpw2019", "projection-medium"),
         default="none",
@@ -89,6 +117,24 @@ def main() -> int:
             progress_interval_s=args.progress_interval_s,
             size_field_max_cells=args.size_field_max_cells,
             boundary_resolution_profile=args.boundary_resolution_profile,
+            bathymetry_gradient_policy=args.bathy_gradient_policy,
+            coastal_gradient_distance_m=args.coastal_gradient_distance_m,
+            regional_spring_relaxation=args.regional_spring_relaxation,
+            spring_relax_iterations=args.spring_relax_iterations,
+            spring_relax_quality_threshold=args.spring_relax_quality_threshold,
+            spring_relax_min_angle_deg=args.spring_relax_min_angle_deg,
+            spring_relax_ring_layers=args.spring_relax_ring_layers,
+            spring_relax_shape_weight=args.spring_relax_shape_weight,
+            thin_triangle_repair=args.thin_triangle_repair,
+            thin_triangle_quality_threshold=args.thin_triangle_quality_threshold,
+            thin_triangle_min_angle_deg=args.thin_triangle_min_angle_deg,
+            thin_triangle_max_passes=args.thin_triangle_max_passes,
+            thin_triangle_max_flips=args.thin_triangle_max_flips,
+            thin_triangle_max_insertions=args.thin_triangle_max_insertions,
+            area_transition_relaxation=args.area_transition_relaxation,
+            area_transition_max_patches=args.area_transition_max_patches,
+            area_transition_area_change_threshold=args.area_transition_area_change_threshold,
+            area_transition_target_gradient_threshold=args.area_transition_target_gradient_threshold,
             postprocess_profile=args.postprocess_profile,
             postprocess_boundary_policy=args.postprocess_boundary_policy,
             postprocess_max_passes=args.postprocess_max_passes,

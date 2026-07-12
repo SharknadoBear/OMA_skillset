@@ -17,9 +17,10 @@ import numpy as np
 from .bathymetry import coarsen_for_size_field, load_bathymetry
 from .boundary import BoundaryConfig, boundary_nodes_geojson, load_boundary_package, load_boundary_resolution, prepare_boundary_nodes
 from .mesh import MeshConfig, generate_mesh
+from .metrics import triangle_geometry
 from .plotting import write_mesh_gpkg, write_mesh_quality_gpkg, write_mesh_review_map
 from .progress import ProgressTracker
-from .projection import unproject_points
+from .projection import project_points, unproject_points
 from .quality import evaluate_mesh_quality
 from .size_field import SizeFieldConfig, build_size_field, write_size_field
 from .sms_2dm import read_2dm, write_2dm
@@ -46,6 +47,24 @@ class GridConfig:
     progress_interval_s: float = 10.0
     size_field_max_cells: int = 1_500_000
     boundary_resolution_profile: str = "legacy"
+    bathymetry_gradient_policy: str = "auto"
+    coastal_gradient_distance_m: float = 25_000.0
+    regional_spring_relaxation: bool = True
+    spring_relax_iterations: int = 20
+    spring_relax_quality_threshold: float = 0.40
+    spring_relax_min_angle_deg: float = 28.0
+    spring_relax_ring_layers: int = 3
+    spring_relax_shape_weight: float = 0.20
+    thin_triangle_repair: bool = True
+    thin_triangle_quality_threshold: float = 0.25
+    thin_triangle_min_angle_deg: float = 20.0
+    thin_triangle_max_passes: int = 2
+    thin_triangle_max_flips: int = 200
+    thin_triangle_max_insertions: int = 50
+    area_transition_relaxation: bool = True
+    area_transition_max_patches: int = 12
+    area_transition_area_change_threshold: float = 0.50
+    area_transition_target_gradient_threshold: float = 0.10
     postprocess_profile: str = "none"
     postprocess_boundary_policy: str = "protect-all"
     postprocess_max_passes: int = 8
@@ -70,6 +89,8 @@ def run_fvcom_grid(
         raise ValueError("Integrated post-generation cleanup is disabled; run postprocess_fvcom_mesh.py explicitly on the finished .2dm")
     if config.boundary_resolution_profile not in {"legacy", "adaptive-coastal-v1"}:
         raise ValueError("boundary_resolution_profile must be legacy or adaptive-coastal-v1")
+    if config.bathymetry_gradient_policy not in {"auto", "global", "coastal", "off"}:
+        raise ValueError("bathymetry_gradient_policy must be auto, global, coastal, or off")
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     progress = ProgressTracker(run_dir=run_dir, name=name, interval_s=float(config.progress_interval_s))
@@ -129,6 +150,8 @@ def run_fvcom_grid(
         gradation=float(config.gradation),
         target_timestep_s=str(config.target_timestep_s),
         adaptive_boundary=bool(boundary_nodes.adaptive_resolution),
+        bathymetry_gradient_policy=str(config.bathymetry_gradient_policy),
+        coastal_gradient_distance_m=float(config.coastal_gradient_distance_m),
     )
     progress.update("build_size_field", 34.0, message="Building bathymetry and shoreline-based mesh-size field.")
     size_field = build_size_field(size_bathy, boundary_nodes, size_config)
@@ -140,6 +163,22 @@ def run_fvcom_grid(
         smooth_iterations=int(config.smooth_iterations),
         max_interior_points=int(config.max_interior_points),
         adaptive_seed=bool(boundary_nodes.adaptive_resolution),
+        regional_spring_relaxation=bool(config.regional_spring_relaxation),
+        spring_relax_iterations=int(config.spring_relax_iterations),
+        spring_relax_quality_threshold=float(config.spring_relax_quality_threshold),
+        spring_relax_min_angle_deg=float(config.spring_relax_min_angle_deg),
+        spring_relax_ring_layers=int(config.spring_relax_ring_layers),
+        spring_relax_shape_weight=float(config.spring_relax_shape_weight),
+        thin_triangle_repair=bool(config.thin_triangle_repair),
+        thin_triangle_quality_threshold=float(config.thin_triangle_quality_threshold),
+        thin_triangle_min_angle_deg=float(config.thin_triangle_min_angle_deg),
+        thin_triangle_max_passes=int(config.thin_triangle_max_passes),
+        thin_triangle_max_flips=int(config.thin_triangle_max_flips),
+        thin_triangle_max_insertions=int(config.thin_triangle_max_insertions),
+        area_transition_relaxation=bool(config.area_transition_relaxation),
+        area_transition_max_patches=int(config.area_transition_max_patches),
+        area_transition_area_change_threshold=float(config.area_transition_area_change_threshold),
+        area_transition_target_gradient_threshold=float(config.area_transition_target_gradient_threshold),
     )
     def _mesh_progress(message: str, fraction: float, extra: dict[str, Any] | None = None) -> None:
         progress.update(
@@ -150,6 +189,20 @@ def run_fvcom_grid(
         )
 
     mesh = generate_mesh(boundary_nodes, size_field, mesh_config, progress_callback=_mesh_progress)
+    conditioning_json = run_dir / "mesh_conditioning.json"
+    conditioning_json.write_text(json.dumps(_json_safe(mesh.report.get("conditioning", {})), indent=2), encoding="utf-8")
+    delivered_boundary_nodes_path = run_dir / "delivered_boundary_nodes.geojson"
+    delivered_boundary_nodes_path.write_text(
+        json.dumps(
+            _postclean_boundary_nodes_geojson(
+                mesh.nodes_lonlat,
+                mesh.constraint_chains,
+                mesh.open_boundary_nodes,
+            ),
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     progress.update("sample_bathymetry_to_mesh", 80.0, message="Sampling bathymetry to the generation-time smoothed mesh.")
     depths = bathy.sample(mesh.nodes_lonlat[:, 0], mesh.nodes_lonlat[:, 1], fill_value=float(np.nanmedian(bathy.depth)))
     depths = np.maximum(np.where(np.isfinite(depths), depths, 2.0), 0.5)
@@ -180,16 +233,72 @@ def run_fvcom_grid(
         mesh_name=name,
     )
     roundtrip = read_2dm(output_2dm)
+    node_count_match = bool(len(roundtrip.nodes_lonlat) == len(mesh.nodes_lonlat))
+    triangle_count_match = bool(len(roundtrip.triangles) == len(mesh.triangles))
+    open_boundary_count_match = bool(len(roundtrip.open_boundary_nodes) == len(mesh.open_boundary_nodes))
+    triangle_connectivity_match = bool(
+        triangle_count_match and np.array_equal(roundtrip.triangles, mesh.triangles)
+    )
+    open_boundary_order_match = bool(
+        open_boundary_count_match
+        and np.array_equal(roundtrip.open_boundary_nodes, mesh.open_boundary_nodes)
+    )
+    coordinate_tolerance_m = 0.01
+    if node_count_match:
+        roundtrip_xy = project_points(roundtrip.nodes_lonlat, boundary_nodes.projection)
+        coordinate_shift_m = np.linalg.norm(roundtrip_xy - mesh.nodes_xy, axis=1)
+        coordinate_max_shift_m: float | None = float(np.max(coordinate_shift_m, initial=0.0))
+        coordinate_rms_shift_m: float | None = float(np.sqrt(np.mean(coordinate_shift_m**2)))
+    else:
+        coordinate_max_shift_m = None
+        coordinate_rms_shift_m = None
+    coordinate_within_tolerance = bool(
+        coordinate_max_shift_m is not None and coordinate_max_shift_m <= coordinate_tolerance_m
+    )
+    if node_count_match and triangle_count_match:
+        roundtrip_signed_areas = triangle_geometry(roundtrip_xy, roundtrip.triangles - 1)["signed_area"]
+        roundtrip_nonpositive_signed_area_count: int | None = int(np.count_nonzero(roundtrip_signed_areas <= 0.0))
+        roundtrip_minimum_signed_area_m2: float | None = float(np.min(roundtrip_signed_areas, initial=np.inf))
+        roundtrip_positive_signed_areas = bool(roundtrip_nonpositive_signed_area_count == 0)
+    else:
+        roundtrip_nonpositive_signed_area_count = None
+        roundtrip_minimum_signed_area_m2 = None
+        roundtrip_positive_signed_areas = False
+    finite_positive_depths = bool(
+        len(roundtrip.depths) == len(mesh.nodes_lonlat)
+        and np.all(np.isfinite(roundtrip.depths))
+        and np.all(roundtrip.depths > 0.0)
+    )
     quality["roundtrip"] = {
         "node_count": int(len(roundtrip.nodes_lonlat)),
         "triangle_count": int(len(roundtrip.triangles)),
         "open_boundary_node_count": int(len(roundtrip.open_boundary_nodes)),
+        "node_count_match": node_count_match,
+        "triangle_count_match": triangle_count_match,
+        "open_boundary_count_match": open_boundary_count_match,
+        "triangle_connectivity_match": triangle_connectivity_match,
+        "open_boundary_order_match": open_boundary_order_match,
+        "finite_positive_depths": finite_positive_depths,
+        "coordinate_tolerance_m": coordinate_tolerance_m,
+        "coordinate_max_shift_m": coordinate_max_shift_m,
+        "coordinate_rms_shift_m": coordinate_rms_shift_m,
+        "coordinate_within_tolerance": coordinate_within_tolerance,
+        "nonpositive_signed_area_count": roundtrip_nonpositive_signed_area_count,
+        "minimum_signed_area_m2": roundtrip_minimum_signed_area_m2,
+        "positive_signed_areas": roundtrip_positive_signed_areas,
         "ok": bool(
-            len(roundtrip.nodes_lonlat) == len(mesh.nodes_lonlat)
-            and len(roundtrip.triangles) == len(mesh.triangles)
-            and len(roundtrip.open_boundary_nodes) == len(mesh.open_boundary_nodes)
+            node_count_match
+            and triangle_count_match
+            and open_boundary_count_match
+            and triangle_connectivity_match
+            and open_boundary_order_match
+            and finite_positive_depths
+            and coordinate_within_tolerance
+            and roundtrip_positive_signed_areas
         ),
     }
+    if not roundtrip_positive_signed_areas:
+        quality["failure_taxonomy"].append("2dm_roundtrip_nonpositive_area")
     if not quality["roundtrip"]["ok"]:
         quality["failure_taxonomy"].append("2dm_roundtrip_failed")
         quality["accepted"] = False
@@ -215,7 +324,7 @@ def run_fvcom_grid(
     )
     final_status = "pass" if quality.get("accepted") else "needs_review"
     manifest = {
-        "schema_version": "fvcom_grid_generation_manifest_v3",
+        "schema_version": "fvcom_grid_generation_manifest_v5",
         "name": name,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "created_by": "fvcom-grid-generation run_fvcom_grid.py",
@@ -236,6 +345,17 @@ def run_fvcom_grid(
             "bathy_max_sources": int(config.bathy_max_sources),
             "size_field_max_cells": int(config.size_field_max_cells),
             "boundary_resolution_profile": config.boundary_resolution_profile,
+            "bathymetry_gradient_policy": str(config.bathymetry_gradient_policy),
+            "coastal_gradient_distance_m": float(config.coastal_gradient_distance_m),
+            "regional_spring_relaxation": bool(config.regional_spring_relaxation),
+            "spring_relax_iterations": int(config.spring_relax_iterations),
+            "thin_triangle_repair": bool(config.thin_triangle_repair),
+            "thin_triangle_min_angle_deg": float(config.thin_triangle_min_angle_deg),
+            "thin_triangle_quality_threshold": float(config.thin_triangle_quality_threshold),
+            "area_transition_relaxation": bool(config.area_transition_relaxation),
+            "area_transition_max_patches": int(config.area_transition_max_patches),
+            "area_transition_area_change_threshold": float(config.area_transition_area_change_threshold),
+            "area_transition_target_gradient_threshold": float(config.area_transition_target_gradient_threshold),
             "postprocess_profile": "none",
         },
         "inputs": {
@@ -262,19 +382,22 @@ def run_fvcom_grid(
         "postprocess": {
             "enabled": False,
             "profile": "none",
-            "reason": "normal_workflow_ends_at_generation_time_smoothed_mesh",
+            "reason": "broad_legacy_cleanup_remains_standalone; normal_workflow_uses_guarded_generation_time_conditioning",
             "standalone_tool": "scripts/postprocess_fvcom_mesh.py",
         },
+        "conditioning": mesh.report.get("conditioning", {}),
         "size_field": size_field.report,
         "quality": quality,
         "outputs": {
             "fvcom_grid_2dm": str(output_2dm),
             "fvcom_grid_manifest": str(run_dir / "fvcom_grid_manifest.json"),
             "mesh_quality_json": str(quality_json),
+            "mesh_conditioning_json": str(conditioning_json),
             "mesh_review_map": str(review_map),
             "size_field_nc": str(size_nc),
             "size_field_png": str(size_png),
             "boundary_nodes_geojson": str(boundary_nodes_path),
+            "delivered_boundary_nodes_geojson": str(delivered_boundary_nodes_path),
             "mesh_nodes_elements_gpkg": str(mesh_gpkg),
             "mesh_quality_elements_gpkg": str(mesh_quality_gpkg),
             "progress_json": str(progress.json_path),

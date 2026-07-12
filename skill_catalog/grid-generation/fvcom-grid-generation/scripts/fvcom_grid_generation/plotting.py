@@ -78,11 +78,18 @@ def write_mesh_quality_gpkg(
     postclean_nodes_lonlat: np.ndarray,
     postclean_triangles_1based: np.ndarray,
 ) -> Path:
-    """Write preclean and postclean per-element geometric QA layers."""
+    """Write final-only or genuine before/after per-element geometric QA layers."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         path.unlink()
+    same_mesh = bool(
+        np.array_equal(np.asarray(preclean_triangles_1based), np.asarray(postclean_triangles_1based))
+        and np.array_equal(np.asarray(preclean_nodes_lonlat), np.asarray(postclean_nodes_lonlat))
+    )
+    if same_mesh:
+        _write_quality_layer(path, "final_elements", postclean_nodes_lonlat, postclean_triangles_1based)
+        return path
     _write_quality_layer(path, "preclean_elements", preclean_nodes_lonlat, preclean_triangles_1based)
     _write_quality_layer(path, "postclean_elements", postclean_nodes_lonlat, postclean_triangles_1based)
     return path

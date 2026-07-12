@@ -16,14 +16,22 @@ import xarray as xr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fvcom_grid_generation.bathymetry import coarsen_for_size_field, write_synthetic_bathymetry  # noqa: E402
+from fvcom_grid_generation.bathymetry import BathymetryGrid, coarsen_for_size_field, write_synthetic_bathymetry  # noqa: E402
 from fvcom_grid_generation.boundary import BoundaryConfig, load_boundary_package, load_boundary_resolution, prepare_boundary_nodes  # noqa: E402
 from fvcom_grid_generation.mesh import _ordered_boundary_kind_group  # noqa: E402
 from fvcom_grid_generation.metrics import compute_mesh_metrics, triangle_geometry  # noqa: E402
 from fvcom_grid_generation.postprocess import PostprocessConfig, _stage_acceptance, postprocess_mesh  # noqa: E402
+from fvcom_grid_generation.regional_conditioning import (  # noqa: E402
+    AreaTransitionRelaxConfig,
+    SpringRelaxConfig,
+    ThinTriangleRepairConfig,
+    relax_mesh_area_transitions,
+    relax_mesh_spring,
+    repair_thin_triangles,
+)
 from fvcom_grid_generation.size_field import SizeFieldConfig, build_size_field  # noqa: E402
 from fvcom_grid_generation.bathymetry import load_bathymetry  # noqa: E402
-from fvcom_grid_generation.sms_2dm import read_2dm  # noqa: E402
+from fvcom_grid_generation.sms_2dm import read_2dm, write_2dm  # noqa: E402
 from fvcom_grid_generation.workflow import GridConfig, _bathy_fetch_command, _parse_required_source_count, run_fvcom_grid  # noqa: E402
 
 
@@ -114,6 +122,194 @@ def test_size_field_limiter_never_coarsens_fine_cells() -> None:
         assert np.nanmin(size.size) >= 700.0 - 1.0e-6
         assert np.all(size.size <= size.raw_size + 1.0e-6)
         assert size.report["gradation"]["max_neighbor_gradation"] <= 0.151
+
+
+def test_adaptive_offshore_sizing_ignores_unmasked_bathymetry_gradient() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        gpkg = _synthetic_boundary_package(root / "loops.gpkg")
+        package = load_boundary_package(gpkg)
+        nodes = prepare_boundary_nodes(package, BoundaryConfig(land_spacing_m=700.0, open_spacing_m=2500.0, island_spacing_m=700.0))
+        nodes.adaptive_resolution = True
+        lon = np.linspace(-75.10, -74.90, 61)
+        lat = np.linspace(39.00, 39.16, 49)
+        lon2, lat2 = np.meshgrid(lon, lat)
+        ridge = 140.0 * np.exp(-((lon2 + 74.902) / 0.008) ** 2 - ((lat2 - 39.08) / 0.020) ** 2)
+        bathy = BathymetryGrid(lon=lon, lat=lat, depth=100.0 + ridge)
+        coastal = build_size_field(
+            bathy,
+            nodes,
+            SizeFieldConfig(
+                land_spacing_m=700.0,
+                open_spacing_m=2500.0,
+                max_size_m=8000.0,
+                adaptive_boundary=True,
+                bathymetry_gradient_policy="coastal",
+                coastal_gradient_distance_m=1500.0,
+            ),
+        )
+        global_field = build_size_field(
+            bathy,
+            nodes,
+            SizeFieldConfig(
+                land_spacing_m=700.0,
+                open_spacing_m=2500.0,
+                max_size_m=8000.0,
+                adaptive_boundary=True,
+                bathymetry_gradient_policy="global",
+                coastal_gradient_distance_m=1500.0,
+            ),
+        )
+        center = (int(np.argmin(np.abs(lat - 39.08))), int(np.argmin(np.abs(lon + 74.902))))
+        assert coastal.report["bathymetry_gradient"]["effective_policy"] == "coastal"
+        assert coastal.report["bathymetry_gradient"]["offshore_slope_limited_count"] == 0
+        assert global_field.report["bathymetry_gradient"]["slope_limited_count"] > 0
+        assert coastal.raw_size[center] > global_field.raw_size[center] + 500.0
+
+
+def test_regional_spring_relaxation_preserves_boundary_and_improves_quality() -> None:
+    points = np.asarray([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0], [0.35, 0.90]])
+    triangles = np.asarray([[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]], dtype=int)
+    fixed = np.asarray([True, True, True, True, False])
+    before = triangle_geometry(points, triangles)
+    result = relax_mesh_spring(
+        points,
+        triangles,
+        fixed,
+        constraint_chains=[[0, 1, 2, 3]],
+        open_boundary_nodes_zero_based=np.asarray([0, 1]),
+        config=SpringRelaxConfig(quality_threshold=0.95, min_angle_deg=55.0, iterations=30, shape_weight=0.35),
+    )
+    after = triangle_geometry(result.nodes_xy, triangles)
+    assert result.report["accepted"] is True
+    assert np.array_equal(result.nodes_xy[:4], points[:4])
+    assert float(np.min(after["quality"])) > float(np.min(before["quality"]))
+    assert result.report["final_energy"] < result.report["initial_energy"]
+    assert np.all(after["signed_area"] > 0.0)
+
+
+def test_area_transition_relaxation_is_eulerian_guarded_and_boundary_fixed() -> None:
+    points = np.asarray([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0], [0.35, 0.90]])
+    triangles = np.asarray([[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]], dtype=int)
+    fixed = np.asarray([True, True, True, True, False])
+    sampled_locations: list[np.ndarray] = []
+
+    def target_sampler(locations: np.ndarray) -> np.ndarray:
+        sampled_locations.append(np.asarray(locations, dtype=float).copy())
+        return np.full(len(locations), 3.0, dtype=float)
+
+    result = relax_mesh_area_transitions(
+        points,
+        triangles,
+        fixed,
+        target_spacing_sampler=target_sampler,
+        constraint_chains=[[0, 1, 2, 3]],
+        open_boundary_nodes_zero_based=np.asarray([0, 1]),
+        config=AreaTransitionRelaxConfig(max_patches=4),
+    )
+    before = result.report["before"]
+    after = result.report["after"]
+    assert result.report["accepted"] is True
+    assert result.report["applied_patch_count"] >= 1
+    assert np.array_equal(result.nodes_xy[:4], points[:4])
+    assert result.report["boundary_coordinate_max_shift_m"] == 0.0
+    assert result.report["constraint_integrity"]["all_protected_edges_present"] is True
+    assert after["maximum_adjacent_area_change"] < before["maximum_adjacent_area_change"]
+    assert after["transition_severity_sum"] < before["transition_severity_sum"]
+    assert after["adjacent_area_change_above_threshold_count"] <= before["adjacent_area_change_above_threshold_count"]
+    assert after["l_over_h"]["count_above_threshold"] <= before["l_over_h"]["count_above_threshold"]
+    assert result.report["maximum_total_displacement_over_h"] <= 0.25 + 1.0e-12
+    assert result.report["target_sampling"]["call_count"] == len(sampled_locations)
+    assert result.report["target_sampling"]["call_count"] >= 4
+    assert np.allclose(result.target_spacing_m, 3.0)
+    assert np.all(triangle_geometry(result.nodes_xy, triangles)["signed_area"] > 0.0)
+
+
+def test_area_transition_high_gradient_trigger_requires_normalized_excess() -> None:
+    points = np.asarray([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.6]])
+    triangles = np.asarray([[0, 1, 2], [0, 2, 3]], dtype=int)
+    fixed = np.ones(4, dtype=bool)
+
+    def target_sampler(locations: np.ndarray) -> np.ndarray:
+        return 1.5 - 0.75 * np.asarray(locations, dtype=float)[:, 0]
+
+    result = relax_mesh_area_transitions(
+        points,
+        triangles,
+        fixed,
+        target_spacing_sampler=target_sampler,
+        constraint_chains=[[0, 1, 2, 3]],
+        open_boundary_nodes_zero_based=np.asarray([0, 1]),
+        config=AreaTransitionRelaxConfig(max_patches=1),
+    )
+    before = result.report["before"]
+    selected = result.report["patches"][0]["selected_pair"]
+    assert result.report["accepted"] is False
+    assert result.report["reason"] == "no_legal_transition_patch"
+    assert before["raw_trigger_pair_count"] == 0
+    assert before["high_gradient_trigger_pair_count"] == 1
+    assert before["candidate_pair_count"] == 1
+    assert selected["area_change"] > 0.375
+    assert selected["area_change"] < 0.50
+    assert selected["target_gradient"] > 0.10
+    assert selected["normalized_log_jump"] > np.log(1.5)
+    assert selected["high_gradient_trigger"] is True
+    assert np.array_equal(result.nodes_xy, points)
+
+
+def test_thin_triangle_edge_flip_preserves_boundary() -> None:
+    points = np.asarray([[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 0.3]])
+    triangles = np.asarray([[0, 1, 2], [0, 2, 3]], dtype=int)
+    fixed = np.ones(4, dtype=bool)
+    result = repair_thin_triangles(
+        points,
+        triangles,
+        fixed,
+        [[0, 1, 2, 3]],
+        np.asarray([0, 1]),
+        target_spacing_m=np.full(4, 2.0),
+        config=ThinTriangleRepairConfig(
+            quality_threshold=0.20,
+            min_angle_deg=8.0,
+            max_passes=2,
+            max_flips=4,
+            max_insertions=0,
+        ),
+    )
+    assert result.report["accepted"] is True
+    assert result.report["edge_flip_count"] == 1
+    assert np.array_equal(result.nodes_xy, points)
+    assert result.report["constraint_integrity"]["all_protected_edges_present"] is True
+
+
+def test_thin_triangle_long_edge_split_and_local_relaxation() -> None:
+    points = np.asarray([[-2.0, 0.0], [2.0, 0.0], [0.0, 1.0], [0.0, -1.0]])
+    triangles = np.asarray([[0, 1, 2], [1, 0, 3]], dtype=int)
+    fixed = np.ones(4, dtype=bool)
+    result = repair_thin_triangles(
+        points,
+        triangles,
+        fixed,
+        [[0, 2, 1, 3]],
+        np.asarray([0, 2, 1]),
+        target_spacing_m=np.full(4, 1.5),
+        config=ThinTriangleRepairConfig(
+            quality_threshold=0.60,
+            min_angle_deg=20.0,
+            max_passes=1,
+            max_flips=0,
+            max_insertions=2,
+            split_target_factor=1.25,
+            relaxation_config=SpringRelaxConfig(quality_threshold=0.75, min_angle_deg=30.0, iterations=10),
+        ),
+    )
+    assert result.report["accepted"] is True
+    assert result.report["edge_split_count"] == 1
+    assert len(result.nodes_xy) == 5
+    assert result.inserted_parent_edges == [(4, 0, 1)]
+    assert np.array_equal(result.nodes_xy[:4], points)
+    assert np.all(triangle_geometry(result.nodes_xy, result.triangles)["signed_area"] > 0.0)
+    assert result.report["constraint_integrity"]["all_protected_edges_present"] is True
 
 
 def test_fallback_bathy_prefers_depth_m() -> None:
@@ -293,6 +489,22 @@ def test_stage_guard_rejects_quality_tail_regression() -> None:
     assert reason == "rollback_quality_tail_regression"
 
 
+def test_2dm_writer_preserves_subnanodegree_orientation() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "precision.2dm"
+        nodes = np.asarray(
+            [
+                [-75.0, 39.0],
+                [-74.99999999996, 39.0],
+                [-75.0, 39.00000000004],
+            ]
+        )
+        write_2dm(path, nodes, np.ones(3), np.asarray([[1, 2, 3]]), np.empty(0, dtype=int))
+        serialized = read_2dm(path)
+        signed_area = triangle_geometry(serialized.nodes_lonlat, serialized.triangles - 1)["signed_area"]
+        assert signed_area[0] > 0.0
+
+
 def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -313,14 +525,17 @@ def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
             bathy_nc=bathy,
         )
         outputs = manifest["outputs"]
+        assert manifest["schema_version"] == "fvcom_grid_generation_manifest_v5"
         for key in (
             "fvcom_grid_2dm",
             "fvcom_grid_manifest",
             "mesh_quality_json",
+            "mesh_conditioning_json",
             "mesh_review_map",
             "size_field_nc",
             "size_field_png",
             "boundary_nodes_geojson",
+            "delivered_boundary_nodes_geojson",
             "mesh_nodes_elements_gpkg",
             "mesh_quality_elements_gpkg",
             "progress_json",
@@ -335,9 +550,35 @@ def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
         assert len(mesh.open_boundary_nodes) >= 2
         assert np.all(mesh.depths > 0)
         assert manifest["mesh"]["constraint_recovery"]["boundary_constraint_recovered"] is True
+        assert manifest["mesh"]["conditioning"]["stage_order"] == [
+            "spring-relax-v1",
+            "thin-repair-v1",
+            "area-transition-relax-v1",
+            "terminal-constraint-audit",
+        ]
+        assert manifest["mesh"]["conditioning"]["area_transition_relaxation"]["profile"] == "area-transition-relax-v1"
         assert manifest["postprocess"]["enabled"] is False
         assert manifest["settings"]["postprocess_profile"] == "none"
+        assert manifest["settings"]["area_transition_relaxation"] is True
         assert manifest["quality"]["constraint_integrity"]["all_protected_edges_present"] is True
+        assert manifest["quality"]["roundtrip"]["triangle_connectivity_match"] is True
+        assert manifest["quality"]["roundtrip"]["open_boundary_order_match"] is True
+        assert manifest["quality"]["roundtrip"]["coordinate_within_tolerance"] is True
+        roundtrip = manifest["quality"]["roundtrip"]
+        assert roundtrip["positive_signed_areas"] is (roundtrip["nonpositive_signed_area_count"] == 0)
+        if not roundtrip["positive_signed_areas"]:
+            assert "2dm_roundtrip_nonpositive_area" in manifest["failure_taxonomy"]
+            assert "2dm_roundtrip_failed" in manifest["failure_taxonomy"]
+            assert manifest["final_status"] == "needs_review"
+        delivered_boundary = json.loads(Path(outputs["delivered_boundary_nodes_geojson"]).read_text(encoding="utf-8"))
+        delivered_ids = {int(feature["properties"]["node_id_1based"]) for feature in delivered_boundary["features"]}
+        delivered_open_ids = {
+            int(feature["properties"]["node_id_1based"])
+            for feature in delivered_boundary["features"]
+            if feature["properties"]["is_open_boundary"]
+        }
+        assert len(delivered_ids) == manifest["mesh"]["boundary_node_count"]
+        assert delivered_open_ids == set(mesh.open_boundary_nodes.tolist())
         assert manifest["final_status"] in {"pass", "needs_review"}
 
 
@@ -379,6 +620,12 @@ def test_adaptive_resolution_workflow_and_quadtree_seed() -> None:
 def main() -> int:
     test_boundary_ingestion_and_densification()
     test_size_field_limiter_never_coarsens_fine_cells()
+    test_adaptive_offshore_sizing_ignores_unmasked_bathymetry_gradient()
+    test_regional_spring_relaxation_preserves_boundary_and_improves_quality()
+    test_area_transition_relaxation_is_eulerian_guarded_and_boundary_fixed()
+    test_area_transition_high_gradient_trigger_requires_normalized_excess()
+    test_thin_triangle_edge_flip_preserves_boundary()
+    test_thin_triangle_long_edge_split_and_local_relaxation()
     test_fallback_bathy_prefers_depth_m()
     test_elevation_m_only_is_positive_up()
     test_size_field_bathy_coarsening_caps_cells()
@@ -389,6 +636,7 @@ def main() -> int:
     test_high_valence_cleanup_never_changes_ring_boundary()
     test_projection_medium_profile_order_and_guard()
     test_stage_guard_rejects_quality_tail_regression()
+    test_2dm_writer_preserves_subnanodegree_orientation()
     test_full_synthetic_workflow_and_2dm_roundtrip()
     test_adaptive_resolution_workflow_and_quadtree_seed()
     print("fvcom-grid-generation selftests passed")

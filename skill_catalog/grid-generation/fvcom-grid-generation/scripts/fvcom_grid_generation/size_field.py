@@ -38,6 +38,8 @@ class SizeFieldConfig:
     target_timestep_s: str = "auto"
     cfl: float = 0.5
     adaptive_boundary: bool = False
+    bathymetry_gradient_policy: str = "auto"
+    coastal_gradient_distance_m: float = 25_000.0
 
 
 @dataclass(frozen=True)
@@ -49,6 +51,10 @@ class SizeField:
     depth: np.ndarray
     slope: np.ndarray
     report: dict[str, Any]
+    boundary_size: np.ndarray | None = None
+    slope_size: np.ndarray | None = None
+    bathymetry_gradient_mask: np.ndarray | None = None
+    coastal_distance_m: np.ndarray | None = None
 
     def sample(self, lon: np.ndarray, lat: np.ndarray) -> np.ndarray:
         interp = RegularGridInterpolator(
@@ -64,18 +70,37 @@ def build_size_field(bathy: BathymetryGrid, boundary: BoundaryNodes, config: Siz
     """Build a size field from bathymetry, boundary distance, and gradation."""
     depth = np.asarray(bathy.depth, dtype=float)
     slope = bathymetric_gradient(bathy)
+    adaptive_boundary = bool(config.adaptive_boundary or boundary.adaptive_resolution)
+    requested_gradient_policy, effective_gradient_policy = _resolve_bathymetry_gradient_policy(config, adaptive_boundary)
+    coastal_distance = coastal_boundary_distance(bathy, boundary)
+    coastal_threshold = float(config.coastal_gradient_distance_m)
+    if coastal_threshold < 0.0:
+        raise ValueError("coastal_gradient_distance_m must be non-negative")
+    coastal_mask = coastal_distance <= coastal_threshold
+
     raw = np.full(depth.shape, config.max_size_m, dtype=float)
-    if not config.adaptive_boundary:
+    if not adaptive_boundary:
         raw = np.where(depth <= config.shelf_depth_m, np.minimum(raw, config.shelf_max_size_m), raw)
         raw = np.where(depth <= config.nearshore_depth_m, np.minimum(raw, config.nearshore_max_size_m), raw)
 
     topo_length = depth / np.maximum(slope, config.min_gradient)
-    slope_size = (2.0 * np.pi / max(config.slope_elements, 1.0)) * topo_length
-    slope_size = np.where(depth > config.nearshore_depth_m, slope_size, np.inf)
-    raw = np.minimum(raw, slope_size)
+    slope_candidate = (2.0 * np.pi / max(config.slope_elements, 1.0)) * topo_length
+    depth_eligible = np.isfinite(depth) & (depth > config.nearshore_depth_m)
+    slope_size = np.where(depth_eligible, slope_candidate, np.nan)
+    if effective_gradient_policy == "global":
+        gradient_mask = depth_eligible
+    elif effective_gradient_policy == "coastal":
+        gradient_mask = depth_eligible & coastal_mask
+    else:
+        gradient_mask = np.zeros(depth.shape, dtype=bool)
 
-    shore_size = shoreline_distance_size(bathy, boundary, config)
-    raw = np.minimum(raw, shore_size)
+    boundary_size = shoreline_distance_size(bathy, boundary, config)
+    raw = np.minimum(raw, boundary_size)
+    pre_slope_size = raw.copy()
+    effective_slope_size = np.where(gradient_mask, slope_candidate, np.inf)
+    slope_limited = gradient_mask & np.isfinite(slope_candidate) & (slope_candidate < pre_slope_size)
+    offshore_slope_limited = slope_limited & ~coastal_mask
+    raw = np.minimum(raw, effective_slope_size)
 
     cfl_report = cfl_size_report(depth, raw, config)
     if cfl_report["mode"] == "enforced":
@@ -93,9 +118,62 @@ def build_size_field(bathy: BathymetryGrid, boundary: BoundaryNodes, config: Siz
         "max_size_m": float(np.nanmax(limited)),
         "land_spacing_m": float(config.land_spacing_m),
         "open_spacing_m": float(config.open_spacing_m),
-        "adaptive_boundary": bool(config.adaptive_boundary),
+        "adaptive_boundary": adaptive_boundary,
+        "bathymetry_gradient_policy_requested": requested_gradient_policy,
+        "bathymetry_gradient_policy_effective": effective_gradient_policy,
+        "bathymetry_gradient": {
+            "requested_policy": requested_gradient_policy,
+            "effective_policy": effective_gradient_policy,
+            "coastal_gradient_distance_m": coastal_threshold,
+            "eligible_depth_cell_count": int(np.count_nonzero(depth_eligible)),
+            "active_cell_count": int(np.count_nonzero(gradient_mask)),
+            "active_cell_fraction": float(np.count_nonzero(gradient_mask) / max(np.count_nonzero(np.isfinite(depth)), 1)),
+            "coastal_cell_count": int(np.count_nonzero(coastal_mask & np.isfinite(depth))),
+            "coastal_cell_fraction": float(np.count_nonzero(coastal_mask & np.isfinite(depth)) / max(np.count_nonzero(np.isfinite(depth)), 1)),
+            "slope_limited_count": int(np.count_nonzero(slope_limited)),
+            "offshore_slope_limited_count": int(np.count_nonzero(offshore_slope_limited)),
+            "land_island_boundary_node_count": int(
+                sum(str(kind).lower() not in {"open", "open_boundary"} for kind in boundary.kinds)
+            ),
+        },
     }
-    return SizeField(lon=bathy.lon, lat=bathy.lat, size=limited, raw_size=raw, depth=depth, slope=slope, report=report)
+    return SizeField(
+        lon=bathy.lon,
+        lat=bathy.lat,
+        size=limited,
+        raw_size=raw,
+        depth=depth,
+        slope=slope,
+        report=report,
+        boundary_size=boundary_size,
+        slope_size=slope_size,
+        bathymetry_gradient_mask=gradient_mask,
+        coastal_distance_m=coastal_distance,
+    )
+
+
+def _resolve_bathymetry_gradient_policy(config: SizeFieldConfig, adaptive_boundary: bool) -> tuple[str, str]:
+    requested = str(config.bathymetry_gradient_policy).strip().lower()
+    allowed = {"auto", "global", "coastal", "off"}
+    if requested not in allowed:
+        raise ValueError(f"bathymetry_gradient_policy must be one of {sorted(allowed)}")
+    effective = "coastal" if requested == "auto" and adaptive_boundary else "global" if requested == "auto" else requested
+    return requested, effective
+
+
+def coastal_boundary_distance(bathy: BathymetryGrid, boundary: BoundaryNodes) -> np.ndarray:
+    """Return projected distance to the nearest fixed land or island boundary node."""
+    lon2, lat2 = np.meshgrid(bathy.lon, bathy.lat)
+    solid_points = np.asarray(
+        [point for point, kind in zip(boundary.xy, boundary.kinds) if str(kind).lower() not in {"open", "open_boundary"}],
+        dtype=float,
+    )
+    if solid_points.size == 0:
+        return np.full(lon2.shape, np.inf, dtype=float)
+    lonlat = np.column_stack([lon2.ravel(), lat2.ravel()])
+    xy = project_points(lonlat, boundary.projection)
+    distance = cKDTree(solid_points).query(xy, workers=-1)[0]
+    return np.asarray(distance, dtype=float).reshape(lon2.shape)
 
 
 def shoreline_distance_size(bathy: BathymetryGrid, boundary: BoundaryNodes, config: SizeFieldConfig) -> np.ndarray:
@@ -213,13 +291,22 @@ def write_size_field(size_field: SizeField, nc_path: str | Path, png_path: str |
     nc_path = Path(nc_path)
     png_path = Path(png_path)
     nc_path.parent.mkdir(parents=True, exist_ok=True)
+    variables: dict[str, Any] = {
+        "mesh_size_m": (("lat", "lon"), size_field.size),
+        "raw_mesh_size_m": (("lat", "lon"), size_field.raw_size),
+        "depth_m": (("lat", "lon"), size_field.depth),
+        "slope": (("lat", "lon"), size_field.slope),
+    }
+    if size_field.boundary_size is not None:
+        variables["boundary_mesh_size_m"] = (("lat", "lon"), size_field.boundary_size)
+    if size_field.slope_size is not None:
+        variables["bathymetry_slope_mesh_size_m"] = (("lat", "lon"), size_field.slope_size)
+    if size_field.bathymetry_gradient_mask is not None:
+        variables["bathymetry_gradient_mask"] = (("lat", "lon"), np.asarray(size_field.bathymetry_gradient_mask, dtype=np.uint8))
+    if size_field.coastal_distance_m is not None:
+        variables["coastal_distance_m"] = (("lat", "lon"), size_field.coastal_distance_m)
     ds = xr.Dataset(
-        {
-            "mesh_size_m": (("lat", "lon"), size_field.size),
-            "raw_mesh_size_m": (("lat", "lon"), size_field.raw_size),
-            "depth_m": (("lat", "lon"), size_field.depth),
-            "slope": (("lat", "lon"), size_field.slope),
-        },
+        variables,
         coords={"lon": size_field.lon, "lat": size_field.lat},
         attrs={"schema_version": "fvcom_size_field_v1"},
     )
