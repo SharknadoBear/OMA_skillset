@@ -65,6 +65,11 @@ class GridConfig:
     area_transition_max_patches: int = 12
     area_transition_area_change_threshold: float = 0.50
     area_transition_target_gradient_threshold: float = 0.10
+    conditioning_profile: str = "auto"
+    aggressive_conditioning_rounds: int = 4
+    aggressive_boundary_edit_policy: str = "kind-aware-envelope"
+    aggressive_max_prunes_per_round: int = 500
+    aggressive_max_valence_repairs_per_round: int = 500
     postprocess_profile: str = "none"
     postprocess_boundary_policy: str = "protect-all"
     postprocess_max_passes: int = 8
@@ -91,6 +96,8 @@ def run_fvcom_grid(
         raise ValueError("boundary_resolution_profile must be legacy or adaptive-coastal-v1")
     if config.bathymetry_gradient_policy not in {"auto", "global", "coastal", "off"}:
         raise ValueError("bathymetry_gradient_policy must be auto, global, coastal, or off")
+    if config.conditioning_profile not in {"auto", "guarded-v1", "aggressive-local-v2", "none"}:
+        raise ValueError("conditioning_profile must be auto, guarded-v1, aggressive-local-v2, or none")
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     progress = ProgressTracker(run_dir=run_dir, name=name, interval_s=float(config.progress_interval_s))
@@ -179,6 +186,11 @@ def run_fvcom_grid(
         area_transition_max_patches=int(config.area_transition_max_patches),
         area_transition_area_change_threshold=float(config.area_transition_area_change_threshold),
         area_transition_target_gradient_threshold=float(config.area_transition_target_gradient_threshold),
+        conditioning_profile=str(config.conditioning_profile),
+        aggressive_conditioning_rounds=int(config.aggressive_conditioning_rounds),
+        aggressive_boundary_edit_policy=str(config.aggressive_boundary_edit_policy),
+        aggressive_max_prunes_per_round=int(config.aggressive_max_prunes_per_round),
+        aggressive_max_valence_repairs_per_round=int(config.aggressive_max_valence_repairs_per_round),
     )
     def _mesh_progress(message: str, fraction: float, extra: dict[str, Any] | None = None) -> None:
         progress.update(
@@ -191,6 +203,11 @@ def run_fvcom_grid(
     mesh = generate_mesh(boundary_nodes, size_field, mesh_config, progress_callback=_mesh_progress)
     conditioning_json = run_dir / "mesh_conditioning.json"
     conditioning_json.write_text(json.dumps(_json_safe(mesh.report.get("conditioning", {})), indent=2), encoding="utf-8")
+    edit_ledger_json = run_dir / "mesh_edit_ledger.json"
+    edit_ledger_json.write_text(
+        json.dumps(_json_safe(mesh.report.get("conditioning", {}).get("mesh_edit_ledger", [])), indent=2),
+        encoding="utf-8",
+    )
     delivered_boundary_nodes_path = run_dir / "delivered_boundary_nodes.geojson"
     delivered_boundary_nodes_path.write_text(
         json.dumps(
@@ -198,6 +215,10 @@ def run_fvcom_grid(
                 mesh.nodes_lonlat,
                 mesh.constraint_chains,
                 mesh.open_boundary_nodes,
+                boundary_kinds=mesh.boundary_kinds,
+                hard_anchor_mask=mesh.hard_anchor_mask,
+                node_lineage=mesh.node_lineage,
+                target_spacing_m=mesh.target_spacing_m,
             ),
             indent=2,
         ),
@@ -324,7 +345,7 @@ def run_fvcom_grid(
     )
     final_status = "pass" if quality.get("accepted") else "needs_review"
     manifest = {
-        "schema_version": "fvcom_grid_generation_manifest_v5",
+        "schema_version": "fvcom_grid_generation_manifest_v6",
         "name": name,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "created_by": "fvcom-grid-generation run_fvcom_grid.py",
@@ -356,6 +377,12 @@ def run_fvcom_grid(
             "area_transition_max_patches": int(config.area_transition_max_patches),
             "area_transition_area_change_threshold": float(config.area_transition_area_change_threshold),
             "area_transition_target_gradient_threshold": float(config.area_transition_target_gradient_threshold),
+            "conditioning_profile_requested": str(config.conditioning_profile),
+            "conditioning_profile_effective": str(mesh.report.get("conditioning", {}).get("profile", "guarded-v1")),
+            "aggressive_conditioning_rounds": int(config.aggressive_conditioning_rounds),
+            "aggressive_boundary_edit_policy": str(config.aggressive_boundary_edit_policy),
+            "aggressive_max_prunes_per_round": int(config.aggressive_max_prunes_per_round),
+            "aggressive_max_valence_repairs_per_round": int(config.aggressive_max_valence_repairs_per_round),
             "postprocess_profile": "none",
         },
         "inputs": {
@@ -393,6 +420,7 @@ def run_fvcom_grid(
             "fvcom_grid_manifest": str(run_dir / "fvcom_grid_manifest.json"),
             "mesh_quality_json": str(quality_json),
             "mesh_conditioning_json": str(conditioning_json),
+            "mesh_edit_ledger_json": str(edit_ledger_json),
             "mesh_review_map": str(review_map),
             "size_field_nc": str(size_nc),
             "size_field_png": str(size_png),
@@ -799,10 +827,19 @@ def _postclean_boundary_nodes_geojson(
     nodes_lonlat: np.ndarray,
     constraint_chains: list[list[int]],
     open_boundary_nodes_1based: np.ndarray,
+    *,
+    boundary_kinds: list[str] | None = None,
+    hard_anchor_mask: np.ndarray | None = None,
+    node_lineage: np.ndarray | None = None,
+    target_spacing_m: np.ndarray | None = None,
 ) -> dict[str, Any]:
     open_set = set((np.asarray(open_boundary_nodes_1based, dtype=int) - 1).tolist())
     features: list[dict[str, Any]] = []
     seen: set[int] = set()
+    kinds = list(boundary_kinds or ["boundary"] * len(nodes_lonlat))
+    hard = np.asarray(hard_anchor_mask if hard_anchor_mask is not None else np.zeros(len(nodes_lonlat), dtype=bool), dtype=bool)
+    lineage = np.asarray(node_lineage if node_lineage is not None else np.arange(len(nodes_lonlat), dtype=int), dtype=int)
+    targets = np.asarray(target_spacing_m if target_spacing_m is not None else np.full(len(nodes_lonlat), np.nan), dtype=float)
     for chain_id, chain in enumerate(constraint_chains):
         for position, node in enumerate(chain):
             if int(node) in seen:
@@ -818,6 +855,11 @@ def _postclean_boundary_nodes_geojson(
                         "constraint_chain_id": int(chain_id),
                         "constraint_chain_position": int(position),
                         "is_open_boundary": bool(int(node) in open_set),
+                        "boundary_kind": str(kinds[int(node)]),
+                        "is_hard_anchor": bool(hard[int(node)]),
+                        "source_node_index_zero_based": int(lineage[int(node)]) if lineage[int(node)] >= 0 else None,
+                        "is_inserted_by_conditioning": bool(lineage[int(node)] < 0),
+                        "target_spacing_m": float(targets[int(node)]) if np.isfinite(targets[int(node)]) else None,
                     },
                     "geometry": {"type": "Point", "coordinates": [float(lon), float(lat)]},
                 }

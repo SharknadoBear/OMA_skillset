@@ -77,6 +77,20 @@ def main() -> int:
     parser.add_argument("--area-transition-area-change-threshold", type=float, default=0.50)
     parser.add_argument("--area-transition-target-gradient-threshold", type=float, default=0.10)
     parser.add_argument(
+        "--conditioning-profile",
+        choices=("auto", "guarded-v1", "aggressive-local-v2", "none"),
+        default="auto",
+        help="Auto selects aggressive-local-v2 for adaptive boundary packages and guarded-v1 for legacy grids.",
+    )
+    parser.add_argument("--aggressive-conditioning-rounds", type=int, default=4)
+    parser.add_argument(
+        "--aggressive-boundary-edit-policy",
+        choices=("kind-aware-envelope", "split-only", "none"),
+        default="kind-aware-envelope",
+    )
+    parser.add_argument("--aggressive-max-prunes-per-round", type=int, default=500)
+    parser.add_argument("--aggressive-max-valence-repairs-per-round", type=int, default=500)
+    parser.add_argument(
         "--postprocess-profile",
         choices=("none", "rpw2019", "projection-medium"),
         default="none",
@@ -135,6 +149,11 @@ def main() -> int:
             area_transition_max_patches=args.area_transition_max_patches,
             area_transition_area_change_threshold=args.area_transition_area_change_threshold,
             area_transition_target_gradient_threshold=args.area_transition_target_gradient_threshold,
+            conditioning_profile=args.conditioning_profile,
+            aggressive_conditioning_rounds=args.aggressive_conditioning_rounds,
+            aggressive_boundary_edit_policy=args.aggressive_boundary_edit_policy,
+            aggressive_max_prunes_per_round=args.aggressive_max_prunes_per_round,
+            aggressive_max_valence_repairs_per_round=args.aggressive_max_valence_repairs_per_round,
             postprocess_profile=args.postprocess_profile,
             postprocess_boundary_policy=args.postprocess_boundary_policy,
             postprocess_max_passes=args.postprocess_max_passes,

@@ -10,10 +10,10 @@ Use this note when changing `.2dm`, OBC nodestring, depth, constraint, or accept
 - Write one ordered `NS` nodestring unless upstream metadata explicitly defines no ocean boundary.
 - Require every consecutive OBC node pair to be an actual mesh boundary edge.
 - Preserve every constraint selected by the postprocessing boundary policy.
-- Keep every pre-existing land, island, frame, and open-boundary coordinate bitwise fixed in projected working space during generation-time conditioning.
+- Keep every pre-existing land, island, frame, and open-boundary coordinate bitwise fixed during guarded-v1 conditioning. Under the explicit `aggressive-local-v2` protocol, keep all hard anchors fixed and require exact coordinates for every surviving original boundary node; only recorded kind-aware split/removal transactions may change boundary discretization.
 - Verify the serialized 2DM roundtrip preserves connectivity and OBC order, keeps coordinate shifts below `0.01 m`, and retains strictly positive projected signed area for every triangle.
 - Write `delivered_boundary_nodes.geojson` from the terminal constraint chains so recovery nodes are represented explicitly.
-- Permit topology edits only on local cavities; never rebuild the full Delaunay triangulation during spring relaxation or thin-triangle repair.
+- Permit topology edits only on local cavities; never rebuild the full Delaunay triangulation during spring relaxation, thin repair, pruning, or valence repair.
 
 ## Default Gates
 
@@ -35,7 +35,9 @@ Adaptive size fields use OBC/boundary target propagation as the offshore control
 
 - `spring-relax-v1` keeps connectivity fixed and moves only nonboundary nodes in defect-selected patches and graph halos.
 - `thin-repair-v1` may flip an unprotected interior edge or split a long unprotected interior edge, then invoke regional spring relaxation.
+- `aggressive-local-v2` runs target-redundant degree-3/4 pruning, superthin-pair midpoint collapse or kind-aware boundary repair, hard valence repair, and two-ring micro-relaxation before area-transition conditioning. See `local_topology_conditioning.md`.
 - `area-transition-relax-v1` re-samples the Eulerian target field and processes excessive adjacent-area pairs sequentially after thin repair. Use raw area change `|A1-A2|/max(A1,A2) > 0.50`, or require target gradient, raw change, and normalized `log(A/A*)` mismatch together for a preemptive trigger.
-- Reject and restore a stage if any signed area becomes nonpositive, a protected/OBC edge is lost, a new nonmanifold edge/component appears, an original boundary coordinate moves, or controlled global quality tails regress.
+- Reject and restore a stage if any signed area becomes nonpositive, a protected/OBC edge is lost, a new nonmanifold edge/component appears, an unedited original boundary coordinate or hard anchor moves, or controlled global quality tails regress.
 - Compare every area-transition patch to the whole-stage baseline for `L/h` maximum, p95, and count above 1.55, permitting at most the explicit 0.1% numerical tolerance on maximum/p95; cap total movement at `0.25h` and retain target-normalized area-jump diagnostics.
 - Record unresolved boundary-imposed defects and retain the mesh as `needs_review`; never alter the boundary to manufacture acceptance.
+- Treat any remaining unique-neighbor valence above eight as a hard FVCOM readiness failure, even when the mesh remains serializable and all other structural invariants pass.

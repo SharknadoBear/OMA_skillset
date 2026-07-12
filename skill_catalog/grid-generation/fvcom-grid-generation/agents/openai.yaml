@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM Grid Generation"
-  short_description: "Generate target-aware adaptive FVCOM meshes"
-  default_prompt: "Use $fvcom-grid-generation to generate and condition an FVCOM 2DM mesh with offshore-efficient sizing, target-aware area transitions, and boundary-preserving quality repair."
+  short_description: "Generate and condition adaptive FVCOM meshes"
+  default_prompt: "Use $fvcom-grid-generation to generate and condition an FVCOM 2DM mesh with offshore-efficient sizing, regional spring relaxation, aggressive local topology repair, and a hard valence-eight gate."

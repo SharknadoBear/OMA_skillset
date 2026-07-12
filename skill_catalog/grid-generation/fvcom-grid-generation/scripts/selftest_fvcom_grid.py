@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fvcom_grid_generation.bathymetry import BathymetryGrid, coarsen_for_size_field, write_synthetic_bathymetry  # noqa: E402
 from fvcom_grid_generation.boundary import BoundaryConfig, load_boundary_package, load_boundary_resolution, prepare_boundary_nodes  # noqa: E402
 from fvcom_grid_generation.mesh import _ordered_boundary_kind_group  # noqa: E402
+from fvcom_grid_generation.local_topology import AggressiveConditioningConfig, condition_mesh_aggressive, inventory_high_valence  # noqa: E402
 from fvcom_grid_generation.metrics import compute_mesh_metrics, triangle_geometry  # noqa: E402
 from fvcom_grid_generation.postprocess import PostprocessConfig, _stage_acceptance, postprocess_mesh  # noqa: E402
 from fvcom_grid_generation.regional_conditioning import (  # noqa: E402
@@ -505,6 +506,61 @@ def test_2dm_writer_preserves_subnanodegree_orientation() -> None:
         assert signed_area[0] > 0.0
 
 
+def test_aggressive_degree_three_pruning_is_target_guarded() -> None:
+    points = np.asarray([[0.0, 0.0], [2.0, 0.0], [0.0, 2.0], [0.6, 0.6]])
+    triangles = np.asarray([[0, 1, 3], [1, 2, 3], [2, 0, 3]], dtype=int)
+    result = condition_mesh_aggressive(
+        points,
+        triangles,
+        np.asarray([True, True, True, False]),
+        [[0, 1, 2]],
+        np.asarray([0, 1]),
+        target_spacing_m=np.full(4, 3.0),
+        boundary_kinds=["land", "open", "land", "interior"],
+        hard_anchor_mask=np.asarray([True, True, True, False]),
+        config=AggressiveConditioningConfig(max_rounds=1, micro_relax_cycles=0),
+    )
+    assert result.report["edit_counts"]["degree-3-vertex-prune"] == 1
+    assert len(result.nodes_xy) == 3
+    assert len(result.triangles) == 1
+    assert result.report["invariants"]["all_protected_edges_present"] is True
+
+
+def test_aggressive_valence_repair_uses_distributed_steiner_nodes() -> None:
+    count = 9
+    angles = np.linspace(0.0, 2.0 * np.pi, count, endpoint=False)
+    ring = np.column_stack((np.cos(angles), np.sin(angles)))
+    points = np.vstack([ring, np.asarray([[0.0, 0.0]])])
+    triangles = np.asarray([[count, index, (index + 1) % count] for index in range(count)], dtype=int)
+    inventory = inventory_high_valence(
+        points,
+        triangles,
+        fixed_node_mask=np.asarray([True] * count + [False]),
+        boundary_kinds=["land"] * count + ["interior"],
+        max_valence=8,
+    )
+    assert inventory["violation_count"] == 1
+    assert inventory["records"][0]["repair_route_hint"] == "interior_cavity"
+    result = condition_mesh_aggressive(
+        points,
+        triangles,
+        np.asarray([True] * count + [False]),
+        [list(range(count))],
+        np.asarray([0, 1]),
+        target_spacing_m=np.full(count + 1, 1.5),
+        boundary_kinds=["land"] * count + ["interior"],
+        hard_anchor_mask=np.asarray([True] * count + [False]),
+        config=AggressiveConditioningConfig(max_rounds=2, max_prunes_per_round=0, micro_relax_cycles=0),
+    )
+    assert result.report["fvcom_valence_gate_passed"] is True
+    assert result.report["after"]["maximum_valence"] <= 8
+    assert result.report["edit_counts"]["high-valence-cavity-remove"] == 1
+    assert count < len(result.nodes_xy) <= count + 8
+    assert np.all(triangle_geometry(result.nodes_xy, result.triangles)["signed_area"] > 0.0)
+    final_inventory = inventory_high_valence(result.nodes_xy, result.triangles, max_valence=8)
+    assert final_inventory["violation_count"] == 0
+
+
 def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -525,12 +581,13 @@ def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
             bathy_nc=bathy,
         )
         outputs = manifest["outputs"]
-        assert manifest["schema_version"] == "fvcom_grid_generation_manifest_v5"
+        assert manifest["schema_version"] == "fvcom_grid_generation_manifest_v6"
         for key in (
             "fvcom_grid_2dm",
             "fvcom_grid_manifest",
             "mesh_quality_json",
             "mesh_conditioning_json",
+            "mesh_edit_ledger_json",
             "mesh_review_map",
             "size_field_nc",
             "size_field_png",
@@ -553,6 +610,7 @@ def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
         assert manifest["mesh"]["conditioning"]["stage_order"] == [
             "spring-relax-v1",
             "thin-repair-v1",
+            "aggressive-local-disabled",
             "area-transition-relax-v1",
             "terminal-constraint-audit",
         ]
@@ -637,6 +695,8 @@ def main() -> int:
     test_projection_medium_profile_order_and_guard()
     test_stage_guard_rejects_quality_tail_regression()
     test_2dm_writer_preserves_subnanodegree_orientation()
+    test_aggressive_degree_three_pruning_is_target_guarded()
+    test_aggressive_valence_repair_uses_distributed_steiner_nodes()
     test_full_synthetic_workflow_and_2dm_roundtrip()
     test_adaptive_resolution_workflow_and_quadtree_seed()
     print("fvcom-grid-generation selftests passed")

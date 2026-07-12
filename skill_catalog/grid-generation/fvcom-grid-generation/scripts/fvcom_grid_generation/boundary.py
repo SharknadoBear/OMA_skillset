@@ -47,6 +47,7 @@ class BoundaryNodes:
     land_boundary_xy: LineString | MultiLineString
     island_polygons_xy: list[Polygon]
     projection: LocalProjection
+    hard_anchor_mask: np.ndarray | None = None
     adaptive_resolution: bool = False
     source_resolution_manifest: str | None = None
 
@@ -159,6 +160,7 @@ def prepare_boundary_nodes(package: BoundaryPackage, config: BoundaryConfig) -> 
         land_boundary_xy=land_xy,
         island_polygons_xy=islands_xy,
         projection=projection,
+        hard_anchor_mask=_boundary_hard_anchor_mask(kinds, constraint_chains),
     )
 
 
@@ -198,6 +200,11 @@ def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage
     xy = project_points(lonlat, projection)
     kinds = [str(value) for value in nodes_gdf["boundary_kind"]]
     targets = np.asarray(nodes_gdf["target_spacing_m"], dtype=float)
+    hard_anchors = (
+        np.asarray(nodes_gdf["is_hard_anchor"], dtype=bool)
+        if "is_hard_anchor" in nodes_gdf
+        else np.zeros(len(nodes_gdf), dtype=bool)
+    )
     chains: list[list[int]] = []
     for _, group in nodes_gdf.groupby("chain_id", sort=True):
         chains.append([int(value) for value in group.index])
@@ -218,6 +225,7 @@ def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage
         land_boundary_xy=LineString(domain_xy.exterior.coords),
         island_polygons_xy=islands_xy,
         projection=projection,
+        hard_anchor_mask=hard_anchors,
         adaptive_resolution=True,
         source_resolution_manifest=str(manifest_path),
     )
@@ -228,6 +236,7 @@ def boundary_nodes_geojson(nodes: BoundaryNodes) -> dict[str, Any]:
     """Return a GeoJSON FeatureCollection for boundary nodes."""
     features = []
     open_set = set(nodes.open_boundary_indices)
+    hard = np.asarray(nodes.hard_anchor_mask if nodes.hard_anchor_mask is not None else np.zeros(len(nodes.lonlat), dtype=bool), dtype=bool)
     for idx, ((lon, lat), kind) in enumerate(zip(nodes.lonlat, nodes.kinds)):
         features.append(
             {
@@ -237,11 +246,24 @@ def boundary_nodes_geojson(nodes: BoundaryNodes) -> dict[str, Any]:
                     "boundary_kind": kind,
                     "target_spacing_m": float(nodes.target_spacing_m[idx]),
                     "is_open_boundary": bool(idx in open_set),
+                    "is_hard_anchor": bool(hard[idx]),
                 },
                 "geometry": {"type": "Point", "coordinates": [float(lon), float(lat)]},
             }
         )
     return {"type": "FeatureCollection", "features": features}
+
+
+def _boundary_hard_anchor_mask(kinds: list[str], chains: list[list[int]]) -> np.ndarray:
+    hard = np.zeros(len(kinds), dtype=bool)
+    if not chains:
+        return hard
+    exterior = chains[0]
+    for position, node in enumerate(exterior):
+        previous = exterior[position - 1]
+        following = exterior[(position + 1) % len(exterior)]
+        hard[int(node)] = bool(kinds[int(previous)] != kinds[int(node)] or kinds[int(following)] != kinds[int(node)])
+    return hard
 
 
 def _sample_segment(seg: LineString, spacing: float, include_end: bool) -> list[tuple[float, float]]:
