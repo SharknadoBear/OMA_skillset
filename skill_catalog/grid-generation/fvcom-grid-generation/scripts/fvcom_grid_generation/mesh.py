@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 import numpy as np
 from scipy.spatial import Delaunay, cKDTree
+from shapely import contains_xy
 from shapely.geometry import Point
 
 from .boundary import BoundaryNodes
@@ -21,7 +22,7 @@ from .regional_conditioning import (
     relax_mesh_spring,
     repair_thin_triangles,
 )
-from .size_field import SizeField
+from .size_field import SizeField, boundary_front_seed_points
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class MeshConfig:
     size_overrun_factor: float = 1.55
     min_angle_refine_deg: float = 24.0
     adaptive_seed: bool = False
+    boundary_front_seeding: bool = True
     regional_spring_relaxation: bool = True
     spring_relax_iterations: int = 20
     spring_relax_quality_threshold: float = 0.40
@@ -314,6 +316,7 @@ def generate_mesh(
             target_spacing_m=conditioning_targets,
             boundary_kinds=kinds,
             hard_anchor_mask=np.asarray(hard_anchors, dtype=bool),
+            target_spacing_sampler=_sample_conditioning_targets,
             config=AggressiveConditioningConfig(
                 enabled=True,
                 max_rounds=int(config.aggressive_conditioning_rounds),
@@ -564,6 +567,22 @@ def _adaptive_quadtree_seed_points(boundary: BoundaryNodes, size_field: SizeFiel
             ],
             dtype=float,
         )
+        # The root quadtree is the square bounding the projected domain, so
+        # its center/corner probes can lie well outside the model polygon.
+        # Adaptive-v2 coverage is intentionally strict; never ask the size
+        # field to extrapolate for those irrelevant probes.  Retain probes
+        # that are actually inside the domain and use a representative point
+        # of the cell/domain overlap when the regular probes all miss a thin
+        # intersection.
+        inside = np.asarray(contains_xy(domain, sample_xy[:, 0], sample_xy[:, 1]), dtype=bool)
+        if np.any(inside):
+            sample_xy = sample_xy[inside]
+        else:
+            overlap = domain.intersection(cell)
+            if overlap.is_empty:
+                continue
+            representative = overlap.representative_point()
+            sample_xy = np.asarray([[representative.x, representative.y]], dtype=float)
         lonlat = unproject_points(sample_xy, boundary.projection)
         targets = size_field.sample(lonlat[:, 0], lonlat[:, 1])
         target = max(10.0, float(np.nanmin(targets)))
@@ -578,14 +597,33 @@ def _adaptive_quadtree_seed_points(boundary: BoundaryNodes, size_field: SizeFiel
         if len(leaves) > int(config.max_interior_points) * 3:
             raise ValueError("Adaptive quadtree seed estimate exceeds --max-interior-points")
     boundary_tree = cKDTree(boundary.xy) if len(boundary.xy) else None
-    accepted: list[tuple[float, float]] = []
+    front = np.empty((0, 2), dtype=float)
+    if bool(config.boundary_front_seeding) and str(getattr(boundary, "resolution_profile", "")) == "adaptive-coastal-v2":
+        front, _ = boundary_front_seed_points(boundary)
+    accepted: list[tuple[float, float]] = [tuple(map(float, value)) for value in np.asarray(front, dtype=float)]
+    accepted_tree = cKDTree(np.asarray(accepted, dtype=float)) if accepted else None
     for x, y, target in sorted(leaves, key=lambda item: (item[1], item[0])):
         point = Point(float(x), float(y))
         if not domain.contains(point):
             continue
-        if boundary_tree is not None and float(boundary_tree.query([x, y])[0]) < 0.35 * target:
+        boundary_distance = float(domain.boundary.distance(point))
+        nearest_boundary_target = target
+        if boundary_tree is not None:
+            _, nearest_boundary = boundary_tree.query([x, y])
+            nearest_boundary_target = float(boundary.target_spacing_m[int(nearest_boundary)])
+        if boundary_distance < 0.20 * min(float(target), nearest_boundary_target):
             continue
+        if accepted_tree is not None and float(accepted_tree.query([x, y])[0]) < 0.35 * min(float(target), nearest_boundary_target):
+            continue
+        if accepted:
+            recent = np.asarray(accepted[-512:], dtype=float)
+            if float(np.min(np.linalg.norm(recent - np.asarray([x, y]), axis=1))) < 0.35 * min(
+                float(target), nearest_boundary_target
+            ):
+                continue
         accepted.append((float(x), float(y)))
+        if len(accepted) % 512 == 0:
+            accepted_tree = cKDTree(np.asarray(accepted, dtype=float))
         if len(accepted) > int(config.max_interior_points):
             raise ValueError("Adaptive quadtree seeds exceed --max-interior-points; raise the cap or coarsen the profile")
     return np.asarray(accepted, dtype=float)

@@ -12,6 +12,7 @@ from .metrics import compute_mesh_metrics
 
 @dataclass(frozen=True)
 class QualityThresholds:
+    min_q_l3_sigma: float = 0.75
     min_angle_deg: float = 30.0
     max_angle_deg: float = 130.0
     max_bathy_slope: float = 0.1
@@ -47,11 +48,19 @@ def evaluate_mesh_quality(
     max_slope = float(metrics["max_bathymetric_slope"] or 0.0)
     max_area_change = float(metrics["max_adjacent_area_change"])
     max_valence = int(metrics["valence"]["max_node_valence"])
+    q_l3_sigma = float(metrics["oceanmesh_quality"].get("q_l3_sigma", float("-inf")))
     topology = metrics["topology"]
     integrity = metrics["constraint_integrity"]
     depth_report = metrics["depths"]
 
     failures: list[str] = []
+    if (
+        int(metrics["oceanmesh_quality"].get("count_q_below_0_10", 0)) > 0
+        or int(metrics["angles"].get("count_min_angle_below_5", 0)) > 0
+    ):
+        failures.append("superthin_elements_present")
+    if not np.isfinite(q_l3_sigma) or q_l3_sigma <= float(thresholds.min_q_l3_sigma):
+        failures.append("q_l3_sigma_below_threshold")
     if min_angle < thresholds.min_angle_deg:
         failures.append("min_angle_below_threshold")
     if max_angle > thresholds.max_angle_deg:

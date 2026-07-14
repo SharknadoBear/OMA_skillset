@@ -4,17 +4,20 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from itertools import combinations
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
 from .metrics import build_edge_topology, chain_edges, constraint_integrity, triangle_geometry
-from .regional_conditioning import SpringRelaxConfig, relax_mesh_spring
+from .regional_conditioning import SpringRelaxConfig, _edge_flip_candidate, relax_mesh_spring
 
 
 @dataclass(frozen=True)
 class AggressiveConditioningConfig:
     enabled: bool = True
+    enable_pruning: bool = True
+    enable_thin_repair: bool = True
+    enable_valence_repair: bool = True
     max_rounds: int = 4
     quality_threshold: float = 0.25
     min_angle_deg: float = 20.0
@@ -23,6 +26,17 @@ class AggressiveConditioningConfig:
     collapse_l_over_h: float = 0.50
     max_collapses_per_round: int = 100
     max_boundary_edits_per_round: int = 25
+    max_superthin_flips_per_round: int = 100
+    max_boundary_welds_per_round: int = 25
+    max_boundary_ear_removals_per_round: int = 25
+    boundary_weld_max_distance_fraction: float = 0.50
+    boundary_weld_max_altitude_to_arc_fraction: float = 0.20
+    boundary_weld_land_max_distance_m: float = 5.0
+    boundary_weld_open_max_distance_m: float = 250.0
+    boundary_weld_anchor_buffer_segments: int = 1
+    boundary_weld_junction_buffer_segments: int = 2
+    boundary_weld_channel_clearance_fraction: float = 1.50
+    boundary_weld_forbidden_kind_tokens: tuple[str, ...] = ("channel", "junction", "landfall")
     max_prunes_per_round: int = 500
     prune_l_over_h: float = 1.25
     prune_min_quality: float = 0.40
@@ -73,6 +87,15 @@ class _State:
     kinds: list[str]
     hard: np.ndarray
     lineage: np.ndarray
+    source_points: np.ndarray
+    source_chains: list[list[int]]
+    source_hard_anchor_lineage: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=int))
+    target_sampler: Callable[[np.ndarray], np.ndarray] | None = None
+    initial_domain_area_m2: float = 0.0
+    initial_boundary_component_count: int = 0
+    initial_boundary_degree_anomaly_count: int = 0
+    initial_singly_connected_triangle_count: int = 0
+    initial_protected_not_boundary_count: int = 0
     ledger: list[dict[str, Any]] = field(default_factory=list)
     cumulative_boundary_area_change_m2: float = 0.0
     last_affected: list[int] = field(default_factory=list)
@@ -88,6 +111,15 @@ class _State:
             kinds=self.kinds.copy(),
             hard=self.hard.copy(),
             lineage=self.lineage.copy(),
+            source_points=self.source_points.copy(),
+            source_chains=[chain.copy() for chain in self.source_chains],
+            source_hard_anchor_lineage=self.source_hard_anchor_lineage.copy(),
+            target_sampler=self.target_sampler,
+            initial_domain_area_m2=float(self.initial_domain_area_m2),
+            initial_boundary_component_count=int(self.initial_boundary_component_count),
+            initial_boundary_degree_anomaly_count=int(self.initial_boundary_degree_anomaly_count),
+            initial_singly_connected_triangle_count=int(self.initial_singly_connected_triangle_count),
+            initial_protected_not_boundary_count=int(self.initial_protected_not_boundary_count),
             ledger=[entry.copy() for entry in self.ledger],
             cumulative_boundary_area_change_m2=float(self.cumulative_boundary_area_change_m2),
             last_affected=self.last_affected.copy(),
@@ -104,6 +136,7 @@ def condition_mesh_aggressive(
     target_spacing_m: np.ndarray,
     boundary_kinds: list[str] | None = None,
     hard_anchor_mask: np.ndarray | None = None,
+    target_spacing_sampler: Callable[[np.ndarray], np.ndarray] | None = None,
     config: AggressiveConditioningConfig | None = None,
 ) -> LocalTopologyResult:
     """Apply target-aware pruning, aggressive thin repair, and hard valence repair."""
@@ -115,19 +148,41 @@ def condition_mesh_aggressive(
     kinds = list(boundary_kinds or ["interior"] * len(points))
     if len(kinds) < len(points):
         kinds.extend(["interior"] * (len(points) - len(kinds)))
+    elif len(kinds) > len(points):
+        # ``kinds`` is descriptive metadata rather than mesh geometry.  A
+        # previously rolled-back insertion can leave stale tail labels in a
+        # caller-owned list; active node indices always occupy the leading
+        # ``len(points)`` entries.  Normalize that harmless tail here while
+        # retaining strict one-value-per-node checks for all numeric fields.
+        kinds = kinds[: len(points)]
     hard = np.asarray(hard_anchor_mask if hard_anchor_mask is not None else np.zeros(len(points), dtype=bool), dtype=bool).copy()
     if len(hard) != len(points):
         raise ValueError("hard_anchor_mask must have one value per node")
+    chains = [list(map(int, chain)) for chain in constraint_chains]
+    initial_topology = build_edge_topology(len(points), tris)
+    initial_boundary = _boundary_graph_audit(initial_topology)
+    initial_protected = chain_edges(chains)
     state = _State(
         points=points,
         triangles=tris,
         fixed=fixed,
         targets=targets,
-        chains=[list(map(int, chain)) for chain in constraint_chains],
+        chains=chains,
         open_nodes=np.asarray(open_boundary_nodes_zero_based, dtype=int).copy(),
         kinds=kinds,
         hard=hard,
         lineage=np.arange(len(points), dtype=int),
+        source_points=points.copy(),
+        source_chains=[chain.copy() for chain in chains],
+        source_hard_anchor_lineage=np.where(hard)[0].astype(int),
+        target_sampler=target_spacing_sampler,
+        initial_domain_area_m2=max(_signed_mesh_area(points, tris), 1.0e-30),
+        initial_boundary_component_count=int(initial_boundary["component_count"]),
+        initial_boundary_degree_anomaly_count=int(initial_boundary["degree_anomaly_count"]),
+        initial_singly_connected_triangle_count=int(np.count_nonzero(initial_topology.triangle_neighbor_count == 1)),
+        initial_protected_not_boundary_count=int(
+            sum(len(initial_topology.edge_to_triangles.get(edge, [])) != 1 for edge in initial_protected)
+        ),
     )
     initial = _summary(state, config)
     initial_components = int(initial["connected_component_count"])
@@ -135,11 +190,28 @@ def condition_mesh_aggressive(
     if config.enabled:
         for round_index in range(max(0, int(config.max_rounds))):
             before_round = _summary(state, config)
-            prune = _prune_redundant_vertices(state, config, initial_components)
-            thin = _repair_superthin(state, config, initial_components)
-            valence = _repair_high_valence(state, config, initial_components)
+            prune = (
+                _prune_redundant_vertices(state, config, initial_components)
+                if config.enable_pruning and int(config.max_prunes_per_round) > 0
+                else _disabled_stage(state, config, "pruning_disabled")
+            )
+            thin = (
+                _repair_superthin(state, config, initial_components)
+                if config.enable_thin_repair and _thin_budget(config) > 0
+                else _disabled_stage(state, config, "thin_repair_disabled")
+            )
+            valence, post_valence_thin, compound = _repair_valence_thin_atomic(
+                state,
+                config,
+                initial_components,
+            )
             after_round = _summary(state, config)
-            operations = int(prune["accepted"] + thin["accepted"] + valence["accepted"])
+            operations = int(
+                prune["accepted"]
+                + thin["accepted"]
+                + valence["accepted"]
+                + post_valence_thin["accepted"]
+            )
             rounds.append(
                 {
                     "round": int(round_index + 1),
@@ -147,6 +219,8 @@ def condition_mesh_aggressive(
                     "redundant_vertex_pruning": prune,
                     "aggressive_thin_repair": thin,
                     "high_valence_repair": valence,
+                    "post_valence_thin_repair": post_valence_thin,
+                    "valence_thin_atomic_transaction": compound,
                     "after": after_round,
                     "accepted_operation_count": operations,
                 }
@@ -157,12 +231,15 @@ def condition_mesh_aggressive(
                 break
     final = _summary(state, config)
     hard_gate = bool(final["count_valence_above_limit"] == 0)
+    superthin_gate = bool(final["superthin_triangle_count"] == 0)
     report = {
         "schema_version": "fvcom_aggressive_local_conditioning_v2",
         "profile": "aggressive-local-v2",
         "settings": asdict(config),
         "accepted": bool(_state_invariants(state, initial_components)[0]),
         "fvcom_valence_gate_passed": hard_gate,
+        "superthin_gate_passed": superthin_gate,
+        "terminal_topology_gate_passed": bool(hard_gate and superthin_gate),
         "before": initial,
         "after": final,
         "rounds": rounds,
@@ -187,6 +264,155 @@ def condition_mesh_aggressive(
         report=report,
         edit_ledger=[entry.copy() for entry in state.ledger],
     )
+
+
+def _thin_budget(config: AggressiveConditioningConfig) -> int:
+    return int(
+        max(0, int(config.max_boundary_ear_removals_per_round))
+        + max(0, int(config.max_boundary_welds_per_round))
+        + max(0, int(config.max_superthin_flips_per_round))
+        + max(0, int(config.max_collapses_per_round))
+        + max(0, int(config.max_boundary_edits_per_round))
+    )
+
+
+def _disabled_stage(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    reason: str,
+) -> dict[str, Any]:
+    summary = _summary(state, config)
+    return {
+        "accepted": 0,
+        "rejected": 0,
+        "disabled": True,
+        "reason": str(reason),
+        "before": summary,
+        "after": summary,
+    }
+
+
+def _repair_valence_thin_atomic(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    initial_components: int,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Close valence and any resulting extreme-shape debt as one transaction.
+
+    A valence edit is useful only if its newly created superthin debt can be
+    repaid immediately.  The transaction therefore snapshots before valence,
+    optionally invokes the thin queue, and rolls back both branches when the
+    final global audit fails.  Disabling thin repair is mode-safe: valence may
+    still proceed, but only when it creates no extreme-shape regression.
+    """
+    before = _summary(state, config)
+    if not config.enable_valence_repair or int(config.max_valence_removals_per_round) <= 0:
+        disabled = _disabled_stage(state, config, "valence_repair_disabled")
+        post = _disabled_stage(state, config, "no_valence_transaction")
+        return disabled, post, {
+            "attempted": False,
+            "accepted": True,
+            "rolled_back": False,
+            "rejected_gates": [],
+            "before": before,
+            "after": before,
+        }
+
+    snapshot = state.clone()
+    valence = _repair_high_valence(state, config, initial_components)
+    if int(valence.get("accepted", 0)) <= 0:
+        post = _disabled_stage(state, config, "no_accepted_valence_edit")
+        after = _summary(state, config)
+        return valence, post, {
+            "attempted": bool(valence.get("attempted_count", 0)),
+            "accepted": True,
+            "rolled_back": False,
+            "rejected_gates": [],
+            "before": before,
+            "after": after,
+        }
+
+    post = (
+        _repair_superthin(state, config, initial_components)
+        if config.enable_thin_repair and _thin_budget(config) > 0
+        else _disabled_stage(state, config, "thin_repair_disabled")
+    )
+    ok, invariants, after = _audit_state(state, config, initial_components)
+    rejected_gates = _compound_valence_thin_failures(before, after, ok, invariants, config)
+    accepted_edits = int(valence.get("accepted", 0)) + int(post.get("accepted", 0))
+    if rejected_gates:
+        attempted_valence = int(valence.get("accepted", 0))
+        attempted_thin = int(post.get("accepted", 0))
+        _restore(state, snapshot)
+        valence = dict(valence)
+        valence.update(
+            {
+                "accepted": 0,
+                "rolled_back_operation_count": attempted_valence,
+                "transaction_rolled_back": True,
+                "after": _summary(state, config),
+            }
+        )
+        post = dict(post)
+        post.update(
+            {
+                "accepted": 0,
+                "rolled_back_operation_count": attempted_thin,
+                "transaction_rolled_back": True,
+                "after": _summary(state, config),
+            }
+        )
+        return valence, post, {
+            "attempted": True,
+            "accepted": False,
+            "rolled_back": True,
+            "rolled_back_operation_count": accepted_edits,
+            "rejected_gates": rejected_gates,
+            "invariants": invariants,
+            "before": before,
+            "trial": after,
+            "after": _summary(state, config),
+        }
+    return valence, post, {
+        "attempted": True,
+        "accepted": True,
+        "rolled_back": False,
+        "accepted_operation_count": accepted_edits,
+        "rejected_gates": [],
+        "invariants": invariants,
+        "before": before,
+        "after": after,
+    }
+
+
+def _compound_valence_thin_failures(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    invariants_ok: bool,
+    invariants: dict[str, Any],
+    config: AggressiveConditioningConfig,
+) -> list[str]:
+    failures: list[str] = []
+    if not invariants_ok:
+        failures.extend(_failed_invariant_names(invariants))
+    if not _nonregression(
+        before,
+        after,
+        purpose="valence",
+        max_l_over_h_count_increase=int(config.max_valence_l_over_h_count_increase),
+    ):
+        failures.append("valence_quality_target_nonregression")
+    if after["superthin_triangle_count"] > before["superthin_triangle_count"]:
+        failures.append("new_superthin_triangles")
+    if after["superthin_severity_sum"] > before["superthin_severity_sum"] + 1.0e-10:
+        failures.append("superthin_severity_regression")
+    if after["singly_connected_triangle_count"] > before["singly_connected_triangle_count"]:
+        failures.append("new_singly_connected_triangles")
+    if after["boundary_degree_anomaly_count"] > before["boundary_degree_anomaly_count"]:
+        failures.append("new_boundary_degree_anomalies")
+    if after["boundary_component_count"] != before["boundary_component_count"]:
+        failures.append("boundary_traversability_component_change")
+    return sorted(set(failures))
 
 
 def inventory_high_valence(
@@ -218,6 +444,8 @@ def inventory_high_valence(
         kinds=kinds,
         hard=hard.copy(),
         lineage=lineage.copy(),
+        source_points=points.copy(),
+        source_chains=[list(map(int, chain)) for chain in (constraint_chains or [])],
     )
     topology = build_edge_topology(node_count, tris)
     geometry = triangle_geometry(points, tris)
@@ -448,65 +676,564 @@ def _best_prune_triangulation(
 
 
 def _repair_superthin(state: _State, config: AggressiveConditioningConfig, initial_components: int) -> dict[str, Any]:
-    before = _summary(state, config)
+    stage_before = _summary(state, config)
+    before = stage_before
+    ear_remove_count = 0
+    boundary_weld_count = 0
+    flip_count = 0
     collapse_count = 0
     boundary_split_count = 0
     boundary_remove_count = 0
     rejected = 0
+    rejected_cases: list[dict[str, Any]] = []
+    screened_rejections: list[dict[str, Any]] = []
+    # Remove a redundant exterior ear only when each protected side remains
+    # represented by another wet triangle.  This is the safe direct-removal
+    # case requested for a near-collinear boundary closure.
+    blocked_ears: set[int] = set()
+    for _ in range(max(0, int(config.max_boundary_ear_removals_per_round))):
+        candidate = _select_boundary_ear_triangle(state, config, blocked_ears)
+        if candidate is None:
+            break
+        snapshot = state.clone()
+        tri_nodes = state.triangles[int(candidate)].copy()
+        signed_area_before = _signed_mesh_area(state.points, state.triangles)
+        state.triangles = np.delete(state.triangles, int(candidate), axis=0)
+        state.last_affected = list(map(int, tri_nodes))
+        actual_area_change = abs(_signed_mesh_area(state.points, state.triangles) - signed_area_before)
+        budget_ok = _boundary_area_budget_allows(state, actual_area_change, config)
+        ok, invariant_report, trial = _audit_state(state, config, initial_components)
+        if not budget_ok or not ok or not _nonregression(before, trial, purpose="thin"):
+            _restore(state, snapshot)
+            blocked_ears.add(int(candidate))
+            rejected += 1
+            rejection = _thin_rejection(
+                "boundary-ear-remove",
+                int(candidate),
+                before,
+                trial,
+                ok,
+                invariant_report=invariant_report,
+            )
+            if not budget_ok:
+                rejection["failures"] = sorted(set([*rejection["failures"], "domain_area_budget"]))
+            rejection["actual_signed_domain_area_change_m2"] = float(actual_area_change)
+            rejected_cases.append(rejection)
+            continue
+        state.cumulative_boundary_area_change_m2 += actual_area_change
+        state.ledger.append(
+            {
+                "operation": "boundary-ear-remove",
+                "triangle_original_node_lineage": [int(state.lineage[node]) for node in tri_nodes],
+                "actual_signed_domain_area_change_m2": float(actual_area_change),
+            }
+        )
+        ear_remove_count += 1
+        before = trial
+        blocked_ears.clear()
+
+    # If a coarse protected arc is the base of a sliver, weld the opposite
+    # free vertex to its perpendicular projection on the arc and insert it in
+    # the constraint chain.  The old sliver disappears and the arc gains the
+    # resolution demanded by the local geometry.
+    blocked_welds: set[tuple[int, int, int]] = set()
+    for _ in range(max(0, int(config.max_boundary_welds_per_round))):
+        proposal, screening = _select_boundary_weld(state, config, blocked_welds)
+        screened_rejections.extend(screening)
+        if proposal is None:
+            break
+        edge, node, triangle_index = proposal
+        snapshot = state.clone()
+        changed, construction_failures = _weld_vertex_to_boundary_arc(state, edge, node, triangle_index, config)
+        if not changed:
+            _restore(state, snapshot)
+            blocked_welds.add((int(edge[0]), int(edge[1]), int(node)))
+            rejected += 1
+            rejected_cases.append(
+                {
+                    "operation": "boundary-arc-weld",
+                    "payload": [int(edge[0]), int(edge[1]), int(node)],
+                    "failures": construction_failures or ["weld_construction_failed"],
+                }
+            )
+            continue
+        _micro_relax(state, replacement_seed_nodes=state.last_affected, config=config)
+        stabilized = _stabilize_after_boundary_removal(state, config)
+        if stabilized:
+            state.ledger.append(
+                {"operation": "boundary-weld-local-valence-stabilize", "followup_edit_count": int(stabilized)}
+            )
+        ok, invariant_report, trial = _audit_state(state, config, initial_components)
+        if not ok or not _nonregression(before, trial, purpose="thin"):
+            _restore(state, snapshot)
+            blocked_welds.add((int(edge[0]), int(edge[1]), int(node)))
+            rejected += 1
+            rejected_cases.append(
+                _thin_rejection(
+                    "boundary-arc-weld",
+                    (*edge, node),
+                    before,
+                    trial,
+                    ok,
+                    invariant_report=invariant_report,
+                )
+            )
+            continue
+        boundary_weld_count += 1
+        before = trial
+        blocked_welds.clear()
+    # First use the cheapest connectivity edit.  Unlike thin-repair-v1's
+    # disjoint global batch, this loop re-evaluates the extreme-tail component
+    # after every accepted flip and can therefore work through a zipper created
+    # by a preceding valence transaction.
+    blocked_flips: set[tuple[int, int]] = set()
+    for _ in range(max(0, int(config.max_superthin_flips_per_round))):
+        proposal = _select_superthin_flip(state, config, blocked_flips)
+        if proposal is None:
+            break
+        edge, first, second, new_first, new_second = proposal
+        snapshot = state.clone()
+        state.triangles[int(first)] = new_first
+        state.triangles[int(second)] = new_second
+        state.triangles = _orient_ccw(state.points, state.triangles)
+        state.last_affected = sorted(set(map(int, np.unique(state.triangles[[int(first), int(second)]]))))
+        _micro_relax(state, replacement_seed_nodes=state.last_affected, config=config)
+        ok, invariant_report, trial = _audit_state(state, config, initial_components)
+        if not ok or not _nonregression(before, trial, purpose="thin"):
+            _restore(state, snapshot)
+            blocked_flips.add(tuple(edge))
+            rejected += 1
+            rejected_cases.append(
+                _thin_rejection(
+                    "superthin-edge-flip", edge, before, trial, ok, invariant_report=invariant_report
+                )
+            )
+            continue
+        state.ledger.append(
+            {
+                "operation": "superthin-edge-flip",
+                "parent_edge_original_nodes": [int(state.lineage[edge[0]]), int(state.lineage[edge[1]])],
+            }
+        )
+        flip_count += 1
+        before = trial
+        blocked_flips.clear()
     # Interior pair collapse: select the worst legal pair and re-evaluate after each edit.
+    blocked_collapses: set[tuple[int, int]] = set()
     for _ in range(max(0, int(config.max_collapses_per_round))):
-        candidate = _select_collapse_edge(state, config)
+        candidate = _select_collapse_edge(state, config, blocked_collapses)
         if candidate is None:
             break
         edge = candidate
         snapshot = state.clone()
         if not _collapse_edge(state, edge):
+            _restore(state, snapshot)
+            blocked_collapses.add(tuple(edge))
             rejected += 1
-            break
+            rejected_cases.append(
+                {
+                    "operation": "interior-edge-collapse",
+                    "payload": list(map(int, edge)),
+                    "failures": ["edit_construction_failed"],
+                }
+            )
+            continue
         _micro_relax(state, replacement_seed_nodes=state.last_affected, config=config)
-        ok, _ = _state_invariants(state, initial_components)
-        trial = _summary(state, config)
+        ok, invariant_report, trial = _audit_state(state, config, initial_components)
         if not ok or not _nonregression(before, trial, purpose="thin"):
             _restore(state, snapshot)
+            blocked_collapses.add(tuple(edge))
             rejected += 1
-            break
+            rejected_cases.append(
+                _thin_rejection(
+                    "interior-edge-collapse", edge, before, trial, ok, invariant_report=invariant_report
+                )
+            )
+            continue
         collapse_count += 1
         before = trial
+        blocked_collapses.clear()
     # Boundary branch: one edit at a time, using the longest-side rule.
     if config.boundary_edit_policy != "none":
+        blocked_boundary: set[tuple[str, tuple[int, ...]]] = set()
         for _ in range(max(0, int(config.max_boundary_edits_per_round))):
-            proposal = _select_boundary_edit(state, config)
+            proposal = _select_boundary_edit(state, config, blocked_boundary)
             if proposal is None:
                 break
             snapshot = state.clone()
             operation, payload = proposal
             changed = _split_boundary_edge(state, payload, config) if operation == "split" else _remove_boundary_vertex(state, int(payload), config)
             if not changed:
+                _restore(state, snapshot)
+                blocked_boundary.add(_proposal_key(operation, payload))
                 rejected += 1
-                break
+                rejected_cases.append(
+                    {
+                        "operation": f"boundary-{operation}",
+                        "payload": list(_proposal_key(operation, payload)[1]),
+                        "failures": ["edit_construction_failed"],
+                    }
+                )
+                continue
             _micro_relax(state, replacement_seed_nodes=state.last_affected, config=config)
-            ok, _ = _state_invariants(state, initial_components)
-            trial = _summary(state, config)
+            ok, invariant_report, trial = _audit_state(state, config, initial_components)
             if not ok or not _nonregression(before, trial, purpose="thin"):
                 _restore(state, snapshot)
+                blocked_boundary.add(_proposal_key(operation, payload))
                 rejected += 1
-                break
+                rejected_cases.append(
+                    _thin_rejection(
+                        f"boundary-{operation}",
+                        payload,
+                        before,
+                        trial,
+                        ok,
+                        invariant_report=invariant_report,
+                    )
+                )
+                continue
             if operation == "split":
                 boundary_split_count += 1
             else:
                 boundary_remove_count += 1
             before = trial
+            blocked_boundary.clear()
     return {
-        "accepted": int(collapse_count + boundary_split_count + boundary_remove_count),
+        "accepted": int(
+            ear_remove_count
+            + boundary_weld_count
+            + flip_count
+            + collapse_count
+            + boundary_split_count
+            + boundary_remove_count
+        ),
+        "boundary_ear_removals": int(ear_remove_count),
+        "boundary_arc_welds": int(boundary_weld_count),
+        "superthin_edge_flips": int(flip_count),
         "interior_pair_collapses": int(collapse_count),
         "boundary_edge_splits": int(boundary_split_count),
         "boundary_vertex_removals": int(boundary_remove_count),
         "rejected": int(rejected),
+        "rejected_cases": rejected_cases,
+        "screened_rejections": _deduplicate_rejections(screened_rejections),
+        "audit_scope": "candidate_patch_precheck_plus_global_transaction_audit",
+        "before": stage_before,
         "after": _summary(state, config),
     }
 
 
-def _select_collapse_edge(state: _State, config: AggressiveConditioningConfig) -> tuple[int, int] | None:
+def _select_boundary_ear_triangle(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    excluded: set[int],
+) -> int | None:
+    topology = build_edge_topology(len(state.points), state.triangles)
+    geometry = triangle_geometry(state.points, state.triangles)
+    min_angles = np.min(geometry["angles_deg"], axis=1)
+    superthin = (geometry["quality"] < float(config.superthin_quality_threshold)) | (
+        min_angles < float(config.superthin_min_angle_deg)
+    )
+    protected = chain_edges(state.chains)
+    ordering = sorted(
+        np.where(superthin)[0],
+        key=lambda index: (float(geometry["quality"][index]), float(min_angles[index]), int(index)),
+    )
+    for index in ordering:
+        if int(index) in excluded:
+            continue
+        tri = state.triangles[int(index)]
+        if not bool(np.all(state.fixed[tri])):
+            continue
+        kind_values = " ".join(str(state.kinds[int(node)]).lower() for node in tri)
+        if any(
+            str(token).lower() in kind_values
+            for token in config.boundary_weld_forbidden_kind_tokens
+            if str(token)
+        ):
+            # Closing or shaving an under-resolved channel is an upstream
+            # semantic decision, never an automatic triangle-deletion route.
+            continue
+        edges = _triangle_edge_keys(tri)
+        protected_edges = [edge for edge in edges if edge in protected]
+        free_edges = [edge for edge in edges if edge not in protected]
+        if len(protected_edges) < 2 or len(free_edges) != 1:
+            continue
+        # The protected chain must survive on the retained wet side, and the
+        # unprotected chord must be an exterior edge belonging only to this ear.
+        if not all(len(topology.edge_to_triangles.get(edge, [])) >= 2 for edge in protected_edges):
+            continue
+        if len(topology.edge_to_triangles.get(free_edges[0], [])) != 1:
+            continue
+        return int(index)
+    return None
+
+
+def _select_boundary_weld(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    excluded: set[tuple[int, int, int]],
+) -> tuple[tuple[tuple[int, int], int, int] | None, list[dict[str, Any]]]:
+    topology = build_edge_topology(len(state.points), state.triangles)
+    geometry = triangle_geometry(state.points, state.triangles)
+    min_angles = np.min(geometry["angles_deg"], axis=1)
+    superthin = (geometry["quality"] < float(config.superthin_quality_threshold)) | (
+        min_angles < float(config.superthin_min_angle_deg)
+    )
+    protected = chain_edges(state.chains)
+    proposals: list[tuple[float, float, tuple[int, int], int, int]] = []
+    screened: list[dict[str, Any]] = []
+    for index in np.where(superthin)[0]:
+        tri = state.triangles[int(index)]
+        for edge in _triangle_edge_keys(tri):
+            if edge not in protected or len(topology.edge_to_triangles.get(edge, [])) != 1:
+                continue
+            opposite = [int(node) for node in tri if int(node) not in edge]
+            if len(opposite) != 1:
+                continue
+            node = opposite[0]
+            key = (int(edge[0]), int(edge[1]), int(node))
+            if key in excluded:
+                continue
+            weld_geometry, failures = _boundary_weld_geometry(state, edge, node, config)
+            if failures or weld_geometry is None:
+                screened.append(
+                    {
+                        "operation": "boundary-arc-weld",
+                        "payload": [int(edge[0]), int(edge[1]), int(node)],
+                        "triangle_index": int(index),
+                        "failures": failures or ["invalid_source_arc_projection"],
+                    }
+                )
+                continue
+            _, _, distance, h = weld_geometry
+            proposals.append((float(geometry["quality"][index]), distance / h, edge, node, int(index)))
+    if not proposals:
+        return None, screened
+    _, _, edge, node, index = min(proposals, key=lambda value: (value[0], value[1], value[4]))
+    return (edge, int(node), int(index)), screened
+
+
+def _weld_vertex_to_boundary_arc(
+    state: _State,
+    edge: tuple[int, int],
+    node: int,
+    triangle_index: int,
+    config: AggressiveConditioningConfig,
+) -> tuple[bool, list[str]]:
+    chain_pos = _find_chain_edge(state.chains, edge)
+    weld_geometry, failures = _boundary_weld_geometry(state, edge, node, config)
+    if chain_pos is None or failures or weld_geometry is None:
+        return False, failures or ["constraint_chain_edge_not_found"]
+    chain_index, position = chain_pos
+    a, b = map(int, edge)
+    fraction, projection, distance, _ = weld_geometry
+    topology = build_edge_topology(len(state.points), state.triangles)
+    attached = topology.edge_to_triangles.get(tuple(sorted(edge)), [])
+    if attached != [int(triangle_index)] and set(attached) != {int(triangle_index)}:
+        return False, ["source_arc_not_exterior_edge"]
+    tri = state.triangles[int(triangle_index)]
+    if int(node) not in tri or not {a, b}.issubset(set(map(int, tri))):
+        return False, ["source_triangle_mismatch"]
+    signed_area_before = _signed_mesh_area(state.points, state.triangles)
+    affected = set(map(int, topology.node_neighbors[int(node)]))
+    affected.update((a, b, int(node)))
+    old_point = state.points[int(node)].copy()
+    state.points[int(node)] = projection
+    state.fixed[int(node)] = True
+    state.hard[int(node)] = False
+    state.kinds[int(node)] = state.kinds[a]
+    state.targets[int(node)] = _sample_target_at(state, projection, fallback=_edge_target(state.targets, edge))
+    state.chains[chain_index].insert(position + 1, int(node))
+    open_values = state.open_nodes.tolist()
+    for open_position, (left, right) in enumerate(zip(open_values[:-1], open_values[1:])):
+        if {int(left), int(right)} == {a, b}:
+            open_values.insert(open_position + 1, int(node))
+            state.open_nodes = np.asarray(open_values, dtype=int)
+            break
+    state.triangles = np.delete(state.triangles, int(triangle_index), axis=0)
+    state.triangles = _orient_ccw(state.points, state.triangles)
+    actual_area_change = abs(_signed_mesh_area(state.points, state.triangles) - signed_area_before)
+    if not _boundary_area_budget_allows(state, actual_area_change, config):
+        return False, ["domain_area_budget"]
+    state.last_affected = sorted(affected)
+    state.cumulative_boundary_area_change_m2 += actual_area_change
+    state.ledger.append(
+        {
+            "operation": "boundary-arc-weld",
+            "welded_original_node": int(state.lineage[int(node)]),
+            "parent_edge_original_nodes": [int(state.lineage[a]), int(state.lineage[b])],
+            "boundary_kind": state.kinds[a],
+            "projection_fraction": fraction,
+            "weld_distance_m": distance,
+            "original_coordinate_xy": [float(old_point[0]), float(old_point[1])],
+            "actual_signed_domain_area_change_m2": float(actual_area_change),
+            "target_spacing_resampled": bool(state.target_sampler is not None),
+        }
+    )
+    return True, []
+
+
+def _boundary_weld_geometry(
+    state: _State,
+    edge: tuple[int, int],
+    node: int,
+    config: AggressiveConditioningConfig,
+) -> tuple[tuple[float, np.ndarray, float, float] | None, list[str]]:
+    """Project to the immutable source arc and return all semantic guard failures."""
+    failures: list[str] = []
+    a, b = map(int, edge)
+    if not (0 <= int(node) < len(state.points)) or state.fixed[int(node)] or state.hard[int(node)]:
+        failures.append("weld_vertex_fixed_or_hard")
+    if not _same_boundary_kind(state, edge):
+        failures.append("mixed_boundary_kind")
+    source_edge = _source_arc_edge(state, edge)
+    if source_edge is None:
+        failures.append("source_arc_edge_not_found")
+        return None, failures
+    source_a, source_b = source_edge
+    vector = source_b - source_a
+    denominator = float(np.dot(vector, vector))
+    if denominator <= 1.0e-20:
+        failures.append("degenerate_source_arc")
+        return None, failures
+    fraction = float(np.dot(state.points[int(node)] - source_a, vector) / denominator)
+    if not 0.02 < fraction < 0.98:
+        failures.append("projection_outside_source_arc_interior")
+    projection = source_a + fraction * vector
+    distance = float(np.linalg.norm(state.points[int(node)] - projection))
+    h = max(_edge_target(state.targets, edge), 1.0e-12)
+    arc_length = float(np.sqrt(denominator))
+    if distance > float(config.boundary_weld_max_distance_fraction) * h:
+        failures.append("weld_distance_fraction")
+    if distance > float(config.boundary_weld_max_altitude_to_arc_fraction) * arc_length:
+        failures.append("weld_altitude_to_arc")
+    kind = str(state.kinds[a]).lower()
+    absolute_limit = (
+        float(config.boundary_weld_open_max_distance_m)
+        if kind in {"open", "frame"}
+        else float(config.boundary_weld_land_max_distance_m)
+    )
+    if distance > absolute_limit:
+        failures.append("weld_absolute_distance")
+    tokens = tuple(str(value).lower() for value in config.boundary_weld_forbidden_kind_tokens)
+    if any(token and token in kind for token in tokens):
+        failures.append("under_resolved_channel_or_junction_requires_upstream_review")
+    chain_pos = _find_chain_edge(state.chains, edge)
+    if chain_pos is None:
+        failures.append("constraint_chain_edge_not_found")
+    else:
+        chain_index, position = chain_pos
+        chain = state.chains[chain_index]
+        anchor_buffer = max(0, int(config.boundary_weld_anchor_buffer_segments))
+        nearby = _cyclic_chain_window(chain, position, anchor_buffer)
+        if any(state.hard[value] for value in nearby):
+            failures.append("hard_anchor_buffer")
+        junction_buffer = max(0, int(config.boundary_weld_junction_buffer_segments))
+        junction_nodes = _cyclic_chain_window(chain, position, junction_buffer)
+        junction_kinds = {str(state.kinds[value]) for value in junction_nodes}
+        if len(junction_kinds) > 1:
+            failures.append("boundary_kind_junction_buffer")
+    clearance = _minimum_remote_boundary_clearance(state, projection, edge)
+    if np.isfinite(clearance) and clearance < float(config.boundary_weld_channel_clearance_fraction) * h:
+        failures.append("narrow_channel_semantic_guard")
+    return (fraction, projection, distance, h), sorted(set(failures))
+
+
+def _select_superthin_flip(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    excluded: set[tuple[int, int]],
+) -> tuple[tuple[int, int], int, int, np.ndarray, np.ndarray] | None:
+    topology = build_edge_topology(len(state.points), state.triangles)
+    geometry = triangle_geometry(state.points, state.triangles)
+    min_angles = np.min(geometry["angles_deg"], axis=1)
+    superthin = (geometry["quality"] < float(config.superthin_quality_threshold)) | (
+        min_angles < float(config.superthin_min_angle_deg)
+    )
+    protected = chain_edges(state.chains)
+    ordering = sorted(
+        np.where(superthin)[0],
+        key=lambda index: (float(geometry["quality"][index]), float(min_angles[index]), int(index)),
+    )
+    for index in ordering:
+        tri = state.triangles[int(index)]
+        for edge in sorted(_triangle_edge_keys(tri)):
+            if edge in excluded or edge in protected:
+                continue
+            attached = list(map(int, topology.edge_to_triangles.get(edge, [])))
+            if len(attached) != 2:
+                continue
+            first, second = attached
+            candidate = _edge_flip_candidate(state.points, state.triangles, edge, first, second)
+            if candidate is None:
+                continue
+            new_first, new_second, old_q, new_q, old_angle, new_angle, new_edge = candidate
+            if new_edge in topology.edge_to_triangles:
+                continue
+            if new_q <= old_q + 1.0e-8 or new_angle <= old_angle + 0.05:
+                continue
+            return edge, first, second, new_first, new_second
+    return None
+
+
+def _proposal_key(operation: str, payload: Any) -> tuple[str, tuple[int, ...]]:
+    if isinstance(payload, tuple):
+        values = tuple(map(int, payload))
+    elif isinstance(payload, (list, np.ndarray)):
+        values = tuple(map(int, payload))
+    else:
+        values = (int(payload),)
+    return str(operation), values
+
+
+def _thin_rejection(
+    operation: str,
+    payload: Any,
+    before: dict[str, Any],
+    trial: dict[str, Any],
+    invariants_ok: bool,
+    *,
+    invariant_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    failures: list[str] = []
+    if not invariants_ok:
+        failures.extend(_failed_invariant_names(invariant_report or {}))
+    if trial["superthin_triangle_count"] > before["superthin_triangle_count"]:
+        failures.append("superthin_count_increase")
+    if trial["thin_severity_sum"] >= before["thin_severity_sum"] - 1.0e-10:
+        failures.append("no_thin_severity_drop")
+    if trial["q_min"] + 1.0e-12 < before["q_min"]:
+        failures.append("q_min_regression")
+    if trial["q_p01"] + 1.0e-9 < before["q_p01"]:
+        failures.append("q_p01_regression")
+    if trial["minimum_angle_deg"] + 1.0e-8 < before["minimum_angle_deg"]:
+        failures.append("minimum_angle_regression")
+    if trial["l_over_h_p95"] > 1.001 * max(before["l_over_h_p95"], 1.0e-12):
+        failures.append("l_over_h_p95_regression")
+    if trial["l_over_h_count_above_1_55"] > before["l_over_h_count_above_1_55"]:
+        failures.append("l_over_h_excess_count_increase")
+    if trial["count_valence_above_limit"] > before["count_valence_above_limit"]:
+        failures.append("valence_gate_regression")
+    if trial["singly_connected_triangle_count"] > before["singly_connected_triangle_count"]:
+        failures.append("new_singly_connected_triangles")
+    if trial["boundary_degree_anomaly_count"] > before["boundary_degree_anomaly_count"]:
+        failures.append("new_boundary_degree_anomalies")
+    if trial["boundary_component_count"] != before["boundary_component_count"]:
+        failures.append("boundary_traversability_component_change")
+    return {
+        "operation": str(operation),
+        "payload": list(_proposal_key(operation, payload)[1]),
+        "failures": failures or ["compound_nonregression_gate"],
+        "before": _summary_from(before),
+        "trial": _summary_from(trial),
+    }
+
+
+def _select_collapse_edge(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    excluded: set[tuple[int, int]] | None = None,
+) -> tuple[int, int] | None:
     topology = build_edge_topology(len(state.points), state.triangles)
     geometry = triangle_geometry(state.points, state.triangles)
     min_angles = np.min(geometry["angles_deg"], axis=1)
@@ -514,6 +1241,8 @@ def _select_collapse_edge(state: _State, config: AggressiveConditioningConfig) -
     protected = chain_edges(state.chains)
     candidates: list[tuple[float, tuple[int, int]]] = []
     for edge, attached in topology.edge_to_triangles.items():
+        if excluded and tuple(edge) in excluded:
+            continue
         if len(attached) != 2 or edge in protected or state.fixed[edge[0]] or state.fixed[edge[1]]:
             continue
         if not all(bool(superthin[int(index)]) for index in attached):
@@ -549,7 +1278,11 @@ def _collapse_edge(state: _State, edge: tuple[int, int]) -> bool:
     return True
 
 
-def _select_boundary_edit(state: _State, config: AggressiveConditioningConfig) -> tuple[str, Any] | None:
+def _select_boundary_edit(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    excluded: set[tuple[str, tuple[int, ...]]] | None = None,
+) -> tuple[str, Any] | None:
     topology = build_edge_topology(len(state.points), state.triangles)
     geometry = triangle_geometry(state.points, state.triangles)
     min_angles = np.min(geometry["angles_deg"], axis=1)
@@ -570,14 +1303,19 @@ def _select_boundary_edit(state: _State, config: AggressiveConditioningConfig) -
         if longest in protected:
             attached = topology.edge_to_triangles.get(longest, [])
             if len(attached) == 1 and _same_boundary_kind(state, longest):
-                return "split", longest
+                proposal = ("split", longest)
+                if not excluded or _proposal_key(*proposal) not in excluded:
+                    return proposal
             continue
         if config.boundary_edit_policy == "split-only":
             continue
         candidates = [int(node) for node in tri if state.fixed[int(node)] and not state.hard[int(node)]]
         candidates = [node for node in candidates if _boundary_removal_allowed(state, node, config)]
         if candidates:
-            return "remove", min(candidates, key=lambda node: _boundary_deviation(state, node))
+            for node in sorted(candidates, key=lambda value: _boundary_deviation(state, value)):
+                proposal = ("remove", node)
+                if not excluded or _proposal_key(*proposal) not in excluded:
+                    return proposal
     return None
 
 
@@ -1774,6 +2512,8 @@ def _micro_relax(state: _State, replacement_seed_nodes: list[int], config: Aggre
         return
     local_points = state.points[patch_nodes].copy()
     for _ in range(max(0, int(config.micro_relax_cycles))):
+        if state.target_sampler is not None:
+            state.targets[patch_nodes] = _sample_targets(state, local_points, fallback=state.targets[patch_nodes])
         relaxed = relax_mesh_spring(
             local_points,
             local_triangles,
@@ -1798,6 +2538,8 @@ def _micro_relax(state: _State, replacement_seed_nodes: list[int], config: Aggre
             break
         local_points = relaxed.nodes_xy
         state.points[patch_nodes] = local_points
+    if state.target_sampler is not None:
+        state.targets[patch_nodes] = _sample_targets(state, state.points[patch_nodes], fallback=state.targets[patch_nodes])
 
 
 def _summary(
@@ -1818,6 +2560,27 @@ def _summary(
     q_std = float(np.std(quality)) if len(quality) else 0.0
     superthin = (quality < float(config.superthin_quality_threshold)) | (min_angles < float(config.superthin_min_angle_deg))
     thin = (quality < float(config.quality_threshold)) | (min_angles < float(config.min_angle_deg))
+    boundary_audit = _boundary_graph_audit(topology)
+    protected = chain_edges(state.chains)
+    protected_not_boundary = sum(len(topology.edge_to_triangles.get(edge, [])) != 1 for edge in protected)
+    superthin_severity = float(
+        np.sum(
+            np.maximum(
+                0.0,
+                (float(config.superthin_quality_threshold) - quality)
+                / max(float(config.superthin_quality_threshold), 1.0e-12),
+            )
+            ** 2
+        )
+        + np.sum(
+            np.maximum(
+                0.0,
+                (float(config.superthin_min_angle_deg) - min_angles)
+                / max(float(config.superthin_min_angle_deg), 1.0e-12),
+            )
+            ** 2
+        )
+    )
     return {
         "node_count": int(len(state.points)),
         "triangle_count": int(len(state.triangles)),
@@ -1829,6 +2592,7 @@ def _summary(
         "minimum_angle_p01_deg": float(np.quantile(min_angles, 0.01)) if len(min_angles) else 0.0,
         "thin_triangle_count": int(np.count_nonzero(thin)),
         "superthin_triangle_count": int(np.count_nonzero(superthin)),
+        "superthin_severity_sum": superthin_severity,
         "thin_severity_sum": float(
             np.sum(np.maximum(0.0, (float(config.quality_threshold) - quality) / max(float(config.quality_threshold), 1.0e-12)) ** 2)
             + np.sum(np.maximum(0.0, (float(config.min_angle_deg) - min_angles) / max(float(config.min_angle_deg), 1.0e-12)) ** 2)
@@ -1842,6 +2606,10 @@ def _summary(
         "connected_component_count": int(len(topology.connected_component_sizes)),
         "nonmanifold_edge_count": int(len(topology.nonmanifold_edges)),
         "nonpositive_signed_area_count": int(np.count_nonzero(geometry["signed_area"] <= _area_tolerance(state.points, state.triangles))),
+        "singly_connected_triangle_count": int(np.count_nonzero(topology.triangle_neighbor_count == 1)),
+        "boundary_degree_anomaly_count": int(boundary_audit["degree_anomaly_count"]),
+        "boundary_component_count": int(boundary_audit["component_count"]),
+        "protected_edge_not_boundary_count": int(protected_not_boundary),
     }
 
 
@@ -1856,12 +2624,20 @@ def _nonregression(
     purpose: str,
     max_l_over_h_count_increase: int = 0,
 ) -> bool:
+    topology_ok = bool(
+        after["singly_connected_triangle_count"] <= before["singly_connected_triangle_count"]
+        and after["boundary_degree_anomaly_count"] <= before["boundary_degree_anomaly_count"]
+        and after["boundary_component_count"] == before["boundary_component_count"]
+        and after["protected_edge_not_boundary_count"] <= before["protected_edge_not_boundary_count"]
+    )
     if purpose == "valence":
         # The FVCOM connectivity cap is a hard structural gate.  A perfectly
         # regular nine-spoke star cannot be reduced to valence eight without
         # changing its quality distribution, so use absolute local-quality
         # floors while still protecting target-size excess.
         return bool(
+            topology_ok
+            and
             (after["count_valence_above_limit"] < before["count_valence_above_limit"] or after["valence_excess_sum"] < before["valence_excess_sum"])
             and after["q_min"] + 1.0e-12 >= min(before["q_min"], 0.25)
             and after["minimum_angle_deg"] + 1.0e-8 >= min(before["minimum_angle_deg"], 20.0)
@@ -1873,15 +2649,18 @@ def _nonregression(
         defect_improved = bool(
             after["superthin_triangle_count"] < before["superthin_triangle_count"]
             or after["thin_triangle_count"] < before["thin_triangle_count"]
-            or after["thin_severity_sum"] <= 0.95 * before["thin_severity_sum"]
+            or after["thin_severity_sum"] < before["thin_severity_sum"] - 1.0e-10
         )
         return bool(
             defect_improved
+            and topology_ok
+            and after["superthin_triangle_count"] <= before["superthin_triangle_count"]
             and after["q_min"] + 1.0e-12 >= before["q_min"]
             and after["q_p01"] + 1.0e-9 >= before["q_p01"]
             and after["minimum_angle_deg"] + 1.0e-8 >= before["minimum_angle_deg"]
             and after["l_over_h_p95"] <= 1.001 * max(before["l_over_h_p95"], 1.0e-12)
             and after["l_over_h_count_above_1_55"] <= before["l_over_h_count_above_1_55"]
+            and after["count_valence_above_limit"] <= before["count_valence_above_limit"]
         )
     size_ok = bool(
         after["l_over_h_maximum"] <= 1.001 * max(before["l_over_h_maximum"], 1.0e-12)
@@ -1889,7 +2668,8 @@ def _nonregression(
         else after["l_over_h_p95"] <= 1.001 * max(before["l_over_h_p95"], 1.0e-12)
     )
     common = bool(
-        after["q_l3_sigma"] + 1.0e-9 >= before["q_l3_sigma"]
+        topology_ok
+        and after["q_l3_sigma"] + 1.0e-9 >= before["q_l3_sigma"]
         and after["q_p01"] + 1.0e-9 >= before["q_p01"]
         and after["minimum_angle_p01_deg"] + 1.0e-3 >= before["minimum_angle_p01_deg"]
         and size_ok
@@ -1913,6 +2693,25 @@ def _state_invariants(
     topology = topology if topology is not None else build_edge_topology(len(state.points), state.triangles)
     integrity = constraint_integrity(topology, state.chains, state.open_nodes.tolist())
     positive = bool(len(state.triangles) and np.all(geometry["signed_area"] > _area_tolerance(state.points, state.triangles)))
+    boundary_audit = _boundary_graph_audit(topology)
+    singly_connected = int(np.count_nonzero(topology.triangle_neighbor_count == 1))
+    protected = chain_edges(state.chains)
+    protected_not_boundary = int(sum(len(topology.edge_to_triangles.get(edge, [])) != 1 for edge in protected))
+    canonical_triangles = [tuple(sorted(map(int, tri))) for tri in np.asarray(state.triangles, dtype=int)]
+    duplicate_triangles = int(len(canonical_triangles) - len(set(canonical_triangles)))
+    repeated_node_triangles = int(sum(len(set(values)) != 3 for values in canonical_triangles))
+    chain_node_range_ok = bool(
+        all(0 <= int(node) < len(state.points) for chain in state.chains for node in chain)
+    )
+    chain_unique_nodes = bool(all(len(chain) == len(set(map(int, chain))) for chain in state.chains))
+    lineage_to_node = {int(value): int(index) for index, value in enumerate(state.lineage)}
+    missing_hard = [int(value) for value in state.source_hard_anchor_lineage if int(value) not in lineage_to_node]
+    moved_hard = [
+        int(value)
+        for value in state.source_hard_anchor_lineage
+        if int(value) in lineage_to_node
+        and not np.array_equal(state.points[lineage_to_node[int(value)]], state.source_points[int(value)])
+    ]
     report = {
         "positive_signed_areas": positive,
         "all_protected_edges_present": bool(not state.chains or integrity["all_protected_edges_present"]),
@@ -1920,6 +2719,25 @@ def _state_invariants(
         "connected_component_count": int(len(topology.connected_component_sizes)),
         "nonmanifold_edge_count": int(len(topology.nonmanifold_edges)),
         "unused_node_count": int(len(state.points) - len(np.unique(state.triangles))) if len(state.triangles) else int(len(state.points)),
+        "singly_connected_triangle_count": singly_connected,
+        "new_singly_connected_triangle_count": int(
+            max(0, singly_connected - int(state.initial_singly_connected_triangle_count))
+        ),
+        "boundary_degree_anomaly_count": int(boundary_audit["degree_anomaly_count"]),
+        "boundary_component_count": int(boundary_audit["component_count"]),
+        "boundary_traversable": bool(
+            boundary_audit["component_count"] == int(state.initial_boundary_component_count)
+            and boundary_audit["degree_anomaly_count"] <= int(state.initial_boundary_degree_anomaly_count)
+        ),
+        "protected_edge_not_boundary_count": protected_not_boundary,
+        "duplicate_triangle_count": duplicate_triangles,
+        "repeated_node_triangle_count": repeated_node_triangles,
+        "chain_node_range_ok": chain_node_range_ok,
+        "chain_unique_nodes": chain_unique_nodes,
+        "missing_hard_anchor_count": int(len(missing_hard)),
+        "moved_hard_anchor_count": int(len(moved_hard)),
+        "missing_hard_anchor_lineage": missing_hard[:100],
+        "moved_hard_anchor_lineage": moved_hard[:100],
         "constraint_integrity": integrity,
     }
     ok = bool(
@@ -1929,22 +2747,94 @@ def _state_invariants(
         and report["connected_component_count"] == int(initial_components)
         and report["nonmanifold_edge_count"] == 0
         and report["unused_node_count"] == 0
+        and report["new_singly_connected_triangle_count"] == 0
+        and report["boundary_traversable"]
+        and report["protected_edge_not_boundary_count"] <= int(state.initial_protected_not_boundary_count)
+        and report["duplicate_triangle_count"] == 0
+        and report["repeated_node_triangle_count"] == 0
+        and report["chain_node_range_ok"]
+        and report["chain_unique_nodes"]
+        and report["missing_hard_anchor_count"] == 0
+        and report["moved_hard_anchor_count"] == 0
     )
     return ok, report
 
 
+def _audit_state(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    initial_components: int,
+) -> tuple[bool, dict[str, Any], dict[str, Any]]:
+    """Share one geometry/topology build across the transaction's global audit."""
+    geometry = triangle_geometry(state.points, state.triangles)
+    topology = build_edge_topology(len(state.points), state.triangles)
+    ok, invariants = _state_invariants(
+        state,
+        initial_components,
+        geometry=geometry,
+        topology=topology,
+    )
+    summary = _summary(state, config, geometry=geometry, topology=topology)
+    return ok, invariants, summary
+
+
+def _failed_invariant_names(report: dict[str, Any]) -> list[str]:
+    boolean_gates = {
+        "positive_signed_areas": report.get("positive_signed_areas"),
+        "all_protected_edges_present": report.get("all_protected_edges_present"),
+        "open_boundary_ordered": report.get("open_boundary_ordered"),
+        "boundary_traversable": report.get("boundary_traversable"),
+        "chain_node_range_ok": report.get("chain_node_range_ok"),
+        "chain_unique_nodes": report.get("chain_unique_nodes"),
+    }
+    failures = [name for name, value in boolean_gates.items() if value is False]
+    count_gates = {
+        "nonmanifold_edges": report.get("nonmanifold_edge_count", 0),
+        "unused_nodes": report.get("unused_node_count", 0),
+        "new_singly_connected_triangles": report.get("new_singly_connected_triangle_count", 0),
+        "duplicate_triangles": report.get("duplicate_triangle_count", 0),
+        "repeated_node_triangles": report.get("repeated_node_triangle_count", 0),
+        "missing_hard_anchors": report.get("missing_hard_anchor_count", 0),
+        "moved_hard_anchors": report.get("moved_hard_anchor_count", 0),
+    }
+    failures.extend(name for name, value in count_gates.items() if int(value) > 0)
+    return sorted(set(failures or ["structural_invariant"]))
+
+
 def _compact(state: _State) -> np.ndarray:
+    node_count = len(state.points)
+    numeric_lengths = {
+        "fixed": len(state.fixed),
+        "targets": len(state.targets),
+        "hard": len(state.hard),
+        "lineage": len(state.lineage),
+    }
+    invalid = {name: length for name, length in numeric_lengths.items() if length != node_count}
+    if invalid:
+        raise ValueError(
+            "Local-topology node metadata length mismatch before compaction: "
+            f"points={node_count}, fields={invalid}"
+        )
+    if len(state.kinds) < node_count:
+        raise ValueError(
+            "Local-topology boundary-kind metadata is missing active node values before compaction: "
+            f"points={node_count}, kinds={len(state.kinds)}"
+        )
+    # Descriptive kind entries beyond the active point array are stale tail
+    # metadata.  They cannot be referenced by triangles or chains and are
+    # safe to discard before applying the compaction mapping.
+    active_kinds = state.kinds[:node_count]
     referenced = set(map(int, np.unique(state.triangles)))
     referenced.update(int(value) for chain in state.chains for value in chain)
-    keep = np.asarray([index in referenced for index in range(len(state.points))], dtype=bool)
-    mapping = np.full(len(state.points), -1, dtype=int)
+    keep = np.asarray([index in referenced for index in range(node_count)], dtype=bool)
+    mapping = np.full(node_count, -1, dtype=int)
     mapping[np.where(keep)[0]] = np.arange(int(np.count_nonzero(keep)), dtype=int)
     state.points = state.points[keep]
     state.fixed = state.fixed[keep]
     state.targets = state.targets[keep]
     state.hard = state.hard[keep]
     state.lineage = state.lineage[keep]
-    state.kinds = [kind for kind, retain in zip(state.kinds, keep, strict=True) if retain]
+    state.kinds = [kind for kind, retain in zip(active_kinds, keep, strict=True) if retain]
     state.triangles = mapping[state.triangles]
     state.chains = [[int(mapping[node]) for node in chain if mapping[node] >= 0] for chain in state.chains]
     state.open_nodes = np.asarray([int(mapping[node]) for node in state.open_nodes if mapping[node] >= 0], dtype=int)
@@ -1962,6 +2852,15 @@ def _restore(state: _State, snapshot: _State) -> None:
     state.kinds = snapshot.kinds
     state.hard = snapshot.hard
     state.lineage = snapshot.lineage
+    state.source_points = snapshot.source_points
+    state.source_chains = snapshot.source_chains
+    state.source_hard_anchor_lineage = snapshot.source_hard_anchor_lineage
+    state.target_sampler = snapshot.target_sampler
+    state.initial_domain_area_m2 = snapshot.initial_domain_area_m2
+    state.initial_boundary_component_count = snapshot.initial_boundary_component_count
+    state.initial_boundary_degree_anomaly_count = snapshot.initial_boundary_degree_anomaly_count
+    state.initial_singly_connected_triangle_count = snapshot.initial_singly_connected_triangle_count
+    state.initial_protected_not_boundary_count = snapshot.initial_protected_not_boundary_count
     state.ledger = snapshot.ledger
     state.cumulative_boundary_area_change_m2 = snapshot.cumulative_boundary_area_change_m2
     state.last_affected = snapshot.last_affected
@@ -2076,6 +2975,121 @@ def _same_boundary_kind(state: _State, edge: tuple[int, int]) -> bool:
     return bool(state.fixed[edge[0]] and state.fixed[edge[1]] and state.kinds[edge[0]] == state.kinds[edge[1]])
 
 
+def _source_arc_edge(state: _State, edge: tuple[int, int]) -> tuple[np.ndarray, np.ndarray] | None:
+    a, b = map(int, edge)
+    source_a = int(state.lineage[a]) if 0 <= a < len(state.lineage) else -1
+    source_b = int(state.lineage[b]) if 0 <= b < len(state.lineage) else -1
+    if source_a < 0 or source_b < 0 or source_a >= len(state.source_points) or source_b >= len(state.source_points):
+        return None
+    target = {source_a, source_b}
+    if not any(
+        {int(left), int(right)} == target
+        for chain in state.source_chains
+        for left, right in zip(chain, [*chain[1:], chain[0]])
+    ):
+        return None
+    return state.source_points[source_a].copy(), state.source_points[source_b].copy()
+
+
+def _cyclic_chain_window(chain: list[int], edge_position: int, radius: int) -> set[int]:
+    if not chain:
+        return set()
+    radius = max(0, int(radius))
+    positions = range(int(edge_position) - radius, int(edge_position) + 2 + radius)
+    return {int(chain[position % len(chain)]) for position in positions}
+
+
+def _minimum_remote_boundary_clearance(
+    state: _State,
+    point: np.ndarray,
+    active_edge: tuple[int, int],
+) -> float:
+    active_nodes = set(map(int, active_edge))
+    distances: list[float] = []
+    for chain in state.chains:
+        for left, right in zip(chain, [*chain[1:], chain[0]]):
+            edge = {int(left), int(right)}
+            if edge & active_nodes:
+                continue
+            distances.append(
+                _point_segment_distance(point, state.points[int(left)], state.points[int(right)])
+            )
+    return float(min(distances)) if distances else float("inf")
+
+
+def _boundary_graph_audit(topology: Any) -> dict[str, int]:
+    adjacency: dict[int, set[int]] = {}
+    for a, b in topology.boundary_edges:
+        adjacency.setdefault(int(a), set()).add(int(b))
+        adjacency.setdefault(int(b), set()).add(int(a))
+    anomaly_count = int(sum(len(values) != 2 for values in adjacency.values()))
+    unseen = set(adjacency)
+    component_count = 0
+    while unseen:
+        component_count += 1
+        start = min(unseen)
+        unseen.remove(start)
+        stack = [start]
+        while stack:
+            current = stack.pop()
+            following = adjacency[current] & unseen
+            unseen.difference_update(following)
+            stack.extend(following)
+    return {
+        "node_count": int(len(adjacency)),
+        "degree_anomaly_count": anomaly_count,
+        "component_count": int(component_count),
+    }
+
+
+def _boundary_area_budget_allows(
+    state: _State,
+    actual_change_m2: float,
+    config: AggressiveConditioningConfig,
+) -> bool:
+    budget = float(config.maximum_domain_area_change_fraction) * max(float(state.initial_domain_area_m2), 1.0e-30)
+    return bool(
+        np.isfinite(actual_change_m2)
+        and actual_change_m2 >= 0.0
+        and state.cumulative_boundary_area_change_m2 + float(actual_change_m2) <= budget + 1.0e-12
+    )
+
+
+def _sample_target_at(state: _State, point: np.ndarray, *, fallback: float) -> float:
+    return float(_sample_targets(state, np.asarray(point, dtype=float).reshape(1, 2), fallback=np.asarray([fallback]))[0])
+
+
+def _sample_targets(state: _State, points: np.ndarray, *, fallback: np.ndarray) -> np.ndarray:
+    fallback_values = np.asarray(fallback, dtype=float).reshape(-1)
+    if state.target_sampler is None:
+        return fallback_values.copy()
+    try:
+        sampled = np.asarray(state.target_sampler(np.asarray(points, dtype=float)), dtype=float).reshape(-1)
+    except Exception:
+        return fallback_values.copy()
+    if len(sampled) == 1 and len(fallback_values) > 1:
+        sampled = np.full(len(fallback_values), float(sampled[0]), dtype=float)
+    if len(sampled) != len(fallback_values):
+        return fallback_values.copy()
+    return np.where(np.isfinite(sampled) & (sampled > 0.0), sampled, fallback_values)
+
+
+def _deduplicate_rejections(values: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for value in values:
+        key = (
+            str(value.get("operation", "")),
+            tuple(map(int, value.get("payload", []))),
+            tuple(map(str, value.get("failures", []))),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(value)
+    return output
+
+
 def _link_condition(topology: Any, edge: tuple[int, int], attached: list[int]) -> bool:
     a, b = map(int, edge)
     common = set(topology.node_neighbors[a]) & set(topology.node_neighbors[b])
@@ -2149,6 +3163,11 @@ def _edge_set(triangles: np.ndarray) -> set[tuple[int, int]]:
     }
 
 
+def _triangle_edge_keys(triangle: np.ndarray) -> set[tuple[int, int]]:
+    a, b, c = map(int, np.asarray(triangle, dtype=int))
+    return {tuple(sorted(edge)) for edge in ((a, b), (b, c), (c, a))}
+
+
 def _incident_triangle_lists(node_count: int, triangles: np.ndarray) -> list[list[int]]:
     incident = [[] for _ in range(int(node_count))]
     for triangle_index, tri in enumerate(np.asarray(triangles, dtype=int)):
@@ -2178,6 +3197,10 @@ def _area_tolerance(points: np.ndarray, triangles: np.ndarray) -> float:
 
 def _mesh_area(points: np.ndarray, triangles: np.ndarray) -> float:
     return float(np.sum(triangle_geometry(points, triangles)["area"])) if len(triangles) else 0.0
+
+
+def _signed_mesh_area(points: np.ndarray, triangles: np.ndarray) -> float:
+    return float(np.sum(triangle_geometry(points, triangles)["signed_area"])) if len(triangles) else 0.0
 
 
 def _point_segment_distance(point: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:

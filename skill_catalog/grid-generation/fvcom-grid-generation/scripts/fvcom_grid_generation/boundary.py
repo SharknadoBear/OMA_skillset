@@ -50,6 +50,9 @@ class BoundaryNodes:
     hard_anchor_mask: np.ndarray | None = None
     adaptive_resolution: bool = False
     source_resolution_manifest: str | None = None
+    resolution_profile: str = "legacy"
+    metadata: dict[str, np.ndarray] | None = None
+    passage_diagnostics: list[dict[str, Any]] | None = None
 
 
 def load_boundary_package(path: str | Path) -> BoundaryPackage:
@@ -168,8 +171,9 @@ def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage
     """Load an explicit adaptive boundary package emitted by fvcom-bdry-arc."""
     manifest_path = Path(manifest_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-    if manifest.get("profile") != "adaptive-coastal-v1":
-        raise ValueError("Boundary resolution manifest must use profile adaptive-coastal-v1")
+    profile = str(manifest.get("profile", ""))
+    if profile not in {"adaptive-coastal-v1", "adaptive-coastal-v2"}:
+        raise ValueError("Boundary resolution manifest must use profile adaptive-coastal-v1 or adaptive-coastal-v2")
     gpkg = Path(manifest["outputs"]["boundary_resolution_gpkg"])
     layers = set(gpd.list_layers(gpkg)["name"])
     required = {"resolved_domain_polygon", "resolved_open_boundary", "boundary_nodes"}
@@ -205,6 +209,35 @@ def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage
         if "is_hard_anchor" in nodes_gdf
         else np.zeros(len(nodes_gdf), dtype=bool)
     )
+    reserved_columns = {
+        "geometry",
+        "node_index_zero_based",
+        "chain_id",
+        "chain_position",
+        "boundary_kind",
+        "target_spacing_m",
+        "is_hard_anchor",
+    }
+    metadata: dict[str, np.ndarray] = {}
+    for column in nodes_gdf.columns:
+        if column in reserved_columns:
+            continue
+        values = nodes_gdf[column].to_numpy(copy=True)
+        metadata[str(column)] = values
+    passage_diagnostics: list[dict[str, Any]] = []
+    if "passage_diagnostics" in layers:
+        passage_gdf = gpd.read_file(gpkg, layer="passage_diagnostics").to_crs("EPSG:4326")
+        for _, row in passage_gdf.iterrows():
+            geometry = row.geometry
+            if geometry is None or geometry.is_empty:
+                continue
+            record = {
+                str(column): row[column]
+                for column in passage_gdf.columns
+                if column != "geometry"
+            }
+            record["geometry_xy"] = project_geometry(geometry, projection)
+            passage_diagnostics.append(record)
     chains: list[list[int]] = []
     for _, group in nodes_gdf.groupby("chain_id", sort=True):
         chains.append([int(value) for value in group.index])
@@ -228,6 +261,9 @@ def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage
         hard_anchor_mask=hard_anchors,
         adaptive_resolution=True,
         source_resolution_manifest=str(manifest_path),
+        resolution_profile=profile,
+        metadata=metadata,
+        passage_diagnostics=passage_diagnostics,
     )
     return package, nodes, manifest
 
@@ -238,6 +274,15 @@ def boundary_nodes_geojson(nodes: BoundaryNodes) -> dict[str, Any]:
     open_set = set(nodes.open_boundary_indices)
     hard = np.asarray(nodes.hard_anchor_mask if nodes.hard_anchor_mask is not None else np.zeros(len(nodes.lonlat), dtype=bool), dtype=bool)
     for idx, ((lon, lat), kind) in enumerate(zip(nodes.lonlat, nodes.kinds)):
+        semantic = {}
+        for key, values in (nodes.metadata or {}).items():
+            if idx >= len(values):
+                continue
+            value = values[idx]
+            if isinstance(value, np.generic):
+                value = value.item()
+            if value is None or isinstance(value, (str, int, float, bool)):
+                semantic[str(key)] = value
         features.append(
             {
                 "type": "Feature",
@@ -247,11 +292,88 @@ def boundary_nodes_geojson(nodes: BoundaryNodes) -> dict[str, Any]:
                     "target_spacing_m": float(nodes.target_spacing_m[idx]),
                     "is_open_boundary": bool(idx in open_set),
                     "is_hard_anchor": bool(hard[idx]),
+                    "resolution_profile": str(nodes.resolution_profile),
+                    **semantic,
                 },
                 "geometry": {"type": "Point", "coordinates": [float(lon), float(lat)]},
             }
         )
     return {"type": "FeatureCollection", "features": features}
+
+
+def evaluate_boundary_contract_v2(
+    nodes: BoundaryNodes,
+    *,
+    gradation: float = 0.15,
+    maximum_l_over_h: float = 1.55,
+    maximum_adjacent_target_ratio: float = 1.50,
+) -> dict[str, Any]:
+    """Audit the adaptive-v2 boundary contract before triangulation."""
+    targets = np.asarray(nodes.target_spacing_m, dtype=float)
+    hard = np.asarray(
+        nodes.hard_anchor_mask if nodes.hard_anchor_mask is not None else np.zeros(len(nodes.xy), dtype=bool),
+        dtype=bool,
+    )
+    failures: list[str] = []
+    if len(targets) != len(nodes.xy) or np.any(~np.isfinite(targets)) or np.any(targets <= 0.0):
+        failures.append("boundary_target_spacing_invalid")
+    open_values = list(map(int, nodes.open_boundary_indices))
+    if len(open_values) < 2 or not hard[open_values[0]] or not hard[open_values[-1]]:
+        failures.append("open_boundary_landfall_anchor_missing")
+
+    maximum_lh = 0.0
+    maximum_gradient = 0.0
+    maximum_ratio = 1.0
+    transition_maximum_ratio = 1.0
+    edge_count = 0
+    for chain in nodes.constraint_chains:
+        values = list(map(int, chain))
+        if len(values) < 2:
+            continue
+        for a, b in zip(values, values[1:] + values[:1]):
+            length = float(np.linalg.norm(nodes.xy[a] - nodes.xy[b]))
+            if length <= 1.0e-10:
+                failures.append("duplicate_boundary_vertex")
+                continue
+            ha = float(targets[a])
+            hb = float(targets[b])
+            harmonic = 2.0 / (1.0 / ha + 1.0 / hb)
+            maximum_lh = max(maximum_lh, length / max(harmonic, 1.0e-12))
+            maximum_gradient = max(maximum_gradient, abs(ha - hb) / length)
+            ratio = max(ha, hb) / max(min(ha, hb), 1.0e-12)
+            maximum_ratio = max(maximum_ratio, ratio)
+            if str(nodes.kinds[a]) != str(nodes.kinds[b]):
+                transition_maximum_ratio = max(transition_maximum_ratio, ratio)
+            edge_count += 1
+    if maximum_lh > float(maximum_l_over_h) + 1.0e-9:
+        failures.append("boundary_edge_target_ratio_exceeded")
+    if maximum_gradient > float(gradation) + 1.0e-9:
+        failures.append("boundary_spacing_gradation_exceeded")
+    if transition_maximum_ratio > float(maximum_adjacent_target_ratio) + 1.0e-9:
+        failures.append("open_land_junction_spacing_jump")
+
+    metadata = nodes.metadata or {}
+    if "is_hard_anchor" in metadata:
+        semantic_hard = np.asarray(metadata["is_hard_anchor"], dtype=bool)
+        if len(semantic_hard) == len(hard) and np.any(semantic_hard & ~hard):
+            failures.append("required_boundary_anchor_lost")
+    return {
+        "schema_version": "fvcom_boundary_contract_v2",
+        "passed": bool(not failures),
+        "failure_taxonomy": sorted(set(failures)),
+        "edge_count": int(edge_count),
+        "hard_anchor_count": int(np.count_nonzero(hard)),
+        "open_boundary_node_count": int(len(open_values)),
+        "maximum_l_over_h": float(maximum_lh),
+        "maximum_spacing_gradient": float(maximum_gradient),
+        "maximum_adjacent_target_ratio": float(maximum_ratio),
+        "maximum_kind_transition_target_ratio": float(transition_maximum_ratio),
+        "thresholds": {
+            "maximum_l_over_h": float(maximum_l_over_h),
+            "gradation": float(gradation),
+            "maximum_adjacent_target_ratio": float(maximum_adjacent_target_ratio),
+        },
+    }
 
 
 def _boundary_hard_anchor_mask(kinds: list[str], chains: list[list[int]]) -> np.ndarray:

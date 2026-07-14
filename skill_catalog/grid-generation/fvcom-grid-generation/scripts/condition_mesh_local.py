@@ -34,7 +34,7 @@ def main_with_mode(forced_mode: str | None = None) -> int:
     parser.add_argument("--boundary-resolution-manifest")
     parser.add_argument("--size-field-nc")
     parser.add_argument("--target-spacing-m", type=float, help="Uniform fallback/override target spacing for standalone tests.")
-    parser.add_argument("--mode", choices=("all", "valence", "prune"), default=forced_mode or "all")
+    parser.add_argument("--mode", choices=("all", "valence", "thin", "prune"), default=forced_mode or "all")
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--boundary-edit-policy", choices=("kind-aware-envelope", "split-only", "none"), default="kind-aware-envelope")
     parser.add_argument("--max-prunes-per-round", type=int, default=500)
@@ -99,10 +99,16 @@ def main_with_mode(forced_mode: str | None = None) -> int:
     mode = str(args.mode)
     config = AggressiveConditioningConfig(
         max_rounds=int(args.rounds),
+        enable_pruning=mode in {"all", "prune"},
+        enable_thin_repair=mode in {"all", "thin", "valence"},
+        enable_valence_repair=mode in {"all", "valence"},
         boundary_edit_policy=str(args.boundary_edit_policy),
         max_prunes_per_round=int(args.max_prunes_per_round) if mode in {"all", "prune"} else 0,
-        max_collapses_per_round=100 if mode == "all" else 0,
-        max_boundary_edits_per_round=25 if mode == "all" else 0,
+        max_collapses_per_round=100 if mode in {"all", "thin", "valence"} else 0,
+        max_boundary_edits_per_round=25 if mode in {"all", "thin", "valence"} else 0,
+        max_superthin_flips_per_round=100 if mode in {"all", "thin", "valence"} else 0,
+        max_boundary_welds_per_round=25 if mode in {"all", "thin", "valence"} else 0,
+        max_boundary_ear_removals_per_round=25 if mode in {"all", "thin", "valence"} else 0,
         max_valence_removals_per_round=int(args.max_valence_repairs_per_round) if mode in {"all", "valence"} else 0,
         max_valence_flip_batch=int(args.max_valence_flip_batch) if mode in {"all", "valence"} else 0,
         max_valence_cluster_merges_per_round=(
@@ -179,7 +185,13 @@ def main_with_mode(forced_mode: str | None = None) -> int:
             indent=2,
         )
     )
-    return 0 if roundtrip["passed"] and (mode == "prune" or result.report["fvcom_valence_gate_passed"]) else 2
+    if mode == "prune":
+        conditioning_gate = bool(result.report["accepted"])
+    elif mode == "thin":
+        conditioning_gate = bool(result.report["superthin_gate_passed"])
+    else:
+        conditioning_gate = bool(result.report["terminal_topology_gate_passed"])
+    return 0 if roundtrip["passed"] and conditioning_gate else 2
 
 
 def _serialized_roundtrip_audit(output_mesh: Path, result: Any, projection: Any) -> dict[str, Any]:

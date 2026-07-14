@@ -29,7 +29,7 @@ from shapely.prepared import prep
 from shapely.ops import linemerge, nearest_points, polygonize, unary_union
 
 from .boundary_loops import build_model_boundary_loops
-from .boundary_resolution import BoundaryResolutionConfig, build_boundary_resolution
+from .boundary_resolution import boundary_resolution_config, build_boundary_resolution
 from .projection import LocalProjection, local_utm_projection, project_geometry, unproject_geometry, unwrap_geometry_longitudes, unwrap_longitude
 
 
@@ -91,8 +91,8 @@ def run_bdry_arc(
         raise ValueError("--topology-mode must be gshhs-vector, island-loop, iterative-raster, or vector-only")
     if config.heuristic_mode not in {"auto", "memory", "unknown"}:
         raise ValueError("--heuristic-mode must be auto, memory, or unknown")
-    if config.boundary_resolution_profile not in {"legacy", "adaptive-coastal-v1"}:
-        raise ValueError("--boundary-resolution-profile must be legacy or adaptive-coastal-v1")
+    if config.boundary_resolution_profile not in {"legacy", "adaptive-coastal-v1", "adaptive-coastal-v2"}:
+        raise ValueError("--boundary-resolution-profile must be legacy, adaptive-coastal-v1, or adaptive-coastal-v2")
     if config.topology_mode == "gshhs-vector" and config.coastline_source == "cusp-legacy":
         raise ValueError("--topology-mode gshhs-vector requires GSHHS/generic polygon-capable coastline input")
     resolved_heuristic_mode, place_memory_enabled = _resolve_heuristic_mode(config.heuristic_mode, config.mode)
@@ -539,7 +539,7 @@ def run_bdry_arc(
         "run_bdry_arc automatically builds continuous model-boundary loops; "
         "the main manifest needs review when the loop package needs review"
     )
-    if config.boundary_resolution_profile == "adaptive-coastal-v1" and loop_outputs.get("model_boundary_loops_gpkg"):
+    if config.boundary_resolution_profile in {"adaptive-coastal-v1", "adaptive-coastal-v2"} and loop_outputs.get("model_boundary_loops_gpkg"):
         resolution_dir = run_dir / "boundary_resolution"
         _write_progress(run_dir, "boundary-resolution", "start", {"run_dir": str(resolution_dir)})
         try:
@@ -550,7 +550,7 @@ def run_bdry_arc(
                 coastline_gpkg,
                 resolution_dir,
                 name,
-                BoundaryResolutionConfig(profile=config.boundary_resolution_profile),
+                boundary_resolution_config(config.boundary_resolution_profile),
             )
             manifest["boundary_resolution"] = resolution_manifest
             manifest["outputs"].update(resolution_manifest.get("outputs", {}))
@@ -561,7 +561,11 @@ def run_bdry_arc(
             _write_progress(run_dir, "boundary-resolution", "done", {"final_status": resolution_manifest.get("final_status")})
         except Exception as exc:
             manifest["boundary_resolution"] = {
-                "schema_version": "fvcom_boundary_resolution_manifest_v1",
+                "schema_version": (
+                    "fvcom_boundary_resolution_manifest_v2"
+                    if config.boundary_resolution_profile == "adaptive-coastal-v2"
+                    else "fvcom_boundary_resolution_manifest_v1"
+                ),
                 "profile": config.boundary_resolution_profile,
                 "final_status": "needs_review",
                 "failure_taxonomy": ["adaptive_boundary_resolution_failed"],

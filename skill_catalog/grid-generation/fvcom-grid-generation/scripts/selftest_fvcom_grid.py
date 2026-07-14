@@ -22,6 +22,7 @@ from fvcom_grid_generation.mesh import _ordered_boundary_kind_group  # noqa: E40
 from fvcom_grid_generation.local_topology import AggressiveConditioningConfig, condition_mesh_aggressive, inventory_high_valence  # noqa: E402
 from fvcom_grid_generation.metrics import compute_mesh_metrics, triangle_geometry  # noqa: E402
 from fvcom_grid_generation.postprocess import PostprocessConfig, _stage_acceptance, postprocess_mesh  # noqa: E402
+from fvcom_grid_generation.quality import evaluate_mesh_quality  # noqa: E402
 from fvcom_grid_generation.regional_conditioning import (  # noqa: E402
     AreaTransitionRelaxConfig,
     SpringRelaxConfig,
@@ -675,6 +676,27 @@ def test_adaptive_resolution_workflow_and_quadtree_seed() -> None:
         assert read_2dm(manifest["outputs"]["fvcom_grid_2dm"]).triangles.size > 0
 
 
+def test_final_quality_requires_q_l3_sigma_above_075() -> None:
+    nodes = np.asarray([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], dtype=float)
+    triangles = np.asarray([[1, 2, 3], [1, 3, 4]], dtype=int)
+    common = {
+        "depths": np.ones(4, dtype=float),
+        "triangles_1based": triangles,
+        "open_boundary_nodes": np.asarray([1, 2], dtype=int),
+        "constraint_report": {"boundary_constraint_recovered": True},
+        "constraint_chains": [[0, 1, 2, 3]],
+    }
+    regular = evaluate_mesh_quality(nodes, **common)
+    assert regular["oceanmesh_quality"]["q_l3_sigma"] > 0.75
+    assert "q_l3_sigma_below_threshold" not in regular["failure_taxonomy"]
+
+    degraded = nodes.copy()
+    degraded[2] = [1.0, 0.01]
+    poor = evaluate_mesh_quality(degraded, **common)
+    assert poor["oceanmesh_quality"]["q_l3_sigma"] <= 0.75
+    assert "q_l3_sigma_below_threshold" in poor["failure_taxonomy"]
+
+
 def main() -> int:
     test_boundary_ingestion_and_densification()
     test_size_field_limiter_never_coarsens_fine_cells()
@@ -699,6 +721,7 @@ def main() -> int:
     test_aggressive_valence_repair_uses_distributed_steiner_nodes()
     test_full_synthetic_workflow_and_2dm_roundtrip()
     test_adaptive_resolution_workflow_and_quadtree_seed()
+    test_final_quality_requires_q_l3_sigma_above_075()
     print("fvcom-grid-generation selftests passed")
     return 0
 

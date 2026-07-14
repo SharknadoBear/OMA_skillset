@@ -8,6 +8,7 @@ nodes for downstream meshing.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -18,6 +19,7 @@ from typing import Any, Iterable
 import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
+from shapely import STRtree
 from shapely.geometry import GeometryCollection, LineString, Point, Polygon, box, mapping
 from shapely.ops import nearest_points, substring, unary_union
 from shapely.prepared import prep
@@ -47,6 +49,32 @@ class BoundaryResolutionConfig:
     hausdorff_tolerance_fraction: float = 0.50
     repair_sample_spacing_m: float = 250.0
     repair_land_clearance_m: float = 25.0
+
+
+@dataclass(frozen=True)
+class BoundaryResolutionV2Config(BoundaryResolutionConfig):
+    """Opt-in controls for feature-anchored, passage-aware boundary sampling."""
+
+    profile: str = "adaptive-coastal-v2"
+    sharp_turn_threshold_deg: float = 35.0
+    spit_turn_threshold_deg: float = 70.0
+    anchor_chord_error_fraction: float = 0.20
+    anchor_min_separation_factor: float = 0.75
+    protected_elements_across: int = 4
+    unprotected_elements_across: int = 3
+    passage_search_spacing_m: float = 300.0
+    passage_max_width_m: float = 5000.0
+    passage_min_along_separation_m: float = 1500.0
+    passage_min_spacing_m: float = 150.0
+
+
+def boundary_resolution_config(profile: str) -> BoundaryResolutionConfig:
+    """Return the profile-specific configuration without changing v1 settings."""
+    if profile == "adaptive-coastal-v2":
+        return BoundaryResolutionV2Config()
+    if profile == "adaptive-coastal-v1":
+        return BoundaryResolutionConfig()
+    raise ValueError(f"Unsupported adaptive boundary-resolution profile: {profile}")
 
 
 def analyze_boundary_resolution(
@@ -85,11 +113,13 @@ def build_boundary_resolution(
     run_dir: str | Path,
     name: str,
     config: BoundaryResolutionConfig | None = None,
+    reuse_boundary_resolution_manifest: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build an adaptive boundary-resolution package without touching legacy outputs."""
     config = config or BoundaryResolutionConfig()
-    if config.profile != "adaptive-coastal-v1":
-        raise ValueError("Boundary resolution builder requires profile adaptive-coastal-v1")
+    if config.profile not in {"adaptive-coastal-v1", "adaptive-coastal-v2"}:
+        raise ValueError("Boundary resolution builder requires profile adaptive-coastal-v1 or adaptive-coastal-v2")
+    use_v2 = config.profile == "adaptive-coastal-v2"
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     source_path = Path(model_boundary_loops_gpkg)
@@ -109,32 +139,98 @@ def build_boundary_resolution(
     if not isinstance(shell_polygon, Polygon) or shell_polygon.is_empty:
         raise ValueError("Adaptive open-arc repair did not produce a valid exterior polygon")
 
-    source_metrics = _island_metrics(islands_xy, source_domain, mission_xy, config)
-    topologized, action_report = _apply_subgrid_actions(
-        shell_polygon,
-        islands_xy,
-        source_metrics,
-        mission_xy,
-        config,
-    )
-    resolved_islands, resolved_records = _generalize_islands(topologized, mission_xy, config)
+    if reuse_boundary_resolution_manifest is not None:
+        if not use_v2:
+            raise ValueError("Resolved-topology reuse is only supported by adaptive-coastal-v2")
+        source_metrics, action_report, resolved_islands, resolved_records = _load_reused_v1_topology(
+            reuse_boundary_resolution_manifest,
+            projection,
+        )
+    else:
+        source_metrics = _island_metrics(islands_xy, source_domain, mission_xy, config)
+        topologized, action_report = _apply_subgrid_actions(
+            shell_polygon,
+            islands_xy,
+            source_metrics,
+            mission_xy,
+            config,
+        )
+        resolved_islands, resolved_records = _generalize_islands(topologized, mission_xy, config)
 
-    open_nodes, open_h = _sample_open_arc(repaired_open, config)
-    land_nodes = _sample_line(landward_xy, config.land_spacing_m, include_end=True)
-    outer_nodes = open_nodes + land_nodes[1:-1]
-    outer_kinds = ["open"] * len(open_nodes) + ["land"] * max(0, len(land_nodes) - 2)
-    outer_h = open_h + [float(config.land_spacing_m)] * max(0, len(land_nodes) - 2)
-    outer_nodes = _deduplicate_ring(outer_nodes)
-    outer_kinds = outer_kinds[: len(outer_nodes)]
-    outer_h = outer_h[: len(outer_nodes)]
+    passage_report = {
+        "policy": "not_enabled_for_profile",
+        "passages": [],
+        "passage_count": 0,
+        "protected_unresolved_count": 0,
+        "unprotected_unresolved_count": 0,
+        "automatic_topology_operation_count": 0,
+    }
+    land_controls: list[dict[str, Any]] = []
+    island_target_overrides: dict[int, float] = {}
+    if use_v2:
+        passage_domain = Polygon(shell_polygon.exterior.coords, holes=[list(poly.exterior.coords) for poly in resolved_islands])
+        passage_report, land_controls, island_target_overrides = _inventory_narrow_passages(
+            landward_xy,
+            resolved_islands,
+            passage_domain,
+            mission_xy,
+            config,
+            projection,
+        )
+        open_nodes, open_h, open_meta, open_sampling = _sample_open_arc_v2(repaired_open, config)
+        land_nodes, land_h, land_meta, land_sampling = _sample_landward_v2(landward_xy, land_controls, config)
+        outer_entries = _deduplicate_node_entries(
+            [
+                {
+                    "xy": xy,
+                    "boundary_kind": "open",
+                    "target_spacing_m": h,
+                    **meta,
+                }
+                for xy, h, meta in zip(open_nodes, open_h, open_meta)
+            ]
+            + [
+                {
+                    "xy": xy,
+                    "boundary_kind": "land",
+                    "target_spacing_m": h,
+                    **meta,
+                }
+                for xy, h, meta in zip(land_nodes[1:-1], land_h[1:-1], land_meta[1:-1])
+            ]
+        )
+        target_gradation_conditioning = _enforce_delivered_target_gradation(
+            outer_entries,
+            float(config.gradation),
+        )
+        outer_nodes = [item["xy"] for item in outer_entries]
+        outer_kinds = [str(item["boundary_kind"]) for item in outer_entries]
+        outer_h = [float(item["target_spacing_m"]) for item in outer_entries]
+        outer_meta = outer_entries
+    else:
+        open_nodes, open_h = _sample_open_arc(repaired_open, config)
+        land_nodes = _sample_line(landward_xy, config.land_spacing_m, include_end=True)
+        outer_nodes = open_nodes + land_nodes[1:-1]
+        outer_kinds = ["open"] * len(open_nodes) + ["land"] * max(0, len(land_nodes) - 2)
+        outer_h = open_h + [float(config.land_spacing_m)] * max(0, len(land_nodes) - 2)
+        outer_nodes = _deduplicate_ring(outer_nodes)
+        outer_kinds = outer_kinds[: len(outer_nodes)]
+        outer_h = outer_h[: len(outer_nodes)]
+        outer_meta = []
+        open_sampling = {}
+        land_sampling = {}
+        target_gradation_conditioning = {}
 
     island_chains: list[list[tuple[float, float]]] = []
     island_targets: list[float] = []
-    for record, polygon in zip(resolved_records, resolved_islands):
+    for resolved_index, (record, polygon) in enumerate(zip(resolved_records, resolved_islands)):
         target = float(record["target_spacing_m"])
+        if use_v2 and resolved_index in island_target_overrides:
+            record["passage_harmonized_target_spacing_m"] = float(island_target_overrides[resolved_index])
+            target = min(target, float(island_target_overrides[resolved_index]))
         if record["protected_mission"]:
-            chain = list(polygon.exterior.coords)[:-1]
-            candidate = polygon
+            chain = _densify_closed_ring_vertices(polygon, target)
+            candidate = Polygon(chain)
         else:
             chain = _sample_closed_ring(polygon, target, config.min_vertices)
             candidate = Polygon(chain)
@@ -177,7 +273,10 @@ def build_boundary_resolution(
 
     node_records: list[dict[str, Any]] = []
     chain_summaries: list[dict[str, Any]] = []
-    _append_node_chain(node_records, chain_summaries, 0, outer_nodes, outer_kinds, outer_h, projection)
+    if use_v2:
+        _append_v2_outer_chain(node_records, chain_summaries, outer_meta, projection)
+    else:
+        _append_node_chain(node_records, chain_summaries, 0, outer_nodes, outer_kinds, outer_h, projection)
     for chain_id, (chain, target) in enumerate(zip(island_chains, island_targets), start=1):
         _append_node_chain(
             node_records,
@@ -202,12 +301,14 @@ def build_boundary_resolution(
         source_metrics,
         resolved_records,
         projection,
+        config.profile,
+        passage_report.get("passages", []) if use_v2 else None,
     )
     diagnostics_path = run_dir / "boundary_resolution_diagnostics.json"
     node_geojson_path = run_dir / "boundary_resolution_nodes.geojson"
     review_map = run_dir / "boundary_resolution_review_map.png"
     diagnostics = {
-        "schema_version": "fvcom_boundary_resolution_diagnostics_v1",
+        "schema_version": "fvcom_boundary_resolution_diagnostics_v2" if use_v2 else "fvcom_boundary_resolution_diagnostics_v1",
         "source_analysis": {
             "island_count": len(source_metrics),
             "class_counts": _count_by(source_metrics, "shape_class"),
@@ -218,6 +319,15 @@ def build_boundary_resolution(
         "resolved_islands": resolved_records,
         "chains": chain_summaries,
     }
+    if use_v2:
+        diagnostics["boundary_sampling"] = {
+            "profile": config.profile,
+            "open": open_sampling,
+            "land": land_sampling,
+            "junctions": _junction_diagnostics(outer_meta, config),
+            "delivered_target_gradation_conditioning": target_gradation_conditioning,
+        }
+        diagnostics["channel_passages"] = passage_report
     diagnostics_path.write_text(json.dumps(_json_safe(diagnostics), indent=2), encoding="utf-8")
     node_geojson_path.write_text(json.dumps(_node_geojson(node_records), indent=2), encoding="utf-8")
     _plot_review(review_map, source_domain, resolved_domain, repaired_open, mission_xy, projection, source_metrics)
@@ -238,8 +348,23 @@ def build_boundary_resolution(
         failures.append("island_topology_area_budget_exceeded")
     if not resolved_domain.is_valid:
         failures.append("resolved_domain_invalid")
+    spacing_qa = _boundary_spacing_qa(outer_nodes, outer_h) if use_v2 else {}
+    hard_anchor_count = int(sum(bool(item.get("is_hard_anchor")) for item in node_records))
+    landfall_hard_anchor_count = int(
+        sum(item.get("anchor_type") == "open_landfall" and bool(item.get("is_hard_anchor")) for item in node_records)
+    )
+    if use_v2 and landfall_hard_anchor_count != 2:
+        failures.append("open_landfall_hard_anchor_count_invalid")
+    if use_v2 and passage_report["protected_unresolved_count"]:
+        failures.append("protected_passage_underresolved")
+    if use_v2 and passage_report["unprotected_unresolved_count"]:
+        failures.append("unprotected_passage_requires_review")
+    if use_v2 and float(spacing_qa.get("maximum_edge_to_target_ratio", 0.0)) > 1.55 + 1.0e-9:
+        failures.append("boundary_edge_to_target_ratio_exceeded")
+    if use_v2 and float(spacing_qa.get("maximum_target_gradation", 0.0)) > float(config.gradation) + 1.0e-9:
+        failures.append("boundary_target_gradation_exceeded")
     manifest = {
-        "schema_version": "fvcom_boundary_resolution_manifest_v1",
+        "schema_version": "fvcom_boundary_resolution_manifest_v2" if use_v2 else "fvcom_boundary_resolution_manifest_v1",
         "name": name,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "created_by": "fvcom-bdry-arc boundary_resolution.py",
@@ -251,6 +376,9 @@ def build_boundary_resolution(
             "model_boundary_loop_manifest": str(model_boundary_loop_manifest) if model_boundary_loop_manifest else None,
             "region_bpoly_json": str(region_bpoly_json) if region_bpoly_json else None,
             "coastline_gpkg": str(coastline_gpkg) if coastline_gpkg else None,
+            "reused_boundary_resolution_manifest": (
+                str(reuse_boundary_resolution_manifest) if reuse_boundary_resolution_manifest else None
+            ),
         },
         "settings": _json_safe(config.__dict__),
         "qa": {
@@ -264,6 +392,21 @@ def build_boundary_resolution(
             "open_arc_land_intersection_m": float(max(repair_report["land_intersection_length_m"], sampled_land_length)),
             "open_arc_exterior_overlap_fraction": exterior_overlap,
             "resolved_domain_valid": bool(resolved_domain.is_valid),
+            **(
+                {
+                    **spacing_qa,
+                    "hard_anchor_count": hard_anchor_count,
+                    "open_landfall_hard_anchor_count": landfall_hard_anchor_count,
+                    "passage_count": int(passage_report["passage_count"]),
+                    "protected_underresolved_passage_count": int(passage_report["protected_unresolved_count"]),
+                    "unprotected_underresolved_passage_count": int(passage_report["unprotected_unresolved_count"]),
+                    "automatic_passage_topology_operation_count": int(
+                        passage_report["automatic_topology_operation_count"]
+                    ),
+                }
+                if use_v2
+                else {}
+            ),
         },
         "chains": chain_summaries,
         "outputs": {
@@ -277,6 +420,62 @@ def build_boundary_resolution(
     manifest_path = run_dir / "boundary_resolution_manifest.json"
     manifest_path.write_text(json.dumps(_json_safe(manifest), indent=2), encoding="utf-8")
     return manifest
+
+
+def _load_reused_v1_topology(
+    manifest_path: str | Path,
+    projection,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[Polygon], list[dict[str, Any]]]:
+    """Load an accepted v1 island topology for a v2-only prevention rebuild."""
+    manifest_path = Path(manifest_path)
+    document = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+    if document.get("profile") != "adaptive-coastal-v1" or document.get("final_status") != "pass":
+        raise ValueError("Topology reuse requires an accepted adaptive-coastal-v1 boundary-resolution manifest")
+    gpkg = Path(document["outputs"]["boundary_resolution_gpkg"])
+    diagnostics_path = Path(document["outputs"]["boundary_resolution_diagnostics_json"])
+    layers = set(gpd.list_layers(gpkg)["name"])
+    required = {"resolved_island_polygons", "island_diagnostics"}
+    if missing := required - layers:
+        raise ValueError(f"Reusable v1 package is missing layers: {sorted(missing)}")
+    diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8-sig"))
+
+    island_gdf = gpd.read_file(gpkg, layer="resolved_island_polygons").to_crs("EPSG:4326")
+    if "resolved_island_id" in island_gdf.columns:
+        island_gdf = island_gdf.sort_values("resolved_island_id")
+    resolved_islands = [
+        project_geometry(geometry, projection).buffer(0)
+        for geometry in island_gdf.geometry
+        if isinstance(geometry, Polygon) and not geometry.is_empty
+    ]
+    resolved_records = [dict(item) for item in diagnostics.get("resolved_islands", [])]
+    if len(resolved_islands) != len(resolved_records):
+        raise ValueError(
+            "Reusable v1 package has inconsistent resolved-island geometry and diagnostic counts: "
+            f"{len(resolved_islands)} != {len(resolved_records)}"
+        )
+
+    source_gdf = gpd.read_file(gpkg, layer="island_diagnostics")
+    if "island_id" in source_gdf.columns:
+        source_gdf = source_gdf.sort_values("island_id")
+    source_metrics = [
+        {
+            str(column): row[column]
+            for column in source_gdf.columns
+            if column != "geometry"
+        }
+        for _, row in source_gdf.iterrows()
+    ]
+    action_report = dict(diagnostics.get("topology_actions", {}))
+    required_actions = {
+        "source_island_area_m2",
+        "cumulative_absolute_area_change_m2",
+        "protected_operation_count",
+    }
+    if missing := required_actions - set(action_report):
+        raise ValueError(f"Reusable v1 topology report is missing fields: {sorted(missing)}")
+    action_report["reused_from_manifest"] = str(manifest_path)
+    action_report["reuse_policy"] = "accepted_v1_topology_v2_prevention_rebuild"
+    return source_metrics, action_report, resolved_islands, resolved_records
 
 
 def _load_loop_package(path: Path) -> dict[str, Any]:
@@ -494,8 +693,9 @@ def _compose_shell(open_line: LineString, landward: LineString, source_domain: P
 def _island_metrics(islands: list[Polygon], domain: Polygon, mission, config: BoundaryResolutionConfig) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     outer = LineString(domain.exterior.coords)
-    for idx, polygon in enumerate(islands):
-        polygon = polygon.buffer(0)
+    cleaned_islands = [polygon.buffer(0) for polygon in islands]
+    island_tree = STRtree(cleaned_islands) if cleaned_islands else None
+    for idx, polygon in enumerate(cleaned_islands):
         area = float(polygon.area)
         perimeter = float(polygon.length)
         diameter = float(2.0 * math.sqrt(area / math.pi)) if area > 0.0 else 0.0
@@ -509,12 +709,10 @@ def _island_metrics(islands: list[Polygon], domain: Polygon, mission, config: Bo
         aspect = float(length / max(width, 1.0e-12))
         gap = float(polygon.distance(outer))
         gap_line = _nearest_connector(polygon, outer)
-        for other_idx, other in enumerate(islands):
-            if other_idx != idx:
-                distance = float(polygon.distance(other))
-                if distance < gap:
-                    gap = distance
-                    gap_line = _nearest_connector(polygon, other)
+        nearest = _nearest_other_island(idx, polygon, cleaned_islands, island_tree)
+        if nearest is not None and nearest[1] < gap:
+            other_idx, gap = nearest
+            gap_line = _nearest_connector(polygon, cleaned_islands[other_idx])
         protected_island = bool(mission is not None and not mission.is_empty and polygon.intersects(mission))
         protected_gap = bool(mission is not None and not mission.is_empty and gap_line.intersects(mission))
         protected = bool(protected_island or protected_gap)
@@ -672,6 +870,7 @@ def _apply_subgrid_actions(shell: Polygon, islands: list[Polygon], metrics: list
 
 def _generalize_islands(domain: Polygon, mission, config: BoundaryResolutionConfig) -> tuple[list[Polygon], list[dict[str, Any]]]:
     islands = [Polygon(ring).buffer(0) for ring in domain.interiors]
+    island_tree = STRtree(islands) if islands else None
     resolved: list[Polygon] = []
     records: list[dict[str, Any]] = []
     for idx, polygon in enumerate(islands):
@@ -687,13 +886,10 @@ def _generalize_islands(domain: Polygon, mission, config: BoundaryResolutionConf
         outer = LineString(domain.exterior.coords)
         gap = float(polygon.distance(outer))
         gap_line = _nearest_connector(polygon, outer)
-        for other_idx, other in enumerate(islands):
-            if other_idx == idx:
-                continue
-            distance = float(polygon.distance(other))
-            if distance < gap:
-                gap = distance
-                gap_line = _nearest_connector(polygon, other)
+        nearest = _nearest_other_island(idx, polygon, islands, island_tree)
+        if nearest is not None and nearest[1] < gap:
+            other_idx, gap = nearest
+            gap_line = _nearest_connector(polygon, islands[other_idx])
         protected_island = bool(mission is not None and not mission.is_empty and polygon.intersects(mission))
         protected_gap = bool(mission is not None and not mission.is_empty and gap_line.intersects(mission))
         protected = bool(protected_island or protected_gap)
@@ -756,6 +952,37 @@ def _generalize_islands(domain: Polygon, mission, config: BoundaryResolutionConf
     return resolved, records
 
 
+def _nearest_other_island(
+    index: int,
+    polygon: Polygon,
+    islands: list[Polygon],
+    tree: STRtree | None,
+) -> tuple[int, float] | None:
+    """Return the exact nearest distinct island using the spatial index."""
+    if tree is None or len(islands) < 2:
+        return None
+    indices, distances = tree.query_nearest(polygon, exclusive=True, return_distance=True)
+    candidates = sorted(
+        (float(distance), int(other_index))
+        for other_index, distance in zip(np.asarray(indices).ravel(), np.asarray(distances).ravel())
+        if int(other_index) != int(index)
+    )
+    if candidates:
+        distance, other_index = candidates[0]
+        return int(other_index), float(distance)
+    # Degenerate duplicate geometries can be excluded together by GEOS.
+    # Preserve exact behavior with a rare linear fallback for that case only.
+    fallback = [
+        (float(polygon.distance(other)), int(other_index))
+        for other_index, other in enumerate(islands)
+        if int(other_index) != int(index)
+    ]
+    if not fallback:
+        return None
+    distance, other_index = min(fallback)
+    return int(other_index), float(distance)
+
+
 def _sample_open_arc(line: LineString, config: BoundaryResolutionConfig) -> tuple[list[tuple[float, float]], list[float]]:
     length = float(line.length)
     positions = [0.0]
@@ -786,6 +1013,611 @@ def _sample_open_arc(line: LineString, config: BoundaryResolutionConfig) -> tupl
         coords.append((float(point.x), float(point.y)))
         sizes.append(float(min(config.open_central_spacing_m, config.open_anchor_spacing_m + config.gradation * min(s, max(0.0, length - s)))))
     return coords, sizes
+
+
+def _inventory_narrow_passages(
+    landward: LineString,
+    islands: list[Polygon],
+    domain: Polygon,
+    mission,
+    config: BoundaryResolutionConfig,
+    projection,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[int, float]]:
+    """Conservatively inventory wet connectors between nonlocal boundary banks.
+
+    The inventory may lower paired sampling targets, but it never closes a
+    channel or changes geographic topology. Ambiguous or unresolvable cases
+    are retained and exposed as review gates.
+    """
+    max_width = float(getattr(config, "passage_max_width_m", 5000.0))
+    search_spacing = float(getattr(config, "passage_search_spacing_m", 300.0))
+    min_along = float(getattr(config, "passage_min_along_separation_m", 1500.0))
+    min_spacing = float(getattr(config, "passage_min_spacing_m", config.land_spacing_m))
+    raw_candidates: list[dict[str, Any]] = []
+
+    # Same-chain search captures opposite banks of a narrow inlet/channel.
+    sample_count = min(1200, max(3, int(math.ceil(float(landward.length) / max(search_spacing, 1.0))) + 1))
+    sample_s = np.linspace(0.0, float(landward.length), sample_count)
+    sample_xy = np.asarray([[landward.interpolate(float(s)).x, landward.interpolate(float(s)).y] for s in sample_s], dtype=float)
+    sample_tangent = np.asarray(
+        [_line_tangent_at(landward, float(s), search_spacing) for s in sample_s],
+        dtype=float,
+    )
+    if sample_count >= 3:
+        distances = np.linalg.norm(sample_xy[:, None, :] - sample_xy[None, :, :], axis=2)
+        np.fill_diagonal(distances, np.inf)
+        neighbor_count = min(64, sample_count - 1)
+        for first in range(sample_count):
+            nearby = np.argpartition(distances[first], neighbor_count - 1)[:neighbor_count]
+            for second in sorted((int(value) for value in nearby), key=lambda value: distances[first, value]):
+                if second <= first or abs(float(sample_s[second] - sample_s[first])) < min_along:
+                    continue
+                width = float(distances[first, second])
+                if not (1.0 < width <= max_width):
+                    continue
+                tangent_a = sample_tangent[first]
+                tangent_b = sample_tangent[second]
+                connector_unit = (sample_xy[second] - sample_xy[first]) / max(width, 1.0e-12)
+                if abs(float(np.dot(tangent_a, tangent_b))) < 0.50:
+                    continue
+                if abs(float(np.dot(tangent_a, connector_unit))) > 0.70 or abs(float(np.dot(tangent_b, connector_unit))) > 0.70:
+                    continue
+                # Geometry-domain intersection is substantially more expensive
+                # than the local tangent screen on a long crenulated shoreline.
+                # Defer it until the vector tests identify a plausible opposite
+                # bank, preserving the same conservative acceptance contract.
+                connector = LineString([sample_xy[first], sample_xy[second]])
+                if not _wet_connector_is_conservative(connector, domain):
+                    continue
+                raw_candidates.append(
+                    {
+                        "bank_a": "land",
+                        "bank_b": "land",
+                        "position_a_m": float(sample_s[first]),
+                        "position_b_m": float(sample_s[second]),
+                        "island_a": None,
+                        "island_b": None,
+                        "width_m": width,
+                        "connector": connector,
+                    }
+                )
+                break
+
+    # Cross-component nearest connectors cover island/mainland and island/island gaps.
+    components: list[tuple[str, int | None, Any]] = [("land", None, landward)] + [
+        ("island", index, LineString(polygon.exterior.coords)) for index, polygon in enumerate(islands)
+    ]
+    component_geometries = [item[2] for item in components]
+    component_tree = STRtree(component_geometries)
+    indexed_component_pair_count = 0
+    all_component_pair_count = len(components) * max(0, len(components) - 1) // 2
+    for first, geometry_a in enumerate(component_geometries):
+        nearby = component_tree.query(geometry_a, predicate="dwithin", distance=max_width)
+        for second in sorted(int(value) for value in nearby if int(value) > first):
+            indexed_component_pair_count += 1
+            kind_a, island_a, geometry_a = components[first]
+            kind_b, island_b, geometry_b = components[second]
+            point_a, point_b = nearest_points(geometry_a, geometry_b)
+            width = float(point_a.distance(point_b))
+            if not (1.0 < width <= max_width):
+                continue
+            connector = LineString([point_a, point_b])
+            if not _wet_connector_is_conservative(connector, domain):
+                continue
+            raw_candidates.append(
+                {
+                    "bank_a": kind_a,
+                    "bank_b": kind_b,
+                    "position_a_m": float(landward.project(point_a)) if kind_a == "land" else float(geometry_a.project(point_a)),
+                    "position_b_m": float(landward.project(point_b)) if kind_b == "land" else float(geometry_b.project(point_b)),
+                    "island_a": island_a,
+                    "island_b": island_b,
+                    "width_m": width,
+                    "connector": connector,
+                }
+            )
+
+    # Keep one narrow representative per local bank-pair neighborhood.
+    accepted: list[dict[str, Any]] = []
+    for candidate in sorted(raw_candidates, key=lambda item: item["width_m"]):
+        duplicate = False
+        for prior in accepted:
+            same_components = {
+                (candidate["bank_a"], candidate["island_a"]),
+                (candidate["bank_b"], candidate["island_b"]),
+            } == {
+                (prior["bank_a"], prior["island_a"]),
+                (prior["bank_b"], prior["island_b"]),
+            }
+            endpoint_distance = float(candidate["connector"].hausdorff_distance(prior["connector"]))
+            if same_components and endpoint_distance <= max(500.0, min(candidate["width_m"], prior["width_m"])):
+                duplicate = True
+                break
+        if not duplicate:
+            accepted.append(candidate)
+
+    passages: list[dict[str, Any]] = []
+    land_controls: list[dict[str, Any]] = []
+    island_targets: dict[int, float] = {}
+    protected_unresolved = 0
+    unprotected_unresolved = 0
+    for passage_id, candidate in enumerate(accepted):
+        connector = candidate.pop("connector")
+        protected = bool(mission is not None and not mission.is_empty and connector.intersects(mission))
+        elements = int(
+            getattr(config, "protected_elements_across", 4)
+            if protected
+            else getattr(config, "unprotected_elements_across", 3)
+        )
+        required_h = float(candidate["width_m"] / max(elements, 1))
+        unresolved = bool(required_h < min_spacing - 1.0e-9)
+        if unresolved and protected:
+            protected_unresolved += 1
+        elif unresolved:
+            unprotected_unresolved += 1
+        action = "retain_needs_review" if unresolved else "harmonize_paired_spacing"
+        if not unresolved:
+            if candidate["bank_a"] == "land":
+                land_controls.append(
+                    {
+                        "passage_id": int(passage_id),
+                        "source_position_m": float(candidate["position_a_m"]),
+                        "target_spacing_m": required_h,
+                    }
+                )
+            elif candidate["island_a"] is not None:
+                island_id = int(candidate["island_a"])
+                island_targets[island_id] = min(island_targets.get(island_id, math.inf), required_h)
+            if candidate["bank_b"] == "land":
+                land_controls.append(
+                    {
+                        "passage_id": int(passage_id),
+                        "source_position_m": float(candidate["position_b_m"]),
+                        "target_spacing_m": required_h,
+                    }
+                )
+            elif candidate["island_b"] is not None:
+                island_id = int(candidate["island_b"])
+                island_targets[island_id] = min(island_targets.get(island_id, math.inf), required_h)
+        connector_ll = unproject_geometry(connector, projection)
+        passages.append(
+            {
+                "passage_id": int(passage_id),
+                **candidate,
+                "protected_mission": protected,
+                "required_elements_across": elements,
+                "required_target_spacing_m": required_h,
+                "minimum_permitted_spacing_m": min_spacing,
+                "resolvable_at_minimum_spacing": not unresolved,
+                "action": action,
+                "automatic_topology_change": False,
+                "connector_lonlat": [[float(x), float(y)] for x, y in connector_ll.coords],
+            }
+        )
+    return (
+        {
+            "policy": "conservative_inventory_harmonize_only_no_topology_closure",
+            "passage_count": int(len(passages)),
+            "protected_unresolved_count": int(protected_unresolved),
+            "unprotected_unresolved_count": int(unprotected_unresolved),
+            "automatic_topology_operation_count": 0,
+            "search_spacing_m": search_spacing,
+            "maximum_inventory_width_m": max_width,
+            "minimum_permitted_spacing_m": min_spacing,
+            "all_component_pair_count": int(all_component_pair_count),
+            "spatially_indexed_component_pair_count": int(indexed_component_pair_count),
+            "passages": passages,
+        },
+        land_controls,
+        island_targets,
+    )
+
+
+def _wet_connector_is_conservative(connector: LineString, domain: Polygon) -> bool:
+    if connector.is_empty or connector.length <= 1.0:
+        return False
+    buffered = domain.buffer(2.0)
+    if not buffered.covers(connector):
+        return False
+    for fraction in np.linspace(0.1, 0.9, 9):
+        if not domain.buffer(0.25).covers(connector.interpolate(float(fraction), normalized=True)):
+            return False
+    return True
+
+
+def _line_tangent_at(line: LineString, position: float, scale: float) -> np.ndarray:
+    half = max(1.0, 0.5 * float(scale))
+    start = line.interpolate(max(0.0, float(position) - half))
+    end = line.interpolate(min(float(line.length), float(position) + half))
+    vector = np.asarray([end.x - start.x, end.y - start.y], dtype=float)
+    norm = float(np.linalg.norm(vector))
+    return vector / norm if norm > 1.0e-12 else np.asarray([1.0, 0.0])
+
+
+def _sample_open_arc_v2(
+    line: LineString,
+    config: BoundaryResolutionConfig,
+) -> tuple[list[tuple[float, float]], list[float], list[dict[str, Any]], dict[str, Any]]:
+    """Sample one OBC chain while retaining stable source-feature vertices exactly."""
+    length = float(line.length)
+
+    def target(s: float) -> float:
+        return float(
+            min(
+                config.open_central_spacing_m,
+                config.open_anchor_spacing_m + config.gradation * min(max(0.0, s), max(0.0, length - s)),
+            )
+        )
+
+    anchors = _stable_feature_anchors(line, target, config)
+    positions = _equidistributed_positions(line, anchors, target)
+    # Curvature/chord control is retained, but every added point is explicitly
+    # non-anchor and source anchors remain exact.
+    for _ in range(12):
+        added: list[float] = []
+        for start, end in zip(positions[:-1], positions[1:]):
+            chord = LineString([line.interpolate(start), line.interpolate(end)])
+            section = substring(line, start, end)
+            local_h = min(target(start), target(end), target(0.5 * (start + end)))
+            if float(section.hausdorff_distance(chord)) > 0.10 * max(float(local_h), 1.0):
+                added.append(0.5 * (start + end))
+        if not added:
+            break
+        positions = sorted(set(positions + added))
+    coords, sizes, metadata = _sample_records(line, positions, anchors, target, "open")
+    return coords, sizes, metadata, {
+        "method": "anchor_interval_metric_equidistribution_with_chord_guard",
+        "source_length_m": length,
+        "node_count": len(coords),
+        "feature_anchor_count": int(sum(item["anchor_type"] != "open_landfall" for item in anchors)),
+        "hard_anchor_count": int(len(anchors)),
+        "anchors": anchors,
+    }
+
+
+def _sample_landward_v2(
+    line: LineString,
+    controls: list[dict[str, Any]],
+    config: BoundaryResolutionConfig,
+) -> tuple[list[tuple[float, float]], list[float], list[dict[str, Any]], dict[str, Any]]:
+    """Sample land boundary with shared landfall targets and passage controls."""
+    length = float(line.length)
+
+    def target(s: float) -> float:
+        distance_from_junction = min(max(0.0, s), max(0.0, length - s))
+        value = max(
+            float(config.land_spacing_m),
+            float(config.open_anchor_spacing_m) - float(config.gradation) * distance_from_junction,
+        )
+        for control in controls:
+            control_s = float(control["source_position_m"])
+            control_h = float(control["target_spacing_m"])
+            value = min(value, control_h + float(config.gradation) * abs(float(s) - control_s))
+        return float(value)
+
+    anchors = _stable_feature_anchors(line, target, config)
+    positions = _equidistributed_positions(line, anchors, target)
+    coords, sizes, metadata = _sample_records(line, positions, anchors, target, "land")
+    return coords, sizes, metadata, {
+        "method": "anchor_interval_metric_equidistribution_with_shared_junction_target",
+        "source_length_m": length,
+        "node_count": len(coords),
+        "feature_anchor_count": int(sum(item["anchor_type"] != "open_landfall" for item in anchors)),
+        "hard_anchor_count": int(len(anchors)),
+        "junction_target_spacing_m": float(config.open_anchor_spacing_m),
+        "interior_land_target_spacing_m": float(config.land_spacing_m),
+        "gradation": float(config.gradation),
+        "junction_transition_length_m": float(
+            max(0.0, config.open_anchor_spacing_m - config.land_spacing_m) / max(float(config.gradation), 1.0e-12)
+        ),
+        "passage_control_count": int(len(controls)),
+        "passage_controls": controls,
+        "anchors": anchors,
+    }
+
+
+def _stable_feature_anchors(line: LineString, target, config: BoundaryResolutionConfig) -> list[dict[str, Any]]:
+    """Return endpoints plus non-noisy sharp-turn/spit anchors on a source chain."""
+    coords = np.asarray(line.coords, dtype=float)
+    if len(coords) < 2:
+        return []
+    edge_lengths = np.linalg.norm(np.diff(coords, axis=0), axis=1)
+    cumulative = np.concatenate(([0.0], np.cumsum(edge_lengths)))
+    length = float(line.length)
+    candidates: list[dict[str, Any]] = []
+    threshold = float(getattr(config, "sharp_turn_threshold_deg", 35.0))
+    spit_threshold = float(getattr(config, "spit_turn_threshold_deg", 70.0))
+    chord_fraction = float(getattr(config, "anchor_chord_error_fraction", 0.20))
+    for idx in range(1, len(coords) - 1):
+        incoming = coords[idx] - coords[idx - 1]
+        outgoing = coords[idx + 1] - coords[idx]
+        turn = _turn_angle_deg(incoming, outgoing)
+        wide_idx0 = max(0, idx - 2)
+        wide_idx1 = min(len(coords) - 1, idx + 2)
+        wide_turn = _turn_angle_deg(coords[idx] - coords[wide_idx0], coords[wide_idx1] - coords[idx])
+        chord = LineString([coords[wide_idx0], coords[wide_idx1]])
+        chord_error = float(Point(coords[idx]).distance(chord))
+        local_h = max(1.0, float(target(float(cumulative[idx]))))
+        stable = bool(turn >= threshold and (wide_turn >= 0.65 * threshold or chord_error >= chord_fraction * local_h))
+        if not stable:
+            continue
+        anchor_type = "spit_tip" if turn >= spit_threshold and chord_error >= chord_fraction * local_h else "sharp_turn"
+        candidates.append(
+            {
+                "source_position_m": float(cumulative[idx]),
+                "anchor_type": anchor_type,
+                "source_vertex_index": int(idx),
+                "turn_angle_deg": float(turn),
+                "multiscale_turn_angle_deg": float(wide_turn),
+                "chord_error_m": chord_error,
+                "local_target_spacing_m": local_h,
+                "score": float(max(turn / max(threshold, 1.0), chord_error / max(chord_fraction * local_h, 1.0))),
+            }
+        )
+    selected: list[dict[str, Any]] = []
+    selected_positions: list[float] = []
+    for candidate in sorted(candidates, key=lambda item: (-item["score"], item["source_position_m"])):
+        separation = float(getattr(config, "anchor_min_separation_factor", 0.75)) * candidate["local_target_spacing_m"]
+        position = float(candidate["source_position_m"])
+        insertion = bisect_left(selected_positions, position)
+        neighbors = selected_positions[max(0, insertion - 1) : min(len(selected_positions), insertion + 1)]
+        if all(abs(position - prior) >= separation for prior in neighbors):
+            selected_positions.insert(insertion, position)
+            selected.append(candidate)
+    endpoints = [
+        {
+            "source_position_m": 0.0,
+            "anchor_type": "open_landfall",
+            "source_vertex_index": 0,
+            "turn_angle_deg": 0.0,
+            "multiscale_turn_angle_deg": 0.0,
+            "chord_error_m": 0.0,
+            "local_target_spacing_m": float(target(0.0)),
+            "score": math.inf,
+        },
+        {
+            "source_position_m": length,
+            "anchor_type": "open_landfall",
+            "source_vertex_index": int(len(coords) - 1),
+            "turn_angle_deg": 0.0,
+            "multiscale_turn_angle_deg": 0.0,
+            "chord_error_m": 0.0,
+            "local_target_spacing_m": float(target(length)),
+            "score": math.inf,
+        },
+    ]
+    result = endpoints + selected
+    result.sort(key=lambda item: item["source_position_m"])
+    for anchor_id, item in enumerate(result):
+        item["anchor_id"] = f"{item['anchor_type']}_{anchor_id:04d}"
+        item.pop("score", None)
+    return result
+
+
+def _turn_angle_deg(first: np.ndarray, second: np.ndarray) -> float:
+    norm = float(np.linalg.norm(first) * np.linalg.norm(second))
+    if norm <= 1.0e-12:
+        return 0.0
+    cosine = float(np.clip(np.dot(first, second) / norm, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosine)))
+
+
+def _equidistributed_positions(line: LineString, anchors: list[dict[str, Any]], target) -> list[float]:
+    """Equidistribute integral(ds/h) independently between retained anchors."""
+    positions: list[float] = []
+    anchor_positions = sorted(set(float(item["source_position_m"]) for item in anchors))
+    for interval_index, (start, end) in enumerate(zip(anchor_positions[:-1], anchor_positions[1:])):
+        if end - start <= 1.0e-9:
+            continue
+        probe_count = min(2049, max(33, int(math.ceil((end - start) / 25.0)) + 1))
+        probe = np.linspace(start, end, probe_count)
+        weight = np.asarray([1.0 / max(float(target(float(s))), 1.0) for s in probe], dtype=float)
+        cumulative = np.concatenate(([0.0], np.cumsum(0.5 * (weight[:-1] + weight[1:]) * np.diff(probe))))
+        interval_count = max(1, int(math.ceil(float(cumulative[-1]) - 1.0e-12)))
+        desired = np.linspace(0.0, float(cumulative[-1]), interval_count + 1)
+        local = np.interp(desired, cumulative, probe).tolist()
+        if interval_index:
+            local = local[1:]
+        positions.extend(float(value) for value in local)
+    if not positions:
+        positions = [0.0, float(line.length)]
+    positions[0] = 0.0
+    positions[-1] = float(line.length)
+    return positions
+
+
+def _sample_records(
+    line: LineString,
+    positions: list[float],
+    anchors: list[dict[str, Any]],
+    target,
+    source_chain: str,
+) -> tuple[list[tuple[float, float]], list[float], list[dict[str, Any]]]:
+    coords: list[tuple[float, float]] = []
+    sizes: list[float] = []
+    metadata: list[dict[str, Any]] = []
+    ordered_anchors = sorted(anchors, key=lambda item: float(item["source_position_m"]))
+    anchor_positions = np.asarray(
+        [float(item["source_position_m"]) for item in ordered_anchors],
+        dtype=float,
+    )
+    for position in positions:
+        point = line.interpolate(float(position))
+        match = None
+        if len(anchor_positions):
+            insertion = int(np.searchsorted(anchor_positions, float(position), side="left"))
+            for candidate in (insertion - 1, insertion):
+                if 0 <= candidate < len(ordered_anchors) and abs(anchor_positions[candidate] - float(position)) <= 1.0e-6:
+                    match = ordered_anchors[candidate]
+                    break
+        coords.append((float(point.x), float(point.y)))
+        sizes.append(float(target(float(position))))
+        metadata.append(
+            {
+                "is_hard_anchor": bool(match is not None),
+                "anchor_type": str(match["anchor_type"]) if match else "",
+                "anchor_id": str(match["anchor_id"]) if match else "",
+                "source_chain": source_chain,
+                "source_position_m": float(position),
+            }
+        )
+    return coords, sizes, metadata
+
+
+def _deduplicate_node_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deduplicate coordinates without separating boundary metadata from nodes."""
+    out: list[dict[str, Any]] = []
+    for entry in entries:
+        item = dict(entry)
+        item["xy"] = (float(item["xy"][0]), float(item["xy"][1]))
+        if out and np.linalg.norm(np.asarray(out[-1]["xy"]) - np.asarray(item["xy"])) <= 1.0e-7:
+            out[-1]["is_hard_anchor"] = bool(out[-1].get("is_hard_anchor") or item.get("is_hard_anchor"))
+            if not out[-1].get("anchor_type"):
+                out[-1]["anchor_type"] = item.get("anchor_type", "")
+                out[-1]["anchor_id"] = item.get("anchor_id", "")
+            out[-1]["target_spacing_m"] = min(float(out[-1]["target_spacing_m"]), float(item["target_spacing_m"]))
+            continue
+        out.append(item)
+    if len(out) > 1 and np.linalg.norm(np.asarray(out[0]["xy"]) - np.asarray(out[-1]["xy"])) <= 1.0e-7:
+        out[0]["is_hard_anchor"] = bool(out[0].get("is_hard_anchor") or out[-1].get("is_hard_anchor"))
+        out[0]["target_spacing_m"] = min(float(out[0]["target_spacing_m"]), float(out[-1]["target_spacing_m"]))
+        out.pop()
+    return out
+
+
+def _append_v2_outer_chain(records, summaries, entries: list[dict[str, Any]], projection) -> None:
+    start = len(records)
+    for pos, item in enumerate(entries):
+        point = unproject_geometry(Point(item["xy"]), projection)
+        records.append(
+            {
+                "node_index_zero_based": int(len(records)),
+                "chain_id": 0,
+                "chain_position": int(pos),
+                "boundary_kind": str(item["boundary_kind"]),
+                "target_spacing_m": float(item["target_spacing_m"]),
+                "is_hard_anchor": bool(item.get("is_hard_anchor", False)),
+                "anchor_type": str(item.get("anchor_type", "")),
+                "anchor_id": str(item.get("anchor_id", "")),
+                "source_chain": str(item.get("source_chain", "")),
+                "source_position_m": float(item.get("source_position_m", 0.0)),
+                "geometry": point,
+            }
+        )
+    summaries.append(
+        {
+            "chain_id": 0,
+            "kind": "outer",
+            "node_count": int(len(entries)),
+            "start_node_index_zero_based": int(start),
+            "end_node_index_zero_based": int(len(records) - 1),
+            "hard_anchor_count": int(sum(bool(item.get("is_hard_anchor")) for item in entries)),
+            "open_landfall_hard_anchor_count": int(
+                sum(bool(item.get("is_hard_anchor")) and item.get("anchor_type") == "open_landfall" for item in entries)
+            ),
+        }
+    )
+
+
+def _boundary_spacing_qa(coords: list[tuple[float, float]], sizes: list[float]) -> dict[str, Any]:
+    if len(coords) < 2:
+        return {"maximum_edge_to_target_ratio": 0.0, "p95_edge_to_target_ratio": 0.0, "maximum_target_gradation": 0.0}
+    points = np.asarray(coords, dtype=float)
+    lengths = np.linalg.norm(np.roll(points, -1, axis=0) - points, axis=1)
+    target = np.asarray(sizes, dtype=float)
+    ratios = lengths / np.maximum(np.minimum(target, np.roll(target, -1)), 1.0)
+    gradation = np.abs(np.roll(target, -1) - target) / np.maximum(lengths, 1.0)
+    return {
+        "maximum_edge_to_target_ratio": float(np.max(ratios)),
+        "p95_edge_to_target_ratio": float(np.percentile(ratios, 95.0)),
+        "maximum_target_gradation": float(np.max(gradation)),
+    }
+
+
+def _enforce_delivered_target_gradation(
+    entries: list[dict[str, Any]],
+    gradation: float,
+) -> dict[str, Any]:
+    """Project targets onto the actual chord-length Lipschitz constraints."""
+    if len(entries) < 2 or gradation <= 0.0:
+        return {"adjusted_node_count": 0, "iteration_count": 0, "maximum_gradient": 0.0}
+    points = np.asarray([item["xy"] for item in entries], dtype=float)
+    raw = np.asarray([item["target_spacing_m"] for item in entries], dtype=float)
+    target = raw.copy()
+    effective_gradation = float(gradation) * (1.0 - 1.0e-4)
+    fixed = np.asarray(
+        [item.get("anchor_type") == "open_landfall" for item in entries],
+        dtype=bool,
+    )
+    lengths = np.linalg.norm(np.roll(points, -1, axis=0) - points, axis=1)
+    iteration_count = 0
+    for iteration_count in range(1, 1001):
+        changed = False
+        for index in range(len(entries)):
+            following = (index + 1) % len(entries)
+            limit = effective_gradation * max(float(lengths[index]), 1.0)
+            difference = float(target[following] - target[index])
+            if abs(difference) <= limit + 1.0e-10:
+                continue
+            sign = 1.0 if difference > 0.0 else -1.0
+            if fixed[index] and fixed[following]:
+                raise ValueError("Fixed landfall targets cannot satisfy delivered boundary gradation")
+            if fixed[index]:
+                target[following] = target[index] + sign * limit
+            elif fixed[following]:
+                target[index] = target[following] - sign * limit
+            else:
+                midpoint = 0.5 * (target[index] + target[following])
+                target[index] = midpoint - 0.5 * sign * limit
+                target[following] = midpoint + 0.5 * sign * limit
+            changed = True
+        if not changed:
+            break
+    gradients = np.abs(np.roll(target, -1) - target) / np.maximum(lengths, 1.0)
+    maximum = float(np.max(gradients))
+    if maximum > float(gradation) + 1.0e-8:
+        raise ValueError(
+            "Delivered target-gradation projection did not converge: "
+            f"{maximum} > {gradation}"
+        )
+    for item, value in zip(entries, target):
+        item["target_spacing_m"] = float(max(value, 1.0))
+    adjusted = np.abs(target - raw) > 1.0e-9
+    return {
+        "method": "anchor_preserving_actual_chord_lipschitz_projection",
+        "requested_gradation": float(gradation),
+        "effective_projection_gradation": effective_gradation,
+        "fixed_landfall_count": int(np.count_nonzero(fixed)),
+        "adjusted_node_count": int(np.count_nonzero(adjusted)),
+        "maximum_adjustment_m": float(np.max(np.abs(target - raw))),
+        "iteration_count": int(iteration_count),
+        "maximum_gradient": maximum,
+    }
+
+
+def _junction_diagnostics(entries: list[dict[str, Any]], config: BoundaryResolutionConfig) -> list[dict[str, Any]]:
+    diagnostics = []
+    count = len(entries)
+    for index, item in enumerate(entries):
+        if item.get("anchor_type") != "open_landfall":
+            continue
+        neighbors = [entries[(index - 1) % count], entries[(index + 1) % count]]
+        land_neighbor = next((neighbor for neighbor in neighbors if neighbor.get("boundary_kind") == "land"), None)
+        diagnostics.append(
+            {
+                "node_index_zero_based": int(index),
+                "hard_anchor": bool(item.get("is_hard_anchor")),
+                "shared_target_spacing_m": float(item["target_spacing_m"]),
+                "expected_shared_target_spacing_m": float(config.open_anchor_spacing_m),
+                "adjacent_land_target_spacing_m": float(land_neighbor["target_spacing_m"]) if land_neighbor else None,
+                "adjacent_land_edge_length_m": float(
+                    Point(item["xy"]).distance(Point(land_neighbor["xy"]))
+                )
+                if land_neighbor
+                else None,
+            }
+        )
+    return diagnostics
 
 
 def _principal_orientation_deg(polygon: Polygon) -> float:
@@ -819,6 +1651,23 @@ def _sample_closed_ring(polygon: Polygon, spacing: float, minimum: int) -> list[
     line = LineString(polygon.exterior.coords)
     n = max(int(minimum), int(math.ceil(line.length / max(float(spacing), 1.0))))
     return [(float(line.interpolate(i * line.length / n).x), float(line.interpolate(i * line.length / n).y)) for i in range(n)]
+
+
+def _densify_closed_ring_vertices(polygon: Polygon, spacing: float) -> list[tuple[float, float]]:
+    """Densify exact source segments while retaining every original vertex."""
+    coords = list(polygon.exterior.coords)
+    out: list[tuple[float, float]] = []
+    for start, end in zip(coords[:-1], coords[1:]):
+        start_xy = np.asarray(start, dtype=float)
+        end_xy = np.asarray(end, dtype=float)
+        length = float(np.linalg.norm(end_xy - start_xy))
+        count = max(1, int(math.ceil(length / max(float(spacing), 1.0))))
+        for index in range(count):
+            fraction = float(index / count)
+            point = (1.0 - fraction) * start_xy + fraction * end_xy
+            if not out or np.linalg.norm(np.asarray(out[-1]) - point) > 1.0e-9:
+                out.append((float(point[0]), float(point[1])))
+    return out
 
 
 def _deduplicate_ring(coords: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -857,10 +1706,22 @@ def _append_node_chain(records, summaries, chain_id, coords, kinds, sizes, proje
     )
 
 
-def _write_resolution_layers(gpkg, domain, open_line, islands, source_islands, node_records, source_metrics, resolved_records, projection) -> None:
+def _write_resolution_layers(
+    gpkg,
+    domain,
+    open_line,
+    islands,
+    source_islands,
+    node_records,
+    source_metrics,
+    resolved_records,
+    projection,
+    profile: str = "adaptive-coastal-v1",
+    passages: list[dict[str, Any]] | None = None,
+) -> None:
     domain_ll = unproject_geometry(domain, projection)
     open_ll = unproject_geometry(open_line, projection)
-    gpd.GeoDataFrame([{"profile": "adaptive-coastal-v1", "geometry": domain_ll}], geometry="geometry", crs="EPSG:4326").to_file(gpkg, layer="resolved_domain_polygon", driver="GPKG")
+    gpd.GeoDataFrame([{"profile": profile, "geometry": domain_ll}], geometry="geometry", crs="EPSG:4326").to_file(gpkg, layer="resolved_domain_polygon", driver="GPKG")
     gpd.GeoDataFrame([{"segment_class": "open_boundary", "geometry": open_ll}], geometry="geometry", crs="EPSG:4326").to_file(gpkg, layer="resolved_open_boundary", driver="GPKG")
     island_rows = []
     for idx, polygon in enumerate(islands):
@@ -876,6 +1737,22 @@ def _write_resolution_layers(gpkg, domain, open_line, islands, source_islands, n
         diagnostic_rows.append({**{k: _json_safe(v) for k, v in record.items()}, "geometry": geometry})
     if diagnostic_rows:
         gpd.GeoDataFrame(diagnostic_rows, geometry="geometry", crs="EPSG:4326").to_file(gpkg, layer="island_diagnostics", driver="GPKG")
+    if passages:
+        passage_rows = []
+        for record in passages:
+            coords = record.get("connector_lonlat", [])
+            if len(coords) < 2:
+                continue
+            passage_rows.append(
+                {
+                    **{key: _json_safe(value) for key, value in record.items() if key != "connector_lonlat"},
+                    "geometry": LineString(coords),
+                }
+            )
+        if passage_rows:
+            gpd.GeoDataFrame(passage_rows, geometry="geometry", crs="EPSG:4326").to_file(
+                gpkg, layer="passage_diagnostics", driver="GPKG"
+            )
 
 
 def _node_geojson(records: list[dict[str, Any]]) -> dict[str, Any]:

@@ -32,6 +32,12 @@ Opt-in adaptive coastal resolution:
 python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --coastline-gpkg gshhs_land.gpkg --coastline-source gshhs --run-dir runs/case --name case --mode test --boundary-resolution-profile adaptive-coastal-v1
 ```
 
+Feature-anchored, passage-aware prevention profile:
+
+```powershell
+python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --coastline-gpkg gshhs_land.gpkg --coastline-source gshhs --run-dir runs/case --name case --mode test --boundary-resolution-profile adaptive-coastal-v2
+```
+
 `adaptive-coastal-v1`:
 
 1. Derive the continuous OBC portion of the accepted exterior loop.
@@ -42,6 +48,17 @@ python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-
 6. Merge or drop only unprotected subgrid candidates and stop at 0.5% cumulative absolute island-area change.
 7. Generalize retained islands with area, centroid, Hausdorff, validity, principal-orientation, and mission-gap guards; split OBC chords when curvature error exceeds 10% of local target size.
 8. Write a separate explicit-chain resolution package; never overwrite legacy loop layers.
+
+`adaptive-coastal-v2` retains the v1 topology and island safeguards, then adds:
+
+1. Exact hard anchors at both OBC landfalls plus stable sharp turns and spit tips.
+2. Anchor-to-anchor metric equidistribution, avoiding an isolated short remainder edge.
+3. One shared land/OBC junction target with the configured gradation into the land chain.
+4. A conservative wet-passage inventory with paired-bank spacing harmonization.
+5. A `needs_review` gate for protected passages that cannot fit four elements across at the permitted minimum spacing.
+6. Explicit anchor, junction, and passage metadata in diagnostics and boundary-node products.
+
+V2 never closes a channel automatically. An unresolved unprotected passage is also retained and reported for review; geographic topology changes require a separate, evidence-backed workflow.
 
 ## Standalone Tools
 
@@ -59,7 +76,7 @@ Every normal run retains the legacy boundary-arc and model-loop outputs. Adaptiv
 - `boundary_resolution/boundary_resolution_nodes.geojson`
 - `boundary_resolution/boundary_resolution_review_map.png`
 
-Require fixed OBC anchors, measured complete exterior overlap, no non-endpoint land intersection in either repaired or sampled geometry, a valid resolved wet domain, zero protected-region topology operations, and area change within budget. Keep artifacts and mark `needs_review` when a guard fails.
+Require fixed OBC anchors, measured complete exterior overlap, no non-endpoint land intersection in either repaired or sampled geometry, a valid resolved wet domain, zero protected-region topology operations, and area change within budget. For v2, additionally require exactly two OBC-landfall hard anchors, boundary edge-to-target ratio no greater than 1.55, and explicit review of every unresolved passage. Keep artifacts and mark `needs_review` when a guard fails.
 
 ## Validation
 

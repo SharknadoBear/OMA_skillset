@@ -31,6 +31,8 @@ def main() -> int:
     parser.add_argument("--gradation", type=float, default=0.15)
     parser.add_argument("--target-timestep-s", default="auto")
     parser.add_argument("--max-interior-points", type=int, default=80_000)
+    parser.add_argument("--max-total-nodes", type=int, default=120_000)
+    parser.add_argument("--node-budget-stop-fraction", type=float, default=0.90)
     parser.add_argument("--refine-iterations", type=int, default=3)
     parser.add_argument("--smooth-iterations", type=int, default=8)
     parser.add_argument(
@@ -47,7 +49,11 @@ def main() -> int:
     parser.add_argument("--bathy-max-sources", type=int, default=256)
     parser.add_argument("--progress-interval-s", type=float, default=10.0)
     parser.add_argument("--size-field-max-cells", type=int, default=1_500_000)
-    parser.add_argument("--boundary-resolution-profile", choices=("legacy", "adaptive-coastal-v1"), default="legacy")
+    parser.add_argument(
+        "--boundary-resolution-profile",
+        choices=("legacy", "adaptive-coastal-v1", "adaptive-coastal-v2"),
+        default="legacy",
+    )
     parser.add_argument(
         "--bathy-gradient-policy",
         choices=("auto", "global", "coastal", "off"),
@@ -122,6 +128,8 @@ def main() -> int:
             gradation=args.gradation,
             target_timestep_s=args.target_timestep_s,
             max_interior_points=args.max_interior_points,
+            max_total_nodes=args.max_total_nodes,
+            node_budget_stop_fraction=args.node_budget_stop_fraction,
             refine_iterations=args.refine_iterations,
             smooth_iterations=args.smooth_iterations,
             bathy_fallback_policy=args.bathy_fallback_policy,

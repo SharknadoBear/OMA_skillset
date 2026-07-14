@@ -41,7 +41,11 @@ def main() -> int:
     parser.add_argument("--progress-interval-s", type=float, default=30.0)
     parser.add_argument("--heuristic-mode", default="auto", choices=("auto", "memory", "unknown"), help="auto uses text memory in execute and disables text-only routing in test.")
     parser.add_argument("--topology-time-budget-s", type=float, default=900.0, help="Maximum seconds to spend evaluating full-resolution topology candidates before returning needs_review.")
-    parser.add_argument("--boundary-resolution-profile", default="legacy", choices=("legacy", "adaptive-coastal-v1"))
+    parser.add_argument(
+        "--boundary-resolution-profile",
+        default="legacy",
+        choices=("legacy", "adaptive-coastal-v1", "adaptive-coastal-v2"),
+    )
     args = parser.parse_args()
 
     config = BdryArcConfig(

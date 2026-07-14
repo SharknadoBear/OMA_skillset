@@ -209,6 +209,7 @@ def compute_mesh_metrics(
             "min_angle_deg": _minimum(min_angles),
             "max_angle_deg": _maximum(max_angles),
             "min_angle_quantiles_deg": _quantiles(min_angles),
+            "count_min_angle_below_5": int(np.sum(min_angles < 5.0)),
             "count_min_angle_below_20": int(np.sum(min_angles < 20.0)),
             "count_min_angle_below_30": int(np.sum(min_angles < 30.0)),
         },

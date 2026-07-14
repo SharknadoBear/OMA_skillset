@@ -38,7 +38,7 @@ Topology edits remain local, use the current Eulerian target field, and never in
 
    Delete the two degenerate incident records created by the merge, compact the cavity, and retain source-node lineage in the edit ledger.
 
-3. **Boundary superthin repair.** Examine the longest side of the worst boundary-adjacent superthin triangle. If that side is a one-sided protected arc whose endpoints have the same boundary kind, insert its midpoint on the arc and update the ordered chain and OBC nodestring. Otherwise, consider removing a non-hard boundary vertex and triangulating its local fan. Removal is accepted only when the vertex-to-neighbor chord deviation is below
+3. **Boundary superthin repair.** Work through a severity-ordered queue and quarantine a rejected candidate so it cannot terminate work on independent defects. First recognize a redundant boundary ear whose deletion exposes the existing chord without losing a protected source arc; charge its actual global signed-area difference to the domain-area budget and require the resulting boundary graph to remain traversable. For a coarse boundary arc with an interior apex close to that arc, project the apex onto the immutable source segment and insert it in the ordered chain. The weld must satisfy target-relative distance and altitude limits, kind-specific absolute displacement, hard-anchor and landfall buffers, and channel-clearance guards; then re-sample its target from the Eulerian size field. Other protected boundary sides may still be split. A non-hard boundary vertex may be removed only inside the boundary envelope. Removal is accepted only when the vertex-to-neighbor chord deviation is below
 
    \[
    \delta_k=\min(\delta_{k,\mathrm{abs}},f_k\bar h),
@@ -83,5 +83,7 @@ Snapshot before every edit. Restore it unless all of the following hold:
 - the targeted defect count or severity improves;
 - controlled (q_{L3\sigma}), first-percentile quality/angle, and (L/h) tails do not regress beyond their documented tolerances;
 - valence work reduces either the count of nodes above eight or their total excess. The default permits no new (L/h>1.55) triangles; an explicit, recorded integer budget may be supplied for a hard-gate closure transaction when the scientific tradeoff is accepted.
+
+Wrap each high-valence stage and its immediate superthin cleanup in a second, outer transaction. The combined branch commits only when valence and target-quality non-regression pass, no new superthin severity or singly connected triangle remains, boundary component/degree audits do not regress, and every ordinary invariant above passes. Otherwise restore coordinates, connectivity, chains, lineage, targets, area accounting, and the edit ledger together.
 
 The outer protocol repeats prune, superthin repair, and high-valence repair for at most four rounds, stopping early when no operation is accepted or when both the superthin count and valence violations reach zero. Write the terminal mesh, delivered boundary metadata, node lineage, and `mesh_edit_ledger.json` even when a remaining hard gate requires `needs_review`.

@@ -13,16 +13,30 @@ import time
 from typing import Any
 
 import numpy as np
+from shapely import contains_xy
 
 from .bathymetry import coarsen_for_size_field, load_bathymetry
-from .boundary import BoundaryConfig, boundary_nodes_geojson, load_boundary_package, load_boundary_resolution, prepare_boundary_nodes
+from .boundary import (
+    BoundaryConfig,
+    boundary_nodes_geojson,
+    evaluate_boundary_contract_v2,
+    load_boundary_package,
+    load_boundary_resolution,
+    prepare_boundary_nodes,
+)
 from .mesh import MeshConfig, generate_mesh
 from .metrics import triangle_geometry
 from .plotting import write_mesh_gpkg, write_mesh_quality_gpkg, write_mesh_review_map
 from .progress import ProgressTracker
 from .projection import project_points, unproject_points
 from .quality import evaluate_mesh_quality
-from .size_field import SizeFieldConfig, build_size_field, write_size_field
+from .size_field import (
+    SizeFieldConfig,
+    SizeFieldSemantics,
+    boundary_front_seed_points,
+    build_size_field,
+    write_size_field,
+)
 from .sms_2dm import read_2dm, write_2dm
 
 
@@ -37,6 +51,8 @@ class GridConfig:
     gradation: float = 0.15
     target_timestep_s: str = "auto"
     max_interior_points: int = 80_000
+    max_total_nodes: int = 120_000
+    node_budget_stop_fraction: float = 0.90
     refine_iterations: int = 3
     smooth_iterations: int = 8
     fetch_bathymetry: bool = True
@@ -92,8 +108,8 @@ def run_fvcom_grid(
     config = config or GridConfig()
     if str(config.postprocess_profile) != "none":
         raise ValueError("Integrated post-generation cleanup is disabled; run postprocess_fvcom_mesh.py explicitly on the finished .2dm")
-    if config.boundary_resolution_profile not in {"legacy", "adaptive-coastal-v1"}:
-        raise ValueError("boundary_resolution_profile must be legacy or adaptive-coastal-v1")
+    if config.boundary_resolution_profile not in {"legacy", "adaptive-coastal-v1", "adaptive-coastal-v2"}:
+        raise ValueError("boundary_resolution_profile must be legacy, adaptive-coastal-v1, or adaptive-coastal-v2")
     if config.bathymetry_gradient_policy not in {"auto", "global", "coastal", "off"}:
         raise ValueError("bathymetry_gradient_policy must be auto, global, coastal, or off")
     if config.conditioning_profile not in {"auto", "guarded-v1", "aggressive-local-v2", "none"}:
@@ -123,12 +139,28 @@ def run_fvcom_grid(
     boundary_resolution_manifest = upstream.get("boundary_resolution_manifest")
     bathy_nc = upstream["bathy_nc"]
     bdry_arc_manifest = upstream.get("bdry_arc_manifest")
-    if config.boundary_resolution_profile == "adaptive-coastal-v1" and not boundary_resolution_manifest:
-        raise ValueError("adaptive-coastal-v1 requires --boundary-resolution-manifest or an upstream adaptive boundary run")
+    if config.boundary_resolution_profile in {"adaptive-coastal-v1", "adaptive-coastal-v2"} and not boundary_resolution_manifest:
+        raise ValueError(
+            f"{config.boundary_resolution_profile} requires --boundary-resolution-manifest or an upstream adaptive boundary run"
+        )
 
     if boundary_resolution_manifest:
         progress.update("load_boundary_resolution", 18.0, message="Loading explicit adaptive boundary chains.", artifact=boundary_resolution_manifest)
         boundary_package, boundary_nodes, resolution_doc = load_boundary_resolution(boundary_resolution_manifest)
+        if config.boundary_resolution_profile != "legacy" and resolution_doc.get("profile") != config.boundary_resolution_profile:
+            raise ValueError(
+                "Requested boundary-resolution profile does not match the supplied manifest: "
+                f"{config.boundary_resolution_profile} != {resolution_doc.get('profile')}"
+            )
+        if (
+            config.boundary_resolution_profile == "adaptive-coastal-v2"
+            and str(resolution_doc.get("final_status", "needs_review")) != "pass"
+        ):
+            failures = list(resolution_doc.get("failure_taxonomy", []))
+            raise ValueError(
+                "adaptive-coastal-v2 boundary package requires scientific review before gridding: "
+                + (", ".join(map(str, failures)) if failures else "upstream final_status is not pass")
+            )
     else:
         progress.update("load_boundary_loops", 18.0, message="Loading model boundary-loop package.", artifact=boundary_loops_gpkg)
         boundary_package = load_boundary_package(boundary_loops_gpkg)
@@ -140,6 +172,23 @@ def run_fvcom_grid(
         resolution_doc = None
     boundary_nodes_path = run_dir / "boundary_nodes.geojson"
     boundary_nodes_path.write_text(json.dumps(boundary_nodes_geojson(boundary_nodes), indent=2), encoding="utf-8")
+    boundary_contract_path = None
+    if config.boundary_resolution_profile == "adaptive-coastal-v2":
+        boundary_contract = evaluate_boundary_contract_v2(boundary_nodes, gradation=float(config.gradation))
+        boundary_contract_path = run_dir / "boundary_contract_v2.json"
+        boundary_contract_path.write_text(json.dumps(_json_safe(boundary_contract), indent=2), encoding="utf-8")
+        progress.update(
+            "boundary_contract_v2",
+            24.0,
+            message="Auditing adaptive-v2 anchors, spacing, and gradation before bathymetry work.",
+            artifact=boundary_contract_path,
+            extra={"passed": bool(boundary_contract["passed"]), "failures": boundary_contract["failure_taxonomy"]},
+        )
+        if not boundary_contract["passed"]:
+            raise ValueError(
+                "adaptive-coastal-v2 boundary contract failed: "
+                + ", ".join(boundary_contract["failure_taxonomy"])
+            )
 
     progress.update("load_bathymetry", 28.0, message="Loading positive-down bathymetry grid.", artifact=bathy_nc)
     bathy = load_bathymetry(bathy_nc)
@@ -159,9 +208,55 @@ def run_fvcom_grid(
         adaptive_boundary=bool(boundary_nodes.adaptive_resolution),
         bathymetry_gradient_policy=str(config.bathymetry_gradient_policy),
         coastal_gradient_distance_m=float(config.coastal_gradient_distance_m),
+        size_field_profile=(
+            "adaptive-coastal-v2" if config.boundary_resolution_profile == "adaptive-coastal-v2" else "v1"
+        ),
+        coverage_policy=("raise" if config.boundary_resolution_profile == "adaptive-coastal-v2" else "auto"),
     )
     progress.update("build_size_field", 34.0, message="Building bathymetry and shoreline-based mesh-size field.")
-    size_field = build_size_field(size_bathy, boundary_nodes, size_config)
+    size_semantics = (
+        _size_field_semantics_v2(size_bathy, boundary_nodes)
+        if config.boundary_resolution_profile == "adaptive-coastal-v2"
+        else None
+    )
+    size_field = build_size_field(size_bathy, boundary_nodes, size_config, semantics=size_semantics)
+    node_budget_path = None
+    if config.boundary_resolution_profile == "adaptive-coastal-v2":
+        _, boundary_front_report = boundary_front_seed_points(boundary_nodes)
+        interior_estimate = int(
+            size_field.report.get("node_budget_estimate", {}).get("estimated_interior_node_count", 0)
+        )
+        boundary_front_count = int(boundary_front_report.get("accepted_count", 0))
+        estimated_total = int(interior_estimate + len(boundary_nodes.xy) + boundary_front_count)
+        node_budget = {
+            "schema_version": "fvcom_node_budget_preflight_v2",
+            "estimated_interior_node_count": interior_estimate,
+            "explicit_boundary_node_count": int(len(boundary_nodes.xy)),
+            "boundary_front_seed_count": boundary_front_count,
+            "estimated_total_node_count": estimated_total,
+            "maximum_total_nodes": int(config.max_total_nodes),
+            "stop_fraction": float(config.node_budget_stop_fraction),
+            "stop_threshold": int(float(config.node_budget_stop_fraction) * int(config.max_total_nodes)),
+            "passed": bool(
+                estimated_total <= float(config.node_budget_stop_fraction) * int(config.max_total_nodes)
+            ),
+            "boundary_front": boundary_front_report,
+        }
+        node_budget_path = run_dir / "node_budget_preflight_v2.json"
+        node_budget_path.write_text(json.dumps(_json_safe(node_budget), indent=2), encoding="utf-8")
+        progress.update(
+            "node_budget_preflight_v2",
+            42.0,
+            message="Estimating adaptive-v2 boundary, front, and interior node demand.",
+            artifact=node_budget_path,
+            extra={"passed": node_budget["passed"], "estimated_total": estimated_total},
+        )
+        if not node_budget["passed"]:
+            raise ValueError(
+                "adaptive-coastal-v2 node-budget preflight failed: "
+                f"estimated {estimated_total} nodes exceeds the stop threshold "
+                f"{node_budget['stop_threshold']}"
+            )
     progress.update("write_size_field", 46.0, message="Writing size-field artifacts.")
     size_nc, size_png = write_size_field(size_field, run_dir / "size_field.nc", run_dir / "size_field.png")
 
@@ -425,6 +520,8 @@ def run_fvcom_grid(
             "size_field_nc": str(size_nc),
             "size_field_png": str(size_png),
             "boundary_nodes_geojson": str(boundary_nodes_path),
+            "boundary_contract_v2_json": str(boundary_contract_path) if boundary_contract_path else None,
+            "node_budget_preflight_v2_json": str(node_budget_path) if node_budget_path else None,
             "delivered_boundary_nodes_geojson": str(delivered_boundary_nodes_path),
             "mesh_nodes_elements_gpkg": str(mesh_gpkg),
             "mesh_quality_elements_gpkg": str(mesh_quality_gpkg),
@@ -436,6 +533,71 @@ def run_fvcom_grid(
     manifest_path.write_text(json.dumps(_json_safe(manifest), indent=2), encoding="utf-8")
     progress.update("complete", 100.0, message=f"FVCOM grid workflow complete with status {final_status}.", artifact=manifest_path)
     return manifest
+
+
+def _size_field_semantics_v2(bathy: Any, boundary: Any) -> SizeFieldSemantics:
+    """Rasterize adaptive-v2 junction and retained-channel semantics."""
+    lon2, lat2 = np.meshgrid(np.asarray(bathy.lon, dtype=float), np.asarray(bathy.lat, dtype=float))
+    query_xy = project_points(np.column_stack([lon2.ravel(), lat2.ravel()]), boundary.projection)
+    shape = lon2.shape
+    domain = boundary.domain_polygon_xy
+    domain_mask = np.asarray(
+        contains_xy(domain, query_xy[:, 0], query_xy[:, 1]),
+        dtype=bool,
+    ).reshape(shape)
+    coverage_mask = np.isfinite(np.asarray(bathy.depth, dtype=float))
+
+    channel_size_flat = np.full(len(query_xy), np.inf, dtype=float)
+    for record in boundary.passage_diagnostics or []:
+        action = str(record.get("action", "")).strip().lower()
+        resolvable = bool(record.get("resolvable_at_minimum_spacing", False))
+        geometry = record.get("geometry_xy")
+        target = _finite_positive(record.get("required_target_spacing_m"))
+        width = _finite_positive(record.get("width_m"))
+        if geometry is None or geometry.is_empty or target is None or width is None:
+            continue
+        if not resolvable or action not in {"harmonize_paired_spacing", "retain", "keep", "resolved"}:
+            continue
+        distance = _point_to_polyline_distance(query_xy, np.asarray(geometry.coords, dtype=float))
+        active = distance <= max(float(width), 1_000.0)
+        channel_size_flat[active] = np.minimum(channel_size_flat[active], float(target))
+    channel_size = channel_size_flat.reshape(shape)
+    channel_size[~np.isfinite(channel_size)] = np.nan
+    channel_size[~domain_mask] = np.nan
+
+    return SizeFieldSemantics(
+        channel_size_m=channel_size,
+        coverage_mask=coverage_mask,
+        domain_mask=domain_mask,
+    )
+
+
+def _finite_positive(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if np.isfinite(result) and result > 0.0 else None
+
+
+def _point_to_polyline_distance(points: np.ndarray, line: np.ndarray) -> np.ndarray:
+    """Return vectorized Euclidean distance from points to a short polyline."""
+    values = np.asarray(points, dtype=float)
+    vertices = np.asarray(line, dtype=float)
+    if len(vertices) < 2:
+        return np.full(len(values), np.inf, dtype=float)
+    best = np.full(len(values), np.inf, dtype=float)
+    for start, end in zip(vertices[:-1], vertices[1:]):
+        segment = end - start
+        denominator = float(np.dot(segment, segment))
+        if denominator <= 1.0e-20:
+            candidate = np.linalg.norm(values - start, axis=1)
+        else:
+            fraction = np.clip(((values - start) @ segment) / denominator, 0.0, 1.0)
+            closest = start + fraction[:, None] * segment
+            candidate = np.linalg.norm(values - closest, axis=1)
+        best = np.minimum(best, candidate)
+    return best
 
 
 def _resolve_upstream_artifacts(
@@ -561,8 +723,8 @@ def _resolve_upstream_artifacts(
     bdry_doc = json.loads(Path(bdry_arc_manifest).read_text(encoding="utf-8-sig"))
     boundary_loops_gpkg = Path(boundary_loops_gpkg or bdry_doc["outputs"]["model_boundary_loops_gpkg"])
     boundary_resolution_manifest = boundary_resolution_manifest or bdry_doc.get("outputs", {}).get("boundary_resolution_manifest")
-    if config.boundary_resolution_profile == "adaptive-coastal-v1" and not boundary_resolution_manifest:
-        raise ValueError("adaptive-coastal-v1 requires a passing boundary_resolution_manifest")
+    if config.boundary_resolution_profile in {"adaptive-coastal-v1", "adaptive-coastal-v2"} and not boundary_resolution_manifest:
+        raise ValueError(f"{config.boundary_resolution_profile} requires a passing boundary_resolution_manifest")
 
     if bathy_nc is None:
         bathy_info = _fetch_bathy_sources(cudem_skill, Path(region_bpoly_json), bathy_dir, name, config, progress)
