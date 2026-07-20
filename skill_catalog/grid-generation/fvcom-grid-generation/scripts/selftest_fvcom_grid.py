@@ -582,7 +582,8 @@ def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
             bathy_nc=bathy,
         )
         outputs = manifest["outputs"]
-        assert manifest["schema_version"] == "fvcom_grid_generation_manifest_v6"
+        assert manifest["schema_version"] == "fvcom_grid_generation_manifest_v7"
+        assert Path(manifest["outputs"]["obc_remap_manifest_json"]).is_file()
         for key in (
             "fvcom_grid_2dm",
             "fvcom_grid_manifest",
@@ -613,6 +614,7 @@ def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
             "thin-repair-v1",
             "aggressive-local-disabled",
             "area-transition-relax-v1",
+            "systematic-thin-terminal-disabled",
             "terminal-constraint-audit",
         ]
         assert manifest["mesh"]["conditioning"]["area_transition_relaxation"]["profile"] == "area-transition-relax-v1"

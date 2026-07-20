@@ -248,6 +248,202 @@ def test_weld_hard_anchor_distance_and_channel_guards_are_reported() -> None:
     assert channel.report["edit_counts"].get("boundary-arc-weld", 0) == 0
 
 
+def test_systematic_v2_closes_fixed_boundary_fan_without_moving_anchors() -> None:
+    points, triangles, fixed, chains, kinds = _weld_fixture()
+    hard = np.zeros(len(points), dtype=bool)
+    hard[[0, 1]] = True
+    result = condition_mesh_aggressive(
+        points,
+        triangles,
+        fixed,
+        chains,
+        np.empty(0, dtype=int),
+        target_spacing_m=np.full(len(points), 20.0),
+        boundary_kinds=kinds,
+        hard_anchor_mask=hard,
+        config=AggressiveConditioningConfig(
+            thin_repair_profile="systematic-v2",
+            max_rounds=1,
+            enable_pruning=False,
+            enable_valence_repair=False,
+            max_prunes_per_round=0,
+            max_valence_removals_per_round=0,
+            micro_relax_cycles=0,
+        ),
+    )
+    assert result.report["before"]["superthin_triangle_count"] == 1
+    assert result.report["after"]["superthin_triangle_count"] == 0
+    assert result.report["edit_counts"].get("systematic-superthin-component-cavity", 0) == 1
+    lineage_to_current = {int(value): index for index, value in enumerate(result.node_lineage)}
+    assert np.array_equal(result.nodes_xy[lineage_to_current[0]], points[0])
+    assert np.array_equal(result.nodes_xy[lineage_to_current[1]], points[1])
+    assert result.report["invariants"]["all_protected_edges_present"] is True
+
+
+def test_systematic_component_inventory_classifies_under_resolved_passage() -> None:
+    points = np.asarray([[0.0, 0.0], [10.0, 0.0], [0.0, 0.1]], dtype=float)
+    state = local_topology._State(
+        points=points.copy(),
+        triangles=np.asarray([[0, 1, 2]], dtype=int),
+        fixed=np.ones(3, dtype=bool),
+        targets=np.full(3, 1.0),
+        chains=[[0, 1], [2]],
+        open_nodes=np.empty(0, dtype=int),
+        kinds=["island", "island", "island"],
+        hard=np.zeros(3, dtype=bool),
+        lineage=np.arange(3, dtype=int),
+        source_points=points.copy(),
+        source_chains=[[0, 1], [2]],
+    )
+    components = local_topology._inventory_superthin_components(
+        state,
+        AggressiveConditioningConfig(thin_repair_profile="systematic-v2"),
+    )
+    assert len(components) == 1
+    assert components[0]["classification"] == "under-resolved-passage"
+    assert components[0]["local_feature_target_m"] <= 0.05 + 1.0e-12
+
+
+def _systematic_v3_weld_config(*, obc_policy: str = "redistribute") -> AggressiveConditioningConfig:
+    return AggressiveConditioningConfig(
+        thin_repair_profile="systematic-v3",
+        systematic_v3_obc_policy=obc_policy,
+        max_rounds=1,
+        enable_pruning=False,
+        enable_valence_repair=False,
+        max_prunes_per_round=0,
+        max_valence_removals_per_round=0,
+        systematic_max_components_per_round=0,
+        max_boundary_ear_removals_per_round=0,
+        max_boundary_welds_per_round=2,
+        max_superthin_flips_per_round=0,
+        max_collapses_per_round=0,
+        max_boundary_edits_per_round=0,
+        micro_relax_cycles=0,
+        maximum_domain_area_change_fraction=0.02,
+    )
+
+
+def test_systematic_v3_weld_redistributes_obc_and_emits_remap() -> None:
+    points, triangles, fixed, chains, kinds = _weld_fixture()
+    kinds = ["open"] * 4 + kinds[4:]
+    hard = np.zeros(len(points), dtype=bool)
+    hard[[0, 1]] = True
+    result = condition_mesh_aggressive(
+        points,
+        triangles,
+        fixed,
+        chains,
+        np.asarray([0, 1], dtype=int),
+        target_spacing_m=np.full(len(points), 2.0),
+        boundary_kinds=kinds,
+        hard_anchor_mask=hard,
+        config=_systematic_v3_weld_config(),
+    )
+    assert result.report["after"]["superthin_triangle_count"] == 0
+    assert result.report["edit_counts"].get("boundary-arc-weld", 0) == 1
+    assert result.open_boundary_nodes_zero_based.tolist() == [0, 4, 1]
+    assert result.obc_remap_manifest["original_obc_count"] == 2
+    assert result.obc_remap_manifest["delivered_obc_count"] == 3
+    assert result.obc_remap_manifest["obc_forcing_compatible"] is False
+    assert result.obc_remap_manifest["forcing_invalidation_required"] is True
+
+
+def test_systematic_v3_preserve_policy_rolls_back_obc_count_change() -> None:
+    points, triangles, fixed, chains, kinds = _weld_fixture()
+    kinds = ["open"] * 4 + kinds[4:]
+    hard = np.zeros(len(points), dtype=bool)
+    hard[[0, 1]] = True
+    result = condition_mesh_aggressive(
+        points,
+        triangles,
+        fixed,
+        chains,
+        np.asarray([0, 1], dtype=int),
+        target_spacing_m=np.full(len(points), 2.0),
+        boundary_kinds=kinds,
+        hard_anchor_mask=hard,
+        config=_systematic_v3_weld_config(obc_policy="preserve"),
+    )
+    assert result.open_boundary_nodes_zero_based.tolist() == [0, 1]
+    v3 = result.report["rounds"][0]["aggressive_thin_repair"]["boundary_adaptive_v3"]
+    assert "obc_count_changed_under_preserve_policy" in v3["guarded_boundary_ladder"]["rollback_failures"]
+
+
+def test_systematic_v3_weld_can_snap_to_unchanged_hard_anchor() -> None:
+    points, triangles, fixed, chains, kinds = _weld_fixture()
+    points[4] = [0.25, 0.01]
+    hard = np.zeros(len(points), dtype=bool)
+    hard[0] = True
+    state = local_topology._State(
+        points=points.copy(),
+        triangles=triangles.copy(),
+        fixed=fixed.copy(),
+        targets=np.full(len(points), 2.0),
+        chains=[chain.copy() for chain in chains],
+        open_nodes=np.empty(0, dtype=int),
+        kinds=kinds.copy(),
+        hard=hard.copy(),
+        lineage=np.arange(len(points), dtype=int),
+        source_points=points.copy(),
+        source_chains=[chain.copy() for chain in chains],
+        source_open_nodes=np.empty(0, dtype=int),
+        source_kinds=kinds.copy(),
+        initial_domain_area_m2=50.0,
+    )
+    changed, failures = local_topology._weld_vertex_to_boundary_arc(
+        state,
+        (0, 1),
+        4,
+        0,
+        AggressiveConditioningConfig(
+            thin_repair_profile="systematic-v3",
+            maximum_domain_area_change_fraction=0.2,
+        ),
+    )
+    assert changed and not failures
+    assert np.array_equal(state.points[0], points[0])
+    assert 4 not in set(map(int, state.lineage))
+    assert state.ledger[-1]["operation"] == "boundary-arc-weld-snap"
+    assert state.ledger[-1]["target_is_hard_anchor"] is True
+    assert state.ledger[-1]["intermediate_degenerate_triangles_removed"] >= 1
+
+
+def test_systematic_v3_source_arc_slide_keeps_hard_endpoints_and_zero_normal_offset() -> None:
+    points, triangles, fixed, chains, kinds = _weld_fixture()
+    hard = np.zeros(len(points), dtype=bool)
+    hard[[0, 2]] = True
+    state = local_topology._State(
+        points=points.copy(),
+        triangles=triangles.copy(),
+        fixed=fixed.copy(),
+        targets=np.full(len(points), 2.0),
+        chains=[chain.copy() for chain in chains],
+        open_nodes=np.empty(0, dtype=int),
+        kinds=kinds.copy(),
+        hard=hard.copy(),
+        lineage=np.arange(len(points), dtype=int),
+        source_points=points.copy(),
+        source_chains=[chain.copy() for chain in chains],
+        source_open_nodes=np.empty(0, dtype=int),
+        source_kinds=kinds.copy(),
+        initial_domain_area_m2=50.0,
+    )
+    changed, evidence = local_topology._apply_source_arc_windows_v3(
+        state,
+        [{"chain_index": 0, "nodes": [0, 1, 2], "boundary_kind": "land"}],
+        AggressiveConditioningConfig(
+            thin_repair_profile="systematic-v3",
+            maximum_domain_area_change_fraction=0.2,
+        ),
+    )
+    assert changed and evidence
+    assert np.array_equal(state.points[0], points[0])
+    assert np.array_equal(state.points[2], points[2])
+    assert not np.array_equal(state.points[1], points[1])
+    assert local_topology._maximum_boundary_source_arc_deviation(state) <= 1.0e-9
+
+
 def _nine_spoke_fixture() -> tuple[np.ndarray, np.ndarray, np.ndarray, list[list[int]], list[str]]:
     count = 9
     angles = np.linspace(0.0, 2.0 * np.pi, count, endpoint=False)
@@ -261,6 +457,88 @@ def _nine_spoke_fixture() -> tuple[np.ndarray, np.ndarray, np.ndarray, list[list
         [list(range(count))],
         ["land"] * count + ["interior"],
     )
+
+
+def test_systematic_v5_rebuilds_complete_retained_center_star() -> None:
+    points = np.asarray(
+        [
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [2.0, 2.0],
+            [0.0, 2.0],
+            [1.0, 0.01],
+        ],
+        dtype=float,
+    )
+    triangles = np.asarray(
+        [[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]],
+        dtype=int,
+    )
+    result = condition_mesh_aggressive(
+        points,
+        triangles,
+        np.asarray([True, True, True, True, False]),
+        [[0, 1, 2, 3]],
+        np.empty(0, dtype=int),
+        target_spacing_m=np.full(len(points), 1.5),
+        boundary_kinds=["land", "land", "land", "land", "interior"],
+        hard_anchor_mask=np.asarray([True, True, True, True, False]),
+        config=_thin_only_config(
+            thin_repair_profile="systematic-v5",
+            systematic_gate_scope="loop-end",
+            systematic_v5_max_star_transactions_per_round=8,
+        ),
+    )
+    assert result.report["after"]["superthin_triangle_count"] == 0
+    assert result.report["after"]["nonpositive_signed_area_count"] == 0
+    operations = [
+        entry
+        for entry in result.edit_ledger
+        if entry.get("operation") == "systematic-v5-complete-locked-star-reconstruction"
+    ]
+    assert operations
+    assert operations[0]["old_star_triangle_count"] == 4
+    assert operations[0]["replacement_triangle_count"] == 4
+    assert operations[0]["candidate"].startswith("center-relocation")
+    assert np.array_equal(result.nodes_xy[:4], points[:4])
+
+
+def test_systematic_v5_transaction_rolls_back_impossible_fixed_star() -> None:
+    points = np.asarray(
+        [
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [2.0, 2.0],
+            [0.0, 2.0],
+            [1.0, 0.01],
+        ],
+        dtype=float,
+    )
+    triangles = np.asarray(
+        [[0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]],
+        dtype=int,
+    )
+    result = condition_mesh_aggressive(
+        points,
+        triangles,
+        np.ones(len(points), dtype=bool),
+        [[0, 1, 2, 3]],
+        np.empty(0, dtype=int),
+        target_spacing_m=np.full(len(points), 1.5),
+        boundary_kinds=["land", "land", "land", "land", "interior"],
+        hard_anchor_mask=np.ones(len(points), dtype=bool),
+        config=_thin_only_config(
+            thin_repair_profile="systematic-v5",
+            systematic_gate_scope="loop-end",
+            systematic_v5_max_star_transactions_per_round=4,
+        ),
+    )
+    assert np.array_equal(result.nodes_xy, points)
+    assert _canonical_triangles(result.triangles) == _canonical_triangles(triangles)
+    assert result.report["after"]["superthin_triangle_count"] > 0
+    stage = result.report["rounds"][0]["aggressive_thin_repair"]
+    assert stage["closure_succeeded"] is False
+    assert stage["blocked_components"]
 
 
 def test_valence_created_sliver_rolls_back_when_thin_branch_is_disabled() -> None:

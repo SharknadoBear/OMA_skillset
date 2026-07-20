@@ -13,6 +13,7 @@ from shapely.geometry import Point
 from .boundary import BoundaryNodes
 from .metrics import build_edge_topology, constraint_integrity, triangle_geometry
 from .local_topology import AggressiveConditioningConfig, condition_mesh_aggressive
+from .systematic_v5 import SystematicV5LoopConfig, run_systematic_v5_loop
 from .projection import unproject_points
 from .regional_conditioning import (
     AreaTransitionRelaxConfig,
@@ -43,6 +44,16 @@ class MeshConfig:
     spring_relax_ring_layers: int = 3
     spring_relax_shape_weight: float = 0.20
     thin_triangle_repair: bool = True
+    thin_repair_profile: str = "guarded-v1"
+    systematic_v3_obc_policy: str = "redistribute"
+    systematic_v5_total_iterations: int = 1000
+    systematic_v5_max_cycles: int = 6
+    systematic_v5_max_burst: int = 250
+    systematic_v5_thin_trigger: int = 25
+    systematic_v5_checkpoint_interval: int = 10
+    systematic_v5_wall_time_s: float = 21600.0
+    systematic_v5_connectivity_restriction: bool = True
+    systematic_v5_max_connectivity_transactions: int = 32
     thin_triangle_quality_threshold: float = 0.25
     thin_triangle_min_angle_deg: float = 20.0
     thin_triangle_max_passes: int = 2
@@ -85,6 +96,18 @@ def generate_mesh(
     progress_callback: ProgressCallback | None = None,
 ) -> MeshResult:
     """Generate a constrained Delaunay mesh with boundary midpoint recovery."""
+    if str(config.thin_repair_profile) not in {
+        "guarded-v1",
+        "systematic-v2",
+        "systematic-v3",
+        "systematic-v5",
+        "none",
+    }:
+        raise ValueError(
+            "thin_repair_profile must be guarded-v1, systematic-v2, systematic-v3, systematic-v5, or none"
+        )
+    if str(config.systematic_v3_obc_policy) not in {"preserve", "redistribute"}:
+        raise ValueError("systematic_v3_obc_policy must be preserve or redistribute")
     _progress(progress_callback, "seed_boundary_nodes", 0.0, {"boundary_node_count": int(len(boundary.xy))})
     points = [tuple(xy) for xy in boundary.xy]
     kinds = list(boundary.kinds)
@@ -305,6 +328,7 @@ def generate_mesh(
         raise ValueError("conditioning_profile must be auto, guarded-v1, aggressive-local-v2, or none")
     aggressive_result = None
     node_lineage = np.arange(len(points_arr), dtype=int)
+    restricted_edges_current: set[tuple[int, int]] = set()
     if effective_conditioning_profile == "aggressive-local-v2":
         _progress(progress_callback, "aggressive_local_topology", 0.965, {"profile": effective_conditioning_profile})
         aggressive_result = condition_mesh_aggressive(
@@ -319,6 +343,17 @@ def generate_mesh(
             target_spacing_sampler=_sample_conditioning_targets,
             config=AggressiveConditioningConfig(
                 enabled=True,
+                enable_thin_repair=str(config.thin_repair_profile) != "none",
+                thin_repair_profile=(
+                    "guarded-v1" if str(config.thin_repair_profile) == "none" else str(config.thin_repair_profile)
+                ),
+                systematic_v3_obc_policy=str(config.systematic_v3_obc_policy),
+                systematic_v5_enable_connectivity_restriction=bool(
+                    config.systematic_v5_connectivity_restriction
+                ),
+                systematic_v5_max_connectivity_transactions_per_round=int(
+                    config.systematic_v5_max_connectivity_transactions
+                ),
                 max_rounds=int(config.aggressive_conditioning_rounds),
                 boundary_edit_policy=str(config.aggressive_boundary_edit_policy),
                 max_prunes_per_round=int(config.aggressive_max_prunes_per_round),
@@ -335,6 +370,10 @@ def generate_mesh(
         kinds = aggressive_result.boundary_kinds.copy()
         hard_anchors = aggressive_result.hard_anchor_mask.tolist()
         node_lineage = aggressive_result.node_lineage.copy()
+        restricted_edges_current = _restrictions_to_delivered_indices(
+            aggressive_result.restricted_lineage_edges,
+            aggressive_result.node_lineage,
+        )
 
     area_transition_config = AreaTransitionRelaxConfig(
         enabled=bool(config.area_transition_relaxation),
@@ -361,6 +400,78 @@ def generate_mesh(
     conditioning_targets = area_transition_result.target_spacing_m
     point_targets = conditioning_targets.tolist()
 
+    terminal_thin_result = None
+    if aggressive_result is not None and str(config.thin_repair_profile) in {
+        "systematic-v2",
+        "systematic-v3",
+        "systematic-v5",
+    }:
+        terminal_profile = str(config.thin_repair_profile)
+        _progress(progress_callback, "terminal_systematic_thin_repair", 0.975, {"profile": terminal_profile})
+        previous_lineage = np.asarray(node_lineage, dtype=int).copy()
+        terminal_config = AggressiveConditioningConfig(
+            enabled=True,
+            thin_repair_profile=terminal_profile,
+            systematic_v3_obc_policy=str(config.systematic_v3_obc_policy),
+            systematic_v5_enable_connectivity_restriction=bool(
+                config.systematic_v5_connectivity_restriction
+            ),
+            systematic_v5_max_connectivity_transactions_per_round=int(
+                config.systematic_v5_max_connectivity_transactions
+            ),
+            max_rounds=1,
+            enable_pruning=False,
+            enable_thin_repair=True,
+            enable_valence_repair=False,
+            max_prunes_per_round=0,
+            max_valence_removals_per_round=0,
+        )
+        if terminal_profile == "systematic-v5":
+            terminal_thin_result = run_systematic_v5_loop(
+                points_arr,
+                triangles,
+                fixed_mask,
+                chains,
+                np.asarray(open_nodes, dtype=int),
+                target_spacing_m=conditioning_targets,
+                boundary_kinds=kinds,
+                hard_anchor_mask=np.asarray(hard_anchors, dtype=bool),
+                target_spacing_sampler=_sample_conditioning_targets,
+                restricted_lineage_edges=restricted_edges_current,
+                topology_config=terminal_config,
+                loop_config=SystematicV5LoopConfig(
+                    total_iterations=int(config.systematic_v5_total_iterations),
+                    maximum_cycles=int(config.systematic_v5_max_cycles),
+                    maximum_burst=int(config.systematic_v5_max_burst),
+                    superthin_trigger=int(config.systematic_v5_thin_trigger),
+                    checkpoint_interval=int(config.systematic_v5_checkpoint_interval),
+                    wall_clock_seconds=float(config.systematic_v5_wall_time_s),
+                ),
+            )
+        else:
+            terminal_thin_result = condition_mesh_aggressive(
+                points_arr,
+                triangles,
+                fixed_mask,
+                chains,
+                np.asarray(open_nodes, dtype=int),
+                target_spacing_m=conditioning_targets,
+                boundary_kinds=kinds,
+                hard_anchor_mask=np.asarray(hard_anchors, dtype=bool),
+                target_spacing_sampler=_sample_conditioning_targets,
+                config=terminal_config,
+            )
+        points_arr = terminal_thin_result.nodes_xy
+        triangles = _orient_ccw(points_arr, terminal_thin_result.triangles)
+        fixed_mask = terminal_thin_result.fixed_node_mask
+        chains = [chain.copy() for chain in terminal_thin_result.constraint_chains]
+        open_nodes = terminal_thin_result.open_boundary_nodes_zero_based.tolist()
+        conditioning_targets = terminal_thin_result.target_spacing_m
+        point_targets = conditioning_targets.tolist()
+        kinds = terminal_thin_result.boundary_kinds.copy()
+        hard_anchors = terminal_thin_result.hard_anchor_mask.tolist()
+        node_lineage = _compose_lineage(previous_lineage, terminal_thin_result.node_lineage)
+
     terminal_audit = _conditioning_terminal_audit(
         points_arr,
         triangles,
@@ -371,6 +482,7 @@ def generate_mesh(
         preconditioning["fixed"],
         node_lineage=node_lineage,
         original_hard=preconditioning["hard_anchors"],
+        allow_boundary_motion=str(config.thin_repair_profile) in {"systematic-v3", "systematic-v5"},
     )
     baseline_audit = _conditioning_terminal_audit(
         preconditioning["points"],
@@ -382,6 +494,7 @@ def generate_mesh(
         preconditioning["fixed"],
         node_lineage=np.arange(len(preconditioning["points"]), dtype=int),
         original_hard=preconditioning["hard_anchors"],
+        allow_boundary_motion=False,
     )
     if aggressive_result is not None and not aggressive_result.report.get("fvcom_valence_gate_passed", False):
         terminal_audit["fvcom_valence_gate_passed"] = False
@@ -400,24 +513,44 @@ def generate_mesh(
         hard_anchors = preconditioning["hard_anchors"].tolist()
         node_lineage = np.arange(len(points_arr), dtype=int)
         terminal_audit = baseline_audit
+    obc_remap_manifest = _generation_obc_remap_manifest(
+        preconditioning,
+        np.asarray(points_arr, dtype=float),
+        chains,
+        np.asarray(open_nodes, dtype=int),
+        np.asarray(node_lineage, dtype=int),
+    )
+    terminal_stage_name = (
+        f"{str(config.thin_repair_profile)}-terminal"
+        if terminal_thin_result is not None
+        else "systematic-thin-terminal-disabled"
+    )
     conditioning_report = {
-        "schema_version": "fvcom_generation_conditioning_v3",
+        "schema_version": "fvcom_generation_conditioning_v4",
         "profile": effective_conditioning_profile,
         "stage_order": [
             "spring-relax-v1",
             "thin-repair-v1",
             "aggressive-local-v2" if aggressive_result is not None else "aggressive-local-disabled",
             "area-transition-relax-v1",
+            terminal_stage_name,
             "terminal-constraint-audit",
         ],
         "spring_relaxation": spring_result.report,
         "thin_triangle_repair": thin_result.report,
         "aggressive_local_topology": aggressive_result.report if aggressive_result is not None else {"enabled": False},
-        "mesh_edit_ledger": aggressive_result.edit_ledger if aggressive_result is not None else [],
+        "mesh_edit_ledger": [
+            *(aggressive_result.edit_ledger if aggressive_result is not None else []),
+            *(terminal_thin_result.edit_ledger if terminal_thin_result is not None else []),
+        ],
         "area_transition_relaxation": area_transition_result.report,
+        "terminal_systematic_thin_repair": (
+            terminal_thin_result.report if terminal_thin_result is not None else {"enabled": False}
+        ),
         "baseline_terminal_audit": baseline_audit,
         "terminal_audit": terminal_audit,
         "terminal_rollback_applied": terminal_rollback,
+        "obc_remap_manifest": obc_remap_manifest,
     }
     final_missing = _missing_constraint_edges(triangles, chains)
     constraint_report["missing_constraint_edge_count"] = int(len(final_missing))
@@ -470,6 +603,7 @@ def _conditioning_terminal_audit(
     *,
     node_lineage: np.ndarray | None = None,
     original_hard: np.ndarray | None = None,
+    allow_boundary_motion: bool = False,
 ) -> dict[str, Any]:
     """Audit the delivered conditioned mesh without changing connectivity."""
     geometry = triangle_geometry(points, triangles)
@@ -490,12 +624,28 @@ def _conditioning_terminal_audit(
     hard_mask = np.asarray(original_hard if original_hard is not None else np.zeros(original_count, dtype=bool), dtype=bool)
     surviving_original_set = set(map(int, surviving_original.tolist()))
     missing_hard = [int(index) for index in np.where(hard_mask)[0] if int(index) not in surviving_original_set]
+    hard_survivors = surviving[hard_mask[surviving_original]] if len(surviving) else np.empty(0, dtype=int)
+    hard_original = lineage[hard_survivors] if len(hard_survivors) else np.empty(0, dtype=int)
+    hard_shift = (
+        float(np.max(np.linalg.norm(points[hard_survivors] - original_points[hard_original], axis=1)))
+        if len(hard_survivors)
+        else 0.0
+    )
     positive = bool(len(triangles) and np.all(geometry["signed_area"] > 0.0))
     constraints_ok = bool(not chains or integrity["all_protected_edges_present"])
     obc_ok = bool(not len(open_nodes_zero_based) or integrity["open_boundary_ordered"])
     one_component = bool(len(topology.connected_component_sizes) == 1)
     manifold = bool(not topology.nonmanifold_edges)
-    passed = bool(positive and constraints_ok and obc_ok and one_component and manifold and boundary_shift <= 1.0e-10 and not missing_hard)
+    passed = bool(
+        positive
+        and constraints_ok
+        and obc_ok
+        and one_component
+        and manifold
+        and (bool(allow_boundary_motion) or boundary_shift <= 1.0e-10)
+        and not missing_hard
+        and hard_shift <= 1.0e-10
+    )
     return {
         "passed": passed,
         "positive_signed_areas": positive,
@@ -504,10 +654,12 @@ def _conditioning_terminal_audit(
         "connected_component_count": int(len(topology.connected_component_sizes)),
         "nonmanifold_edge_count": int(len(topology.nonmanifold_edges)),
         "original_boundary_coordinate_max_shift_m": boundary_shift,
+        "boundary_motion_policy": "source-arc-audited" if allow_boundary_motion else "fixed",
         "surviving_original_boundary_node_count": int(len(boundary_survivors)),
         "removed_original_boundary_node_count": int(np.count_nonzero(original_mask) - len(boundary_survivors)),
         "missing_hard_anchor_count": int(len(missing_hard)),
         "missing_hard_anchors": missing_hard[:100],
+        "hard_anchor_coordinate_max_shift_m": hard_shift,
         "constraint_integrity": integrity,
     }
 
@@ -629,6 +781,39 @@ def _adaptive_quadtree_seed_points(boundary: BoundaryNodes, size_field: SizeFiel
     return np.asarray(accepted, dtype=float)
 
 
+def _restrictions_to_delivered_indices(
+    restrictions: set[tuple[int, int]],
+    node_lineage: np.ndarray,
+) -> set[tuple[int, int]]:
+    inverse = {
+        int(source): int(delivered)
+        for delivered, source in enumerate(
+            np.asarray(node_lineage, dtype=int)
+        )
+        if int(source) >= 0
+    }
+    return {
+        tuple(sorted((inverse[int(left)], inverse[int(right)])))
+        for left, right in restrictions
+        if int(left) in inverse and int(right) in inverse
+    }
+
+
+def _compose_lineage(previous: np.ndarray, current: np.ndarray) -> np.ndarray:
+    """Compose a conditioning-stage lineage map, preserving unique inserted IDs."""
+    previous = np.asarray(previous, dtype=int)
+    current = np.asarray(current, dtype=int)
+    next_inserted = min(int(np.min(previous)) if len(previous) else 0, 0) - 1
+    output = np.empty(len(current), dtype=int)
+    for index, value in enumerate(current):
+        if 0 <= int(value) < len(previous):
+            output[index] = int(previous[int(value)])
+        else:
+            output[index] = int(next_inserted)
+            next_inserted -= 1
+    return output
+
+
 def _triangulate_filtered(points: np.ndarray, boundary: BoundaryNodes) -> np.ndarray:
     if len(points) < 3:
         return np.empty((0, 3), dtype=int)
@@ -686,6 +871,134 @@ def _ordered_boundary_kind_group(chain: list[int], kinds: list[str], target_kind
     if current:
         groups.append(current)
     return max(groups, key=lambda values: (len(values), -values[0])) if groups else []
+
+
+def _generation_obc_remap_manifest(
+    baseline: dict[str, Any],
+    delivered_points: np.ndarray,
+    delivered_chains: list[list[int]],
+    delivered_open: np.ndarray,
+    delivered_lineage: np.ndarray,
+) -> dict[str, Any]:
+    source_points = np.asarray(baseline["points"], dtype=float)
+    source_chains = [list(map(int, chain)) for chain in baseline["chains"]]
+    source_open = list(map(int, np.asarray(baseline["open_nodes"], dtype=int)))
+    delivered = list(map(int, np.asarray(delivered_open, dtype=int)))
+    source_set = set(source_open)
+
+    def chain_for_node(chains: list[list[int]], node: int) -> int | None:
+        for chain_index, chain in enumerate(chains):
+            if int(node) in chain:
+                return int(chain_index)
+        return None
+
+    def source_curve(chain_index: int) -> tuple[np.ndarray, np.ndarray, float] | None:
+        if not 0 <= chain_index < len(source_chains):
+            return None
+        chain = source_chains[chain_index]
+        if len(chain) < 2:
+            return None
+        coordinates = source_points[np.asarray([*chain, chain[0]], dtype=int)]
+        lengths = np.linalg.norm(np.diff(coordinates, axis=0), axis=1)
+        cumulative = np.concatenate([[0.0], np.cumsum(lengths)])
+        total = float(cumulative[-1])
+        return (coordinates, cumulative, total) if total > 1.0e-12 else None
+
+    def project(chain_index: int, point: np.ndarray) -> tuple[float, float] | None:
+        curve = source_curve(chain_index)
+        if curve is None:
+            return None
+        coordinates, cumulative, total = curve
+        best: tuple[float, float] | None = None
+        for index, (left, right) in enumerate(zip(coordinates[:-1], coordinates[1:])):
+            vector = right - left
+            denominator = float(np.dot(vector, vector))
+            fraction = (
+                0.0
+                if denominator <= 1.0e-20
+                else float(np.clip(np.dot(point - left, vector) / denominator, 0.0, 1.0))
+            )
+            projected = left + fraction * vector
+            distance = float(np.linalg.norm(point - projected))
+            s = float(cumulative[index] + fraction * (cumulative[index + 1] - cumulative[index]))
+            if best is None or (distance, s) < (best[1], best[0]):
+                best = (s % total, distance)
+        return best
+
+    source_positions: dict[int, tuple[int, float]] = {}
+    for source_node in source_open:
+        chain_index = chain_for_node(source_chains, source_node)
+        projected = project(chain_index, source_points[source_node]) if chain_index is not None else None
+        if chain_index is not None and projected is not None:
+            source_positions[source_node] = (chain_index, projected[0])
+
+    entries: list[dict[str, Any]] = []
+    delivered_lineages: list[int] = []
+    for order, node in enumerate(delivered):
+        lineage = int(delivered_lineage[node])
+        delivered_lineages.append(lineage)
+        chain_index = chain_for_node(delivered_chains, node)
+        projected = project(chain_index, delivered_points[node]) if chain_index is not None else None
+        moved = bool(
+            0 <= lineage < len(source_points)
+            and not np.allclose(delivered_points[node], source_points[lineage], atol=1.0e-9, rtol=0.0)
+        )
+        status = (
+            "slid"
+            if lineage in source_set and moved
+            else "retained"
+            if lineage in source_set
+            else "redistributed"
+            if lineage >= 0
+            else "inserted"
+        )
+        nearest = sorted(
+            (
+                (abs(source_s - projected[0]), source_node)
+                for source_node, (source_chain, source_s) in source_positions.items()
+                if projected is not None and source_chain == chain_index
+            )
+        )[:2]
+        curve = source_curve(chain_index) if chain_index is not None else None
+        entries.append(
+            {
+                "delivered_order_zero_based": int(order),
+                "delivered_node_index_zero_based": int(node),
+                "status": status,
+                "source_node_lineage": lineage if lineage >= 0 else None,
+                "bracketing_original_obc_lineage": [int(value[1]) for value in nearest],
+                "constraint_chain_id": chain_index,
+                "source_arc_position_m": float(projected[0]) if projected is not None else None,
+                "source_arc_fraction": (
+                    float(projected[0] / curve[2]) if projected is not None and curve is not None else None
+                ),
+                "coordinate_xy": [float(delivered_points[node, 0]), float(delivered_points[node, 1])],
+            }
+        )
+    compatible = bool(
+        len(delivered) == len(source_open)
+        and delivered_lineages == source_open
+        and all(entry["status"] == "retained" for entry in entries)
+    )
+    return {
+        "schema_version": "fvcom_obc_remap_manifest_v1",
+        "original_obc_count": int(len(source_open)),
+        "delivered_obc_count": int(len(delivered)),
+        "obc_forcing_compatible": compatible,
+        "forcing_invalidation_required": not compatible,
+        "orientation_preserved": bool(
+            not source_open
+            or not delivered_lineages
+            or (
+                delivered_lineages[0] == source_open[0]
+                and delivered_lineages[-1] == source_open[-1]
+            )
+        ),
+        "removed_original_obc_lineage": [
+            int(node) for node in source_open if int(node) not in set(delivered_lineages)
+        ],
+        "delivered_nodes": entries,
+    }
 
 
 def _refinement_points(points: np.ndarray, triangles: np.ndarray, boundary: BoundaryNodes, size_field: SizeField, config: MeshConfig) -> np.ndarray:

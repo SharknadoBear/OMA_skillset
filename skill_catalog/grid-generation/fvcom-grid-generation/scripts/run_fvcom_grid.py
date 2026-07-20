@@ -68,6 +68,35 @@ def main() -> int:
     parser.add_argument("--spring-relax-ring-layers", type=int, default=3)
     parser.add_argument("--spring-relax-shape-weight", type=float, default=0.20)
     parser.add_argument("--thin-triangle-repair", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--thin-repair-profile",
+        choices=("guarded-v1", "systematic-v2", "systematic-v3", "systematic-v5", "none"),
+        default="guarded-v1",
+        help="Extreme-tail topology profile. systematic-v2, boundary-adaptive v3, and locked-star relaxation v5 are opt-in.",
+    )
+    parser.add_argument(
+        "--systematic-v3-obc-policy",
+        choices=("preserve", "redistribute"),
+        default="redistribute",
+        help="Preserve the OBC node count or allow source-arc redistribution when systematic-v3 is selected.",
+    )
+    parser.add_argument("--systematic-v5-total-iterations", type=int, default=1000)
+    parser.add_argument("--systematic-v5-max-cycles", type=int, default=6)
+    parser.add_argument("--systematic-v5-max-burst", type=int, default=250)
+    parser.add_argument("--systematic-v5-thin-trigger", type=int, default=25)
+    parser.add_argument("--systematic-v5-checkpoint-interval", type=int, default=10)
+    parser.add_argument("--systematic-v5-wall-time-s", type=float, default=21600.0)
+    parser.add_argument(
+        "--systematic-v5-connectivity-restriction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable research-only persistent allowed-edge closure under systematic-v5.",
+    )
+    parser.add_argument(
+        "--systematic-v5-max-connectivity-transactions",
+        type=int,
+        default=32,
+    )
     parser.add_argument("--thin-triangle-quality-threshold", type=float, default=0.25)
     parser.add_argument("--thin-triangle-min-angle-deg", type=float, default=20.0)
     parser.add_argument("--thin-triangle-max-passes", type=int, default=2)
@@ -148,6 +177,20 @@ def main() -> int:
             spring_relax_ring_layers=args.spring_relax_ring_layers,
             spring_relax_shape_weight=args.spring_relax_shape_weight,
             thin_triangle_repair=args.thin_triangle_repair,
+            thin_repair_profile=args.thin_repair_profile,
+            systematic_v3_obc_policy=args.systematic_v3_obc_policy,
+            systematic_v5_total_iterations=args.systematic_v5_total_iterations,
+            systematic_v5_max_cycles=args.systematic_v5_max_cycles,
+            systematic_v5_max_burst=args.systematic_v5_max_burst,
+            systematic_v5_thin_trigger=args.systematic_v5_thin_trigger,
+            systematic_v5_checkpoint_interval=args.systematic_v5_checkpoint_interval,
+            systematic_v5_wall_time_s=args.systematic_v5_wall_time_s,
+            systematic_v5_connectivity_restriction=(
+                args.systematic_v5_connectivity_restriction
+            ),
+            systematic_v5_max_connectivity_transactions=(
+                args.systematic_v5_max_connectivity_transactions
+            ),
             thin_triangle_quality_threshold=args.thin_triangle_quality_threshold,
             thin_triangle_min_angle_deg=args.thin_triangle_min_angle_deg,
             thin_triangle_max_passes=args.thin_triangle_max_passes,

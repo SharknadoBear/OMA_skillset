@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import shutil
 import sys
+import time
 from typing import Any
 
 import numpy as np
@@ -14,6 +16,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fvcom_grid_generation.postprocess import boundary_chains_from_mesh  # noqa: E402
+from fvcom_grid_generation.local_topology import AggressiveConditioningConfig, condition_mesh_aggressive  # noqa: E402
 from fvcom_grid_generation.projection import local_utm_projection, project_points, unproject_points  # noqa: E402
 from fvcom_grid_generation.regional_conditioning import (  # noqa: E402
     SpringRelaxConfig,
@@ -21,6 +24,13 @@ from fvcom_grid_generation.regional_conditioning import (  # noqa: E402
     repair_thin_triangles,
 )
 from fvcom_grid_generation.sms_2dm import read_2dm, write_2dm  # noqa: E402
+from condition_mesh_local import (  # noqa: E402
+    _boundary_geojson,
+    _boundary_metadata,
+    _remap_depths,
+    _serialized_roundtrip_audit,
+    _target_sizes,
+)
 
 
 def main() -> int:
@@ -29,6 +39,36 @@ def main() -> int:
     parser.add_argument("--output-mesh", "--output", dest="output_mesh", required=True, help="Repaired output 2DM mesh.")
     parser.add_argument("--report", required=True, help="JSON repair report.")
     parser.add_argument("--name", help="Output MESHNAME; defaults to <input-name>_thin_repaired.")
+    parser.add_argument(
+        "--thin-repair-profile",
+        choices=("guarded-v1", "systematic-v2", "systematic-v3", "systematic-v5", "none"),
+        default="guarded-v1",
+        help="Choose guarded-v1, systematic-v2, boundary-adaptive systematic-v3, locked-star systematic-v5, or none.",
+    )
+    parser.add_argument("--systematic-v3-obc-policy", choices=("preserve", "redistribute"), default="redistribute")
+    parser.add_argument("--systematic-v5-max-star-transactions", type=int, default=256)
+    parser.add_argument(
+        "--systematic-v5-connectivity-restriction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--systematic-v5-max-connectivity-transactions",
+        type=int,
+        default=32,
+    )
+    parser.add_argument("--systematic-v5-wall-time-s", type=float, default=21600.0)
+    parser.add_argument(
+        "--systematic-v5-boundary-window-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--boundary-nodes-geojson")
+    parser.add_argument("--output-boundary-nodes")
+    parser.add_argument("--output-obc-remap-manifest")
+    parser.add_argument("--boundary-resolution-manifest")
+    parser.add_argument("--size-field-nc")
+    parser.add_argument("--target-spacing-m", type=float)
     parser.add_argument(
         "--region-bbox",
         nargs=4,
@@ -59,6 +99,21 @@ def main() -> int:
     _validate_paths(mesh_path, output_path, report_path, overwrite=bool(args.overwrite))
     _validate_controls(args, parser)
 
+    if args.thin_repair_profile == "none":
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(mesh_path, output_path)
+        document = {
+            "schema_version": "fvcom_thin_triangle_repair_cli_v2",
+            "profile": "none",
+            "input_mesh": str(mesh_path),
+            "output_mesh": str(output_path),
+            "repair": {"enabled": False, "reason": "thin_repair_profile_none", "edit_count": 0},
+        }
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+        print(json.dumps({"output_mesh": str(output_path), "report": str(report_path)}, indent=2))
+        return 0
+
     mesh = read_2dm(mesh_path)
     projection = local_utm_projection(_mesh_bbox(mesh.nodes_lonlat))
     nodes_xy = project_points(mesh.nodes_lonlat, projection)
@@ -67,6 +122,145 @@ def main() -> int:
     chains = boundary_chains_from_mesh(mesh.triangles)
     fixed = _fixed_boundary_mask(len(nodes_xy), chains)
     region_bbox_xy = _project_bbox(args.region_bbox, projection) if args.region_bbox else None
+
+    if args.thin_repair_profile in {"systematic-v2", "systematic-v3", "systematic-v5"}:
+        systematic_profile = str(args.thin_repair_profile)
+        if args.region_bbox:
+            parser.error(f"--region-bbox is not supported by {systematic_profile}; connected components define local patches")
+        chains, kinds, hard, explicit_targets = _boundary_metadata(
+            len(nodes_xy),
+            triangles_zero,
+            open_zero,
+            args.boundary_nodes_geojson,
+            args.boundary_resolution_manifest,
+        )
+        fixed = _fixed_boundary_mask(len(nodes_xy), chains)
+        targets = _target_sizes(mesh.nodes_lonlat, nodes_xy, triangles_zero, args.size_field_nc)
+        if args.target_spacing_m is not None:
+            if args.target_spacing_m <= 0.0:
+                parser.error("--target-spacing-m must be positive")
+            targets[:] = float(args.target_spacing_m)
+        explicit = np.isfinite(explicit_targets) & (explicit_targets > 0.0)
+        targets[explicit] = explicit_targets[explicit]
+        systematic = condition_mesh_aggressive(
+            nodes_xy,
+            triangles_zero,
+            fixed,
+            chains,
+            open_zero,
+            target_spacing_m=targets,
+            boundary_kinds=kinds,
+            hard_anchor_mask=hard,
+            config=AggressiveConditioningConfig(
+                thin_repair_profile=systematic_profile,
+                systematic_v3_obc_policy=str(args.systematic_v3_obc_policy),
+                systematic_gate_scope=(
+                    "loop-end" if systematic_profile == "systematic-v5" else "candidate"
+                ),
+                systematic_v5_max_star_transactions_per_round=int(
+                    args.systematic_v5_max_star_transactions
+                ),
+                systematic_v5_enable_connectivity_restriction=bool(
+                    args.systematic_v5_connectivity_restriction
+                ),
+                systematic_v5_max_connectivity_transactions_per_round=int(
+                    args.systematic_v5_max_connectivity_transactions
+                ),
+                systematic_v5_enable_boundary_window_fallback=bool(
+                    args.systematic_v5_boundary_window_fallback
+                ),
+                deadline_monotonic_s=(
+                    time.perf_counter() + float(args.systematic_v5_wall_time_s)
+                    if systematic_profile == "systematic-v5"
+                    else None
+                ),
+                max_rounds=int(args.max_passes),
+                enable_pruning=False,
+                enable_thin_repair=True,
+                enable_valence_repair=False,
+                max_prunes_per_round=0,
+                max_valence_removals_per_round=0,
+            ),
+        )
+        depths = _remap_depths(mesh.depths, nodes_xy, systematic.nodes_xy, systematic.node_lineage)
+        output_name = args.name or f"{mesh.mesh_name}_{systematic_profile.replace('-', '_')}"
+        output_mesh = write_2dm(
+            output_path,
+            unproject_points(systematic.nodes_xy, projection),
+            depths,
+            systematic.triangles + 1,
+            systematic.open_boundary_nodes_zero_based + 1,
+            mesh_name=output_name,
+        )
+        roundtrip = _serialized_roundtrip_audit(output_mesh, systematic, projection)
+        boundary_output = Path(args.output_boundary_nodes) if args.output_boundary_nodes else None
+        obc_remap_output = Path(args.output_obc_remap_manifest) if args.output_obc_remap_manifest else None
+        if boundary_output is not None:
+            boundary_output.parent.mkdir(parents=True, exist_ok=True)
+            boundary_output.write_text(
+                json.dumps(
+                    _boundary_geojson(
+                        unproject_points(systematic.nodes_xy, projection),
+                        systematic.constraint_chains,
+                        systematic.open_boundary_nodes_zero_based,
+                        systematic.boundary_kinds,
+                        systematic.hard_anchor_mask,
+                        systematic.node_lineage,
+                        systematic.target_spacing_m,
+                    ),
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        if obc_remap_output is not None:
+            obc_remap_output.parent.mkdir(parents=True, exist_ok=True)
+            obc_remap_output.write_text(
+                json.dumps(_json_safe(systematic.obc_remap_manifest), indent=2),
+                encoding="utf-8",
+            )
+        lineage_to_current = {
+            int(lineage): int(index)
+            for index, lineage in enumerate(np.asarray(systematic.node_lineage, dtype=int))
+            if int(lineage) >= 0
+        }
+        original_boundary = np.where(fixed)[0]
+        if systematic_profile == "systematic-v2" and any(
+            int(node) not in lineage_to_current for node in original_boundary
+        ):
+            raise RuntimeError("systematic-v2 removed an original protected boundary node")
+        surviving_boundary = [int(node) for node in original_boundary if int(node) in lineage_to_current]
+        current_boundary = np.asarray([lineage_to_current[node] for node in surviving_boundary], dtype=int)
+        boundary_shift = (
+            _maximum_shift(nodes_xy[np.asarray(surviving_boundary, dtype=int)], systematic.nodes_xy[current_boundary])
+            if surviving_boundary
+            else 0.0
+        )
+        delivered_open_lineage = np.asarray(
+            [systematic.node_lineage[int(node)] for node in systematic.open_boundary_nodes_zero_based],
+            dtype=int,
+        )
+        _require_constraints(systematic.triangles, systematic.constraint_chains, systematic.open_boundary_nodes_zero_based)
+        document = {
+            "schema_version": "fvcom_thin_triangle_repair_cli_v2",
+            "profile": systematic_profile,
+            "input_mesh": str(mesh_path),
+            "output_mesh": str(output_mesh),
+            "output_boundary_nodes": str(boundary_output) if boundary_output is not None else None,
+            "output_obc_remap_manifest": str(obc_remap_output) if obc_remap_output is not None else None,
+            "projection_epsg": int(projection.epsg),
+            "boundary_metadata_supplied": bool(args.boundary_nodes_geojson),
+            "size_field_supplied": bool(args.size_field_nc),
+            "original_boundary_coordinate_max_shift_m": float(boundary_shift),
+            "obc_order_preserved": bool(np.array_equal(open_zero, delivered_open_lineage)),
+            "obc_remap_manifest": systematic.obc_remap_manifest,
+            "serialized_roundtrip": roundtrip,
+            "repair": systematic.report,
+            "edit_ledger": systematic.edit_ledger,
+        }
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(_json_safe(document), indent=2), encoding="utf-8")
+        print(json.dumps({"output_mesh": str(output_mesh), "report": str(report_path)}, indent=2))
+        return 0 if systematic.report["superthin_gate_passed"] and roundtrip["passed"] else 2
 
     relaxation_config = SpringRelaxConfig(
         enabled=True,
@@ -295,6 +489,10 @@ def _validate_controls(args: argparse.Namespace, parser: argparse.ArgumentParser
             parser.error(f"--{name.replace('_', '-')} must be between 0 and 60")
     if min(args.max_passes, args.max_flips, args.max_insertions, args.relax_ring_layers, args.relax_iterations) < 0:
         parser.error("pass, operation, ring, and iteration budgets must be nonnegative")
+    if args.systematic_v5_max_connectivity_transactions < 0:
+        parser.error(
+            "--systematic-v5-max-connectivity-transactions must be nonnegative"
+        )
     if args.split_target_factor <= 0.0 or args.relax_max_step_fraction <= 0.0 or args.relax_force_tolerance <= 0.0:
         parser.error("split factor, relaxation step fraction, and force tolerance must be positive")
     if not 0.0 < args.relax_damping <= 1.0 or args.relax_shape_weight < 0.0:

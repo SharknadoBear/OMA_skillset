@@ -18,6 +18,7 @@ import xarray as xr
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fvcom_grid_generation.local_topology import AggressiveConditioningConfig, condition_mesh_aggressive  # noqa: E402
+from fvcom_grid_generation.systematic_v5 import SystematicV5LoopConfig, run_systematic_v5_loop  # noqa: E402
 from fvcom_grid_generation.metrics import build_edge_topology, triangle_geometry  # noqa: E402
 from fvcom_grid_generation.postprocess import boundary_chains_from_mesh  # noqa: E402
 from fvcom_grid_generation.projection import local_utm_projection, project_points, unproject_points  # noqa: E402
@@ -30,11 +31,35 @@ def main_with_mode(forced_mode: str | None = None) -> int:
     parser.add_argument("--output-mesh", required=True)
     parser.add_argument("--report", required=True)
     parser.add_argument("--output-boundary-nodes")
+    parser.add_argument("--output-obc-remap-manifest")
     parser.add_argument("--boundary-nodes-geojson")
     parser.add_argument("--boundary-resolution-manifest")
     parser.add_argument("--size-field-nc")
     parser.add_argument("--target-spacing-m", type=float, help="Uniform fallback/override target spacing for standalone tests.")
     parser.add_argument("--mode", choices=("all", "valence", "thin", "prune"), default=forced_mode or "all")
+    parser.add_argument(
+        "--thin-repair-profile",
+        choices=("guarded-v1", "systematic-v2", "systematic-v3", "systematic-v5", "none"),
+        default="guarded-v1",
+        help="Extreme-tail repair profile; none disables thin repair while leaving the selected non-thin conditioning mode active.",
+    )
+    parser.add_argument("--systematic-v3-obc-policy", choices=("preserve", "redistribute"), default="redistribute")
+    parser.add_argument("--systematic-v5-total-iterations", type=int, default=1000)
+    parser.add_argument("--systematic-v5-max-cycles", type=int, default=6)
+    parser.add_argument("--systematic-v5-max-burst", type=int, default=250)
+    parser.add_argument("--systematic-v5-thin-trigger", type=int, default=25)
+    parser.add_argument("--systematic-v5-checkpoint-interval", type=int, default=10)
+    parser.add_argument("--systematic-v5-wall-time-s", type=float, default=21600.0)
+    parser.add_argument(
+        "--systematic-v5-connectivity-restriction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--systematic-v5-max-connectivity-transactions",
+        type=int,
+        default=32,
+    )
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--boundary-edit-policy", choices=("kind-aware-envelope", "split-only", "none"), default="kind-aware-envelope")
     parser.add_argument("--max-prunes-per-round", type=int, default=500)
@@ -61,15 +86,20 @@ def main_with_mode(forced_mode: str | None = None) -> int:
         args.mode = forced_mode
     if any(value <= 0 for value in args.only_node_id_1based):
         parser.error("--only-node-id-1based values must be positive")
+    if args.systematic_v5_max_connectivity_transactions < 0:
+        parser.error(
+            "--systematic-v5-max-connectivity-transactions must be nonnegative"
+        )
     mesh_path = Path(args.mesh)
     output_path = Path(args.output_mesh)
     report_path = Path(args.report)
     boundary_output = Path(args.output_boundary_nodes) if args.output_boundary_nodes else None
+    obc_remap_output = Path(args.output_obc_remap_manifest) if args.output_obc_remap_manifest else None
     if not mesh_path.is_file():
         raise FileNotFoundError(mesh_path)
     if output_path.resolve() == mesh_path.resolve():
         raise ValueError("Refusing to overwrite the input mesh")
-    existing = [path for path in (output_path, report_path, boundary_output) if path is not None and path.exists()]
+    existing = [path for path in (output_path, report_path, boundary_output, obc_remap_output) if path is not None and path.exists()]
     if existing and not args.overwrite:
         raise FileExistsError(f"Refusing to overwrite existing outputs: {existing}")
 
@@ -97,10 +127,19 @@ def main_with_mode(forced_mode: str | None = None) -> int:
     targets[valid_explicit] = explicit_targets[valid_explicit]
 
     mode = str(args.mode)
+    thin_enabled = str(args.thin_repair_profile) != "none"
     config = AggressiveConditioningConfig(
         max_rounds=int(args.rounds),
+        thin_repair_profile=(str(args.thin_repair_profile) if thin_enabled else "guarded-v1"),
+        systematic_v3_obc_policy=str(args.systematic_v3_obc_policy),
+        systematic_v5_enable_connectivity_restriction=bool(
+            args.systematic_v5_connectivity_restriction
+        ),
+        systematic_v5_max_connectivity_transactions_per_round=int(
+            args.systematic_v5_max_connectivity_transactions
+        ),
         enable_pruning=mode in {"all", "prune"},
-        enable_thin_repair=mode in {"all", "thin", "valence"},
+        enable_thin_repair=thin_enabled and mode in {"all", "thin", "valence"},
         enable_valence_repair=mode in {"all", "valence"},
         boundary_edit_policy=str(args.boundary_edit_policy),
         max_prunes_per_round=int(args.max_prunes_per_round) if mode in {"all", "prune"} else 0,
@@ -120,17 +159,38 @@ def main_with_mode(forced_mode: str | None = None) -> int:
         valence_node_lineage_filter=tuple(int(value) - 1 for value in args.only_node_id_1based) if mode in {"all", "valence"} else (),
         micro_relax_cycles=int(args.micro_relax_cycles),
     )
-    result = condition_mesh_aggressive(
-        points,
-        triangles,
-        fixed,
-        chains,
-        open_nodes,
-        target_spacing_m=targets,
-        boundary_kinds=kinds,
-        hard_anchor_mask=hard,
-        config=config,
-    )
+    if str(args.thin_repair_profile) == "systematic-v5" and mode in {"all", "thin", "valence"}:
+        result = run_systematic_v5_loop(
+            points,
+            triangles,
+            fixed,
+            chains,
+            open_nodes,
+            target_spacing_m=targets,
+            boundary_kinds=kinds,
+            hard_anchor_mask=hard,
+            topology_config=config,
+            loop_config=SystematicV5LoopConfig(
+                total_iterations=int(args.systematic_v5_total_iterations),
+                maximum_cycles=int(args.systematic_v5_max_cycles),
+                maximum_burst=int(args.systematic_v5_max_burst),
+                superthin_trigger=int(args.systematic_v5_thin_trigger),
+                checkpoint_interval=int(args.systematic_v5_checkpoint_interval),
+                wall_clock_seconds=float(args.systematic_v5_wall_time_s),
+            ),
+        )
+    else:
+        result = condition_mesh_aggressive(
+            points,
+            triangles,
+            fixed,
+            chains,
+            open_nodes,
+            target_spacing_m=targets,
+            boundary_kinds=kinds,
+            hard_anchor_mask=hard,
+            config=config,
+        )
     depths = _remap_depths(mesh.depths, points, result.nodes_xy, result.node_lineage)
     output_mesh = write_2dm(
         output_path,
@@ -158,18 +218,26 @@ def main_with_mode(forced_mode: str | None = None) -> int:
             ),
             encoding="utf-8",
         )
+    if obc_remap_output is not None:
+        obc_remap_output.parent.mkdir(parents=True, exist_ok=True)
+        obc_remap_output.write_text(
+            json.dumps(_json_safe(result.obc_remap_manifest), indent=2),
+            encoding="utf-8",
+        )
     document = {
         "schema_version": "fvcom_local_conditioning_cli_v2",
         "mode": mode,
         "input_mesh": str(mesh_path),
         "output_mesh": str(output_mesh),
         "output_boundary_nodes": str(boundary_output) if boundary_output is not None else None,
+        "output_obc_remap_manifest": str(obc_remap_output) if obc_remap_output is not None else None,
         "projection_epsg": int(projection.epsg),
         "boundary_metadata_supplied": bool(args.boundary_nodes_geojson),
         "size_field_supplied": bool(args.size_field_nc),
         "serialized_roundtrip": roundtrip,
         "conditioning": result.report,
         "edit_ledger": result.edit_ledger,
+        "obc_remap_manifest": result.obc_remap_manifest,
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(_json_safe(document), indent=2), encoding="utf-8")
@@ -180,6 +248,7 @@ def main_with_mode(forced_mode: str | None = None) -> int:
                 "report": str(report_path),
                 "edit_count": int(len(result.edit_ledger)),
                 "fvcom_valence_gate_passed": bool(result.report["fvcom_valence_gate_passed"]),
+                "superthin_gate_passed": bool(result.report["superthin_gate_passed"]),
                 "serialized_roundtrip_passed": bool(roundtrip["passed"]),
             },
             indent=2,
@@ -249,18 +318,45 @@ def _boundary_metadata(
         groups: dict[int, list[tuple[int, int]]] = {}
         for feature in document.get("features", []):
             props = feature.get("properties", {})
-            node = int(props.get("node_index_zero_based", int(props["node_id_1based"]) - 1))
-            chain = int(props["constraint_chain_id"])
-            position = int(props["constraint_chain_position"])
-            chain_position_to_node[(chain, position)] = node
-            groups.setdefault(chain, []).append((position, node))
+            if "node_index_zero_based" in props:
+                node = int(props["node_index_zero_based"])
+            elif "node_id_1based" in props:
+                node = int(props["node_id_1based"]) - 1
+            else:
+                continue
+            chain_value = props.get("constraint_chain_id")
+            position_value = props.get(
+                "constraint_chain_position"
+            )
+            if chain_value is not None and position_value is not None:
+                chain = int(chain_value)
+                position = int(position_value)
+                chain_position_to_node[(chain, position)] = node
+                groups.setdefault(chain, []).append((position, node))
             if node < node_count:
-                kinds[node] = str(props.get("boundary_kind", "open" if props.get("is_open_boundary") else "island" if chain > 0 else "land"))
+                fallback_kind = (
+                    "open"
+                    if props.get("is_open_boundary")
+                    else "island"
+                    if chain_value is not None
+                    and int(chain_value) > 0
+                    else "land"
+                )
+                kinds[node] = str(
+                    props.get("boundary_kind", fallback_kind)
+                )
                 hard[node] = bool(props.get("is_hard_anchor", False))
                 value = props.get("target_spacing_m")
                 if value is not None:
                     targets[node] = float(value)
-        chains = [[node for _, node in sorted(groups[key])] for key in sorted(groups)]
+        chains = (
+            [
+                [node for _, node in sorted(groups[key])]
+                for key in sorted(groups)
+            ]
+            if groups
+            else boundary_chains_from_mesh(triangles + 1)
+        )
     else:
         chains = boundary_chains_from_mesh(triangles + 1)
         for chain_index, chain in enumerate(chains):

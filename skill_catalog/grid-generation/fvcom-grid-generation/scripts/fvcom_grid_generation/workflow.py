@@ -72,6 +72,16 @@ class GridConfig:
     spring_relax_ring_layers: int = 3
     spring_relax_shape_weight: float = 0.20
     thin_triangle_repair: bool = True
+    thin_repair_profile: str = "guarded-v1"
+    systematic_v3_obc_policy: str = "redistribute"
+    systematic_v5_total_iterations: int = 1000
+    systematic_v5_max_cycles: int = 6
+    systematic_v5_max_burst: int = 250
+    systematic_v5_thin_trigger: int = 25
+    systematic_v5_checkpoint_interval: int = 10
+    systematic_v5_wall_time_s: float = 21600.0
+    systematic_v5_connectivity_restriction: bool = True
+    systematic_v5_max_connectivity_transactions: int = 32
     thin_triangle_quality_threshold: float = 0.25
     thin_triangle_min_angle_deg: float = 20.0
     thin_triangle_max_passes: int = 2
@@ -114,6 +124,22 @@ def run_fvcom_grid(
         raise ValueError("bathymetry_gradient_policy must be auto, global, coastal, or off")
     if config.conditioning_profile not in {"auto", "guarded-v1", "aggressive-local-v2", "none"}:
         raise ValueError("conditioning_profile must be auto, guarded-v1, aggressive-local-v2, or none")
+    if config.thin_repair_profile not in {
+        "guarded-v1",
+        "systematic-v2",
+        "systematic-v3",
+        "systematic-v5",
+        "none",
+    }:
+        raise ValueError(
+            "thin_repair_profile must be guarded-v1, systematic-v2, systematic-v3, systematic-v5, or none"
+        )
+    if config.systematic_v3_obc_policy not in {"preserve", "redistribute"}:
+        raise ValueError("systematic_v3_obc_policy must be preserve or redistribute")
+    if int(config.systematic_v5_max_connectivity_transactions) < 0:
+        raise ValueError(
+            "systematic_v5_max_connectivity_transactions must be nonnegative"
+        )
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
     progress = ProgressTracker(run_dir=run_dir, name=name, interval_s=float(config.progress_interval_s))
@@ -272,6 +298,20 @@ def run_fvcom_grid(
         spring_relax_ring_layers=int(config.spring_relax_ring_layers),
         spring_relax_shape_weight=float(config.spring_relax_shape_weight),
         thin_triangle_repair=bool(config.thin_triangle_repair),
+        thin_repair_profile=str(config.thin_repair_profile),
+        systematic_v3_obc_policy=str(config.systematic_v3_obc_policy),
+        systematic_v5_total_iterations=int(config.systematic_v5_total_iterations),
+        systematic_v5_max_cycles=int(config.systematic_v5_max_cycles),
+        systematic_v5_max_burst=int(config.systematic_v5_max_burst),
+        systematic_v5_thin_trigger=int(config.systematic_v5_thin_trigger),
+        systematic_v5_checkpoint_interval=int(config.systematic_v5_checkpoint_interval),
+        systematic_v5_wall_time_s=float(config.systematic_v5_wall_time_s),
+        systematic_v5_connectivity_restriction=bool(
+            config.systematic_v5_connectivity_restriction
+        ),
+        systematic_v5_max_connectivity_transactions=int(
+            config.systematic_v5_max_connectivity_transactions
+        ),
         thin_triangle_quality_threshold=float(config.thin_triangle_quality_threshold),
         thin_triangle_min_angle_deg=float(config.thin_triangle_min_angle_deg),
         thin_triangle_max_passes=int(config.thin_triangle_max_passes),
@@ -301,6 +341,14 @@ def run_fvcom_grid(
     edit_ledger_json = run_dir / "mesh_edit_ledger.json"
     edit_ledger_json.write_text(
         json.dumps(_json_safe(mesh.report.get("conditioning", {}).get("mesh_edit_ledger", [])), indent=2),
+        encoding="utf-8",
+    )
+    obc_remap_json = run_dir / "obc_remap_manifest.json"
+    obc_remap_json.write_text(
+        json.dumps(
+            _json_safe(mesh.report.get("conditioning", {}).get("obc_remap_manifest", {})),
+            indent=2,
+        ),
         encoding="utf-8",
     )
     delivered_boundary_nodes_path = run_dir / "delivered_boundary_nodes.geojson"
@@ -440,7 +488,7 @@ def run_fvcom_grid(
     )
     final_status = "pass" if quality.get("accepted") else "needs_review"
     manifest = {
-        "schema_version": "fvcom_grid_generation_manifest_v6",
+        "schema_version": "fvcom_grid_generation_manifest_v7",
         "name": name,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "created_by": "fvcom-grid-generation run_fvcom_grid.py",
@@ -466,6 +514,20 @@ def run_fvcom_grid(
             "regional_spring_relaxation": bool(config.regional_spring_relaxation),
             "spring_relax_iterations": int(config.spring_relax_iterations),
             "thin_triangle_repair": bool(config.thin_triangle_repair),
+            "thin_repair_profile": str(config.thin_repair_profile),
+            "systematic_v3_obc_policy": str(config.systematic_v3_obc_policy),
+            "systematic_v5_total_iterations": int(config.systematic_v5_total_iterations),
+            "systematic_v5_max_cycles": int(config.systematic_v5_max_cycles),
+            "systematic_v5_max_burst": int(config.systematic_v5_max_burst),
+            "systematic_v5_thin_trigger": int(config.systematic_v5_thin_trigger),
+            "systematic_v5_checkpoint_interval": int(config.systematic_v5_checkpoint_interval),
+            "systematic_v5_wall_time_s": float(config.systematic_v5_wall_time_s),
+            "systematic_v5_connectivity_restriction": bool(
+                config.systematic_v5_connectivity_restriction
+            ),
+            "systematic_v5_max_connectivity_transactions": int(
+                config.systematic_v5_max_connectivity_transactions
+            ),
             "thin_triangle_min_angle_deg": float(config.thin_triangle_min_angle_deg),
             "thin_triangle_quality_threshold": float(config.thin_triangle_quality_threshold),
             "area_transition_relaxation": bool(config.area_transition_relaxation),
@@ -516,6 +578,7 @@ def run_fvcom_grid(
             "mesh_quality_json": str(quality_json),
             "mesh_conditioning_json": str(conditioning_json),
             "mesh_edit_ledger_json": str(edit_ledger_json),
+            "obc_remap_manifest_json": str(obc_remap_json),
             "mesh_review_map": str(review_map),
             "size_field_nc": str(size_nc),
             "size_field_png": str(size_png),

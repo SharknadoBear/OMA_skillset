@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+import hashlib
 from itertools import combinations
+import time
 from typing import Any, Callable
 
 import numpy as np
+from scipy.spatial import Delaunay, QhullError
+from shapely import contains_xy
+from shapely.geometry import LineString, Polygon
 
+from .connectivity_restriction import (
+    AllowedEdgePolicy,
+    ConnectivityRestrictionConfig,
+)
 from .metrics import build_edge_topology, chain_edges, constraint_integrity, triangle_geometry
 from .regional_conditioning import SpringRelaxConfig, _edge_flip_candidate, relax_mesh_spring
 
@@ -18,6 +27,7 @@ class AggressiveConditioningConfig:
     enable_pruning: bool = True
     enable_thin_repair: bool = True
     enable_valence_repair: bool = True
+    thin_repair_profile: str = "guarded-v1"
     max_rounds: int = 4
     quality_threshold: float = 0.25
     min_angle_deg: float = 20.0
@@ -29,6 +39,30 @@ class AggressiveConditioningConfig:
     max_superthin_flips_per_round: int = 100
     max_boundary_welds_per_round: int = 25
     max_boundary_ear_removals_per_round: int = 25
+    systematic_max_components_per_round: int = 24
+    systematic_min_patch_rings: int = 2
+    systematic_max_patch_rings: int = 4
+    systematic_max_support_points: int = 8
+    systematic_min_passage_elements: int = 2
+    systematic_v3_obc_policy: str = "redistribute"
+    systematic_v3_boundary_window_radius: int = 4
+    systematic_v3_max_candidates_per_component: int = 12
+    systematic_v3_weld_snap_fraction: float = 0.15
+    systematic_v3_passage_clearance_tolerance_m: float = 0.50
+    systematic_gate_scope: str = "candidate"
+    systematic_collapse_welds_per_round: int = 0
+    systematic_v5_max_star_transactions_per_round: int = 256
+    systematic_v5_max_lawson_flips_per_transaction: int = 128
+    systematic_v5_patch_ring_ladder: tuple[int, ...] = (1, 2, 4)
+    systematic_v5_enable_boundary_window_fallback: bool = True
+    systematic_v5_enable_connectivity_restriction: bool = True
+    systematic_v5_connectivity_only: bool = False
+    systematic_v5_max_connectivity_transactions_per_round: int = 32
+    systematic_v5_max_connectivity_candidates_per_component: int = 8
+    systematic_v5_connectivity_shortcut_arc_chord_ratio: float = 3.0
+    systematic_v5_connectivity_shortcut_arc_target_ratio: float = 3.0
+    systematic_v5_audit_reserve_seconds: float = 120.0
+    deadline_monotonic_s: float | None = None
     boundary_weld_max_distance_fraction: float = 0.50
     boundary_weld_max_altitude_to_arc_fraction: float = 0.20
     boundary_weld_land_max_distance_m: float = 5.0
@@ -72,8 +106,10 @@ class LocalTopologyResult:
     boundary_kinds: list[str]
     hard_anchor_mask: np.ndarray
     node_lineage: np.ndarray
+    restricted_lineage_edges: set[tuple[int, int]]
     report: dict[str, Any]
     edit_ledger: list[dict[str, Any]]
+    obc_remap_manifest: dict[str, Any]
 
 
 @dataclass
@@ -89,6 +125,8 @@ class _State:
     lineage: np.ndarray
     source_points: np.ndarray
     source_chains: list[list[int]]
+    source_open_nodes: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=int))
+    source_kinds: list[str] = field(default_factory=list)
     source_hard_anchor_lineage: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=int))
     target_sampler: Callable[[np.ndarray], np.ndarray] | None = None
     initial_domain_area_m2: float = 0.0
@@ -96,6 +134,7 @@ class _State:
     initial_boundary_degree_anomaly_count: int = 0
     initial_singly_connected_triangle_count: int = 0
     initial_protected_not_boundary_count: int = 0
+    restricted_lineage_edges: set[tuple[int, int]] = field(default_factory=set)
     ledger: list[dict[str, Any]] = field(default_factory=list)
     cumulative_boundary_area_change_m2: float = 0.0
     last_affected: list[int] = field(default_factory=list)
@@ -113,6 +152,8 @@ class _State:
             lineage=self.lineage.copy(),
             source_points=self.source_points.copy(),
             source_chains=[chain.copy() for chain in self.source_chains],
+            source_open_nodes=self.source_open_nodes.copy(),
+            source_kinds=self.source_kinds.copy(),
             source_hard_anchor_lineage=self.source_hard_anchor_lineage.copy(),
             target_sampler=self.target_sampler,
             initial_domain_area_m2=float(self.initial_domain_area_m2),
@@ -120,6 +161,7 @@ class _State:
             initial_boundary_degree_anomaly_count=int(self.initial_boundary_degree_anomaly_count),
             initial_singly_connected_triangle_count=int(self.initial_singly_connected_triangle_count),
             initial_protected_not_boundary_count=int(self.initial_protected_not_boundary_count),
+            restricted_lineage_edges=set(self.restricted_lineage_edges),
             ledger=[entry.copy() for entry in self.ledger],
             cumulative_boundary_area_change_m2=float(self.cumulative_boundary_area_change_m2),
             last_affected=self.last_affected.copy(),
@@ -137,10 +179,24 @@ def condition_mesh_aggressive(
     boundary_kinds: list[str] | None = None,
     hard_anchor_mask: np.ndarray | None = None,
     target_spacing_sampler: Callable[[np.ndarray], np.ndarray] | None = None,
+    restricted_lineage_edges: set[tuple[int, int]] | None = None,
     config: AggressiveConditioningConfig | None = None,
 ) -> LocalTopologyResult:
     """Apply target-aware pruning, aggressive thin repair, and hard valence repair."""
     config = config or AggressiveConditioningConfig()
+    if str(config.thin_repair_profile) not in {
+        "guarded-v1",
+        "systematic-v2",
+        "systematic-v3",
+        "systematic-v5",
+    }:
+        raise ValueError(
+            "thin_repair_profile must be guarded-v1, systematic-v2, systematic-v3, or systematic-v5"
+        )
+    if str(config.systematic_v3_obc_policy) not in {"preserve", "redistribute"}:
+        raise ValueError("systematic_v3_obc_policy must be preserve or redistribute")
+    if str(config.systematic_gate_scope) not in {"candidate", "loop-end"}:
+        raise ValueError("systematic_gate_scope must be candidate or loop-end")
     points = np.asarray(nodes_xy, dtype=float).copy()
     tris = _orient_ccw(points, np.asarray(triangles, dtype=int).copy())
     fixed = np.asarray(fixed_node_mask, dtype=bool).copy()
@@ -174,6 +230,8 @@ def condition_mesh_aggressive(
         lineage=np.arange(len(points), dtype=int),
         source_points=points.copy(),
         source_chains=[chain.copy() for chain in chains],
+        source_open_nodes=np.asarray(open_boundary_nodes_zero_based, dtype=int).copy(),
+        source_kinds=kinds.copy(),
         source_hard_anchor_lineage=np.where(hard)[0].astype(int),
         target_sampler=target_spacing_sampler,
         initial_domain_area_m2=max(_signed_mesh_area(points, tris), 1.0e-30),
@@ -183,6 +241,10 @@ def condition_mesh_aggressive(
         initial_protected_not_boundary_count=int(
             sum(len(initial_topology.edge_to_triangles.get(edge, [])) != 1 for edge in initial_protected)
         ),
+        restricted_lineage_edges={
+            tuple(sorted(map(int, edge)))
+            for edge in (restricted_lineage_edges or set())
+        },
     )
     initial = _summary(state, config)
     initial_components = int(initial["connected_component_count"])
@@ -230,13 +292,18 @@ def condition_mesh_aggressive(
             if after_round["count_valence_above_limit"] == 0 and after_round["superthin_triangle_count"] == 0:
                 break
     final = _summary(state, config)
+    final_invariants_ok, final_invariants, _ = _audit_state(
+        state,
+        config,
+        initial_components,
+    )
     hard_gate = bool(final["count_valence_above_limit"] == 0)
     superthin_gate = bool(final["superthin_triangle_count"] == 0)
     report = {
         "schema_version": "fvcom_aggressive_local_conditioning_v2",
         "profile": "aggressive-local-v2",
         "settings": asdict(config),
-        "accepted": bool(_state_invariants(state, initial_components)[0]),
+        "accepted": bool(final_invariants_ok),
         "fvcom_valence_gate_passed": hard_gate,
         "superthin_gate_passed": superthin_gate,
         "terminal_topology_gate_passed": bool(hard_gate and superthin_gate),
@@ -249,7 +316,12 @@ def condition_mesh_aggressive(
         "cumulative_boundary_area_change_fraction": float(
             state.cumulative_boundary_area_change_m2 / max(_mesh_area(points, tris), 1.0e-30)
         ),
-        "invariants": _state_invariants(state, initial_components)[1],
+        "invariants": final_invariants,
+        "obc_remap_manifest": _obc_remap_manifest(state),
+        "restricted_lineage_edges": [
+            list(map(int, edge))
+            for edge in sorted(state.restricted_lineage_edges)
+        ],
     }
     return LocalTopologyResult(
         nodes_xy=state.points,
@@ -261,8 +333,10 @@ def condition_mesh_aggressive(
         boundary_kinds=state.kinds.copy(),
         hard_anchor_mask=state.hard.copy(),
         node_lineage=state.lineage.copy(),
+        restricted_lineage_edges=set(state.restricted_lineage_edges),
         report=report,
         edit_ledger=[entry.copy() for entry in state.ledger],
+        obc_remap_manifest=_obc_remap_manifest(state),
     )
 
 
@@ -273,6 +347,12 @@ def _thin_budget(config: AggressiveConditioningConfig) -> int:
         + max(0, int(config.max_superthin_flips_per_round))
         + max(0, int(config.max_collapses_per_round))
         + max(0, int(config.max_boundary_edits_per_round))
+        + max(0, int(config.systematic_collapse_welds_per_round))
+        + (
+            max(0, int(config.systematic_v5_max_star_transactions_per_round))
+            if str(config.thin_repair_profile).lower() == "systematic-v5"
+            else 0
+        )
     )
 
 
@@ -446,6 +526,8 @@ def inventory_high_valence(
         lineage=lineage.copy(),
         source_points=points.copy(),
         source_chains=[list(map(int, chain)) for chain in (constraint_chains or [])],
+        source_open_nodes=np.empty(0, dtype=int),
+        source_kinds=kinds.copy(),
     )
     topology = build_edge_topology(node_count, tris)
     geometry = triangle_geometry(points, tris)
@@ -676,6 +758,96 @@ def _best_prune_triangulation(
 
 
 def _repair_superthin(state: _State, config: AggressiveConditioningConfig, initial_components: int) -> dict[str, Any]:
+    """Run the selected extreme-tail repair profile.
+
+    ``systematic-v2`` deliberately keeps every existing model-boundary node
+    fixed. ``systematic-v3`` retains that ladder and then adds transactional
+    source-arc welding, sliding, and boundary-node redistribution.
+    ``systematic-v5`` removes and reconstructs the complete causal node star
+    before accepting a collapse; distributional engineering gates are left to
+    the enclosing zero-debt relaxation/closure cycle.
+    """
+    profile = str(config.thin_repair_profile).lower()
+    if profile not in {"guarded-v1", "systematic-v2", "systematic-v3", "systematic-v5"}:
+        raise ValueError(
+            "thin_repair_profile must be guarded-v1, systematic-v2, systematic-v3, or systematic-v5"
+        )
+    if profile == "guarded-v1":
+        return _repair_superthin_guarded(state, config, initial_components)
+    if profile == "systematic-v5":
+        return _repair_superthin_systematic_v5(state, config, initial_components)
+    stage_before = _summary(state, config)
+    interior_only = replace(
+        config,
+        max_boundary_ear_removals_per_round=0,
+        max_boundary_welds_per_round=0,
+        max_boundary_edits_per_round=0,
+    )
+    cheap = _repair_superthin_guarded(state, interior_only, initial_components)
+    systematic = _repair_superthin_components(state, config, initial_components)
+    boundary_adaptive = (
+        _repair_superthin_boundary_adaptive_v3(state, config, initial_components)
+        if profile == "systematic-v3"
+        else None
+    )
+    return {
+        "profile": profile,
+        "accepted": (
+            int(cheap.get("accepted", 0))
+            + int(systematic.get("accepted", 0))
+            + int((boundary_adaptive or {}).get("accepted", 0))
+        ),
+        "rejected": (
+            int(cheap.get("rejected", 0))
+            + int(systematic.get("rejected", 0))
+            + int((boundary_adaptive or {}).get("rejected", 0))
+        ),
+        "cheap_interior_ladder": cheap,
+        "systematic_components": systematic,
+        "boundary_adaptive_v3": boundary_adaptive,
+        "component_classifications": [
+            *systematic.get("component_classifications", []),
+            *((boundary_adaptive or {}).get("component_classifications", [])),
+        ],
+        "candidate_attempts": [
+            *systematic.get("candidate_attempts", []),
+            *((boundary_adaptive or {}).get("candidate_attempts", [])),
+        ],
+        "blocked_components": (
+            (boundary_adaptive or {}).get("blocked_components", systematic.get("blocked_components", []))
+        ),
+        "runtime_seconds": (
+            float(systematic.get("runtime_seconds", 0.0))
+            + float((boundary_adaptive or {}).get("runtime_seconds", 0.0))
+        ),
+        "before": stage_before,
+        "after": _summary(state, config),
+    }
+
+
+def _thin_transaction_passes(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    invariants_ok: bool,
+    config: AggressiveConditioningConfig,
+) -> bool:
+    """Apply only structural and debt gates inside a v4 loop transaction."""
+    if not invariants_ok:
+        return False
+    if str(config.systematic_gate_scope) != "loop-end":
+        return bool(_nonregression(before, after, purpose="thin"))
+    debt_before = (
+        int(before["superthin_triangle_count"]),
+        float(before["superthin_severity_sum"]),
+    )
+    debt_after = (
+        int(after["superthin_triangle_count"]),
+        float(after["superthin_severity_sum"]),
+    )
+    return bool(debt_after < debt_before)
+
+
+def _repair_superthin_guarded(state: _State, config: AggressiveConditioningConfig, initial_components: int) -> dict[str, Any]:
     stage_before = _summary(state, config)
     before = stage_before
     ear_remove_count = 0
@@ -692,6 +864,8 @@ def _repair_superthin(state: _State, config: AggressiveConditioningConfig, initi
     # case requested for a near-collinear boundary closure.
     blocked_ears: set[int] = set()
     for _ in range(max(0, int(config.max_boundary_ear_removals_per_round))):
+        if _deadline_reached(config):
+            break
         candidate = _select_boundary_ear_triangle(state, config, blocked_ears)
         if candidate is None:
             break
@@ -703,7 +877,7 @@ def _repair_superthin(state: _State, config: AggressiveConditioningConfig, initi
         actual_area_change = abs(_signed_mesh_area(state.points, state.triangles) - signed_area_before)
         budget_ok = _boundary_area_budget_allows(state, actual_area_change, config)
         ok, invariant_report, trial = _audit_state(state, config, initial_components)
-        if not budget_ok or not ok or not _nonregression(before, trial, purpose="thin"):
+        if not budget_ok or not _thin_transaction_passes(before, trial, ok, config):
             _restore(state, snapshot)
             blocked_ears.add(int(candidate))
             rejected += 1
@@ -738,6 +912,8 @@ def _repair_superthin(state: _State, config: AggressiveConditioningConfig, initi
     # resolution demanded by the local geometry.
     blocked_welds: set[tuple[int, int, int]] = set()
     for _ in range(max(0, int(config.max_boundary_welds_per_round))):
+        if _deadline_reached(config):
+            break
         proposal, screening = _select_boundary_weld(state, config, blocked_welds)
         screened_rejections.extend(screening)
         if proposal is None:
@@ -764,7 +940,7 @@ def _repair_superthin(state: _State, config: AggressiveConditioningConfig, initi
                 {"operation": "boundary-weld-local-valence-stabilize", "followup_edit_count": int(stabilized)}
             )
         ok, invariant_report, trial = _audit_state(state, config, initial_components)
-        if not ok or not _nonregression(before, trial, purpose="thin"):
+        if not _thin_transaction_passes(before, trial, ok, config):
             _restore(state, snapshot)
             blocked_welds.add((int(edge[0]), int(edge[1]), int(node)))
             rejected += 1
@@ -788,6 +964,8 @@ def _repair_superthin(state: _State, config: AggressiveConditioningConfig, initi
     # by a preceding valence transaction.
     blocked_flips: set[tuple[int, int]] = set()
     for _ in range(max(0, int(config.max_superthin_flips_per_round))):
+        if _deadline_reached(config):
+            break
         proposal = _select_superthin_flip(state, config, blocked_flips)
         if proposal is None:
             break
@@ -799,7 +977,7 @@ def _repair_superthin(state: _State, config: AggressiveConditioningConfig, initi
         state.last_affected = sorted(set(map(int, np.unique(state.triangles[[int(first), int(second)]]))))
         _micro_relax(state, replacement_seed_nodes=state.last_affected, config=config)
         ok, invariant_report, trial = _audit_state(state, config, initial_components)
-        if not ok or not _nonregression(before, trial, purpose="thin"):
+        if not _thin_transaction_passes(before, trial, ok, config):
             _restore(state, snapshot)
             blocked_flips.add(tuple(edge))
             rejected += 1
@@ -821,6 +999,8 @@ def _repair_superthin(state: _State, config: AggressiveConditioningConfig, initi
     # Interior pair collapse: select the worst legal pair and re-evaluate after each edit.
     blocked_collapses: set[tuple[int, int]] = set()
     for _ in range(max(0, int(config.max_collapses_per_round))):
+        if _deadline_reached(config):
+            break
         candidate = _select_collapse_edge(state, config, blocked_collapses)
         if candidate is None:
             break
@@ -840,7 +1020,7 @@ def _repair_superthin(state: _State, config: AggressiveConditioningConfig, initi
             continue
         _micro_relax(state, replacement_seed_nodes=state.last_affected, config=config)
         ok, invariant_report, trial = _audit_state(state, config, initial_components)
-        if not ok or not _nonregression(before, trial, purpose="thin"):
+        if not _thin_transaction_passes(before, trial, ok, config):
             _restore(state, snapshot)
             blocked_collapses.add(tuple(edge))
             rejected += 1
@@ -857,6 +1037,8 @@ def _repair_superthin(state: _State, config: AggressiveConditioningConfig, initi
     if config.boundary_edit_policy != "none":
         blocked_boundary: set[tuple[str, tuple[int, ...]]] = set()
         for _ in range(max(0, int(config.max_boundary_edits_per_round))):
+            if _deadline_reached(config):
+                break
             proposal = _select_boundary_edit(state, config, blocked_boundary)
             if proposal is None:
                 break
@@ -877,7 +1059,7 @@ def _repair_superthin(state: _State, config: AggressiveConditioningConfig, initi
                 continue
             _micro_relax(state, replacement_seed_nodes=state.last_affected, config=config)
             ok, invariant_report, trial = _audit_state(state, config, initial_components)
-            if not ok or not _nonregression(before, trial, purpose="thin"):
+            if not _thin_transaction_passes(before, trial, ok, config):
                 _restore(state, snapshot)
                 blocked_boundary.add(_proposal_key(operation, payload))
                 rejected += 1
@@ -920,6 +1102,4083 @@ def _repair_superthin(state: _State, config: AggressiveConditioningConfig, initi
         "before": stage_before,
         "after": _summary(state, config),
     }
+
+
+def _repair_superthin_components(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    initial_components: int,
+) -> dict[str, Any]:
+    """Repair connected extreme-tail debt with deterministic local cavities."""
+    started = time.perf_counter()
+    stage_before = _summary(state, config)
+    initial_summary = dict(stage_before)
+    classifications: list[dict[str, Any]] = []
+    attempts: list[dict[str, Any]] = []
+    blocked: dict[str, dict[str, Any]] = {}
+    accepted = 0
+    for _ in range(max(0, int(config.systematic_max_components_per_round))):
+        if _deadline_reached(config):
+            break
+        components = _inventory_superthin_components(state, config)
+        if not components:
+            break
+        available = [component for component in components if component["component_id"] not in blocked]
+        if not available:
+            break
+        component = available[0]
+        classifications.append({key: value for key, value in component.items() if key != "triangle_indices"})
+        best: tuple[tuple[float, ...], _State, dict[str, Any]] | None = None
+        component_attempts: list[dict[str, Any]] = []
+        topology = build_edge_topology(len(state.points), state.triangles)
+        for rings in range(
+            max(0, int(config.systematic_min_patch_rings)),
+            max(0, int(config.systematic_max_patch_rings)) + 1,
+        ):
+            if _deadline_reached(config):
+                break
+            patch = _expand_triangle_patch(state.triangles, topology, component["triangle_indices"], rings)
+            ring = _ordered_patch_boundary(state.triangles, patch)
+            if ring is None:
+                component_attempts.append(
+                    {
+                        "component_id": component["component_id"],
+                        "patch_rings": int(rings),
+                        "accepted": False,
+                        "failures": ["non_simple_patch_boundary"],
+                    }
+                )
+                continue
+            support_groups, support_evidence = _systematic_support_groups(
+                state,
+                component,
+                patch,
+                ring,
+                config,
+            )
+            for support_index, support in enumerate(support_groups):
+                if _deadline_reached(config):
+                    break
+                trial = state.clone()
+                changed, construction = _retriangulate_patch_with_support(
+                    trial,
+                    patch,
+                    ring,
+                    support,
+                    component,
+                    config,
+                )
+                record: dict[str, Any] = {
+                    "component_id": component["component_id"],
+                    "classification": component["classification"],
+                    "patch_rings": int(rings),
+                    "patch_triangle_count": int(len(patch)),
+                    "support_group": int(support_index),
+                    "support_point_count": int(len(support)),
+                    "support_evidence": support_evidence,
+                    "accepted": False,
+                }
+                if not changed:
+                    record["failures"] = construction or ["cavity_construction_failed"]
+                    component_attempts.append(record)
+                    continue
+                _micro_relax(trial, replacement_seed_nodes=trial.last_affected, config=config)
+                ok, invariant_report, trial_summary = _audit_state(trial, config, initial_components)
+                loop_end_scope = str(config.systematic_gate_scope) == "loop-end"
+                nonregression = loop_end_scope or _nonregression(stage_before, trial_summary, purpose="thin")
+                failures: list[str] = []
+                if loop_end_scope and not ok:
+                    failures = _failed_invariant_names(invariant_report)
+                elif not ok or not nonregression:
+                    failures = _thin_rejection(
+                        "systematic-component-cavity",
+                        tuple(component["node_lineage"]),
+                        stage_before,
+                        trial_summary,
+                        ok,
+                        invariant_report=invariant_report,
+                    )["failures"]
+                if not nonregression:
+                    failures = sorted(set([*failures, "global_thin_nonregression_gate"]))
+                debt_before = (
+                    int(stage_before["superthin_triangle_count"]),
+                    float(stage_before["superthin_severity_sum"]),
+                )
+                debt_after = (
+                    int(trial_summary["superthin_triangle_count"]),
+                    float(trial_summary["superthin_severity_sum"]),
+                )
+                if not debt_after < debt_before:
+                    failures = sorted(set([*failures, "superthin_debt_not_reduced"]))
+                record["trial"] = _summary_from(trial_summary)
+                record["invariants"] = invariant_report
+                record["failures"] = failures
+                if failures:
+                    component_attempts.append(record)
+                    continue
+                score = (
+                    float(trial_summary["superthin_triangle_count"]),
+                    float(trial_summary["superthin_severity_sum"]),
+                    -float(trial_summary["q_min"]),
+                    -float(trial_summary["minimum_angle_deg"]),
+                    float(trial_summary["count_valence_above_limit"]),
+                    float(trial_summary["l_over_h_count_above_1_55"]),
+                    float(trial_summary["area_transition_count_above_0_50"]),
+                    float(len(support)),
+                    float(rings),
+                    float(support_index),
+                )
+                record["failures"] = []
+                record["candidate_score"] = list(score)
+                component_attempts.append(record)
+                if best is None or score < best[0]:
+                    best = (score, trial, record)
+        attempts.extend(component_attempts)
+        if best is None:
+            blocked[component["component_id"]] = {
+                **{key: value for key, value in component.items() if key != "triangle_indices"},
+                "attempt_count": int(len(component_attempts)),
+                "failure_counts": _failure_counts(component_attempts),
+            }
+            continue
+        _, selected, selected_record = best
+        before_count = int(stage_before["superthin_triangle_count"])
+        _restore(state, selected)
+        selected_record["accepted"] = True
+        state.ledger.append(
+            {
+                "operation": "systematic-superthin-component-cavity",
+                "component_id": component["component_id"],
+                "classification": component["classification"],
+                "source_triangle_lineage": component["node_lineage"],
+                "patch_rings": int(selected_record["patch_rings"]),
+                "support_point_count": int(selected_record["support_point_count"]),
+                "local_feature_target_m": component.get("local_feature_target_m"),
+                "superthin_before": before_count,
+                "superthin_after": int(_summary(state, config)["superthin_triangle_count"]),
+            }
+        )
+        accepted += 1
+        stage_before = _summary(state, config)
+        blocked.clear()
+    final_components = _inventory_superthin_components(state, config)
+    for component in final_components:
+        blocked.setdefault(
+            component["component_id"],
+            {key: value for key, value in component.items() if key != "triangle_indices"},
+        )
+    return {
+        "schema_version": "fvcom_systematic_thin_repair_v2",
+        "profile": "systematic-v2",
+        "accepted": int(accepted),
+        "rejected": int(sum(not bool(item.get("accepted")) for item in attempts)),
+        "component_classifications": classifications,
+        "candidate_attempts": attempts,
+        "blocked_components": list(blocked.values()),
+        "before": initial_summary,
+        "after": _summary(state, config),
+        "runtime_seconds": float(time.perf_counter() - started),
+    }
+
+
+def _connectivity_restriction_config(
+    config: AggressiveConditioningConfig,
+) -> ConnectivityRestrictionConfig:
+    return ConnectivityRestrictionConfig(
+        enabled=bool(config.systematic_v5_enable_connectivity_restriction),
+        maximum_transactions=max(
+            0,
+            int(config.systematic_v5_max_connectivity_transactions_per_round),
+        ),
+        maximum_candidates_per_component=max(
+            0,
+            int(config.systematic_v5_max_connectivity_candidates_per_component),
+        ),
+        patch_ring_ladder=tuple(
+            int(value)
+            for value in config.systematic_v5_patch_ring_ladder
+        ),
+        shortcut_arc_chord_ratio=float(
+            config.systematic_v5_connectivity_shortcut_arc_chord_ratio
+        ),
+        shortcut_arc_target_ratio=float(
+            config.systematic_v5_connectivity_shortcut_arc_target_ratio
+        ),
+    )
+
+
+def _allowed_edge_policy(
+    state: _State,
+    config: AggressiveConditioningConfig,
+) -> AllowedEdgePolicy:
+    return AllowedEdgePolicy(
+        state.points,
+        state.targets,
+        state.chains,
+        state.lineage,
+        restricted_lineage_edges=state.restricted_lineage_edges,
+        config=_connectivity_restriction_config(config),
+    )
+
+
+def _repair_superthin_connectivity_v1(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    initial_components: int,
+) -> dict[str, Any]:
+    """Remove causal superthin connectivity without moving or adding nodes."""
+    started = time.perf_counter()
+    before = _summary(state, config)
+    settings = asdict(_connectivity_restriction_config(config))
+    if (
+        not bool(config.systematic_v5_enable_connectivity_restriction)
+        or int(config.systematic_v5_max_connectivity_transactions_per_round)
+        <= 0
+    ):
+        return {
+            "schema_version": "fvcom_superthin_connectivity_restriction_v1",
+            "profile": "superthin-connectivity-v1",
+            "enabled": False,
+            "reason": "connectivity_restriction_disabled",
+            "settings": settings,
+            "accepted": 0,
+            "rejected": 0,
+            "candidate_attempts": [],
+            "blocked_components": [],
+            "restricted_lineage_edges": [
+                list(map(int, edge))
+                for edge in sorted(state.restricted_lineage_edges)
+            ],
+            "restricted_edge_violation_count": int(
+                len(_restricted_edge_violation_records(state))
+            ),
+            "before": before,
+            "after": before,
+            "runtime_seconds": float(time.perf_counter() - started),
+        }
+
+    accepted = 0
+    rejected = 0
+    attempts: list[dict[str, Any]] = []
+    classifications: list[dict[str, Any]] = []
+    blocked: dict[str, dict[str, Any]] = {}
+    transaction_limit = max(
+        0,
+        int(config.systematic_v5_max_connectivity_transactions_per_round),
+    )
+    audit_config = replace(config, systematic_gate_scope="loop-end")
+    passage_baseline = _passage_clearance_inventory(state, config)
+    for _ in range(transaction_limit):
+        if _deadline_reached(
+            config,
+            reserve_seconds=float(config.systematic_v5_audit_reserve_seconds),
+        ):
+            break
+        components = _inventory_superthin_components(state, config)
+        if not components:
+            break
+        component = next(
+            (
+                value
+                for value in components
+                if str(value["component_id"]) not in blocked
+            ),
+            None,
+        )
+        if component is None:
+            break
+        component_id = str(component["component_id"])
+        classifications.append(
+            {
+                key: value
+                for key, value in component.items()
+                if key != "triangle_indices"
+            }
+        )
+        geometry = triangle_geometry(state.points, state.triangles)
+        minimum_angles = np.min(geometry["angles_deg"], axis=1)
+        superthin_mask = (
+            geometry["quality"]
+            < float(config.superthin_quality_threshold)
+        ) | (
+            minimum_angles
+            < float(config.superthin_min_angle_deg)
+        )
+        policy = _allowed_edge_policy(state, config)
+        records = policy.candidate_records(
+            state.triangles,
+            component["triangle_indices"],
+            superthin_mask,
+        )
+        component_attempts: list[dict[str, Any]] = []
+        best: tuple[tuple[float, ...], _State, dict[str, Any]] | None = None
+        before_summary = _summary(state, config)
+        for record in records:
+            if _deadline_reached(
+                config,
+                reserve_seconds=float(config.systematic_v5_audit_reserve_seconds),
+            ):
+                break
+            edge = tuple(map(int, record["edge"]))
+            patches = _connectivity_patch_candidates_v1(
+                state,
+                component,
+                edge,
+                config,
+            )
+            for patch_mode, patch in patches:
+                if _deadline_reached(
+                    config,
+                    reserve_seconds=float(config.systematic_v5_audit_reserve_seconds),
+                ):
+                    break
+                trial = state.clone()
+                lineage_edge = tuple(
+                    sorted(map(int, record["lineage_edge"]))
+                )
+                trial.restricted_lineage_edges.add(lineage_edge)
+                changed, failures, evidence = (
+                    _reconstruct_connectivity_patch_v1(
+                        trial,
+                        patch,
+                        forbidden_lineage_edge=lineage_edge,
+                        config=config,
+                    )
+                )
+                attempt: dict[str, Any] = {
+                    "component_id": component_id,
+                    "classification": component["classification"],
+                    "candidate_rank": int(record["candidate_rank"]),
+                    "edge": list(map(int, edge)),
+                    "lineage_edge": list(map(int, lineage_edge)),
+                    "edge_evidence": {
+                        key: value
+                        for key, value in record.items()
+                        if key
+                        not in {
+                            "edge",
+                            "lineage_edge",
+                            "candidate_rank",
+                        }
+                    },
+                    "patch_mode": str(patch_mode),
+                    "patch_triangle_count": int(len(patch)),
+                    "accepted": False,
+                }
+                if not changed:
+                    attempt["failures"] = failures or [
+                        "connectivity_patch_construction_failed"
+                    ]
+                    component_attempts.append(attempt)
+                    rejected += 1
+                    continue
+                local_before = evidence["local_debt_before"]
+                local_after = evidence["local_debt_after"]
+                local_debt_before = (
+                    int(local_before["superthin_triangle_count"]),
+                    float(local_before["superthin_severity_sum"]),
+                )
+                local_debt_after = (
+                    int(local_after["superthin_triangle_count"]),
+                    float(local_after["superthin_severity_sum"]),
+                )
+                strict_isolated_transaction = bool(
+                    config.systematic_v5_connectivity_only
+                )
+                local_debt_is_admissible = (
+                    local_debt_after < local_debt_before
+                    if strict_isolated_transaction
+                    else local_debt_after[0] <= local_debt_before[0]
+                )
+                if not local_debt_is_admissible:
+                    attempt.update(
+                        {
+                            "evidence": evidence,
+                            "failures": [
+                                "replacement_does_not_reduce_patch_superthin"
+                                if strict_isolated_transaction
+                                else "replacement_increases_patch_superthin_count"
+                            ],
+                        }
+                    )
+                    component_attempts.append(attempt)
+                    rejected += 1
+                    continue
+                ok, invariant_report, trial_summary = _audit_state(
+                    trial,
+                    audit_config,
+                    initial_components,
+                )
+                hard_failures = _v5_hard_gate_failures(
+                    state,
+                    trial,
+                    config,
+                    passage_baseline,
+                )
+                gate_failures = (
+                    []
+                    if ok
+                    else _failed_invariant_names(invariant_report)
+                )
+                gate_failures = sorted(
+                    set([*gate_failures, *hard_failures])
+                )
+                if len(trial.points) != len(state.points):
+                    gate_failures.append("node_count_changed")
+                elif not np.array_equal(trial.points, state.points):
+                    gate_failures.append("node_coordinates_changed")
+                if trial.chains != state.chains:
+                    gate_failures.append("boundary_chain_changed")
+                if not np.array_equal(trial.open_nodes, state.open_nodes):
+                    gate_failures.append("open_boundary_membership_changed")
+                if (
+                    strict_isolated_transaction
+                    and not _connectivity_nonregression(
+                        before_summary,
+                        trial_summary,
+                    )
+                ):
+                    gate_failures.append(
+                        "global_connectivity_nonregression_gate"
+                    )
+                global_debt_before = (
+                    int(before_summary["superthin_triangle_count"]),
+                    float(before_summary["superthin_severity_sum"]),
+                )
+                global_debt_after = (
+                    int(trial_summary["superthin_triangle_count"]),
+                    float(trial_summary["superthin_severity_sum"]),
+                )
+                if strict_isolated_transaction:
+                    if not global_debt_after < global_debt_before:
+                        gate_failures.append(
+                            "global_superthin_debt_not_reduced"
+                        )
+                elif global_debt_after[0] > global_debt_before[0]:
+                    gate_failures.append(
+                        "global_superthin_count_increased_during_transfer"
+                    )
+                gate_failures = sorted(set(gate_failures))
+                attempt.update(
+                    {
+                        "evidence": evidence,
+                        "trial": _summary_from(trial_summary),
+                        "invariants": invariant_report,
+                        "failures": gate_failures,
+                    }
+                )
+                component_attempts.append(attempt)
+                if gate_failures:
+                    rejected += 1
+                    continue
+                score = (
+                    float(trial_summary["superthin_triangle_count"]),
+                    float(trial_summary["superthin_severity_sum"]),
+                    float(record["candidate_rank"]),
+                    -float(trial_summary["q_min"]),
+                    -float(trial_summary["q_l3_sigma"]),
+                    float(
+                        trial_summary[
+                            "l_over_h_count_above_1_55"
+                        ]
+                    ),
+                    float(
+                        trial_summary[
+                            "area_transition_count_above_0_50"
+                        ]
+                    ),
+                    float(len(patch)),
+                )
+                attempt["candidate_score"] = list(score)
+                if best is None or score < best[0]:
+                    best = (score, trial, attempt)
+            if (
+                best is not None
+                and int(best[2]["candidate_rank"])
+                == int(record["candidate_rank"])
+            ):
+                # Candidate ranking is part of the policy.  Finish the
+                # preferred edge's complete patch ladder, then commit its
+                # best admissible reconstruction without screening
+                # lower-ranked causal hypotheses.
+                break
+        attempts.extend(component_attempts)
+        if best is None:
+            blocked[component_id] = {
+                **{
+                    key: value
+                    for key, value in component.items()
+                    if key != "triangle_indices"
+                },
+                "attempt_count": int(len(component_attempts)),
+                "failure_counts": _failure_counts(component_attempts),
+            }
+            continue
+        _, winner, winner_record = best
+        _restore(state, winner)
+        winner_record["accepted"] = True
+        winner_record["failures"] = []
+        accepted += 1
+        blocked.pop(component_id, None)
+
+    after = _summary(state, config)
+    return {
+        "schema_version": "fvcom_superthin_connectivity_restriction_v1",
+        "profile": "superthin-connectivity-v1",
+        "enabled": True,
+        "settings": settings,
+        "closure_succeeded": bool(
+            after["superthin_triangle_count"] == 0
+        ),
+        "accepted": int(accepted),
+        "rejected": int(rejected),
+        "component_classifications": classifications,
+        "candidate_attempts": attempts,
+        "blocked_components": list(blocked.values()),
+        "restricted_lineage_edges": [
+            list(map(int, edge))
+            for edge in sorted(state.restricted_lineage_edges)
+        ],
+        "restricted_edge_violation_count": int(
+            len(_restricted_edge_violation_records(state))
+        ),
+        "deadline_reached": bool(_deadline_reached(config)),
+        "before": before,
+        "after": after,
+        "runtime_seconds": float(time.perf_counter() - started),
+    }
+
+
+def _connectivity_patch_candidates_v1(
+    state: _State,
+    component: dict[str, Any],
+    edge: tuple[int, int],
+    config: AggressiveConditioningConfig,
+) -> list[tuple[str, np.ndarray]]:
+    topology = build_edge_topology(len(state.points), state.triangles)
+    attached = set(
+        map(int, topology.edge_to_triangles.get(tuple(sorted(edge)), []))
+    )
+    component_triangles = set(
+        map(int, component.get("triangle_indices", []))
+    )
+    seeds = attached | component_triangles
+    patches: list[tuple[str, np.ndarray]] = []
+    seen: set[tuple[int, ...]] = set()
+
+    def append(name: str, values: Iterable[int]) -> None:
+        key = tuple(sorted(set(map(int, values))))
+        if not key or key in seen or len(key) > 5000:
+            return
+        seen.add(key)
+        patches.append((name, np.asarray(key, dtype=int)))
+
+    append("component-edge", seeds)
+    endpoint_stars = set(seeds)
+    for node in edge:
+        endpoint_stars.update(
+            map(
+                int,
+                np.where(
+                    np.any(state.triangles == int(node), axis=1)
+                )[0],
+            )
+        )
+    append("coupled-endpoint-stars", endpoint_stars)
+    for rings in tuple(
+        int(value)
+        for value in config.systematic_v5_patch_ring_ladder
+    ):
+        if rings <= 0:
+            continue
+        expanded = _expand_triangle_patch(
+            state.triangles,
+            topology,
+            sorted(seeds),
+            rings,
+        )
+        append(f"expanded-{rings}-ring", expanded)
+    return patches
+
+
+def _reconstruct_connectivity_patch_v1(
+    state: _State,
+    patch: np.ndarray,
+    *,
+    forbidden_lineage_edge: tuple[int, int],
+    config: AggressiveConditioningConfig,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    """Retriangulate one constrained patch with all coordinates unchanged."""
+    patch = np.asarray(sorted(set(map(int, patch))), dtype=int)
+    if not len(patch):
+        return False, ["empty_connectivity_patch"], {}
+    old_triangles = state.triangles[patch].copy()
+    old_nodes = sorted(set(map(int, np.unique(old_triangles))))
+    protected = chain_edges(state.chains)
+    groups = _patch_groups_split_by_protected_chords(
+        state.triangles,
+        patch,
+        protected,
+    )
+    if not groups:
+        return False, ["connectivity_patch_has_no_constrained_faces"], {}
+    policy = _allowed_edge_policy(state, config)
+
+    def edge_allowed(edge: tuple[int, int]) -> bool:
+        return bool(
+            policy.is_allowed(
+                edge,
+                reject_same_chain_shortcuts=False,
+            )
+        )
+
+    replacements: list[np.ndarray] = []
+    face_evidence: list[dict[str, Any]] = []
+    for group in groups:
+        ring = _ordered_patch_boundary(state.triangles, group)
+        if ring is None:
+            return False, ["non_simple_constrained_subface"], {}
+        ring_polygon = Polygon(
+            state.points[np.asarray(ring, dtype=int)]
+        )
+        if not ring_polygon.is_valid or ring_polygon.area <= 0.0:
+            return False, ["invalid_constrained_subface_polygon"], {}
+        group_nodes = sorted(
+            set(
+                map(
+                    int,
+                    np.unique(state.triangles[group]),
+                )
+            )
+        )
+        interior_nodes = sorted(set(group_nodes) - set(ring))
+        replacement = _triangulate_ring_with_existing_hub_v1(
+            state.points,
+            ring,
+            interior_nodes,
+            edge_allowed=edge_allowed,
+        )
+        triangulation_method = "existing-interior-hub"
+        nodes_to_insert = [
+            node
+            for node in interior_nodes
+            if replacement is None
+            or node not in set(map(int, np.unique(replacement)))
+        ]
+        if replacement is None:
+            replacement = _triangulate_ring_greedy(
+                state.points,
+                ring,
+                None,
+                max(int(config.max_valence), 8),
+                edge_allowed=edge_allowed,
+            )
+            triangulation_method = "allowed-edge-ear"
+            nodes_to_insert = interior_nodes
+        if replacement is None:
+            return False, ["allowed_edge_ear_triangulation_failed"], {}
+        replacement, insertion_failures = (
+            _insert_existing_patch_nodes_v1(
+                state.points,
+                replacement,
+                nodes_to_insert,
+                edge_allowed=edge_allowed,
+            )
+        )
+        if insertion_failures:
+            return False, insertion_failures, {}
+        replacements.append(replacement)
+        face_evidence.append(
+            {
+                "source_triangle_count": int(len(group)),
+                "ring_node_count": int(len(ring)),
+                "interior_node_count": int(len(interior_nodes)),
+                "replacement_triangle_count": int(len(replacement)),
+                "triangulation_method": triangulation_method,
+            }
+        )
+    replacement = _orient_ccw(
+        state.points,
+        np.vstack(replacements),
+    )
+    replacement_nodes = set(map(int, np.unique(replacement)))
+    if replacement_nodes != set(old_nodes):
+        return False, ["connectivity_patch_node_set_changed"], {}
+    replacement_edges = _edge_set(replacement)
+    if forbidden_lineage_edge in {
+        tuple(
+            sorted(
+                (
+                    int(state.lineage[a]),
+                    int(state.lineage[b]),
+                )
+            )
+        )
+        for a, b in replacement_edges
+    }:
+        return False, ["forbidden_lineage_edge_reintroduced"], {}
+    old_geometry = triangle_geometry(state.points, old_triangles)
+    replacement_geometry = triangle_geometry(
+        state.points,
+        replacement,
+    )
+    if np.any(
+        replacement_geometry["signed_area"]
+        <= _area_tolerance(state.points, replacement)
+    ):
+        return False, ["nonpositive_connectivity_replacement"], {}
+    old_area = float(np.sum(old_geometry["area"]))
+    new_area = float(np.sum(replacement_geometry["area"]))
+    if abs(new_area - old_area) > 1.0e-8 * max(old_area, 1.0):
+        return False, ["connectivity_patch_area_mismatch"], {}
+    old_patch_edges = _edge_set(old_triangles)
+    protected_inside = protected & old_patch_edges
+    if not protected_inside.issubset(replacement_edges):
+        return False, ["protected_chord_missing_from_replacement"], {}
+    patch_perimeter = _patch_perimeter_edges(
+        state.triangles,
+        patch,
+    )
+    if not patch_perimeter.issubset(replacement_edges):
+        return False, ["connectivity_patch_perimeter_changed"], {}
+    keep = np.ones(len(state.triangles), dtype=bool)
+    keep[patch] = False
+    outside = state.triangles[keep]
+    state.triangles = _orient_ccw(
+        state.points,
+        np.vstack([outside, replacement]),
+    )
+    replacement_ids = set(
+        range(len(outside), len(outside) + len(replacement))
+    )
+    flip_count = _lawson_legalize_locked_patch(
+        state,
+        replacement_ids,
+        patch_perimeter | protected,
+        max_flips=max(
+            0,
+            int(config.systematic_v5_max_lawson_flips_per_transaction),
+        ),
+        edge_allowed=edge_allowed,
+    )
+    delivered_edges = _edge_set(state.triangles)
+    if not patch_perimeter.issubset(delivered_edges):
+        return False, ["locked_connectivity_perimeter_changed"], {}
+    if not protected.issubset(delivered_edges):
+        return False, ["protected_edge_missing"], {}
+    if _restricted_edge_violation_records(state):
+        return False, ["restricted_edge_present_after_reconstruction"], {}
+    state.last_affected = old_nodes
+    delivered_patch_geometry = triangle_geometry(
+        state.points,
+        state.triangles[
+            np.asarray(sorted(replacement_ids), dtype=int)
+        ],
+    )
+    evidence = {
+        "candidate": "topology-only-coupled-connectivity",
+        "forbidden_lineage_edge": list(
+            map(int, forbidden_lineage_edge)
+        ),
+        "source_patch_triangle_count": int(len(patch)),
+        "replacement_triangle_count": int(len(replacement)),
+        "patch_node_count": int(len(old_nodes)),
+        "constrained_subface_count": int(len(groups)),
+        "constrained_subfaces": face_evidence,
+        "protected_chord_count": int(len(protected_inside)),
+        "lawson_flip_count": int(flip_count),
+        "node_coordinate_change_m": 0.0,
+        "boundary_node_set_changed": False,
+        "old_patch_area_m2": float(old_area),
+        "new_patch_area_m2": float(new_area),
+        "local_debt_before": _geometry_superthin_debt(
+            old_geometry,
+            config,
+        ),
+        "local_debt_after": _geometry_superthin_debt(
+            delivered_patch_geometry,
+            config,
+        ),
+    }
+    state.ledger.append(
+        {
+            "operation": "systematic-v5-superthin-connectivity-restriction",
+            **evidence,
+        }
+    )
+    return True, [], evidence
+
+
+def _patch_groups_split_by_protected_chords(
+    triangles: np.ndarray,
+    patch: np.ndarray,
+    protected: set[tuple[int, int]],
+) -> list[np.ndarray]:
+    patch_set = set(map(int, np.asarray(patch, dtype=int)))
+    edge_to_patch: dict[tuple[int, int], list[int]] = {}
+    for triangle_index in sorted(patch_set):
+        for edge in _triangle_edge_keys(
+            triangles[int(triangle_index)]
+        ):
+            edge_to_patch.setdefault(edge, []).append(
+                int(triangle_index)
+            )
+    adjacency: dict[int, set[int]] = {
+        index: set()
+        for index in patch_set
+    }
+    for edge, attached in edge_to_patch.items():
+        if edge in protected or len(attached) != 2:
+            continue
+        left, right = map(int, attached)
+        adjacency[left].add(right)
+        adjacency[right].add(left)
+    remaining = set(patch_set)
+    groups: list[np.ndarray] = []
+    while remaining:
+        start = min(remaining)
+        remaining.remove(start)
+        stack = [start]
+        group: list[int] = []
+        while stack:
+            current = stack.pop()
+            group.append(int(current))
+            for following in sorted(
+                adjacency[current] & remaining,
+                reverse=True,
+            ):
+                remaining.remove(following)
+                stack.append(int(following))
+        groups.append(
+            np.asarray(sorted(group), dtype=int)
+        )
+    return groups
+
+
+def _patch_perimeter_edges(
+    triangles: np.ndarray,
+    patch: np.ndarray,
+) -> set[tuple[int, int]]:
+    counts: dict[tuple[int, int], int] = {}
+    for triangle in np.asarray(triangles, dtype=int)[
+        np.asarray(patch, dtype=int)
+    ]:
+        for edge in _triangle_edge_keys(triangle):
+            counts[edge] = counts.get(edge, 0) + 1
+    return {
+        edge
+        for edge, count in counts.items()
+        if count == 1
+    }
+
+
+def _triangulate_ring_with_existing_hub_v1(
+    points: np.ndarray,
+    ring: list[int],
+    interior_nodes: Iterable[int],
+    *,
+    edge_allowed: Callable[[tuple[int, int]], bool],
+) -> np.ndarray | None:
+    """Use an unchanged interior node as a constrained polygon fan hub."""
+    if len(ring) < 3:
+        return None
+    polygon = Polygon(points[np.asarray(ring, dtype=int)])
+    if not polygon.is_valid or polygon.area <= 0.0:
+        return None
+    span = np.ptp(points[np.asarray(ring, dtype=int)], axis=0)
+    tolerance = max(1.0e-12, 1.0e-12 * float(np.max(span)))
+    covered_polygon = polygon.buffer(tolerance)
+    candidates: list[tuple[tuple[float, ...], np.ndarray]] = []
+    for hub in sorted(set(map(int, interior_nodes))):
+        fan = _orient_ccw(
+            points,
+            np.asarray(
+                [
+                    [hub, int(ring[index]), int(ring[(index + 1) % len(ring)])]
+                    for index in range(len(ring))
+                ],
+                dtype=int,
+            ),
+        )
+        geometry = triangle_geometry(points, fan)
+        if np.any(
+            geometry["signed_area"]
+            <= _area_tolerance(points, fan)
+        ):
+            continue
+        if any(
+            not covered_polygon.covers(
+                Polygon(points[np.asarray(triangle, dtype=int)])
+            )
+            for triangle in fan
+        ):
+            continue
+        if any(
+            not edge_allowed(edge)
+            for edge in _edge_set(fan)
+        ):
+            continue
+        area = float(np.sum(geometry["area"]))
+        if abs(area - float(polygon.area)) > 1.0e-8 * max(
+            float(polygon.area),
+            1.0,
+        ):
+            continue
+        score = (
+            -float(np.min(geometry["quality"])),
+            -float(np.min(geometry["angles_deg"])),
+            float(hub),
+        )
+        candidates.append((score, fan))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])[1]
+
+
+def _insert_existing_patch_nodes_v1(
+    points: np.ndarray,
+    triangles: np.ndarray,
+    nodes: Iterable[int],
+    *,
+    edge_allowed: Callable[[tuple[int, int]], bool],
+) -> tuple[np.ndarray, list[str]]:
+    """Insert existing fixed-coordinate nodes into a polygon triangulation."""
+    delivered = _orient_ccw(
+        points,
+        np.asarray(triangles, dtype=int),
+    )
+    for node in sorted(set(map(int, nodes))):
+        if node in set(map(int, np.unique(delivered))):
+            continue
+        containing: list[
+            tuple[int, np.ndarray]
+        ] = []
+        for triangle_index, triangle in enumerate(delivered):
+            barycentric = _barycentric_coordinates(
+                points[int(node)],
+                points[np.asarray(triangle, dtype=int)],
+            )
+            if barycentric is not None and np.all(
+                barycentric >= -1.0e-10
+            ):
+                containing.append(
+                    (int(triangle_index), barycentric)
+                )
+        if not containing:
+            return delivered, [
+                "existing_patch_node_outside_retriangulation"
+            ]
+        edge_hit: tuple[int, int] | None = None
+        for triangle_index, barycentric in containing:
+            zero = np.where(np.abs(barycentric) <= 1.0e-10)[0]
+            if len(zero):
+                triangle = delivered[int(triangle_index)]
+                opposite = int(zero[0])
+                edge_hit = tuple(
+                    sorted(
+                        map(
+                            int,
+                            np.delete(triangle, opposite),
+                        )
+                    )
+                )
+                break
+        if edge_hit is None:
+            triangle_index = int(containing[0][0])
+            triangle = list(
+                map(int, delivered[triangle_index])
+            )
+            new_edges = [
+                tuple(sorted((node, vertex)))
+                for vertex in triangle
+            ]
+            if any(
+                not edge_allowed(edge)
+                for edge in new_edges
+            ):
+                return delivered, [
+                    "existing_node_insertion_creates_restricted_edge"
+                ]
+            replacement = np.asarray(
+                [
+                    [node, triangle[0], triangle[1]],
+                    [node, triangle[1], triangle[2]],
+                    [node, triangle[2], triangle[0]],
+                ],
+                dtype=int,
+            )
+            delivered = np.vstack(
+                [
+                    np.delete(
+                        delivered,
+                        triangle_index,
+                        axis=0,
+                    ),
+                    replacement,
+                ]
+            )
+            delivered = _orient_ccw(points, delivered)
+            continue
+        attached = [
+            index
+            for index, triangle in enumerate(delivered)
+            if set(edge_hit).issubset(
+                set(map(int, triangle))
+            )
+        ]
+        if not attached or len(attached) > 2:
+            return delivered, [
+                "existing_node_edge_insertion_nonmanifold"
+            ]
+        replacement_rows: list[list[int]] = []
+        for triangle_index in attached:
+            triangle = list(
+                map(int, delivered[int(triangle_index)])
+            )
+            opposite_values = [
+                value
+                for value in triangle
+                if value not in edge_hit
+            ]
+            if len(opposite_values) != 1:
+                return delivered, [
+                    "existing_node_edge_insertion_invalid_triangle"
+                ]
+            opposite = int(opposite_values[0])
+            replacement_rows.extend(
+                [
+                    [node, int(edge_hit[0]), opposite],
+                    [node, opposite, int(edge_hit[1])],
+                ]
+            )
+        new_edges = {
+            tuple(sorted((node, int(edge_hit[0])))),
+            tuple(sorted((node, int(edge_hit[1])))),
+            *(
+                tuple(
+                    sorted(
+                        (
+                            node,
+                            int(
+                                next(
+                                    value
+                                    for value in delivered[index]
+                                    if int(value)
+                                    not in edge_hit
+                                )
+                            ),
+                        )
+                    )
+                )
+                for index in attached
+            ),
+        }
+        if any(
+            not edge_allowed(edge)
+            for edge in new_edges
+        ):
+            return delivered, [
+                "existing_node_edge_insertion_creates_restricted_edge"
+            ]
+        keep = np.ones(len(delivered), dtype=bool)
+        keep[np.asarray(attached, dtype=int)] = False
+        delivered = np.vstack(
+            [
+                delivered[keep],
+                np.asarray(replacement_rows, dtype=int),
+            ]
+        )
+        delivered = _orient_ccw(points, delivered)
+    geometry = triangle_geometry(points, delivered)
+    if np.any(
+        geometry["signed_area"]
+        <= _area_tolerance(points, delivered)
+    ):
+        return delivered, [
+            "existing_node_insertion_nonpositive_geometry"
+        ]
+    return delivered, []
+
+
+def _barycentric_coordinates(
+    point: np.ndarray,
+    triangle: np.ndarray,
+) -> np.ndarray | None:
+    a, b, c = np.asarray(triangle, dtype=float)
+    matrix = np.column_stack((b - a, c - a))
+    try:
+        uv = np.linalg.solve(
+            matrix,
+            np.asarray(point, dtype=float) - a,
+        )
+    except np.linalg.LinAlgError:
+        return None
+    return np.asarray(
+        [1.0 - float(uv[0]) - float(uv[1]), uv[0], uv[1]],
+        dtype=float,
+    )
+
+
+def _failure_counts(
+    attempts: Iterable[dict[str, Any]],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for attempt in attempts:
+        for failure in attempt.get("failures", []):
+            key = str(failure)
+            counts[key] = counts.get(key, 0) + 1
+    return dict(
+        sorted(
+            counts.items(),
+            key=lambda item: (-int(item[1]), item[0]),
+        )
+    )
+
+
+def _repair_superthin_systematic_v5(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    initial_components: int,
+) -> dict[str, Any]:
+    """Restrict causal edges, run locked stars, and finish with closure."""
+    started = time.perf_counter()
+    before = _summary(state, config)
+    connectivity_initial = _repair_superthin_connectivity_v1(
+        state,
+        config,
+        initial_components,
+    )
+    if bool(config.systematic_v5_connectivity_only):
+        after = _summary(state, config)
+        return {
+            "schema_version": "fvcom_systematic_thin_repair_v5",
+            "profile": "systematic-v5",
+            "closure_succeeded": bool(
+                after["superthin_triangle_count"] == 0
+            ),
+            "accepted": int(
+                connectivity_initial.get("accepted", 0)
+            ),
+            "rejected": int(
+                connectivity_initial.get("rejected", 0)
+            ),
+            "connectivity_restriction_initial": connectivity_initial,
+            "connectivity_restriction_recheck": None,
+            "locked_star_initial": None,
+            "component_cavity_recovery": None,
+            "boundary_adaptive_recovery": None,
+            "locked_star_final": None,
+            "component_classifications": list(
+                connectivity_initial.get(
+                    "component_classifications",
+                    [],
+                )
+            ),
+            "candidate_attempts": list(
+                connectivity_initial.get("candidate_attempts", [])
+            ),
+            "blocked_components": list(
+                connectivity_initial.get("blocked_components", [])
+            ),
+            "recurrence_counts": {},
+            "restricted_lineage_edges": [
+                list(map(int, edge))
+                for edge in sorted(state.restricted_lineage_edges)
+            ],
+            "restricted_edge_violation_count": int(
+                len(_restricted_edge_violation_records(state))
+            ),
+            "deadline_reached": bool(_deadline_reached(config)),
+            "before": before,
+            "after": after,
+            "runtime_seconds": float(
+                time.perf_counter() - started
+            ),
+        }
+    first = _repair_superthin_locked_star_v5(state, config, initial_components)
+    cavity: dict[str, Any] | None = None
+    connectivity_recheck: dict[str, Any] | None = None
+    boundary: dict[str, Any] | None = None
+    second: dict[str, Any] | None = None
+    residual = _inventory_superthin_components(state, config)
+    if residual and not _deadline_reached(
+        config,
+        reserve_seconds=float(config.systematic_v5_audit_reserve_seconds),
+    ):
+        cavity = _repair_superthin_components(
+            state,
+            replace(
+                config,
+                thin_repair_profile="systematic-v2",
+                systematic_gate_scope="loop-end",
+                systematic_min_patch_rings=1,
+                systematic_max_patch_rings=4,
+                systematic_max_components_per_round=min(
+                    16,
+                    max(1, int(config.systematic_max_components_per_round)),
+                ),
+                micro_relax_cycles=min(1, int(config.micro_relax_cycles)),
+                micro_relax_iterations=min(2, int(config.micro_relax_iterations)),
+                micro_relax_ring_layers=2,
+            ),
+            initial_components,
+        )
+        residual = _inventory_superthin_components(state, config)
+    if (
+        residual
+        and bool(config.systematic_v5_enable_connectivity_restriction)
+        and not _deadline_reached(
+            config,
+            reserve_seconds=float(config.systematic_v5_audit_reserve_seconds),
+        )
+    ):
+        connectivity_recheck = _repair_superthin_connectivity_v1(
+            state,
+            replace(
+                config,
+                systematic_v5_max_connectivity_transactions_per_round=max(
+                    1,
+                    int(
+                        config.systematic_v5_max_connectivity_transactions_per_round
+                    )
+                    - int(connectivity_initial.get("accepted", 0)),
+                ),
+            ),
+            initial_components,
+        )
+        residual = _inventory_superthin_components(state, config)
+    has_boundary_residual = any(
+        bool(component.get("boundary_chain_ids"))
+        for component in residual
+    )
+    if (
+        has_boundary_residual
+        and bool(config.systematic_v5_enable_boundary_window_fallback)
+        and not _deadline_reached(
+            config,
+            reserve_seconds=float(config.systematic_v5_audit_reserve_seconds),
+        )
+    ):
+        boundary_config = replace(
+            config,
+            thin_repair_profile="systematic-v3",
+            systematic_gate_scope="loop-end",
+            systematic_max_components_per_round=min(
+                8,
+                max(1, int(config.systematic_max_components_per_round)),
+            ),
+            systematic_v3_max_candidates_per_component=min(
+                8,
+                max(1, int(config.systematic_v3_max_candidates_per_component)),
+            ),
+            systematic_collapse_welds_per_round=0,
+            max_boundary_welds_per_round=min(
+                8,
+                max(1, int(config.max_boundary_welds_per_round)),
+            ),
+            max_boundary_edits_per_round=min(
+                8,
+                max(1, int(config.max_boundary_edits_per_round)),
+            ),
+            micro_relax_cycles=min(1, int(config.micro_relax_cycles)),
+            micro_relax_iterations=min(2, int(config.micro_relax_iterations)),
+            micro_relax_ring_layers=2,
+        )
+        boundary = _repair_superthin_boundary_adaptive_v3(
+            state,
+            boundary_config,
+            initial_components,
+        )
+    if (
+        int(_summary(state, config)["superthin_triangle_count"]) > 0
+        and not _deadline_reached(
+            config,
+            reserve_seconds=float(config.systematic_v5_audit_reserve_seconds),
+        )
+    ):
+        second = _repair_superthin_locked_star_v5(
+            state,
+            replace(
+                config,
+                systematic_v5_max_star_transactions_per_round=max(
+                    1,
+                    int(config.systematic_v5_max_star_transactions_per_round)
+                    - int(first.get("accepted", 0)),
+                ),
+            ),
+            initial_components,
+        )
+    after = _summary(state, config)
+    reports = [
+        value
+        for value in (
+            connectivity_initial,
+            first,
+            cavity,
+            connectivity_recheck,
+            boundary,
+            second,
+        )
+        if value is not None
+    ]
+    return {
+        "schema_version": "fvcom_systematic_thin_repair_v5",
+        "profile": "systematic-v5",
+        "closure_succeeded": bool(
+            after["superthin_triangle_count"] == 0
+            and after["restricted_edge_violation_count"] == 0
+            and _connectivity_nonregression(before, after)
+        ),
+        "accepted": int(sum(int(value.get("accepted", 0)) for value in reports)),
+        "rejected": int(sum(int(value.get("rejected", 0)) for value in reports)),
+        "connectivity_restriction_initial": connectivity_initial,
+        "locked_star_initial": first,
+        "component_cavity_recovery": cavity,
+        "connectivity_restriction_recheck": connectivity_recheck,
+        "boundary_adaptive_recovery": boundary,
+        "locked_star_final": second,
+        "component_classifications": [
+            item
+            for value in reports
+            for item in value.get("component_classifications", [])
+        ],
+        "candidate_attempts": [
+            item
+            for value in reports
+            for item in value.get("candidate_attempts", [])
+        ],
+        "blocked_components": (
+            (
+                second
+                or boundary
+                or connectivity_recheck
+                or cavity
+                or first
+                or connectivity_initial
+            ).get("blocked_components", [])
+        ),
+        "recurrence_counts": {
+            str(key): int(count)
+            for value in (first, second)
+            if value is not None
+            for key, count in value.get("recurrence_counts", {}).items()
+        },
+        "restricted_lineage_edges": [
+            list(map(int, edge))
+            for edge in sorted(state.restricted_lineage_edges)
+        ],
+        "restricted_edge_violation_count": int(
+            len(_restricted_edge_violation_records(state))
+        ),
+        "deadline_reached": bool(_deadline_reached(config)),
+        "before": before,
+        "after": after,
+        "runtime_seconds": float(time.perf_counter() - started),
+    }
+
+
+def _repair_superthin_locked_star_v5(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    initial_components: int,
+) -> dict[str, Any]:
+    """Exhaust superthin debt through complete, atomic node-star replacement.
+
+    V4 moved an apex and repaired only the two triangles adjacent to its
+    altitude base.  Every other face incident on that apex retained its old
+    connectivity.  V5 locks the complete one-ring perimeter, removes every
+    face in the old fan, and installs a fully legal replacement before the
+    trial can be audited or committed.
+    """
+    started = time.perf_counter()
+    initial_summary = _summary(state, config)
+    current_summary = dict(initial_summary)
+    attempts: list[dict[str, Any]] = []
+    classifications: list[dict[str, Any]] = []
+    blocked: dict[str, dict[str, Any]] = {}
+    accepted = 0
+    recurrence: dict[str, int] = {}
+    audit_config = replace(config, systematic_gate_scope="loop-end")
+    transaction_limit = max(0, int(config.systematic_v5_max_star_transactions_per_round))
+    passage_baseline = _passage_clearance_inventory(state, config)
+    for _ in range(transaction_limit):
+        if _deadline_reached(
+            config,
+            reserve_seconds=float(config.systematic_v5_audit_reserve_seconds),
+        ):
+            break
+        components = _inventory_superthin_components(state, config)
+        if not components:
+            break
+        component = next(
+            (value for value in components if value["component_id"] not in blocked),
+            None,
+        )
+        if component is None:
+            break
+        component_id = str(component["component_id"])
+        recurrence[component_id] = recurrence.get(component_id, 0) + 1
+        classifications.append(
+            {key: value for key, value in component.items() if key != "triangle_indices"}
+        )
+        geometry = triangle_geometry(state.points, state.triangles)
+        minimum_angles = np.min(geometry["angles_deg"], axis=1)
+        triangle_order = sorted(
+            map(int, component["triangle_indices"]),
+            key=lambda index: (
+                float(geometry["quality"][index]),
+                float(minimum_angles[index]),
+                int(index),
+            ),
+        )
+        best: tuple[tuple[float, ...], _State, dict[str, Any]] | None = None
+        component_attempts: list[dict[str, Any]] = []
+        pending_candidates: list[
+            tuple[tuple[float, ...], _State, dict[str, Any], dict[str, Any]]
+        ] = []
+        screened_centers: set[int] = set()
+        for triangle_index in triangle_order:
+            if _deadline_reached(
+                config,
+                reserve_seconds=float(config.systematic_v5_audit_reserve_seconds),
+            ):
+                break
+            triangle = list(map(int, state.triangles[int(triangle_index)]))
+            protected = chain_edges(state.chains)
+            triangle_coordinates = state.points[np.asarray(triangle, dtype=int)]
+            opposite_lengths = np.asarray(
+                [
+                    np.linalg.norm(triangle_coordinates[1] - triangle_coordinates[2]),
+                    np.linalg.norm(triangle_coordinates[0] - triangle_coordinates[2]),
+                    np.linalg.norm(triangle_coordinates[0] - triangle_coordinates[1]),
+                ],
+                dtype=float,
+            )
+            # The minimum-angle vertex opposite the longest edge is the
+            # unique shortest-altitude causal apex.  Testing the other two
+            # vertices only repeats non-causal global audits.
+            causal_center = int(triangle[int(np.argmax(opposite_lengths))])
+            for center in [causal_center]:
+                if _deadline_reached(
+                    config,
+                    reserve_seconds=float(config.systematic_v5_audit_reserve_seconds),
+                ):
+                    break
+                if int(center) in screened_centers:
+                    continue
+                screened_centers.add(int(center))
+                incident = np.where(np.any(state.triangles == int(center), axis=1))[0]
+                ring = _ordered_one_ring(state.triangles[incident], int(center))
+                if ring is None:
+                    boundary_trial = state.clone()
+                    changed, construction, evidence = _reconstruct_locked_boundary_fan_candidate(
+                        boundary_trial,
+                        center=int(center),
+                        triangle_index=int(triangle_index),
+                        config=config,
+                    )
+                    if changed:
+                        mode = {"name": "boundary-fan-ear-retriangulation"}
+                        quick = _v5_quick_metrics_from_evidence(
+                            current_summary,
+                            evidence,
+                        )
+                        record = {
+                            "component_id": component_id,
+                            "classification": component["classification"],
+                            "triangle_index": int(triangle_index),
+                            "center_lineage": int(state.lineage[int(center)]),
+                            "candidate": str(mode["name"]),
+                            "accepted": False,
+                            "star_triangle_count": int(len(incident)),
+                            "ring_node_count": int(evidence.get("patch_ring_node_count", 0)),
+                            "patch_rings": 1,
+                            "evidence": evidence,
+                            "quick_trial": quick,
+                        }
+                        debt_before = (
+                            int(current_summary["superthin_triangle_count"]),
+                            float(current_summary["superthin_severity_sum"]),
+                        )
+                        debt_after = (
+                            int(quick["superthin_triangle_count"]),
+                            float(quick["superthin_severity_sum"]),
+                        )
+                        if debt_after < debt_before:
+                            quick_score = _v5_quick_candidate_score(
+                                quick,
+                                evidence,
+                                mode,
+                            )
+                            record["quick_candidate_score"] = list(quick_score)
+                            pending_candidates.append(
+                                (quick_score, boundary_trial, record, mode)
+                            )
+                        else:
+                            record["failures"] = ["superthin_debt_not_reduced"]
+                            component_attempts.append(record)
+                        continue
+                    component_attempts.append(
+                        {
+                            "component_id": component_id,
+                            "operation": "locked-star-screen",
+                            "triangle_index": int(triangle_index),
+                            "center_lineage": int(state.lineage[int(center)]),
+                            "accepted": False,
+                            "failures": construction or ["open_or_nonmanifold_node_star"],
+                        }
+                    )
+                    continue
+                incident_edges = _edge_set(state.triangles[incident])
+                protected_chords = sorted(
+                    edge
+                    for edge in protected & incident_edges
+                    if int(center) in edge
+                )
+                if protected_chords:
+                    component_attempts.append(
+                        {
+                            "component_id": component_id,
+                            "operation": "locked-star-screen",
+                            "triangle_index": int(triangle_index),
+                            "center_lineage": int(state.lineage[int(center)]),
+                            "accepted": False,
+                            "failures": ["center_has_protected_incident_chord"],
+                        }
+                    )
+                    continue
+                modes = _locked_star_modes(
+                    state,
+                    int(center),
+                    ring,
+                    int(triangle_index),
+                    config,
+                )
+                for mode in modes:
+                    if _deadline_reached(
+                        config,
+                        reserve_seconds=float(config.systematic_v5_audit_reserve_seconds),
+                    ):
+                        break
+                    trial = state.clone()
+                    changed, construction, evidence = _reconstruct_locked_star_candidate(
+                        trial,
+                        center=int(center),
+                        triangle_index=int(triangle_index),
+                        mode=mode,
+                        config=config,
+                    )
+                    record: dict[str, Any] = {
+                        "component_id": component_id,
+                        "classification": component["classification"],
+                        "triangle_index": int(triangle_index),
+                        "center_lineage": int(state.lineage[int(center)]),
+                        "candidate": str(mode["name"]),
+                        "accepted": False,
+                        "star_triangle_count": int(len(incident)),
+                        "ring_node_count": int(len(ring)),
+                        "patch_rings": 1,
+                    }
+                    if not changed:
+                        record["failures"] = construction or ["locked_star_construction_failed"]
+                        component_attempts.append(record)
+                        continue
+                    quick = _v5_quick_metrics_from_evidence(
+                        current_summary,
+                        evidence,
+                    )
+                    debt_before = (
+                        int(current_summary["superthin_triangle_count"]),
+                        float(current_summary["superthin_severity_sum"]),
+                    )
+                    debt_after = (
+                        int(quick["superthin_triangle_count"]),
+                        float(quick["superthin_severity_sum"]),
+                    )
+                    if not debt_after < debt_before:
+                        record.update(
+                            {
+                                "evidence": evidence,
+                                "quick_trial": quick,
+                                "failures": ["superthin_debt_not_reduced"],
+                            }
+                        )
+                        component_attempts.append(record)
+                        continue
+                    quick_score = _v5_quick_candidate_score(
+                        quick,
+                        evidence,
+                        mode,
+                    )
+                    record.update(
+                        {
+                            "evidence": evidence,
+                            "quick_trial": quick,
+                            "quick_candidate_score": list(quick_score),
+                        }
+                    )
+                    pending_candidates.append((quick_score, trial, record, mode))
+        for pending_index, (_, trial, record, mode) in enumerate(
+            sorted(pending_candidates, key=lambda item: item[0])
+        ):
+            if _deadline_reached(
+                config,
+                reserve_seconds=float(config.systematic_v5_audit_reserve_seconds),
+            ):
+                break
+            _micro_relax(
+                trial,
+                replacement_seed_nodes=trial.last_affected,
+                config=replace(
+                    config,
+                    micro_relax_cycles=min(1, int(config.micro_relax_cycles)),
+                    micro_relax_iterations=min(2, int(config.micro_relax_iterations)),
+                    micro_relax_ring_layers=2,
+                ),
+            )
+            hard_ok, hard_report, trial_summary = _audit_state(
+                trial,
+                audit_config,
+                initial_components,
+            )
+            extra_failures = _v5_hard_gate_failures(
+                state,
+                trial,
+                config,
+                passage_baseline,
+            )
+            failures = [] if hard_ok else _failed_invariant_names(hard_report)
+            failures = sorted(set([*failures, *extra_failures]))
+            debt_before = (
+                int(current_summary["superthin_triangle_count"]),
+                float(current_summary["superthin_severity_sum"]),
+            )
+            debt_after = (
+                int(trial_summary["superthin_triangle_count"]),
+                float(trial_summary["superthin_severity_sum"]),
+            )
+            if not debt_after < debt_before:
+                failures = sorted(set([*failures, "superthin_debt_not_reduced"]))
+            # These gates are deferred across relaxation, but a closure
+            # checkpoint is not eligible to become the champion if it adds
+            # either defect.
+            if int(trial_summary["singly_connected_triangle_count"]) > int(
+                current_summary["singly_connected_triangle_count"]
+            ):
+                failures = sorted(set([*failures, "new_singly_connected_triangles"]))
+            if int(trial_summary["boundary_degree_anomaly_count"]) > int(
+                current_summary["boundary_degree_anomaly_count"]
+            ):
+                failures = sorted(set([*failures, "new_boundary_degree_anomalies"]))
+            record.update(
+                {
+                    "global_audit_rank": int(pending_index),
+                    "trial": _summary_from(trial_summary),
+                    "invariants": hard_report,
+                    "failures": failures,
+                }
+            )
+            component_attempts.append(record)
+            if failures:
+                continue
+            score = _v5_candidate_score(
+                trial_summary,
+                record["evidence"],
+                mode,
+            )
+            record["candidate_score"] = list(score)
+            best = (score, trial, record)
+            break
+        if best is not None:
+            audited_ids = {id(item) for item in component_attempts}
+            for _, _, record, _ in pending_candidates:
+                if id(record) in audited_ids:
+                    continue
+                record["failures"] = ["lower_ranked_candidate_not_globally_audited"]
+                component_attempts.append(record)
+        if best is None:
+            expanded_best, expanded_attempts = _try_expanded_locked_patches_v5(
+                state,
+                component,
+                config,
+                audit_config,
+                initial_components,
+                current_summary,
+                passage_baseline,
+            )
+            component_attempts.extend(expanded_attempts)
+            if expanded_best is not None:
+                best = expanded_best
+        attempts.extend(component_attempts)
+        if best is None:
+            blocked[component_id] = {
+                **{key: value for key, value in component.items() if key != "triangle_indices"},
+                "attempt_count": int(len(component_attempts)),
+                "failure_counts": _failure_counts(component_attempts),
+            }
+            continue
+        _, selected, selected_record = best
+        before_debt = (
+            int(current_summary["superthin_triangle_count"]),
+            float(current_summary["superthin_severity_sum"]),
+        )
+        _restore(state, selected)
+        selected_record["accepted"] = True
+        current_summary = _summary(state, config)
+        state.ledger.append(
+            {
+                "operation": "systematic-v5-locked-star-transaction",
+                "component_id": component_id,
+                "classification": component["classification"],
+                "candidate": selected_record["candidate"],
+                "patch_rings": int(selected_record.get("patch_rings", 1)),
+                "debt_before": list(before_debt),
+                "debt_after": [
+                    int(current_summary["superthin_triangle_count"]),
+                    float(current_summary["superthin_severity_sum"]),
+                ],
+                "evidence": selected_record.get("evidence", {}),
+            }
+        )
+        accepted += 1
+        blocked.clear()
+    residual = _inventory_superthin_components(state, config)
+    for component in residual:
+        blocked.setdefault(
+            str(component["component_id"]),
+            {key: value for key, value in component.items() if key != "triangle_indices"},
+        )
+    final_summary = _summary(state, config)
+    return {
+        "schema_version": "fvcom_systematic_thin_repair_v5",
+        "profile": "systematic-v5",
+        "closure_succeeded": bool(final_summary["superthin_triangle_count"] == 0),
+        "accepted": int(accepted),
+        "rejected": int(sum(not bool(item.get("accepted")) for item in attempts)),
+        "component_classifications": classifications,
+        "candidate_attempts": attempts,
+        "blocked_components": list(blocked.values()),
+        "recurrence_counts": dict(sorted(recurrence.items())),
+        "deadline_reached": bool(_deadline_reached(config)),
+        "before": initial_summary,
+        "after": final_summary,
+        "runtime_seconds": float(time.perf_counter() - started),
+    }
+
+
+def _locked_star_modes(
+    state: _State,
+    center: int,
+    ring: list[int],
+    triangle_index: int,
+    config: AggressiveConditioningConfig,
+) -> list[dict[str, Any]]:
+    """Return the deterministic V5 candidate ladder for one closed star."""
+    triangle = list(map(int, state.triangles[int(triangle_index)]))
+    other = [value for value in triangle if value != int(center)]
+    if len(other) != 2:
+        return []
+    base = tuple(sorted(map(int, other)))
+    coordinates = state.points[np.asarray(triangle, dtype=int)]
+    opposite_lengths = np.asarray(
+        [
+            np.linalg.norm(coordinates[1] - coordinates[2]),
+            np.linalg.norm(coordinates[0] - coordinates[2]),
+            np.linalg.norm(coordinates[0] - coordinates[1]),
+        ],
+        dtype=float,
+    )
+    incenter = np.sum(coordinates * opposite_lengths[:, None], axis=0) / max(
+        float(np.sum(opposite_lengths)),
+        1.0e-12,
+    )
+    ring_points = state.points[np.asarray(ring, dtype=int)]
+    weights = 1.0 / np.maximum(state.targets[np.asarray(ring, dtype=int)], 1.0e-12)
+    weighted_centroid = np.sum(ring_points * weights[:, None], axis=0) / float(np.sum(weights))
+    polygon = Polygon(ring_points)
+    representative = np.asarray(
+        [polygon.representative_point().x, polygon.representative_point().y],
+        dtype=float,
+    )
+    base_vector = state.points[base[1]] - state.points[base[0]]
+    denominator = float(np.dot(base_vector, base_vector))
+    projection = (
+        state.points[base[0]].copy()
+        if denominator <= 1.0e-20
+        else state.points[base[0]]
+        + float(
+            np.clip(
+                np.dot(state.points[int(center)] - state.points[base[0]], base_vector)
+                / denominator,
+                0.02,
+                0.98,
+            )
+        )
+        * base_vector
+    )
+    nearest_ring = int(
+        min(
+            ring,
+            key=lambda node: (
+                float(np.linalg.norm(state.points[int(node)] - projection)),
+                int(node),
+            ),
+        )
+    )
+    modes: list[dict[str, Any]] = []
+    if float(np.linalg.norm(state.points[nearest_ring] - projection)) <= (
+        float(config.systematic_v3_weld_snap_fraction)
+        * max(float(state.targets[int(center)]), 1.0e-12)
+    ):
+        modes.append(
+            {
+                "name": "contract-existing",
+                "target_node": nearest_ring,
+            }
+        )
+    modes.extend([
+        {"name": "center-elimination"},
+        {
+            "name": "center-relocation-altitude",
+            "coordinate": 0.88 * projection + 0.12 * representative,
+        },
+        {"name": "center-relocation-incenter", "coordinate": incenter},
+        {
+            "name": "center-relocation-offcenter",
+            "coordinate": 0.55 * incenter + 0.45 * representative,
+        },
+        {
+            "name": "center-relocation-monitor-centroid",
+            "coordinate": 0.70 * weighted_centroid + 0.30 * representative,
+        },
+    ])
+    protected = chain_edges(state.chains)
+    if (
+        base in protected
+        and not state.fixed[int(center)]
+        and not state.hard[int(center)]
+        and bool(config.systematic_v5_enable_boundary_window_fallback)
+    ):
+        relaxed = replace(
+            config,
+            boundary_weld_max_distance_fraction=max(
+                2.0,
+                float(config.boundary_weld_max_distance_fraction),
+            ),
+            boundary_weld_max_altitude_to_arc_fraction=max(
+                1.0,
+                float(config.boundary_weld_max_altitude_to_arc_fraction),
+            ),
+            boundary_weld_land_max_distance_m=max(
+                1000.0,
+                float(config.boundary_weld_land_max_distance_m),
+            ),
+            boundary_weld_open_max_distance_m=max(
+                1000.0,
+                float(config.boundary_weld_open_max_distance_m),
+            ),
+            boundary_weld_anchor_buffer_segments=0,
+            boundary_weld_junction_buffer_segments=0,
+            boundary_weld_channel_clearance_fraction=0.0,
+            boundary_weld_forbidden_kind_tokens=(),
+        )
+        weld, failures = _boundary_weld_geometry(state, base, int(center), relaxed)
+        if weld is not None and not failures:
+            fraction, arc_projection, distance, h = weld
+            snap_target = min(
+                base,
+                key=lambda node: (
+                    float(np.linalg.norm(arc_projection - state.points[int(node)])),
+                    int(node),
+                ),
+            )
+            snap_distance = float(
+                np.linalg.norm(arc_projection - state.points[int(snap_target)])
+            )
+            if snap_distance <= float(config.systematic_v3_weld_snap_fraction) * max(h, 1.0e-12):
+                modes.insert(
+                    0,
+                    {
+                        "name": "boundary-snap-existing",
+                        "base": base,
+                        "target_node": int(snap_target),
+                        "coordinate": state.points[int(snap_target)].copy(),
+                        "projection_fraction": float(fraction),
+                        "weld_distance_m": float(distance),
+                    },
+                )
+            else:
+                modes.insert(
+                    0,
+                    {
+                        "name": "boundary-source-arc-insertion",
+                        "base": base,
+                        "coordinate": np.asarray(arc_projection, dtype=float),
+                        "projection_fraction": float(fraction),
+                        "weld_distance_m": float(distance),
+                    },
+                )
+    modes.append({"name": "support-node-fallback", "coordinate": representative})
+    return modes
+
+
+def _reconstruct_locked_boundary_fan_candidate(
+    state: _State,
+    *,
+    center: int,
+    triangle_index: int,
+    config: AggressiveConditioningConfig,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    """Rebuild every face of an open boundary-node star without moving it."""
+    center = int(center)
+    membership = _find_chain_node(state.chains, center)
+    if membership is None:
+        return False, ["open_star_center_not_on_boundary_chain"], {}
+    chain_index, position = membership
+    chain = state.chains[int(chain_index)]
+    if len(chain) < 3:
+        return False, ["boundary_chain_too_short"], {}
+    previous = int(chain[(position - 1) % len(chain)])
+    following = int(chain[(position + 1) % len(chain)])
+    incident = np.where(np.any(state.triangles == center, axis=1))[0]
+    fan = _ordered_boundary_fan(
+        state.triangles[incident],
+        center,
+        previous,
+        following,
+    )
+    if fan is None:
+        fan = _ordered_boundary_fan(
+            state.triangles[incident],
+            center,
+            following,
+            previous,
+        )
+    if fan is None or len(fan) < 2:
+        return False, ["non_simple_boundary_fan"], {}
+    patch_ring = [center, *map(int, fan)]
+    if len(set(patch_ring)) != len(patch_ring):
+        return False, ["repeated_boundary_fan_ring_node"], {}
+    old_fan = state.triangles[incident].copy()
+    old_geometry = triangle_geometry(state.points, old_fan)
+    replacement = _triangulate_ring_greedy(
+        state.points,
+        patch_ring,
+        None,
+        max(int(config.max_valence), 8),
+    )
+    if replacement is None:
+        return False, ["deterministic_boundary_fan_ear_triangulation_failed"], {}
+    replacement_geometry = triangle_geometry(state.points, replacement)
+    if np.any(
+        replacement_geometry["signed_area"]
+        <= _area_tolerance(state.points, replacement)
+    ):
+        return False, ["nonpositive_boundary_fan_replacement"], {}
+    old_area = float(np.sum(old_geometry["area"]))
+    new_area = float(np.sum(replacement_geometry["area"]))
+    if abs(new_area - old_area) > 1.0e-8 * max(old_area, 1.0):
+        return False, ["boundary_fan_area_mismatch"], {}
+    perimeter = {
+        tuple(
+            sorted(
+                (
+                    int(patch_ring[index]),
+                    int(patch_ring[(index + 1) % len(patch_ring)]),
+                )
+            )
+        )
+        for index in range(len(patch_ring))
+    }
+    protected = chain_edges(state.chains)
+    protected_inside = protected & _edge_set(old_fan)
+    if not protected_inside.issubset(perimeter):
+        return False, ["boundary_fan_contains_protected_internal_chord"], {}
+    keep = np.ones(len(state.triangles), dtype=bool)
+    keep[incident] = False
+    outside = state.triangles[keep]
+    state.triangles = _orient_ccw(state.points, np.vstack([outside, replacement]))
+    replacement_ids = set(range(len(outside), len(outside) + len(replacement)))
+    flip_count = _lawson_legalize_locked_patch(
+        state,
+        replacement_ids,
+        perimeter | protected,
+        max_flips=max(
+            0,
+            int(config.systematic_v5_max_lawson_flips_per_transaction),
+        ),
+    )
+    delivered_edges = _edge_set(state.triangles)
+    if not perimeter.issubset(delivered_edges):
+        return False, ["locked_boundary_fan_perimeter_changed"], {}
+    if not protected.issubset(delivered_edges):
+        return False, ["protected_edge_missing"], {}
+    state.last_affected = sorted(set(map(int, patch_ring)))
+    delivered_patch_geometry = triangle_geometry(
+        state.points,
+        state.triangles[np.asarray(sorted(replacement_ids), dtype=int)],
+    )
+    evidence = {
+        "candidate": "boundary-fan-ear-retriangulation",
+        "center_original_lineage": int(state.lineage[center]),
+        "center_is_hard_anchor": bool(state.hard[center]),
+        "source_triangle_index": int(triangle_index),
+        "old_star_triangle_count": int(len(incident)),
+        "replacement_triangle_count": int(len(replacement)),
+        "patch_ring_node_count": int(len(patch_ring)),
+        "locked_ring_original_lineage": [
+            int(state.lineage[node]) for node in patch_ring
+        ],
+        "lawson_flip_count": int(flip_count),
+        "inserted_support_node_count": 0,
+        "old_star_area_m2": float(old_area),
+        "new_star_area_m2": float(new_area),
+        "local_debt_before": _geometry_superthin_debt(old_geometry, config),
+        "local_debt_after": _geometry_superthin_debt(delivered_patch_geometry, config),
+    }
+    state.ledger.append(
+        {
+            "operation": "systematic-v5-complete-locked-boundary-fan-reconstruction",
+            **evidence,
+        }
+    )
+    return True, [], evidence
+
+
+def _reconstruct_locked_star_candidate(
+    state: _State,
+    *,
+    center: int,
+    triangle_index: int,
+    mode: dict[str, Any],
+    config: AggressiveConditioningConfig,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    center = int(center)
+    incident = np.where(np.any(state.triangles == center, axis=1))[0]
+    ring = _ordered_one_ring(state.triangles[incident], center)
+    if ring is None:
+        return False, ["open_or_nonmanifold_node_star"], {}
+    if state.hard[center] or state.fixed[center] or _find_chain_node(state.chains, center) is not None:
+        if str(mode["name"]) not in {
+            "center-relocation-altitude",
+            "center-relocation-incenter",
+            "center-relocation-offcenter",
+            "center-relocation-monitor-centroid",
+        }:
+            return False, ["center_fixed_or_hard"], {}
+        return False, ["fixed_center_relocation_forbidden"], {}
+    old_fan = state.triangles[incident].copy()
+    old_geometry = triangle_geometry(state.points, old_fan)
+    old_area = float(np.sum(old_geometry["area"]))
+    old_coordinate = state.points[center].copy()
+    protected_before = chain_edges(state.chains)
+    old_fan_edges = _edge_set(old_fan)
+    internal_protected = {
+        edge
+        for edge in protected_before & old_fan_edges
+        if center in edge
+    }
+    if internal_protected:
+        return False, ["center_has_protected_incident_chord"], {}
+    base_replacement = _triangulate_ring_greedy(
+        state.points,
+        ring,
+        None,
+        max(int(config.max_valence), 8),
+        removed_node=center,
+    )
+    if base_replacement is None:
+        return False, ["deterministic_ear_triangulation_failed"], {}
+    name = str(mode["name"])
+    inserted_support = 0
+    boundary_inserted = False
+    replacement: np.ndarray
+    if name.startswith("center-relocation"):
+        coordinate = np.asarray(mode["coordinate"], dtype=float)
+        polygon = Polygon(state.points[np.asarray(ring, dtype=int)])
+        if not bool(contains_xy(polygon, np.asarray([coordinate[0]]), np.asarray([coordinate[1]]))[0]):
+            return False, ["relocated_center_outside_locked_ring"], {}
+        state.points[center] = coordinate
+        replacement = _orient_ccw(
+            state.points,
+            np.asarray(
+                [
+                    [center, int(ring[index]), int(ring[(index + 1) % len(ring)])]
+                    for index in range(len(ring))
+                ],
+                dtype=int,
+            ),
+        )
+    elif name == "boundary-source-arc-insertion":
+        base = tuple(sorted(map(int, mode["base"])))
+        chain_position = _find_chain_edge(state.chains, base)
+        if chain_position is None:
+            return False, ["constraint_chain_edge_not_found"], {}
+        matching = [
+            index
+            for index, triangle in enumerate(base_replacement)
+            if set(base).issubset(set(map(int, triangle)))
+        ]
+        if len(matching) != 1:
+            return False, ["boundary_base_not_unique_in_ring_replacement"], {}
+        split_index = int(matching[0])
+        third = [value for value in base_replacement[split_index] if int(value) not in base]
+        if len(third) != 1:
+            return False, ["boundary_split_opposite_not_unique"], {}
+        state.points[center] = np.asarray(mode["coordinate"], dtype=float)
+        state.fixed[center] = True
+        state.hard[center] = False
+        state.kinds[center] = state.kinds[base[0]]
+        state.targets[center] = _sample_target_at(
+            state,
+            state.points[center],
+            fallback=_edge_target(state.targets, base),
+        )
+        replacement = np.vstack(
+            [
+                np.delete(base_replacement, split_index, axis=0),
+                np.asarray(
+                    [
+                        [base[0], center, int(third[0])],
+                        [center, base[1], int(third[0])],
+                    ],
+                    dtype=int,
+                ),
+            ]
+        )
+        chain_index, position = chain_position
+        chain = state.chains[int(chain_index)]
+        left = int(chain[position])
+        right = int(chain[(position + 1) % len(chain)])
+        insert_position = int(position + 1)
+        chain.insert(insert_position, center)
+        open_values = state.open_nodes.tolist()
+        for open_position, (open_left, open_right) in enumerate(
+            zip(open_values[:-1], open_values[1:])
+        ):
+            if int(open_left) == left and int(open_right) == right:
+                open_values.insert(open_position + 1, center)
+                state.open_nodes = np.asarray(open_values, dtype=int)
+                break
+            if int(open_left) == right and int(open_right) == left:
+                open_values.insert(open_position + 1, center)
+                state.open_nodes = np.asarray(open_values, dtype=int)
+                break
+        boundary_inserted = True
+    elif name == "support-node-fallback":
+        coordinate = np.asarray(mode["coordinate"], dtype=float)
+        polygon = Polygon(state.points[np.asarray(ring, dtype=int)])
+        if not bool(contains_xy(polygon, np.asarray([coordinate[0]]), np.asarray([coordinate[1]]))[0]):
+            return False, ["support_node_outside_locked_ring"], {}
+        support = len(state.points)
+        state.points = np.vstack([state.points, coordinate])
+        state.fixed = np.concatenate([state.fixed, np.zeros(1, dtype=bool)])
+        state.targets = np.concatenate(
+            [
+                state.targets,
+                np.asarray(
+                    [
+                        _sample_target_at(
+                            state,
+                            coordinate,
+                            fallback=float(np.median(state.targets[np.asarray(ring, dtype=int)])),
+                        )
+                    ],
+                    dtype=float,
+                ),
+            ]
+        )
+        state.kinds.append("interior")
+        state.hard = np.concatenate([state.hard, np.zeros(1, dtype=bool)])
+        state.lineage = np.concatenate([state.lineage, _new_lineage_ids(state, 1)])
+        replacement = _orient_ccw(
+            state.points,
+            np.asarray(
+                [
+                    [support, int(ring[index]), int(ring[(index + 1) % len(ring)])]
+                    for index in range(len(ring))
+                ],
+                dtype=int,
+            ),
+        )
+        inserted_support = 1
+    else:
+        # Both contraction to an existing ring node and explicit center
+        # elimination produce the same locked-ring triangulation.  Their
+        # distinct labels retain the causal decision in the transaction log.
+        replacement = base_replacement
+    replacement = _orient_ccw(state.points, replacement)
+    replacement_geometry = triangle_geometry(state.points, replacement)
+    if np.any(
+        replacement_geometry["signed_area"]
+        <= _area_tolerance(state.points, replacement)
+    ):
+        return False, ["nonpositive_locked_star_replacement"], {}
+    new_area = float(np.sum(replacement_geometry["area"]))
+    if abs(new_area - old_area) > 1.0e-8 * max(old_area, 1.0):
+        return False, ["locked_star_area_mismatch"], {
+            "old_star_area_m2": old_area,
+            "new_star_area_m2": new_area,
+        }
+    keep = np.ones(len(state.triangles), dtype=bool)
+    keep[incident] = False
+    outside = state.triangles[keep]
+    state.triangles = _orient_ccw(
+        state.points,
+        np.vstack([outside, replacement]),
+    )
+    replacement_ids = set(
+        range(len(outside), len(outside) + len(replacement))
+    )
+    ring_edges = {
+        tuple(sorted((int(ring[index]), int(ring[(index + 1) % len(ring)]))))
+        for index in range(len(ring))
+    }
+    if boundary_inserted:
+        base = tuple(sorted(map(int, mode["base"])))
+        ring_edges.discard(base)
+        ring_edges.update(
+            {
+                tuple(sorted((base[0], center))),
+                tuple(sorted((center, base[1]))),
+            }
+        )
+    protected_after = chain_edges(state.chains)
+    locked_edges = ring_edges | protected_after
+    flip_count = _lawson_legalize_locked_patch(
+        state,
+        replacement_ids,
+        locked_edges,
+        max_flips=max(
+            0,
+            int(config.systematic_v5_max_lawson_flips_per_transaction),
+        ),
+    )
+    delivered_edges = _edge_set(state.triangles)
+    if not ring_edges.issubset(delivered_edges):
+        return False, ["locked_patch_perimeter_changed"], {}
+    if not protected_after.issubset(delivered_edges):
+        return False, ["protected_edge_missing"], {}
+    canonical = [tuple(sorted(map(int, tri))) for tri in state.triangles]
+    if len(canonical) != len(set(canonical)):
+        return False, ["duplicate_triangle_after_star_reconstruction"], {}
+    state.last_affected = sorted(
+        set(map(int, np.unique(replacement)))
+        | set(map(int, ring))
+    )
+    delivered_patch_geometry = triangle_geometry(
+        state.points,
+        state.triangles[np.asarray(sorted(replacement_ids), dtype=int)],
+    )
+    evidence = {
+        "candidate": name,
+        "center_original_lineage": int(state.lineage[center]),
+        "source_triangle_index": int(triangle_index),
+        "old_star_triangle_count": int(len(incident)),
+        "replacement_triangle_count": int(len(replacement)),
+        "locked_ring_original_lineage": [
+            int(state.lineage[node]) for node in ring
+        ],
+        "protected_chord_count": int(
+            len(protected_before & old_fan_edges)
+        ),
+        "lawson_flip_count": int(flip_count),
+        "inserted_support_node_count": int(inserted_support),
+        "boundary_node_inserted": bool(boundary_inserted),
+        "old_coordinate_xy": list(map(float, old_coordinate)),
+        "new_coordinate_xy": (
+            list(map(float, state.points[center]))
+            if center < len(state.points)
+            else None
+        ),
+        "old_star_area_m2": float(old_area),
+        "new_star_area_m2": float(new_area),
+        "local_debt_before": _geometry_superthin_debt(old_geometry, config),
+        "local_debt_after": _geometry_superthin_debt(delivered_patch_geometry, config),
+        "intermediate_degenerate_triangles_removed": int(
+            1 if name.startswith("boundary-") else 0
+        ),
+    }
+    state.ledger.append(
+        {
+            "operation": "systematic-v5-complete-locked-star-reconstruction",
+            **evidence,
+        }
+    )
+    _compact(state)
+    return True, [], evidence
+
+
+def _try_expanded_locked_patches_v5(
+    state: _State,
+    component: dict[str, Any],
+    config: AggressiveConditioningConfig,
+    audit_config: AggressiveConditioningConfig,
+    initial_components: int,
+    before_summary: dict[str, Any],
+    passage_baseline: dict[tuple[int, int], float],
+) -> tuple[
+    tuple[tuple[float, ...], _State, dict[str, Any]] | None,
+    list[dict[str, Any]],
+]:
+    """Expand a failed causal star through the configured 1→2→4 ring ladder."""
+    attempts: list[dict[str, Any]] = []
+    best: tuple[tuple[float, ...], _State, dict[str, Any]] | None = None
+    topology = build_edge_topology(len(state.points), state.triangles)
+    for rings in tuple(int(value) for value in config.systematic_v5_patch_ring_ladder):
+        if rings <= 1 or _deadline_reached(config):
+            continue
+        patch = _expand_triangle_patch(
+            state.triangles,
+            topology,
+            component["triangle_indices"],
+            rings,
+        )
+        ring = _ordered_patch_boundary(state.triangles, patch)
+        record: dict[str, Any] = {
+            "component_id": component["component_id"],
+            "classification": component["classification"],
+            "candidate": "expanded-ring-elimination",
+            "patch_rings": int(rings),
+            "patch_triangle_count": int(len(patch)),
+            "accepted": False,
+        }
+        if ring is None:
+            record["failures"] = ["non_simple_patch_boundary"]
+            attempts.append(record)
+            continue
+        trial = state.clone()
+        changed, failures, evidence = _reconstruct_expanded_ring_v5(
+            trial,
+            patch,
+            ring,
+            config,
+        )
+        if not changed:
+            record["failures"] = failures or ["expanded_patch_construction_failed"]
+            attempts.append(record)
+            continue
+        _micro_relax(
+            trial,
+            replacement_seed_nodes=trial.last_affected,
+            config=replace(
+                config,
+                micro_relax_cycles=min(1, int(config.micro_relax_cycles)),
+                micro_relax_iterations=min(2, int(config.micro_relax_iterations)),
+                micro_relax_ring_layers=2,
+            ),
+        )
+        ok, invariant_report, trial_summary = _audit_state(
+            trial,
+            audit_config,
+            initial_components,
+        )
+        hard_failures = _v5_hard_gate_failures(
+            state,
+            trial,
+            config,
+            passage_baseline,
+        )
+        all_failures = [] if ok else _failed_invariant_names(invariant_report)
+        all_failures = sorted(set([*all_failures, *hard_failures]))
+        debt_before = (
+            int(before_summary["superthin_triangle_count"]),
+            float(before_summary["superthin_severity_sum"]),
+        )
+        debt_after = (
+            int(trial_summary["superthin_triangle_count"]),
+            float(trial_summary["superthin_severity_sum"]),
+        )
+        if not debt_after < debt_before:
+            all_failures = sorted(set([*all_failures, "superthin_debt_not_reduced"]))
+        record.update(
+            {
+                "evidence": evidence,
+                "trial": _summary_from(trial_summary),
+                "invariants": invariant_report,
+                "failures": all_failures,
+            }
+        )
+        attempts.append(record)
+        if all_failures:
+            continue
+        score = _v5_candidate_score(
+            trial_summary,
+            evidence,
+            {"name": "expanded-ring-elimination"},
+        )
+        record["candidate_score"] = list(score)
+        if best is None or score < best[0]:
+            best = (score, trial, record)
+    return best, attempts
+
+
+def _reconstruct_expanded_ring_v5(
+    state: _State,
+    patch: np.ndarray,
+    ring: list[int],
+    config: AggressiveConditioningConfig,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    """Deterministically eliminate a movable expanded cavity and ear-triangulate it."""
+    patch = np.asarray(patch, dtype=int)
+    patch_nodes = set(map(int, np.unique(state.triangles[patch])))
+    interior = sorted(patch_nodes - set(map(int, ring)))
+    protected = chain_edges(state.chains)
+    protected_inside = protected & _edge_set(state.triangles[patch])
+    perimeter = {
+        tuple(sorted((int(ring[index]), int(ring[(index + 1) % len(ring)]))))
+        for index in range(len(ring))
+    }
+    if any(
+        state.fixed[node]
+        or state.hard[node]
+        or _find_chain_node(state.chains, int(node)) is not None
+        for node in interior
+    ):
+        return False, ["expanded_patch_contains_immutable_interior_node"], {}
+    if not protected_inside.issubset(perimeter):
+        return False, ["expanded_patch_contains_protected_chord"], {}
+    replacement = _triangulate_ring_greedy(
+        state.points,
+        ring,
+        None,
+        max(int(config.max_valence), 8),
+    )
+    if replacement is None:
+        return False, ["deterministic_ear_triangulation_failed"], {}
+    old_geometry = triangle_geometry(state.points, state.triangles[patch])
+    replacement_geometry = triangle_geometry(state.points, replacement)
+    old_area = float(np.sum(old_geometry["area"]))
+    new_area = float(np.sum(replacement_geometry["area"]))
+    if abs(new_area - old_area) > 1.0e-8 * max(old_area, 1.0):
+        return False, ["expanded_patch_area_mismatch"], {}
+    keep = np.ones(len(state.triangles), dtype=bool)
+    keep[patch] = False
+    outside = state.triangles[keep]
+    state.triangles = _orient_ccw(state.points, np.vstack([outside, replacement]))
+    replacement_ids = set(range(len(outside), len(outside) + len(replacement)))
+    flip_count = _lawson_legalize_locked_patch(
+        state,
+        replacement_ids,
+        perimeter | protected,
+        max_flips=max(
+            0,
+            int(config.systematic_v5_max_lawson_flips_per_transaction),
+        ),
+    )
+    state.last_affected = sorted(set(map(int, ring)))
+    delivered_patch_geometry = triangle_geometry(
+        state.points,
+        state.triangles[np.asarray(sorted(replacement_ids), dtype=int)],
+    )
+    evidence = {
+        "candidate": "expanded-ring-elimination",
+        "patch_triangle_count": int(len(patch)),
+        "replacement_triangle_count": int(len(replacement)),
+        "removed_movable_node_count": int(len(interior)),
+        "locked_ring_original_lineage": [int(state.lineage[node]) for node in ring],
+        "lawson_flip_count": int(flip_count),
+        "old_patch_area_m2": float(old_area),
+        "new_patch_area_m2": float(new_area),
+        "inserted_support_node_count": 0,
+        "local_debt_before": _geometry_superthin_debt(old_geometry, config),
+        "local_debt_after": _geometry_superthin_debt(delivered_patch_geometry, config),
+    }
+    state.ledger.append(
+        {
+            "operation": "systematic-v5-expanded-locked-patch-reconstruction",
+            **evidence,
+        }
+    )
+    _compact(state)
+    return True, [], evidence
+
+
+def _lawson_legalize_locked_patch(
+    state: _State,
+    patch_triangle_ids: set[int],
+    locked_edges: set[tuple[int, int]],
+    *,
+    max_flips: int,
+    edge_allowed: Callable[[tuple[int, int]], bool] | None = None,
+) -> int:
+    """Apply deterministic protected-edge-safe Lawson flips inside one patch."""
+    flips = 0
+    patch_triangle_ids = {
+        int(value)
+        for value in patch_triangle_ids
+        if 0 <= int(value) < len(state.triangles)
+    }
+    outside_ids = [
+        index
+        for index in range(len(state.triangles))
+        if int(index) not in patch_triangle_ids
+    ]
+    outside_edges = (
+        _edge_set(state.triangles[np.asarray(outside_ids, dtype=int)])
+        if outside_ids
+        else set()
+    )
+    for _ in range(max(0, int(max_flips))):
+        local_edges: dict[tuple[int, int], list[int]] = {}
+        for triangle_id in sorted(patch_triangle_ids):
+            for edge in _triangle_edge_keys(state.triangles[int(triangle_id)]):
+                local_edges.setdefault(edge, []).append(int(triangle_id))
+        selected: tuple[int, int, np.ndarray] | None = None
+        for edge in sorted(local_edges):
+            attached = list(map(int, local_edges[edge]))
+            if edge in locked_edges or len(attached) != 2:
+                continue
+            first, second = attached
+            c_values = [
+                int(value)
+                for value in state.triangles[first]
+                if int(value) not in edge
+            ]
+            d_values = [
+                int(value)
+                for value in state.triangles[second]
+                if int(value) not in edge
+            ]
+            if len(c_values) != 1 or len(d_values) != 1 or c_values[0] == d_values[0]:
+                continue
+            c, d = c_values[0], d_values[0]
+            new_edge = tuple(sorted((c, d)))
+            if (
+                new_edge in local_edges
+                or new_edge in outside_edges
+                or new_edge in locked_edges
+                or (
+                    edge_allowed is not None
+                    and not bool(edge_allowed(new_edge))
+                )
+            ):
+                continue
+            if not _delaunay_edge_is_illegal(
+                state.points,
+                int(edge[0]),
+                int(edge[1]),
+                c,
+                d,
+            ):
+                continue
+            replacement = _orient_ccw(
+                state.points,
+                np.asarray(
+                    [[c, d, int(edge[0])], [d, c, int(edge[1])]],
+                    dtype=int,
+                ),
+            )
+            geometry = triangle_geometry(state.points, replacement)
+            if np.any(
+                geometry["signed_area"]
+                <= _area_tolerance(state.points, replacement)
+            ):
+                continue
+            selected = (first, second, replacement)
+            break
+        if selected is None:
+            break
+        first, second, replacement = selected
+        state.triangles[first] = replacement[0]
+        state.triangles[second] = replacement[1]
+        flips += 1
+    return int(flips)
+
+
+def _delaunay_edge_is_illegal(
+    points: np.ndarray,
+    a: int,
+    b: int,
+    c: int,
+    d: int,
+) -> bool:
+    """Return True when d lies strictly inside circumcircle(a,b,c)."""
+    pa = np.asarray(points[int(a)], dtype=float)
+    pb = np.asarray(points[int(b)], dtype=float)
+    pc = np.asarray(points[int(c)], dtype=float)
+    pd = np.asarray(points[int(d)], dtype=float)
+    orient = float(np.cross(pb - pa, pc - pa))
+    if abs(orient) <= 1.0e-20:
+        return False
+    shifted = np.vstack([pa - pd, pb - pd, pc - pd])
+    squared = np.sum(shifted * shifted, axis=1)
+    determinant = float(
+        np.linalg.det(
+            np.column_stack([shifted[:, 0], shifted[:, 1], squared])
+        )
+    )
+    signed = determinant if orient > 0.0 else -determinant
+    scale = max(
+        float(np.max(np.linalg.norm(shifted, axis=1))) ** 4,
+        1.0,
+    )
+    return bool(signed > 1.0e-13 * scale)
+
+
+def _v5_hard_gate_failures(
+    before_state: _State,
+    trial: _State,
+    config: AggressiveConditioningConfig,
+    passage_baseline: dict[tuple[int, int], float],
+) -> list[str]:
+    failures: list[str] = []
+    if not np.all(np.isfinite(trial.points)):
+        failures.append("nonfinite_coordinates")
+    boundary_changed = _v5_boundary_changed(before_state, trial)
+    open_boundary_changed = (
+        _open_boundary_lineage_sequence(before_state)
+        != _open_boundary_lineage_sequence(trial)
+    )
+    if not bool(config.systematic_v5_enable_boundary_window_fallback):
+        if boundary_changed:
+            failures.append("topology_only_boundary_changed")
+        if open_boundary_changed:
+            failures.append("topology_only_open_boundary_changed")
+    if boundary_changed:
+        if not _boundary_loops_simple(trial):
+            failures.append("boundary_loop_invalid_or_self_intersecting")
+        if _maximum_boundary_source_arc_deviation(trial) > 1.0e-7:
+            failures.append("boundary_off_source_arc")
+    area_change = abs(
+        _signed_mesh_area(trial.points, trial.triangles)
+        - _signed_mesh_area(before_state.points, before_state.triangles)
+    )
+    if area_change > float(config.maximum_domain_area_change_fraction) * max(
+        float(trial.initial_domain_area_m2),
+        1.0e-30,
+    ):
+        failures.append("domain_area_budget")
+    if boundary_changed:
+        clearance_tolerance = float(config.systematic_v3_passage_clearance_tolerance_m)
+        for pair, baseline in passage_baseline.items():
+            delivered = _chain_pair_clearance(trial, *pair)
+            if not np.isfinite(delivered):
+                failures.append("passage_bank_identity")
+                continue
+            if delivered + clearance_tolerance < float(baseline):
+                failures.append("passage_clearance_loss")
+    return sorted(set(failures))
+
+
+def _v5_boundary_changed(before_state: _State, trial: _State) -> bool:
+    """Compare boundary lineage/order/coordinates without assuming stable indices."""
+    def signature(state: _State) -> tuple[tuple[tuple[int, ...], ...], dict[int, tuple[float, float]]]:
+        chains = tuple(
+            tuple(int(state.lineage[int(node)]) for node in chain)
+            for chain in state.chains
+        )
+        coordinates = {
+            int(state.lineage[int(node)]): (
+                float(state.points[int(node), 0]),
+                float(state.points[int(node), 1]),
+            )
+            for chain in state.chains
+            for node in chain
+        }
+        return chains, coordinates
+
+    return bool(signature(before_state) != signature(trial))
+
+
+def _open_boundary_lineage_sequence(
+    state: _State,
+) -> tuple[int, ...]:
+    return tuple(
+        int(state.lineage[int(node)])
+        for node in np.asarray(state.open_nodes, dtype=int)
+    )
+
+
+def _geometry_superthin_debt(
+    geometry: dict[str, np.ndarray],
+    config: AggressiveConditioningConfig,
+) -> dict[str, Any]:
+    quality = np.asarray(geometry["quality"], dtype=float)
+    minimum_angles = np.min(np.asarray(geometry["angles_deg"], dtype=float), axis=1)
+    superthin = (
+        (quality < float(config.superthin_quality_threshold))
+        | (minimum_angles < float(config.superthin_min_angle_deg))
+    )
+    severity = float(
+        np.sum(
+            np.maximum(
+                0.0,
+                (
+                    float(config.superthin_quality_threshold) - quality
+                )
+                / max(float(config.superthin_quality_threshold), 1.0e-12),
+            )
+            ** 2
+        )
+        + np.sum(
+            np.maximum(
+                0.0,
+                (
+                    float(config.superthin_min_angle_deg) - minimum_angles
+                )
+                / max(float(config.superthin_min_angle_deg), 1.0e-12),
+            )
+            ** 2
+        )
+    )
+    return {
+        "superthin_triangle_count": int(np.count_nonzero(superthin)),
+        "superthin_severity_sum": severity,
+        "q_min": float(np.min(quality)) if len(quality) else 0.0,
+        "minimum_angle_deg": float(np.min(minimum_angles)) if len(minimum_angles) else 0.0,
+    }
+
+
+def _v5_quick_metrics_from_evidence(
+    baseline: dict[str, Any],
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    """Rank a star from its changed faces; all other global debt is constant."""
+    before = evidence.get("local_debt_before", {})
+    after = evidence.get("local_debt_after", {})
+    return {
+        "superthin_triangle_count": int(
+            int(baseline["superthin_triangle_count"])
+            - int(before.get("superthin_triangle_count", 0))
+            + int(after.get("superthin_triangle_count", 0))
+        ),
+        "superthin_severity_sum": float(
+            float(baseline["superthin_severity_sum"])
+            - float(before.get("superthin_severity_sum", 0.0))
+            + float(after.get("superthin_severity_sum", 0.0))
+        ),
+        "q_min": float(after.get("q_min", baseline["q_min"])),
+        "minimum_angle_deg": float(
+            after.get("minimum_angle_deg", baseline["minimum_angle_deg"])
+        ),
+    }
+
+
+def _v5_quick_candidate_score(
+    summary: dict[str, Any],
+    evidence: dict[str, Any],
+    mode: dict[str, Any],
+) -> tuple[float, ...]:
+    return (
+        float(summary["superthin_triangle_count"]),
+        float(summary["superthin_severity_sum"]),
+        -float(summary["q_min"]),
+        -float(summary["minimum_angle_deg"]),
+        float(evidence.get("inserted_support_node_count", 0)),
+        float(_v5_mode_order(str(mode.get("name")))),
+    )
+
+
+def _v5_mode_order(name: str) -> int:
+    return {
+        "boundary-snap-existing": 0,
+        "boundary-source-arc-insertion": 1,
+        "boundary-fan-ear-retriangulation": 2,
+        "contract-existing": 3,
+        "center-elimination": 4,
+        "center-relocation-altitude": 5,
+        "center-relocation-incenter": 6,
+        "center-relocation-offcenter": 7,
+        "center-relocation-monitor-centroid": 8,
+        "expanded-ring-elimination": 9,
+        "support-node-fallback": 10,
+    }.get(str(name), 99)
+
+
+def _v5_candidate_score(
+    summary: dict[str, Any],
+    evidence: dict[str, Any],
+    mode: dict[str, Any],
+) -> tuple[float, ...]:
+    return (
+        float(summary["superthin_triangle_count"]),
+        float(summary["superthin_severity_sum"]),
+        float(summary["singly_connected_triangle_count"]),
+        float(summary["boundary_degree_anomaly_count"]),
+        -float(summary["q_min"]),
+        -float(summary["minimum_angle_deg"]),
+        float(summary["valence_excess_sum"]),
+        float(summary["l_over_h_count_above_1_55"]),
+        float(summary["area_transition_count_above_0_50"]),
+        float(evidence.get("inserted_support_node_count", 0)),
+        float(_v5_mode_order(str(mode.get("name")))),
+    )
+
+
+def _select_interior_skeleton_collapse(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    excluded: set[tuple[int, int, int]],
+) -> tuple[tuple[tuple[int, int], int, int] | None, list[dict[str, Any]]]:
+    """Select an interior sliver apex for contraction to its altitude base."""
+    topology = build_edge_topology(len(state.points), state.triangles)
+    geometry = triangle_geometry(state.points, state.triangles)
+    minimum_angles = np.min(geometry["angles_deg"], axis=1)
+    superthin = (geometry["quality"] < float(config.superthin_quality_threshold)) | (
+        minimum_angles < float(config.superthin_min_angle_deg)
+    )
+    protected = chain_edges(state.chains)
+    proposals: list[tuple[float, float, float, tuple[int, int], int, int]] = []
+    screened: list[dict[str, Any]] = []
+    for triangle_index in np.where(superthin)[0]:
+        triangle = list(map(int, state.triangles[int(triangle_index)]))
+        altitude_cases: list[tuple[float, tuple[int, int], int]] = []
+        for apex in triangle:
+            base_values = [value for value in triangle if value != apex]
+            edge = tuple(sorted(map(int, base_values)))
+            length = float(np.linalg.norm(state.points[edge[1]] - state.points[edge[0]]))
+            altitude_cases.append((length, edge, int(apex)))
+        _, edge, apex = max(altitude_cases, key=lambda item: (item[0], item[1], -item[2]))
+        key = (int(edge[0]), int(edge[1]), int(apex))
+        failures: list[str] = []
+        if key in excluded:
+            continue
+        if edge in protected:
+            failures.append("skeleton_base_is_protected_boundary")
+        attached = list(map(int, topology.edge_to_triangles.get(edge, [])))
+        if len(attached) != 2 or int(triangle_index) not in attached:
+            failures.append("skeleton_base_not_internal_two_sided_edge")
+        if bool(state.fixed[int(apex)]) or bool(state.hard[int(apex)]):
+            failures.append("skeleton_apex_fixed_or_hard")
+        if _find_chain_node(state.chains, int(apex)) is not None:
+            failures.append("skeleton_apex_is_boundary_node")
+        base_vector = state.points[edge[1]] - state.points[edge[0]]
+        denominator = float(np.dot(base_vector, base_vector))
+        if denominator <= 1.0e-20:
+            failures.append("degenerate_skeleton_base")
+            fraction = 0.0
+            distance = float("inf")
+        else:
+            fraction = float(
+                np.dot(state.points[int(apex)] - state.points[edge[0]], base_vector)
+                / denominator
+            )
+            projection = state.points[edge[0]] + fraction * base_vector
+            distance = float(np.linalg.norm(state.points[int(apex)] - projection))
+            if not 0.02 < fraction < 0.98:
+                failures.append("skeleton_projection_outside_edge_interior")
+        if failures:
+            screened.append(
+                {
+                    "operation": "systematic-v4-interior-skeleton-collapse",
+                    "payload": [int(edge[0]), int(edge[1]), int(apex)],
+                    "triangle_index": int(triangle_index),
+                    "failures": sorted(set(failures)),
+                }
+            )
+            continue
+        proposals.append(
+            (
+                float(geometry["quality"][int(triangle_index)]),
+                float(minimum_angles[int(triangle_index)]),
+                float(distance),
+                edge,
+                int(apex),
+                int(triangle_index),
+            )
+        )
+    if not proposals:
+        return None, screened
+    _, _, _, edge, apex, triangle_index = min(
+        proposals,
+        key=lambda item: (item[0], item[1], item[2], item[5], item[3], item[4]),
+    )
+    return (edge, int(apex), int(triangle_index)), screened
+
+
+def _contract_apex_to_internal_edge(
+    state: _State,
+    edge: tuple[int, int],
+    apex: int,
+    triangle_index: int,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    """Contract a sliver apex to an internal edge and retain a two-sided line."""
+    a, b = map(int, edge)
+    apex = int(apex)
+    topology = build_edge_topology(len(state.points), state.triangles)
+    attached = list(map(int, topology.edge_to_triangles.get(tuple(sorted(edge)), [])))
+    if len(attached) != 2 or int(triangle_index) not in attached:
+        return False, ["skeleton_base_not_internal_two_sided_edge"], {}
+    source_triangle = set(map(int, state.triangles[int(triangle_index)]))
+    if source_triangle != {a, b, apex}:
+        return False, ["skeleton_source_triangle_mismatch"], {}
+    if state.fixed[apex] or state.hard[apex] or _find_chain_node(state.chains, apex) is not None:
+        return False, ["skeleton_apex_fixed_or_hard"], {}
+    base_vector = state.points[b] - state.points[a]
+    denominator = float(np.dot(base_vector, base_vector))
+    if denominator <= 1.0e-20:
+        return False, ["degenerate_skeleton_base"], {}
+    fraction = float(np.dot(state.points[apex] - state.points[a], base_vector) / denominator)
+    if not 0.02 < fraction < 0.98:
+        return False, ["skeleton_projection_outside_edge_interior"], {}
+    projection = state.points[a] + fraction * base_vector
+    original_coordinate = state.points[apex].copy()
+    affected = set(map(int, topology.node_neighbors[apex]))
+    affected.update(map(int, topology.node_neighbors[a]))
+    affected.update(map(int, topology.node_neighbors[b]))
+    affected.update((a, b, apex))
+    state.points[apex] = projection
+
+    ordinary: list[np.ndarray] = []
+    split: list[np.ndarray] = []
+    for index, triangle in enumerate(np.asarray(state.triangles, dtype=int)):
+        values = set(map(int, triangle))
+        if int(index) == int(triangle_index):
+            continue
+        if {a, b}.issubset(values):
+            others = sorted(values - {a, b})
+            if len(others) != 1 or int(others[0]) == apex:
+                return False, ["skeleton_adjacent_triangle_mismatch"], {}
+            other = int(others[0])
+            split.extend(
+                [
+                    np.asarray([a, apex, other], dtype=int),
+                    np.asarray([apex, b, other], dtype=int),
+                ]
+            )
+        else:
+            ordinary.append(np.asarray(triangle, dtype=int))
+    ordinary_array = np.asarray(ordinary, dtype=int)
+    tolerance = _area_tolerance(state.points, ordinary_array)
+    removed_degenerate = 1
+    if len(ordinary_array):
+        ordinary_geometry = triangle_geometry(state.points, ordinary_array)
+        if np.any(ordinary_geometry["signed_area"] < -tolerance):
+            return False, ["skeleton_contraction_inverted_adjacent_triangle"], {}
+        keep = ordinary_geometry["signed_area"] > tolerance
+        removed_degenerate += int(np.count_nonzero(~keep))
+        ordinary_array = ordinary_array[keep]
+    split_array = _orient_ccw(state.points, np.asarray(split, dtype=int))
+    if len(split_array):
+        split_geometry = triangle_geometry(state.points, split_array)
+        if np.any(split_geometry["signed_area"] <= _area_tolerance(state.points, split_array)):
+            return False, ["skeleton_split_created_nonpositive_triangle"], {}
+    combined = np.vstack([ordinary_array, split_array]) if len(ordinary_array) else split_array
+    canonical: set[tuple[int, int, int]] = set()
+    unique: list[np.ndarray] = []
+    duplicate_count = 0
+    for triangle in combined:
+        key = tuple(sorted(map(int, triangle)))
+        if len(set(key)) != 3:
+            removed_degenerate += 1
+            continue
+        if key in canonical:
+            duplicate_count += 1
+            continue
+        canonical.add(key)
+        unique.append(np.asarray(triangle, dtype=int))
+    if not unique:
+        return False, ["skeleton_contraction_removed_complete_mesh"], {}
+    state.triangles = np.asarray(unique, dtype=int)
+    delivered_topology = build_edge_topology(len(state.points), state.triangles)
+    retained_edges = (tuple(sorted((a, apex))), tuple(sorted((apex, b))))
+    if any(len(delivered_topology.edge_to_triangles.get(value, [])) != 2 for value in retained_edges):
+        return False, ["collapsed_internal_line_not_two_sided"], {}
+    state.last_affected = sorted(affected)
+    evidence = {
+        "source_triangle": int(triangle_index),
+        "source_triangle_original_lineage": [
+            int(state.lineage[value]) for value in sorted(source_triangle)
+        ],
+        "apex_original_lineage": int(state.lineage[apex]),
+        "base_original_lineage": [int(state.lineage[a]), int(state.lineage[b])],
+        "projection_fraction": float(fraction),
+        "original_coordinate_xy": list(map(float, original_coordinate)),
+        "projection_coordinate_xy": list(map(float, projection)),
+        "intermediate_degenerate_triangles_removed": int(removed_degenerate),
+        "duplicate_triangles_removed": int(duplicate_count),
+        "retained_internal_line_edges": [list(map(int, value)) for value in retained_edges],
+    }
+    state.ledger.append(
+        {
+            "operation": "systematic-v4-interior-skeleton-collapse",
+            **evidence,
+        }
+    )
+    return True, [], evidence
+
+
+def _repair_skeleton_boundary_welds_loop(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    initial_components: int,
+) -> dict[str, Any]:
+    """Collapse boundary-directed slivers while deferring engineering gates.
+
+    This research-only ladder keeps structural/source-arc gates inside each
+    transaction, but leaves distributional quality gates to the surrounding
+    relaxation-collapse loop.
+    """
+    started = time.perf_counter()
+    baseline_state = state.clone()
+    passage_baseline = _passage_clearance_inventory(state, config)
+    attempts: list[dict[str, Any]] = []
+    excluded: set[tuple[int, int, int]] = set()
+    excluded_interior: set[tuple[int, int, int]] = set()
+    accepted = 0
+    collapse_config = replace(
+        config,
+        boundary_weld_max_distance_fraction=max(1.0, float(config.boundary_weld_max_distance_fraction)),
+        boundary_weld_max_altitude_to_arc_fraction=max(
+            0.50,
+            float(config.boundary_weld_max_altitude_to_arc_fraction),
+        ),
+        boundary_weld_land_max_distance_m=max(250.0, float(config.boundary_weld_land_max_distance_m)),
+        boundary_weld_open_max_distance_m=max(500.0, float(config.boundary_weld_open_max_distance_m)),
+        boundary_weld_anchor_buffer_segments=0,
+        boundary_weld_junction_buffer_segments=1,
+        boundary_weld_channel_clearance_fraction=0.0,
+        boundary_weld_forbidden_kind_tokens=(),
+    )
+    for _ in range(max(0, int(config.systematic_collapse_welds_per_round))):
+        if _deadline_reached(config):
+            break
+        proposal, screened = _select_boundary_weld(state, collapse_config, excluded)
+        attempts.extend(screened)
+        operation = "systematic-v4-skeleton-boundary-weld"
+        if proposal is None:
+            proposal, screened = _select_interior_skeleton_collapse(
+                state,
+                collapse_config,
+                excluded_interior,
+            )
+            attempts.extend(screened)
+            operation = "systematic-v4-interior-skeleton-collapse"
+        if proposal is None:
+            break
+        edge, node, triangle_index = proposal
+        key = (int(edge[0]), int(edge[1]), int(node))
+        if operation == "systematic-v4-skeleton-boundary-weld":
+            excluded.add(key)
+        else:
+            excluded_interior.add(key)
+        before = _summary(state, config)
+        trial = state.clone()
+        construction_evidence: dict[str, Any] = {}
+        if operation == "systematic-v4-skeleton-boundary-weld":
+            changed, construction_failures = _weld_vertex_to_boundary_arc(
+                trial,
+                edge,
+                int(node),
+                int(triangle_index),
+                collapse_config,
+            )
+        else:
+            changed, construction_failures, construction_evidence = _contract_apex_to_internal_edge(
+                trial,
+                edge,
+                int(node),
+                int(triangle_index),
+            )
+        record: dict[str, Any] = {
+            "operation": operation,
+            "payload": [int(edge[0]), int(edge[1]), int(node)],
+            "triangle_index": int(triangle_index),
+            "collapse_target": construction_evidence,
+            "accepted": False,
+        }
+        if not changed:
+            record["failures"] = construction_failures or ["skeleton_weld_construction_failed"]
+            attempts.append(record)
+            continue
+        _micro_relax(trial, replacement_seed_nodes=trial.last_affected, config=config)
+        if _deadline_reached(config):
+            record["failures"] = ["deadline_before_candidate_audit"]
+            attempts.append(record)
+            break
+        ok, invariant_report, after = _audit_state(trial, config, initial_components)
+        failures = _v3_trial_failures(
+            trial,
+            before,
+            after,
+            ok,
+            invariant_report,
+            None,
+            None,
+            config,
+        )
+        failures.extend(
+            _v3_global_boundary_failures(
+                trial,
+                baseline_state,
+                passage_baseline,
+                config,
+            )
+        )
+        record["before"] = _summary_from(before)
+        record["trial"] = _summary_from(after)
+        record["invariants"] = invariant_report
+        record["failures"] = sorted(set(failures))
+        attempts.append(record)
+        if failures:
+            continue
+        _restore(state, trial)
+        record["accepted"] = True
+        accepted += 1
+        excluded.clear()
+        excluded_interior.clear()
+    return {
+        "schema_version": "fvcom_systematic_skeleton_weld_loop_v1",
+        "accepted": int(accepted),
+        "rejected": int(sum(not bool(item.get("accepted")) for item in attempts)),
+        "candidate_attempts": attempts,
+        "deadline_reached": bool(_deadline_reached(config)),
+        "runtime_seconds": float(time.perf_counter() - started),
+    }
+
+
+def _repair_superthin_boundary_adaptive_v3(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    initial_components: int,
+) -> dict[str, Any]:
+    """Close residual boundary debt with source-arc-only transactions."""
+    started = time.perf_counter()
+    initial_summary = _summary(state, config)
+    attempts: list[dict[str, Any]] = []
+    classifications: list[dict[str, Any]] = []
+    accepted = 0
+
+    passage_baseline = _passage_clearance_inventory(state, config)
+    boundary_snapshot = state.clone()
+    boundary_config = replace(
+        config,
+        max_boundary_ear_removals_per_round=0,
+        max_boundary_welds_per_round=min(8, max(0, int(config.max_boundary_welds_per_round))),
+        max_boundary_edits_per_round=min(8, max(0, int(config.max_boundary_edits_per_round))),
+        max_superthin_flips_per_round=0,
+        max_collapses_per_round=0,
+        boundary_weld_anchor_buffer_segments=0,
+        boundary_weld_junction_buffer_segments=1,
+        boundary_weld_channel_clearance_fraction=0.0,
+        boundary_weld_forbidden_kind_tokens=(),
+    )
+    guarded = _repair_superthin_guarded(state, boundary_config, initial_components)
+    guarded_failures = _v3_global_boundary_failures(
+        state,
+        boundary_snapshot,
+        passage_baseline,
+        config,
+    )
+    if guarded_failures:
+        _restore(state, boundary_snapshot)
+        attempts.append(
+            {
+                "operation": "systematic-v3-boundary-weld-redistribution-ladder",
+                "accepted": False,
+                "failures": guarded_failures,
+                "nested_report": guarded,
+            }
+        )
+        guarded = {
+            **guarded,
+            "accepted": 0,
+            "rolled_back": True,
+            "rollback_failures": guarded_failures,
+        }
+    else:
+        accepted += int(guarded.get("accepted", 0))
+        attempts.append(
+            {
+                "operation": "systematic-v3-boundary-weld-redistribution-ladder",
+                "accepted": bool(guarded.get("accepted", 0)),
+                "failures": [],
+                "nested_report": guarded,
+            }
+        )
+
+    skeleton_welds = (
+        _repair_skeleton_boundary_welds_loop(state, config, initial_components)
+        if str(config.systematic_gate_scope) == "loop-end"
+        and int(config.systematic_collapse_welds_per_round) > 0
+        else {
+            "schema_version": "fvcom_systematic_skeleton_weld_loop_v1",
+            "accepted": 0,
+            "rejected": 0,
+            "candidate_attempts": [],
+            "deadline_reached": bool(_deadline_reached(config)),
+            "reason": "disabled",
+        }
+    )
+    accepted += int(skeleton_welds.get("accepted", 0))
+    attempts.extend(skeleton_welds.get("candidate_attempts", []))
+
+    blocked: dict[str, dict[str, Any]] = {}
+    for _ in range(max(0, int(config.systematic_max_components_per_round))):
+        if _deadline_reached(config):
+            break
+        components = _inventory_superthin_components(state, config)
+        boundary_components = [
+            component
+            for component in components
+            if component.get("boundary_chain_ids")
+            and component["component_id"] not in blocked
+        ]
+        if not boundary_components:
+            break
+        component = boundary_components[0]
+        classifications.append({key: value for key, value in component.items() if key != "triangle_indices"})
+        raw_windows = _component_boundary_windows_v3(state, component, config)
+        windows_by_chain: dict[int, list[dict[str, Any]]] = {}
+        for window in raw_windows:
+            windows_by_chain.setdefault(int(window["chain_index"]), []).append(window)
+        windows: list[dict[str, Any]] = []
+        for chain_index in sorted(windows_by_chain):
+            ranked = sorted(
+                windows_by_chain[chain_index],
+                key=lambda item: (
+                    -len(item.get("component_nodes", [])),
+                    len(item.get("nodes", [])),
+                    tuple(item.get("nodes", [])),
+                ),
+            )
+            windows.extend(ranked[:2])
+        base_window_groups: list[list[dict[str, Any]]] = [[window] for window in windows]
+        if component["classification"] == "under-resolved-passage":
+            by_chain: dict[int, dict[str, Any]] = {}
+            for window in windows:
+                by_chain.setdefault(int(window["chain_index"]), window)
+            chain_ids = list(map(int, component.get("boundary_chain_ids", [])))
+            if all(chain_id in by_chain for chain_id in chain_ids[:2]):
+                base_window_groups.insert(0, [by_chain[chain_ids[0]], by_chain[chain_ids[1]]])
+        slide_budget = max(1, int(config.systematic_v3_max_candidates_per_component) // 2)
+        candidate_windows = [
+            {"windows": group, "slide_fraction": fraction}
+            for fraction in (0.25, 0.50, 0.75, 1.0)
+            for group in base_window_groups
+        ][:slide_budget]
+        best: tuple[tuple[float, ...], _State, dict[str, Any]] | None = None
+        component_attempts: list[dict[str, Any]] = []
+        stage_before = _summary(state, config)
+        passage_before = _component_passage_clearance(state, component)
+        for candidate_spec in candidate_windows:
+            if _deadline_reached(config):
+                break
+            window_group = candidate_spec["windows"]
+            slide_fraction = float(candidate_spec["slide_fraction"])
+            trial = state.clone()
+            changed, evidence = _apply_source_arc_windows_v3(
+                trial,
+                window_group,
+                config,
+                slide_fraction=slide_fraction,
+            )
+            record: dict[str, Any] = {
+                "component_id": component["component_id"],
+                "classification": component["classification"],
+                "operation": "systematic-v3-source-arc-slide",
+                "boundary_windows": evidence,
+                "slide_fraction": slide_fraction,
+                "accepted": False,
+            }
+            if not changed:
+                record["failures"] = ["source_arc_window_no_change"]
+                component_attempts.append(record)
+                continue
+            _micro_relax(trial, replacement_seed_nodes=trial.last_affected, config=config)
+            ok, invariant_report, trial_summary = _audit_state(trial, config, initial_components)
+            passage_after = _component_passage_clearance(trial, component)
+            failures = _v3_trial_failures(
+                trial,
+                stage_before,
+                trial_summary,
+                ok,
+                invariant_report,
+                passage_before,
+                passage_after,
+                config,
+            )
+            record["trial"] = _summary_from(trial_summary)
+            record["invariants"] = invariant_report
+            record["passage_clearance_before_m"] = passage_before
+            record["passage_clearance_after_m"] = passage_after
+            record["failures"] = failures
+            if failures:
+                component_attempts.append(record)
+                continue
+            score = _v3_candidate_score(trial_summary, evidence, state, trial)
+            record["candidate_score"] = list(score)
+            component_attempts.append(record)
+            if best is None or score < best[0]:
+                best = (score, trial, record)
+        remaining_budget = max(
+            0,
+            int(config.systematic_v3_max_candidates_per_component) - len(component_attempts),
+        )
+        for operation, payload in _component_boundary_redistribution_candidates_v3(
+            state,
+            component,
+            config,
+        )[:remaining_budget]:
+            if _deadline_reached(config):
+                break
+            trial = state.clone()
+            if operation == "remove":
+                changed = _remove_boundary_vertex(trial, int(payload), config)
+            else:
+                changed = _split_boundary_edge(trial, tuple(map(int, payload)), config)
+            record = {
+                "component_id": component["component_id"],
+                "classification": component["classification"],
+                "operation": f"systematic-v3-boundary-{operation}",
+                "payload": list(_proposal_key(operation, payload)[1]),
+                "accepted": False,
+            }
+            if not changed:
+                record["failures"] = ["boundary_redistribution_construction_failed"]
+                component_attempts.append(record)
+                continue
+            _micro_relax(trial, replacement_seed_nodes=trial.last_affected, config=config)
+            ok, invariant_report, trial_summary = _audit_state(trial, config, initial_components)
+            passage_after = _component_passage_clearance(trial, component)
+            failures = _v3_trial_failures(
+                trial,
+                stage_before,
+                trial_summary,
+                ok,
+                invariant_report,
+                passage_before,
+                passage_after,
+                config,
+            )
+            record["trial"] = _summary_from(trial_summary)
+            record["invariants"] = invariant_report
+            record["passage_clearance_before_m"] = passage_before
+            record["passage_clearance_after_m"] = passage_after
+            record["failures"] = failures
+            if failures:
+                component_attempts.append(record)
+                continue
+            evidence = [{"operation": operation, "payload": record["payload"]}]
+            score = _v3_candidate_score(trial_summary, evidence, state, trial)
+            record["candidate_score"] = list(score)
+            component_attempts.append(record)
+            if best is None or score < best[0]:
+                best = (score, trial, record)
+        attempts.extend(component_attempts)
+        if best is None:
+            blocked[component["component_id"]] = {
+                **{key: value for key, value in component.items() if key != "triangle_indices"},
+                "attempt_count": int(len(component_attempts)),
+                "failure_counts": _failure_counts(component_attempts),
+            }
+            continue
+        _, selected, selected_record = best
+        _restore(state, selected)
+        selected_record["accepted"] = True
+        accepted += 1
+        blocked.clear()
+
+    final_components = _inventory_superthin_components(state, config)
+    for component in final_components:
+        blocked.setdefault(
+            component["component_id"],
+            {key: value for key, value in component.items() if key != "triangle_indices"},
+        )
+    return {
+        "schema_version": "fvcom_systematic_thin_repair_v3",
+        "profile": "systematic-v3",
+        "settings": {
+            "boundary_motion": "source-arc-only",
+            "obc_policy": str(config.systematic_v3_obc_policy),
+            "window_radius": int(config.systematic_v3_boundary_window_radius),
+            "weld_snap_fraction": float(config.systematic_v3_weld_snap_fraction),
+            "passage_clearance_tolerance_m": float(config.systematic_v3_passage_clearance_tolerance_m),
+        },
+        "accepted": int(accepted),
+        "rejected": int(sum(not bool(item.get("accepted")) for item in attempts)),
+        "guarded_boundary_ladder": guarded,
+        "skeleton_boundary_welds": skeleton_welds,
+        "component_classifications": classifications,
+        "candidate_attempts": attempts,
+        "blocked_components": list(blocked.values()),
+        "obc_remap_manifest": _obc_remap_manifest(state),
+        "before": initial_summary,
+        "after": _summary(state, config),
+        "runtime_seconds": float(time.perf_counter() - started),
+        "deadline_reached": bool(_deadline_reached(config)),
+    }
+
+
+def _component_boundary_windows_v3(
+    state: _State,
+    component: dict[str, Any],
+    config: AggressiveConditioningConfig,
+) -> list[dict[str, Any]]:
+    component_nodes = set(
+        map(
+            int,
+            np.unique(state.triangles[np.asarray(component["triangle_indices"], dtype=int)]),
+        )
+    )
+    radius = max(1, int(config.systematic_v3_boundary_window_radius))
+    windows: dict[tuple[int, tuple[int, ...]], dict[str, Any]] = {}
+    for node in sorted(component_nodes):
+        membership = _find_chain_node(state.chains, node)
+        if membership is None:
+            continue
+        chain_index, position = membership
+        chain = state.chains[chain_index]
+        kind = str(state.kinds[node])
+        positions = [int(position)]
+        for direction in (-1, 1):
+            current = int(position)
+            side: list[int] = []
+            for _ in range(radius):
+                following = (current + direction) % len(chain)
+                candidate = int(chain[following])
+                if str(state.kinds[candidate]) != kind:
+                    break
+                side.append(int(following))
+                current = following
+                if bool(state.hard[candidate]):
+                    break
+            if direction < 0:
+                positions = list(reversed(side)) + positions
+            else:
+                positions.extend(side)
+        ordered_nodes = [int(chain[index]) for index in positions]
+        if len(ordered_nodes) < 3:
+            continue
+        movable = [
+            value
+            for value in ordered_nodes[1:-1]
+            if not bool(state.hard[value]) and str(state.kinds[value]) == kind
+        ]
+        if not movable:
+            continue
+        key = (int(chain_index), tuple(ordered_nodes))
+        windows[key] = {
+            "chain_index": int(chain_index),
+            "nodes": ordered_nodes,
+            "component_nodes": sorted(component_nodes & set(ordered_nodes)),
+            "boundary_kind": kind,
+        }
+    return [windows[key] for key in sorted(windows)]
+
+
+def _component_boundary_redistribution_candidates_v3(
+    state: _State,
+    component: dict[str, Any],
+    config: AggressiveConditioningConfig,
+) -> list[tuple[str, Any]]:
+    triangle_indices = np.asarray(component["triangle_indices"], dtype=int)
+    component_nodes = sorted(set(map(int, np.unique(state.triangles[triangle_indices]))))
+    open_set = set(map(int, state.open_nodes))
+    proposals: list[tuple[str, Any]] = []
+    for node in component_nodes:
+        if not state.fixed[node] or state.hard[node]:
+            continue
+        if (
+            str(config.systematic_v3_obc_policy) == "preserve"
+            and node in open_set
+        ):
+            continue
+        if _boundary_removal_allowed(state, node, config):
+            proposals.append(("remove", int(node)))
+    protected = chain_edges(state.chains)
+    component_edges = sorted(
+        set(
+            edge
+            for triangle_index in triangle_indices
+            for edge in _triangle_edge_keys(state.triangles[int(triangle_index)])
+            if edge in protected
+        )
+    )
+    for edge in component_edges:
+        if (
+            str(config.systematic_v3_obc_policy) == "preserve"
+            and edge[0] in open_set
+            and edge[1] in open_set
+        ):
+            continue
+        proposals.append(("split", edge))
+    return proposals
+
+
+def _apply_source_arc_windows_v3(
+    state: _State,
+    windows: list[dict[str, Any]],
+    config: AggressiveConditioningConfig,
+    *,
+    slide_fraction: float = 1.0,
+) -> tuple[bool, list[dict[str, Any]]]:
+    signed_area_before = _signed_mesh_area(state.points, state.triangles)
+    moved: set[int] = set()
+    evidence: list[dict[str, Any]] = []
+    for window in windows:
+        chain_index = int(window["chain_index"])
+        nodes = list(map(int, window["nodes"]))
+        if len(nodes) < 3:
+            continue
+        positions = _target_equalized_source_arc_positions(state, chain_index, nodes)
+        if positions is None:
+            continue
+        changes: list[dict[str, Any]] = []
+        for node, target_point in zip(nodes[1:-1], positions, strict=True):
+            if bool(state.hard[node]):
+                continue
+            old = state.points[node].copy()
+            point = _source_arc_fractional_move(
+                state,
+                chain_index,
+                old,
+                target_point,
+                float(slide_fraction),
+            )
+            if point is None:
+                continue
+            if np.linalg.norm(old - point) <= 1.0e-9:
+                continue
+            state.points[node] = point
+            state.targets[node] = _sample_target_at(state, point, fallback=float(state.targets[node]))
+            moved.add(int(node))
+            changes.append(
+                {
+                    "node_lineage": int(state.lineage[node]),
+                    "old_xy": [float(old[0]), float(old[1])],
+                    "new_xy": [float(point[0]), float(point[1])],
+                }
+            )
+        if changes:
+            evidence.append(
+                {
+                    "chain_index": chain_index,
+                    "boundary_kind": str(window["boundary_kind"]),
+                    "slide_fraction": float(slide_fraction),
+                    "window_node_lineage": [int(state.lineage[node]) for node in nodes],
+                    "moved_nodes": changes,
+                }
+            )
+    if not moved:
+        return False, evidence
+    actual_area_change = abs(_signed_mesh_area(state.points, state.triangles) - signed_area_before)
+    if not _boundary_area_budget_allows(state, actual_area_change, config):
+        return False, [*evidence, {"failure": "domain_area_budget"}]
+    affected = set(moved)
+    topology = build_edge_topology(len(state.points), state.triangles)
+    for node in moved:
+        affected.update(map(int, topology.node_neighbors[int(node)]))
+    state.last_affected = sorted(affected)
+    state.cumulative_boundary_area_change_m2 += actual_area_change
+    state.ledger.append(
+        {
+            "operation": "systematic-v3-source-arc-slide",
+            "windows": evidence,
+            "actual_signed_domain_area_change_m2": float(actual_area_change),
+        }
+    )
+    return True, evidence
+
+
+def _v3_trial_failures(
+    trial: _State,
+    before: dict[str, Any],
+    after: dict[str, Any],
+    invariants_ok: bool,
+    invariant_report: dict[str, Any],
+    passage_before: float | None,
+    passage_after: float | None,
+    config: AggressiveConditioningConfig,
+) -> list[str]:
+    failures: list[str] = []
+    if not invariants_ok:
+        failures.extend(_failed_invariant_names(invariant_report))
+    debt_before = (int(before["superthin_triangle_count"]), float(before["superthin_severity_sum"]))
+    debt_after = (int(after["superthin_triangle_count"]), float(after["superthin_severity_sum"]))
+    if not debt_after < debt_before:
+        failures.append("superthin_debt_not_reduced")
+    if str(config.systematic_gate_scope) != "loop-end":
+        if after["q_min"] + 1.0e-12 < before["q_min"]:
+            failures.append("q_min_regression")
+        if after["q_p01"] + 1.0e-6 < before["q_p01"]:
+            failures.append("q_p01_regression")
+        if after["q_l3_sigma"] + 1.0e-8 < before["q_l3_sigma"]:
+            failures.append("q_l3_sigma_regression")
+        if after["minimum_angle_deg"] + 1.0e-8 < before["minimum_angle_deg"]:
+            failures.append("minimum_angle_regression")
+        if after["minimum_angle_p01_deg"] + 1.0e-3 < before["minimum_angle_p01_deg"]:
+            failures.append("minimum_angle_p01_regression")
+        if after["l_over_h_p95"] > 1.001 * max(before["l_over_h_p95"], 1.0e-12):
+            failures.append("l_over_h_p95_regression")
+        if after["l_over_h_count_above_1_55"] > before["l_over_h_count_above_1_55"]:
+            failures.append("l_over_h_excess_count_increase")
+        if after["area_transition_count_above_0_50"] > before["area_transition_count_above_0_50"]:
+            failures.append("area_transition_excess_count_increase")
+        if after["count_valence_above_limit"] > before["count_valence_above_limit"]:
+            failures.append("valence_gate_regression")
+        if after["singly_connected_triangle_count"] > before["singly_connected_triangle_count"]:
+            failures.append("new_singly_connected_triangles")
+    if after["boundary_degree_anomaly_count"] > before["boundary_degree_anomaly_count"]:
+        failures.append("new_boundary_degree_anomalies")
+    if after["boundary_component_count"] != before["boundary_component_count"]:
+        failures.append("boundary_traversability_component_change")
+    if _maximum_boundary_source_arc_deviation(trial) > 1.0e-6:
+        failures.append("boundary_vertex_off_source_arc")
+    if not _boundary_loops_simple(trial):
+        failures.append("boundary_self_intersection")
+    if (
+        passage_before is not None
+        and passage_after is not None
+        and passage_after + float(config.systematic_v3_passage_clearance_tolerance_m) < passage_before
+    ):
+        failures.append("passage_clearance_regression")
+    if str(config.systematic_v3_obc_policy) == "preserve":
+        manifest = _obc_remap_manifest(trial)
+        if int(manifest["delivered_obc_count"]) != int(manifest["original_obc_count"]):
+            failures.append("obc_count_changed_under_preserve_policy")
+    return sorted(set(failures))
+
+
+def _v3_global_boundary_failures(
+    trial: _State,
+    before_state: _State,
+    passage_baseline: dict[tuple[int, int], float],
+    config: AggressiveConditioningConfig,
+) -> list[str]:
+    failures: list[str] = []
+    if _maximum_boundary_source_arc_deviation(trial) > 1.0e-6:
+        failures.append("boundary_vertex_off_source_arc")
+    if not _boundary_loops_simple(trial):
+        failures.append("boundary_self_intersection")
+    current = _passage_clearance_inventory(trial, config)
+    for pair, baseline in passage_baseline.items():
+        if pair in current and current[pair] + float(config.systematic_v3_passage_clearance_tolerance_m) < baseline:
+            failures.append(f"passage_clearance_regression:{pair[0]}-{pair[1]}")
+    if str(config.systematic_v3_obc_policy) == "preserve":
+        if len(trial.open_nodes) != len(before_state.open_nodes):
+            failures.append("obc_count_changed_under_preserve_policy")
+    return sorted(set(failures))
+
+
+def _v3_candidate_score(
+    summary: dict[str, Any],
+    evidence: list[dict[str, Any]],
+    before_state: _State,
+    trial: _State,
+) -> tuple[float, ...]:
+    moved_count = int(
+        sum(len(window.get("moved_nodes", [])) for window in evidence)
+    )
+    return (
+        float(summary["superthin_triangle_count"]),
+        float(summary["superthin_severity_sum"]),
+        -float(summary["q_min"]),
+        -float(summary["minimum_angle_deg"]),
+        float(_maximum_boundary_source_arc_deviation(trial)),
+        float(summary["count_valence_above_limit"]),
+        float(summary["l_over_h_count_above_1_55"]),
+        float(summary["area_transition_count_above_0_50"]),
+        float(abs(len(trial.open_nodes) - len(before_state.open_nodes))),
+        float(moved_count),
+    )
+
+
+def _inventory_superthin_components(state: _State, config: AggressiveConditioningConfig) -> list[dict[str, Any]]:
+    geometry = triangle_geometry(state.points, state.triangles)
+    minimum_angles = np.min(geometry["angles_deg"], axis=1)
+    bad = np.where(
+        (geometry["quality"] < float(config.superthin_quality_threshold))
+        | (minimum_angles < float(config.superthin_min_angle_deg))
+    )[0]
+    if not len(bad):
+        return []
+    bad_set = set(map(int, bad))
+    node_to_bad: dict[int, list[int]] = {}
+    for triangle_index in bad_set:
+        for node in state.triangles[triangle_index]:
+            node_to_bad.setdefault(int(node), []).append(int(triangle_index))
+    unseen = set(bad_set)
+    raw_components: list[list[int]] = []
+    while unseen:
+        start = min(unseen)
+        unseen.remove(start)
+        stack = [start]
+        component: list[int] = []
+        while stack:
+            current = stack.pop()
+            component.append(int(current))
+            neighbors: set[int] = set()
+            for node in state.triangles[current]:
+                neighbors.update(node_to_bad.get(int(node), []))
+            for following in sorted(neighbors & unseen, reverse=True):
+                unseen.remove(int(following))
+                stack.append(int(following))
+        raw_components.append(sorted(component))
+    chain_membership: dict[int, set[int]] = {}
+    for chain_index, chain in enumerate(state.chains):
+        for node in chain:
+            chain_membership.setdefault(int(node), set()).add(int(chain_index))
+    output: list[dict[str, Any]] = []
+    for triangles in raw_components:
+        nodes = sorted(set(map(int, np.unique(state.triangles[np.asarray(triangles, dtype=int)]))))
+        lineage = sorted(map(int, state.lineage[np.asarray(nodes, dtype=int)]))
+        digest = hashlib.sha1(",".join(map(str, lineage)).encode("ascii")).hexdigest()[:10]
+        fixed_nodes = [node for node in nodes if bool(state.fixed[node])]
+        hard_nodes = [node for node in nodes if bool(state.hard[node])]
+        chain_ids = sorted(set().union(*(chain_membership.get(node, set()) for node in fixed_nodes))) if fixed_nodes else []
+        passage_width = float("nan")
+        if len(chain_ids) >= 2:
+            candidates: list[float] = []
+            for first, second in combinations(chain_ids, 2):
+                left = [node for node in fixed_nodes if first in chain_membership.get(node, set())]
+                right = [node for node in fixed_nodes if second in chain_membership.get(node, set())]
+                if left and right:
+                    delta = state.points[np.asarray(left, dtype=int)][:, None, :] - state.points[np.asarray(right, dtype=int)][None, :, :]
+                    candidates.append(float(np.min(np.linalg.norm(delta, axis=2))))
+            if candidates:
+                passage_width = float(min(candidates))
+        target = float(np.median(state.targets[np.asarray(nodes, dtype=int)])) if nodes else float("nan")
+        gap_ratio = passage_width / max(target, 1.0e-12) if np.isfinite(passage_width) else float("nan")
+        if len(chain_ids) >= 2 and np.isfinite(gap_ratio) and gap_ratio < 1.5:
+            classification = "under-resolved-passage"
+        elif fixed_nodes and hard_nodes:
+            classification = "fixed-boundary-hard-anchor-fan"
+        elif fixed_nodes:
+            classification = "fixed-boundary-fan"
+        elif not fixed_nodes:
+            classification = "interior-connectivity-transition"
+        else:
+            classification = "mixed"
+        severity = float(
+            np.sum(
+                np.maximum(0.0, float(config.superthin_quality_threshold) - geometry["quality"][triangles])
+                + np.maximum(0.0, float(config.superthin_min_angle_deg) - minimum_angles[triangles])
+            )
+        )
+        output.append(
+            {
+                "component_id": f"thin-{lineage[0]}-{digest}",
+                "classification": classification,
+                "triangle_indices": triangles,
+                "triangle_count": int(len(triangles)),
+                "node_lineage": lineage,
+                "fixed_node_count": int(len(fixed_nodes)),
+                "hard_anchor_count": int(len(hard_nodes)),
+                "boundary_chain_ids": chain_ids,
+                "passage_width_m": passage_width if np.isfinite(passage_width) else None,
+                "gap_over_h": gap_ratio if np.isfinite(gap_ratio) else None,
+                "local_feature_target_m": (
+                    min(target, passage_width / max(1, int(config.systematic_min_passage_elements)))
+                    if np.isfinite(passage_width)
+                    else None
+                ),
+                "minimum_quality": float(np.min(geometry["quality"][triangles])),
+                "minimum_angle_deg": float(np.min(minimum_angles[triangles])),
+                "severity": severity,
+            }
+        )
+    output.sort(key=lambda item: (-float(item["severity"]), int(item["node_lineage"][0])))
+    return output
+
+
+def _expand_triangle_patch(triangles: np.ndarray, topology: Any, seeds: list[int], rings: int) -> np.ndarray:
+    selected = set(map(int, seeds))
+    frontier = set(selected)
+    for _ in range(max(0, int(rings))):
+        following: set[int] = set()
+        for triangle_index in frontier:
+            tri = np.asarray(triangles, dtype=int)[int(triangle_index)]
+            for edge in _triangle_edge_keys(tri):
+                following.update(map(int, topology.edge_to_triangles.get(edge, [])))
+        following -= selected
+        selected.update(following)
+        frontier = following
+        if not frontier:
+            break
+    return np.asarray(sorted(selected), dtype=int)
+
+
+def _ordered_patch_boundary(triangles: np.ndarray, patch: np.ndarray) -> list[int] | None:
+    edge_counts: dict[tuple[int, int], int] = {}
+    for tri in np.asarray(triangles, dtype=int)[np.asarray(patch, dtype=int)]:
+        for edge in _triangle_edge_keys(tri):
+            edge_counts[edge] = edge_counts.get(edge, 0) + 1
+    boundary_edges = [edge for edge, count in edge_counts.items() if count == 1]
+    adjacency: dict[int, list[int]] = {}
+    for a, b in boundary_edges:
+        adjacency.setdefault(int(a), []).append(int(b))
+        adjacency.setdefault(int(b), []).append(int(a))
+    if not adjacency or any(len(values) != 2 for values in adjacency.values()):
+        return None
+    start = min(adjacency)
+    ring = [start]
+    previous = -1
+    current = start
+    for _ in range(len(adjacency) + 1):
+        choices = sorted(value for value in adjacency[current] if value != previous)
+        if not choices:
+            return None
+        following = choices[0]
+        if following == start:
+            break
+        if following in ring:
+            return None
+        ring.append(int(following))
+        previous, current = current, following
+    if len(ring) != len(adjacency):
+        return None
+    return ring
+
+
+def _systematic_support_groups(
+    state: _State,
+    component: dict[str, Any],
+    patch: np.ndarray,
+    ring: list[int],
+    config: AggressiveConditioningConfig,
+) -> tuple[list[np.ndarray], dict[str, Any]]:
+    polygon = Polygon(state.points[np.asarray(ring, dtype=int)])
+    if not polygon.is_valid or polygon.area <= 0.0:
+        return [np.empty((0, 2), dtype=float)], {"reason": "invalid_patch_polygon"}
+    patch_nodes = sorted(set(map(int, np.unique(state.triangles[np.asarray(patch, dtype=int)]))))
+    existing = state.points[np.asarray(patch_nodes, dtype=int)]
+    supports: list[np.ndarray] = []
+    protected = chain_edges(state.chains)
+    patch_centroid = np.asarray([polygon.representative_point().x, polygon.representative_point().y], dtype=float)
+    for triangle_index in component["triangle_indices"]:
+        tri = state.triangles[int(triangle_index)]
+        protected_edges = [edge for edge in _triangle_edge_keys(tri) if edge in protected]
+        for edge in protected_edges:
+            a, b = map(int, edge)
+            midpoint = 0.5 * (state.points[a] + state.points[b])
+            direction = patch_centroid - midpoint
+            norm = float(np.linalg.norm(direction))
+            if norm <= 1.0e-12:
+                continue
+            edge_length = float(np.linalg.norm(state.points[b] - state.points[a]))
+            if component["classification"] == "fixed-boundary-hard-anchor-fan":
+                height = 0.15 * edge_length
+            elif component["classification"] == "under-resolved-passage":
+                passage_width = component.get("passage_width_m")
+                width_cap = 0.40 * float(passage_width) if passage_width is not None else float("inf")
+                height = min(0.25 * edge_length, width_cap)
+            else:
+                height = 0.30 * edge_length
+            supports.append(midpoint + min(height, 0.75 * norm) * direction / norm)
+        coords = state.points[np.asarray(tri, dtype=int)]
+        lengths = np.asarray(
+            [
+                np.linalg.norm(coords[1] - coords[2]),
+                np.linalg.norm(coords[0] - coords[2]),
+                np.linalg.norm(coords[0] - coords[1]),
+            ],
+            dtype=float,
+        )
+        incenter = np.sum(coords * lengths[:, None], axis=0) / max(float(np.sum(lengths)), 1.0e-12)
+        supports.append(0.35 * incenter + 0.65 * patch_centroid)
+    if component["classification"] == "under-resolved-passage":
+        chain_ids = list(map(int, component.get("boundary_chain_ids", [])))
+        membership: dict[int, set[int]] = {}
+        for chain_index in chain_ids:
+            for node in state.chains[chain_index]:
+                membership.setdefault(int(node), set()).add(chain_index)
+        pairs: list[tuple[float, np.ndarray]] = []
+        fixed_nodes = [node for node in patch_nodes if state.fixed[node] and node in membership]
+        for a, b in combinations(fixed_nodes, 2):
+            if membership[a].isdisjoint(membership[b]):
+                distance = float(np.linalg.norm(state.points[a] - state.points[b]))
+                pairs.append((distance, 0.5 * (state.points[a] + state.points[b])))
+        passage_support = [
+            midpoint
+            for _, midpoint in sorted(pairs, key=lambda item: item[0])[: max(2, int(config.systematic_max_support_points))]
+        ]
+        supports = [*passage_support, *supports]
+    supports.append(patch_centroid)
+    tolerance = max(np.sqrt(max(float(polygon.area), 1.0e-30)) * 1.0e-8, 1.0e-6)
+    unique: list[np.ndarray] = []
+    for point in supports:
+        point = np.asarray(point, dtype=float)
+        if not bool(contains_xy(polygon, np.asarray([point[0]]), np.asarray([point[1]]))[0]):
+            continue
+        if len(existing) and float(np.min(np.linalg.norm(existing - point, axis=1))) <= tolerance:
+            continue
+        if any(float(np.linalg.norm(value - point)) <= tolerance for value in unique):
+            continue
+        unique.append(point)
+    unique = unique[: max(0, int(config.systematic_max_support_points))]
+    empty = np.empty((0, 2), dtype=float)
+    all_support = np.asarray(unique, dtype=float) if unique else empty
+    if component["classification"] == "under-resolved-passage":
+        groups = [all_support]
+    elif component["classification"] in {"fixed-boundary-fan", "fixed-boundary-hard-anchor-fan"}:
+        groups = [all_support, empty] if len(all_support) else [empty]
+    else:
+        groups = [empty]
+        if len(all_support):
+            groups.append(np.asarray([all_support[0]], dtype=float))
+        if len(all_support) > 1:
+            groups.append(all_support)
+    return groups, {
+        "candidate_support_point_count": int(len(unique)),
+        "passage_width_m": component.get("passage_width_m"),
+        "local_feature_target_m": component.get("local_feature_target_m"),
+    }
+
+
+def _retriangulate_patch_with_support(
+    state: _State,
+    patch: np.ndarray,
+    ring: list[int],
+    support: np.ndarray,
+    component: dict[str, Any],
+    config: AggressiveConditioningConfig,
+) -> tuple[bool, list[str]]:
+    patch = np.asarray(patch, dtype=int)
+    patch_nodes = sorted(set(map(int, np.unique(state.triangles[patch]))))
+    component_nodes = set(
+        map(
+            int,
+            np.unique(state.triangles[np.asarray(component["triangle_indices"], dtype=int)]),
+        )
+    )
+    removable_component_nodes = {
+        node for node in component_nodes if not state.fixed[node] and node not in set(ring)
+    }
+    patch_nodes = [node for node in patch_nodes if node not in removable_component_nodes]
+    local_points = state.points[np.asarray(patch_nodes, dtype=int)].copy()
+    support = np.asarray(support, dtype=float).reshape((-1, 2))
+    local_input = np.vstack([local_points, support]) if len(support) else local_points
+    if len(local_input) < 3:
+        return False, ["insufficient_patch_points"]
+    try:
+        simplices = np.asarray(Delaunay(local_input).simplices, dtype=int)
+    except (QhullError, ValueError):
+        return False, ["local_delaunay_failed"]
+    polygon = Polygon(state.points[np.asarray(ring, dtype=int)])
+    centroids = np.mean(local_input[simplices], axis=1)
+    inside = np.asarray(contains_xy(polygon, centroids[:, 0], centroids[:, 1]), dtype=bool)
+    simplices = simplices[inside]
+    if not len(simplices):
+        return False, ["no_triangles_inside_patch"]
+    new_ids = list(range(len(state.points), len(state.points) + len(support)))
+    local_to_global = np.asarray([*patch_nodes, *new_ids], dtype=int)
+    replacement = local_to_global[simplices]
+    trial_points = np.vstack([state.points, support]) if len(support) else state.points.copy()
+    replacement = _orient_ccw(trial_points, replacement)
+    ring_edges = {
+        tuple(sorted((int(ring[index]), int(ring[(index + 1) % len(ring)]))))
+        for index in range(len(ring))
+    }
+    replacement_edges = _edge_set(replacement)
+    if not ring_edges.issubset(replacement_edges):
+        return False, ["patch_boundary_edge_missing"]
+    protected_inside = chain_edges(state.chains) & _edge_set(state.triangles[patch])
+    if not protected_inside.issubset(replacement_edges):
+        return False, ["protected_edge_missing"]
+    old_geometry = triangle_geometry(state.points, state.triangles[patch])
+    old_area = float(np.sum(old_geometry["area"]))
+    new_geometry = triangle_geometry(trial_points, replacement)
+    if np.any(new_geometry["signed_area"] <= _area_tolerance(trial_points, replacement)):
+        return False, ["nonpositive_replacement_area"]
+    new_area = float(np.sum(new_geometry["area"]))
+    if abs(new_area - old_area) > 1.0e-8 * max(old_area, 1.0):
+        return False, ["patch_area_mismatch"]
+    minimum_angles = np.min(new_geometry["angles_deg"], axis=1)
+    old_minimum_angles = np.min(old_geometry["angles_deg"], axis=1)
+    old_superthin = int(
+        np.count_nonzero(
+            (old_geometry["quality"] < float(config.superthin_quality_threshold))
+            | (old_minimum_angles < float(config.superthin_min_angle_deg))
+        )
+    )
+    new_superthin = int(
+        np.count_nonzero(
+            (new_geometry["quality"] < float(config.superthin_quality_threshold))
+            | (minimum_angles < float(config.superthin_min_angle_deg))
+        )
+    )
+    if new_superthin >= old_superthin:
+        return False, ["replacement_does_not_reduce_patch_superthin"]
+    if len(support):
+        feature_target = component.get("local_feature_target_m")
+        fallback = float(np.median(state.targets[np.asarray(patch_nodes, dtype=int)]))
+        targets = np.asarray(
+            [
+                _sample_target_at(state, point, fallback=fallback)
+                for point in support
+            ],
+            dtype=float,
+        )
+        if feature_target is not None and np.isfinite(float(feature_target)):
+            targets = np.minimum(targets, float(feature_target))
+        state.points = trial_points
+        state.fixed = np.concatenate([state.fixed, np.zeros(len(support), dtype=bool)])
+        state.targets = np.concatenate([state.targets, targets])
+        state.kinds.extend(["interior"] * len(support))
+        state.hard = np.concatenate([state.hard, np.zeros(len(support), dtype=bool)])
+        state.lineage = np.concatenate([state.lineage, _new_lineage_ids(state, len(support))])
+    keep = np.ones(len(state.triangles), dtype=bool)
+    keep[patch] = False
+    state.triangles = _orient_ccw(state.points, np.vstack([state.triangles[keep], replacement]))
+    state.last_affected = sorted(set(map(int, np.unique(replacement))))
+    state.ledger.append(
+        {
+            "operation": "systematic-cavity-retriangulation",
+            "component_id": component["component_id"],
+            "classification": component["classification"],
+            "patch_triangle_count": int(len(patch)),
+            "replacement_triangle_count": int(len(replacement)),
+            "inserted_support_node_count": int(len(support)),
+            "removed_movable_component_node_count": int(len(removable_component_nodes)),
+            "local_feature_target_m": component.get("local_feature_target_m"),
+        }
+    )
+    _compact(state)
+    return True, []
+
+
+def _failure_counts(attempts: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for attempt in attempts:
+        for failure in attempt.get("failures", []):
+            counts[str(failure)] = counts.get(str(failure), 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _connectivity_nonregression(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> bool:
+    """Apply the topology-only acceptance contract for one restriction."""
+    topology_ok = bool(
+        after["singly_connected_triangle_count"]
+        <= before["singly_connected_triangle_count"]
+        and after["boundary_degree_anomaly_count"]
+        <= before["boundary_degree_anomaly_count"]
+        and after["boundary_component_count"]
+        == before["boundary_component_count"]
+        and after["protected_edge_not_boundary_count"]
+        <= before["protected_edge_not_boundary_count"]
+    )
+    return bool(
+        topology_ok
+        and after["superthin_triangle_count"]
+        <= before["superthin_triangle_count"]
+        and after["q_min"] + 1.0e-12 >= before["q_min"]
+        and after["q_p01"] + 1.0e-9 >= before["q_p01"]
+        and after["q_l3_sigma"] + 1.0e-9
+        >= before["q_l3_sigma"]
+        and after["minimum_angle_deg"] + 1.0e-8
+        >= before["minimum_angle_deg"]
+        and after["l_over_h_count_above_1_55"]
+        <= before["l_over_h_count_above_1_55"]
+        and after["area_transition_count_above_0_50"]
+        <= before["area_transition_count_above_0_50"]
+        and after["count_valence_above_limit"]
+        <= before["count_valence_above_limit"]
+        and after["valence_excess_sum"]
+        <= before["valence_excess_sum"]
+    )
+
+
+def _deadline_reached(config: AggressiveConditioningConfig, *, reserve_seconds: float = 0.0) -> bool:
+    deadline = config.deadline_monotonic_s
+    return bool(
+        deadline is not None
+        and time.perf_counter() + max(0.0, float(reserve_seconds)) >= float(deadline)
+    )
 
 
 def _select_boundary_ear_triangle(
@@ -1038,6 +5297,44 @@ def _weld_vertex_to_boundary_arc(
     affected = set(map(int, topology.node_neighbors[int(node)]))
     affected.update((a, b, int(node)))
     old_point = state.points[int(node)].copy()
+    if str(config.thin_repair_profile) == "systematic-v3":
+        snap_limit = float(config.systematic_v3_weld_snap_fraction) * max(
+            _edge_target(state.targets, edge),
+            1.0e-12,
+        )
+        snap_target = min(
+            (a, b),
+            key=lambda value: float(np.linalg.norm(projection - state.points[int(value)])),
+        )
+        snap_distance = float(np.linalg.norm(projection - state.points[int(snap_target)]))
+        if snap_distance <= snap_limit:
+            state.triangles[state.triangles == int(node)] = int(snap_target)
+            keep = np.asarray(
+                [len(set(map(int, values))) == 3 for values in state.triangles],
+                dtype=bool,
+            )
+            state.triangles = _orient_ccw(state.points, state.triangles[keep])
+            actual_area_change = abs(_signed_mesh_area(state.points, state.triangles) - signed_area_before)
+            if not _boundary_area_budget_allows(state, actual_area_change, config):
+                return False, ["domain_area_budget"]
+            state.last_affected = sorted(affected)
+            state.cumulative_boundary_area_change_m2 += actual_area_change
+            state.ledger.append(
+                {
+                    "operation": "boundary-arc-weld-snap",
+                    "welded_original_node": int(state.lineage[int(node)]),
+                    "target_original_node": int(state.lineage[int(snap_target)]),
+                    "target_is_hard_anchor": bool(state.hard[int(snap_target)]),
+                    "parent_edge_original_nodes": [int(state.lineage[a]), int(state.lineage[b])],
+                    "projection_fraction": float(fraction),
+                    "weld_distance_m": float(distance),
+                    "snap_distance_m": float(snap_distance),
+                    "intermediate_degenerate_triangles_removed": int(np.count_nonzero(~keep)),
+                    "actual_signed_domain_area_change_m2": float(actual_area_change),
+                }
+            )
+            _compact(state)
+            return True, []
     state.points[int(node)] = projection
     state.fixed[int(node)] = True
     state.hard[int(node)] = False
@@ -1126,16 +5423,18 @@ def _boundary_weld_geometry(
         chain = state.chains[chain_index]
         anchor_buffer = max(0, int(config.boundary_weld_anchor_buffer_segments))
         nearby = _cyclic_chain_window(chain, position, anchor_buffer)
-        if any(state.hard[value] for value in nearby):
+        if str(config.thin_repair_profile) != "systematic-v3" and any(state.hard[value] for value in nearby):
             failures.append("hard_anchor_buffer")
         junction_buffer = max(0, int(config.boundary_weld_junction_buffer_segments))
         junction_nodes = _cyclic_chain_window(chain, position, junction_buffer)
         junction_kinds = {str(state.kinds[value]) for value in junction_nodes}
         if len(junction_kinds) > 1:
             failures.append("boundary_kind_junction_buffer")
-    clearance = _minimum_remote_boundary_clearance(state, projection, edge)
-    if np.isfinite(clearance) and clearance < float(config.boundary_weld_channel_clearance_fraction) * h:
-        failures.append("narrow_channel_semantic_guard")
+    clearance_fraction = float(config.boundary_weld_channel_clearance_fraction)
+    if clearance_fraction > 0.0:
+        clearance = _minimum_remote_boundary_clearance(state, projection, edge)
+        if np.isfinite(clearance) and clearance < clearance_fraction * h:
+            failures.append("narrow_channel_semantic_guard")
     return (fraction, projection, distance, h), sorted(set(failures))
 
 
@@ -1212,6 +5511,8 @@ def _thin_rejection(
         failures.append("l_over_h_p95_regression")
     if trial["l_over_h_count_above_1_55"] > before["l_over_h_count_above_1_55"]:
         failures.append("l_over_h_excess_count_increase")
+    if trial["area_transition_count_above_0_50"] > before["area_transition_count_above_0_50"]:
+        failures.append("area_transition_excess_count_increase")
     if trial["count_valence_above_limit"] > before["count_valence_above_limit"]:
         failures.append("valence_gate_regression")
     if trial["singly_connected_triangle_count"] > before["singly_connected_triangle_count"]:
@@ -1334,7 +5635,12 @@ def _split_boundary_edge(state: _State, edge: tuple[int, int], config: Aggressiv
     if len(opposite) != 1:
         return False
     new_node = len(state.points)
-    state.points = np.vstack([state.points, 0.5 * (state.points[a] + state.points[b])])
+    new_point = 0.5 * (state.points[a] + state.points[b])
+    if str(config.thin_repair_profile) == "systematic-v3":
+        source_midpoint = _source_arc_midpoint(state, chain_index, a, b)
+        if source_midpoint is not None:
+            new_point = source_midpoint
+    state.points = np.vstack([state.points, new_point])
     state.fixed = np.concatenate([state.fixed, np.asarray([True])])
     state.targets = np.concatenate([state.targets, np.asarray([_edge_target(state.targets, edge)])])
     state.kinds.append(state.kinds[a])
@@ -2104,6 +6410,7 @@ def _triangulate_ring_greedy(
     limit: int,
     *,
     removed_node: int | None = None,
+    edge_allowed: Callable[[tuple[int, int]], bool] | None = None,
 ) -> np.ndarray | None:
     if len(ring) < 3:
         return None
@@ -2118,6 +6425,20 @@ def _triangulate_ring_greedy(
     existing = {tuple(sorted((int(vertices[i]), int(vertices[(i + 1) % len(vertices)])))) for i in range(len(vertices))}
     output: list[list[int]] = []
     while len(vertices) > 3:
+        active_polygon = Polygon(
+            points[np.asarray(vertices, dtype=int)]
+        )
+        span = np.ptp(
+            points[np.asarray(vertices, dtype=int)],
+            axis=0,
+        )
+        coverage_tolerance = max(
+            1.0e-12,
+            1.0e-12 * float(np.max(span)),
+        )
+        if not active_polygon.is_valid or active_polygon.area <= 0.0:
+            return None
+        covered_polygon = active_polygon.buffer(coverage_tolerance)
         ears: list[tuple[tuple[float, ...], int, list[int], tuple[int, int]]] = []
         for index, current in enumerate(vertices):
             previous = int(vertices[index - 1])
@@ -2126,9 +6447,23 @@ def _triangulate_ring_greedy(
             geometry = triangle_geometry(points, np.asarray([triangle], dtype=int))
             if geometry["signed_area"][0] <= _area_tolerance(points, np.asarray([triangle], dtype=int)):
                 continue
+            ear_polygon = Polygon(
+                points[np.asarray(triangle, dtype=int)]
+            )
+            if (
+                not ear_polygon.is_valid
+                or not covered_polygon.covers(ear_polygon)
+            ):
+                continue
             if any(_point_in_triangle(points[value], points[np.asarray(triangle, dtype=int)]) for value in vertices if value not in triangle):
                 continue
             diagonal = tuple(sorted((previous, following)))
+            if (
+                diagonal not in existing
+                and edge_allowed is not None
+                and not bool(edge_allowed(diagonal))
+            ):
+                continue
             add = 0 if diagonal in existing else 1
             pred_prev = int(simulated[previous] + add)
             pred_next = int(simulated[following] + add)
@@ -2542,6 +6877,53 @@ def _micro_relax(state: _State, replacement_seed_nodes: list[int], config: Aggre
         state.targets[patch_nodes] = _sample_targets(state, state.points[patch_nodes], fallback=state.targets[patch_nodes])
 
 
+def _restricted_edge_violation_records(
+    state: _State,
+    *,
+    topology: Any | None = None,
+) -> list[dict[str, Any]]:
+    if not state.restricted_lineage_edges:
+        return []
+    topology = (
+        topology
+        if topology is not None
+        else build_edge_topology(
+            len(state.points),
+            state.triangles,
+        )
+    )
+    records: list[dict[str, Any]] = []
+    for edge in sorted(topology.edge_to_triangles):
+        a, b = map(int, edge)
+        lineage_edge = tuple(
+            sorted(
+                (
+                    int(state.lineage[a]),
+                    int(state.lineage[b]),
+                )
+            )
+        )
+        if lineage_edge in state.restricted_lineage_edges:
+            records.append(
+                {
+                    "edge": [a, b],
+                    "lineage_edge": list(
+                        map(int, lineage_edge)
+                    ),
+                    "attached_triangle_indices": list(
+                        map(
+                            int,
+                            topology.edge_to_triangles.get(
+                                edge,
+                                [],
+                            ),
+                        )
+                    ),
+                }
+            )
+    return records
+
+
 def _summary(
     state: _State,
     config: AggressiveConditioningConfig,
@@ -2563,6 +6945,11 @@ def _summary(
     boundary_audit = _boundary_graph_audit(topology)
     protected = chain_edges(state.chains)
     protected_not_boundary = sum(len(topology.edge_to_triangles.get(edge, [])) != 1 for edge in protected)
+    area_transition = _area_transition_tail(geometry["area"], topology)
+    restricted_violations = _restricted_edge_violation_records(
+        state,
+        topology=topology,
+    )
     superthin_severity = float(
         np.sum(
             np.maximum(
@@ -2603,6 +6990,8 @@ def _summary(
         "l_over_h_p95": float(np.quantile(l_over_h, 0.95)) if len(l_over_h) else 0.0,
         "l_over_h_maximum": float(np.max(l_over_h)) if len(l_over_h) else 0.0,
         "l_over_h_count_above_1_55": int(np.count_nonzero(l_over_h > 1.55)),
+        "area_transition_count_above_0_50": int(area_transition["count_above_0_50"]),
+        "area_transition_maximum": float(area_transition["maximum"]),
         "connected_component_count": int(len(topology.connected_component_sizes)),
         "nonmanifold_edge_count": int(len(topology.nonmanifold_edges)),
         "nonpositive_signed_area_count": int(np.count_nonzero(geometry["signed_area"] <= _area_tolerance(state.points, state.triangles))),
@@ -2610,11 +6999,30 @@ def _summary(
         "boundary_degree_anomaly_count": int(boundary_audit["degree_anomaly_count"]),
         "boundary_component_count": int(boundary_audit["component_count"]),
         "protected_edge_not_boundary_count": int(protected_not_boundary),
+        "restricted_edge_violation_count": int(
+            len(restricted_violations)
+        ),
     }
 
 
 def _summary_from(value: dict[str, Any]) -> dict[str, Any]:
     return dict(value)
+
+
+def _area_transition_tail(areas: np.ndarray, topology: Any) -> dict[str, Any]:
+    values: list[float] = []
+    area_values = np.asarray(areas, dtype=float)
+    for attached in topology.edge_to_triangles.values():
+        if len(attached) != 2:
+            continue
+        first, second = map(int, attached)
+        denominator = max(float(area_values[first]), float(area_values[second]), 1.0e-30)
+        values.append(abs(float(area_values[first]) - float(area_values[second])) / denominator)
+    array = np.asarray(values, dtype=float)
+    return {
+        "count_above_0_50": int(np.count_nonzero(array > 0.50)),
+        "maximum": float(np.max(array)) if len(array) else 0.0,
+    }
 
 
 def _nonregression(
@@ -2660,6 +7068,7 @@ def _nonregression(
             and after["minimum_angle_deg"] + 1.0e-8 >= before["minimum_angle_deg"]
             and after["l_over_h_p95"] <= 1.001 * max(before["l_over_h_p95"], 1.0e-12)
             and after["l_over_h_count_above_1_55"] <= before["l_over_h_count_above_1_55"]
+            and after["area_transition_count_above_0_50"] <= before["area_transition_count_above_0_50"]
             and after["count_valence_above_limit"] <= before["count_valence_above_limit"]
         )
     size_ok = bool(
@@ -2688,6 +7097,7 @@ def _state_invariants(
     *,
     geometry: dict[str, np.ndarray] | None = None,
     topology: Any | None = None,
+    allow_new_singly_connected: bool = False,
 ) -> tuple[bool, dict[str, Any]]:
     geometry = geometry if geometry is not None else triangle_geometry(state.points, state.triangles)
     topology = topology if topology is not None else build_edge_topology(len(state.points), state.triangles)
@@ -2712,6 +7122,10 @@ def _state_invariants(
         if int(value) in lineage_to_node
         and not np.array_equal(state.points[lineage_to_node[int(value)]], state.source_points[int(value)])
     ]
+    restricted_violations = _restricted_edge_violation_records(
+        state,
+        topology=topology,
+    )
     report = {
         "positive_signed_areas": positive,
         "all_protected_edges_present": bool(not state.chains or integrity["all_protected_edges_present"]),
@@ -2738,6 +7152,10 @@ def _state_invariants(
         "moved_hard_anchor_count": int(len(moved_hard)),
         "missing_hard_anchor_lineage": missing_hard[:100],
         "moved_hard_anchor_lineage": moved_hard[:100],
+        "restricted_edge_violation_count": int(
+            len(restricted_violations)
+        ),
+        "restricted_edge_violations": restricted_violations[:100],
         "constraint_integrity": integrity,
     }
     ok = bool(
@@ -2747,7 +7165,7 @@ def _state_invariants(
         and report["connected_component_count"] == int(initial_components)
         and report["nonmanifold_edge_count"] == 0
         and report["unused_node_count"] == 0
-        and report["new_singly_connected_triangle_count"] == 0
+        and (allow_new_singly_connected or report["new_singly_connected_triangle_count"] == 0)
         and report["boundary_traversable"]
         and report["protected_edge_not_boundary_count"] <= int(state.initial_protected_not_boundary_count)
         and report["duplicate_triangle_count"] == 0
@@ -2756,6 +7174,7 @@ def _state_invariants(
         and report["chain_unique_nodes"]
         and report["missing_hard_anchor_count"] == 0
         and report["moved_hard_anchor_count"] == 0
+        and report["restricted_edge_violation_count"] == 0
     )
     return ok, report
 
@@ -2773,7 +7192,30 @@ def _audit_state(
         initial_components,
         geometry=geometry,
         topology=topology,
+        allow_new_singly_connected=str(config.systematic_gate_scope) == "loop-end",
     )
+    if (
+        str(config.thin_repair_profile) == "systematic-v5"
+        and not bool(
+            config.systematic_v5_enable_boundary_window_fallback
+        )
+    ):
+        source_open = tuple(
+            map(
+                int,
+                np.asarray(state.source_open_nodes, dtype=int),
+            )
+        )
+        delivered_open = _open_boundary_lineage_sequence(state)
+        unchanged = bool(delivered_open == source_open)
+        invariants["open_boundary_membership_unchanged"] = unchanged
+        invariants["source_open_boundary_count"] = int(
+            len(source_open)
+        )
+        invariants["delivered_open_boundary_count"] = int(
+            len(delivered_open)
+        )
+        ok = bool(ok and unchanged)
     summary = _summary(state, config, geometry=geometry, topology=topology)
     return ok, invariants, summary
 
@@ -2786,6 +7228,9 @@ def _failed_invariant_names(report: dict[str, Any]) -> list[str]:
         "boundary_traversable": report.get("boundary_traversable"),
         "chain_node_range_ok": report.get("chain_node_range_ok"),
         "chain_unique_nodes": report.get("chain_unique_nodes"),
+        "open_boundary_membership_unchanged": report.get(
+            "open_boundary_membership_unchanged"
+        ),
     }
     failures = [name for name, value in boolean_gates.items() if value is False]
     count_gates = {
@@ -2796,6 +7241,10 @@ def _failed_invariant_names(report: dict[str, Any]) -> list[str]:
         "repeated_node_triangles": report.get("repeated_node_triangle_count", 0),
         "missing_hard_anchors": report.get("missing_hard_anchor_count", 0),
         "moved_hard_anchors": report.get("moved_hard_anchor_count", 0),
+        "restricted_edges": report.get(
+            "restricted_edge_violation_count",
+            0,
+        ),
     }
     failures.extend(name for name, value in count_gates.items() if int(value) > 0)
     return sorted(set(failures or ["structural_invariant"]))
@@ -2854,6 +7303,8 @@ def _restore(state: _State, snapshot: _State) -> None:
     state.lineage = snapshot.lineage
     state.source_points = snapshot.source_points
     state.source_chains = snapshot.source_chains
+    state.source_open_nodes = snapshot.source_open_nodes
+    state.source_kinds = snapshot.source_kinds
     state.source_hard_anchor_lineage = snapshot.source_hard_anchor_lineage
     state.target_sampler = snapshot.target_sampler
     state.initial_domain_area_m2 = snapshot.initial_domain_area_m2
@@ -2861,6 +7312,7 @@ def _restore(state: _State, snapshot: _State) -> None:
     state.initial_boundary_degree_anomaly_count = snapshot.initial_boundary_degree_anomaly_count
     state.initial_singly_connected_triangle_count = snapshot.initial_singly_connected_triangle_count
     state.initial_protected_not_boundary_count = snapshot.initial_protected_not_boundary_count
+    state.restricted_lineage_edges = set(snapshot.restricted_lineage_edges)
     state.ledger = snapshot.ledger
     state.cumulative_boundary_area_change_m2 = snapshot.cumulative_boundary_area_change_m2
     state.last_affected = snapshot.last_affected
@@ -2989,6 +7441,320 @@ def _source_arc_edge(state: _State, edge: tuple[int, int]) -> tuple[np.ndarray, 
     ):
         return None
     return state.source_points[source_a].copy(), state.source_points[source_b].copy()
+
+
+def _source_chain_curve(state: _State, chain_index: int) -> tuple[np.ndarray, np.ndarray, float] | None:
+    if not 0 <= int(chain_index) < len(state.source_chains):
+        return None
+    source_chain = list(map(int, state.source_chains[int(chain_index)]))
+    if len(source_chain) < 2:
+        return None
+    coordinates = state.source_points[np.asarray([*source_chain, source_chain[0]], dtype=int)]
+    lengths = np.linalg.norm(np.diff(coordinates, axis=0), axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(lengths)])
+    total = float(cumulative[-1])
+    if not np.isfinite(total) or total <= 1.0e-12:
+        return None
+    return coordinates, cumulative, total
+
+
+def _project_to_source_arc(
+    state: _State,
+    chain_index: int,
+    point: np.ndarray,
+) -> tuple[float, np.ndarray, float] | None:
+    curve = _source_chain_curve(state, chain_index)
+    if curve is None:
+        return None
+    coordinates, cumulative, total = curve
+    best: tuple[float, float, np.ndarray] | None = None
+    for index, (left, right) in enumerate(zip(coordinates[:-1], coordinates[1:])):
+        vector = right - left
+        denominator = float(np.dot(vector, vector))
+        fraction = (
+            0.0
+            if denominator <= 1.0e-20
+            else float(np.clip(np.dot(np.asarray(point, dtype=float) - left, vector) / denominator, 0.0, 1.0))
+        )
+        projection = left + fraction * vector
+        distance = float(np.linalg.norm(np.asarray(point, dtype=float) - projection))
+        s = float(cumulative[index] + fraction * (cumulative[index + 1] - cumulative[index]))
+        candidate = (distance, s, projection)
+        if best is None or (candidate[0], candidate[1]) < (best[0], best[1]):
+            best = candidate
+    if best is None:
+        return None
+    return float(best[1] % total), best[2].copy(), float(best[0])
+
+
+def _interpolate_source_arc(state: _State, chain_index: int, s: float) -> np.ndarray | None:
+    curve = _source_chain_curve(state, chain_index)
+    if curve is None:
+        return None
+    coordinates, cumulative, total = curve
+    value = float(s % total)
+    index = int(np.searchsorted(cumulative, value, side="right") - 1)
+    index = min(max(index, 0), len(coordinates) - 2)
+    span = float(cumulative[index + 1] - cumulative[index])
+    fraction = 0.0 if span <= 1.0e-20 else (value - float(cumulative[index])) / span
+    return coordinates[index] + float(fraction) * (coordinates[index + 1] - coordinates[index])
+
+
+def _source_arc_midpoint(
+    state: _State,
+    chain_index: int,
+    first: int,
+    second: int,
+) -> np.ndarray | None:
+    chain = state.chains[int(chain_index)]
+    edge_pos = _find_chain_edge([chain], (int(first), int(second)))
+    if edge_pos is None:
+        return None
+    _, position = edge_pos
+    left = int(chain[position])
+    right = int(chain[(position + 1) % len(chain)])
+    left_projection = _project_to_source_arc(state, chain_index, state.points[left])
+    right_projection = _project_to_source_arc(state, chain_index, state.points[right])
+    curve = _source_chain_curve(state, chain_index)
+    if left_projection is None or right_projection is None or curve is None:
+        return None
+    total = float(curve[2])
+    delta = (float(right_projection[0]) - float(left_projection[0])) % total
+    return _interpolate_source_arc(state, chain_index, float(left_projection[0]) + 0.5 * delta)
+
+
+def _target_equalized_source_arc_positions(
+    state: _State,
+    chain_index: int,
+    nodes: list[int],
+) -> list[np.ndarray] | None:
+    if len(nodes) < 3:
+        return None
+    curve = _source_chain_curve(state, chain_index)
+    left = _project_to_source_arc(state, chain_index, state.points[int(nodes[0])])
+    right = _project_to_source_arc(state, chain_index, state.points[int(nodes[-1])])
+    if curve is None or left is None or right is None:
+        return None
+    total = float(curve[2])
+    delta = (float(right[0]) - float(left[0])) % total
+    if delta <= 1.0e-9 or delta >= 0.90 * total:
+        return None
+    sample_count = 129
+    fractions = np.linspace(0.0, 1.0, sample_count)
+    h_left = max(float(state.targets[int(nodes[0])]), 1.0e-12)
+    h_right = max(float(state.targets[int(nodes[-1])]), 1.0e-12)
+    h = (1.0 - fractions) * h_left + fractions * h_right
+    ds = delta / float(sample_count - 1)
+    density = 1.0 / np.maximum(h, 1.0e-12)
+    metric = np.concatenate(
+        [[0.0], np.cumsum(0.5 * (density[:-1] + density[1:]) * ds)]
+    )
+    if metric[-1] <= 1.0e-20:
+        return None
+    output: list[np.ndarray] = []
+    count = len(nodes) - 2
+    for rank in range(1, count + 1):
+        target_metric = float(metric[-1]) * float(rank) / float(count + 1)
+        fraction = float(np.interp(target_metric, metric, fractions))
+        point = _interpolate_source_arc(
+            state,
+            chain_index,
+            float(left[0]) + fraction * delta,
+        )
+        if point is None:
+            return None
+        output.append(np.asarray(point, dtype=float))
+    return output
+
+
+def _source_arc_fractional_move(
+    state: _State,
+    chain_index: int,
+    current_point: np.ndarray,
+    target_point: np.ndarray,
+    fraction: float,
+) -> np.ndarray | None:
+    current = _project_to_source_arc(state, chain_index, current_point)
+    target = _project_to_source_arc(state, chain_index, target_point)
+    curve = _source_chain_curve(state, chain_index)
+    if current is None or target is None or curve is None:
+        return None
+    total = float(curve[2])
+    delta = float(target[0]) - float(current[0])
+    if delta > 0.5 * total:
+        delta -= total
+    elif delta < -0.5 * total:
+        delta += total
+    return _interpolate_source_arc(
+        state,
+        chain_index,
+        float(current[0]) + float(np.clip(fraction, 0.0, 1.0)) * delta,
+    )
+
+
+def _maximum_boundary_source_arc_deviation(state: _State) -> float:
+    maximum = 0.0
+    for chain_index, chain in enumerate(state.chains):
+        for node in chain:
+            lineage = int(state.lineage[int(node)])
+            if (
+                0 <= lineage < len(state.source_points)
+                and np.array_equal(state.points[int(node)], state.source_points[lineage])
+            ):
+                continue
+            projection = _project_to_source_arc(state, chain_index, state.points[int(node)])
+            if projection is None:
+                return float("inf")
+            maximum = max(maximum, float(projection[2]))
+    return float(maximum)
+
+
+def _boundary_loops_simple(state: _State) -> bool:
+    for chain in state.chains:
+        if len(chain) < 3:
+            return False
+        coordinates = state.points[np.asarray([*chain, chain[0]], dtype=int)]
+        line = LineString(coordinates)
+        if not line.is_valid or not line.is_simple:
+            return False
+    return True
+
+
+def _chain_pair_clearance(state: _State, first: int, second: int) -> float:
+    if not (0 <= int(first) < len(state.chains) and 0 <= int(second) < len(state.chains)):
+        return float("nan")
+    left = state.chains[int(first)]
+    right = state.chains[int(second)]
+    if len(left) < 2 or len(right) < 2:
+        return float("nan")
+    left_line = LineString(state.points[np.asarray([*left, left[0]], dtype=int)])
+    right_line = LineString(state.points[np.asarray([*right, right[0]], dtype=int)])
+    return float(left_line.distance(right_line))
+
+
+def _component_passage_clearance(state: _State, component: dict[str, Any]) -> float | None:
+    chain_ids = list(map(int, component.get("boundary_chain_ids", [])))
+    if len(chain_ids) < 2:
+        return None
+    values = [
+        _chain_pair_clearance(state, first, second)
+        for first, second in combinations(chain_ids, 2)
+    ]
+    finite = [value for value in values if np.isfinite(value)]
+    return float(min(finite)) if finite else None
+
+
+def _passage_clearance_inventory(
+    state: _State,
+    config: AggressiveConditioningConfig,
+) -> dict[tuple[int, int], float]:
+    output: dict[tuple[int, int], float] = {}
+    for component in _inventory_superthin_components(state, config):
+        chain_ids = list(map(int, component.get("boundary_chain_ids", [])))
+        if len(chain_ids) < 2:
+            continue
+        for first, second in combinations(chain_ids, 2):
+            pair = tuple(sorted((int(first), int(second))))
+            value = _chain_pair_clearance(state, *pair)
+            if np.isfinite(value):
+                output[pair] = float(value)
+    return output
+
+
+def _obc_remap_manifest(state: _State) -> dict[str, Any]:
+    source_open = list(map(int, np.asarray(state.source_open_nodes, dtype=int)))
+    source_set = set(source_open)
+    delivered = list(map(int, np.asarray(state.open_nodes, dtype=int)))
+    delivered_lineage = [int(state.lineage[node]) for node in delivered]
+    source_positions: dict[int, tuple[int, float, float]] = {}
+    for source_node in source_open:
+        for chain_index, chain in enumerate(state.source_chains):
+            if int(source_node) in set(map(int, chain)):
+                projection = _project_to_source_arc(
+                    state,
+                    chain_index,
+                    state.source_points[int(source_node)],
+                )
+                curve = _source_chain_curve(state, chain_index)
+                if projection is not None and curve is not None:
+                    source_positions[int(source_node)] = (
+                        int(chain_index),
+                        float(projection[0]),
+                        float(curve[2]),
+                    )
+                break
+    entries: list[dict[str, Any]] = []
+    for order, node in enumerate(delivered):
+        lineage = int(state.lineage[node])
+        membership = _find_chain_node(state.chains, int(node))
+        chain_index = int(membership[0]) if membership is not None else -1
+        projection = (
+            _project_to_source_arc(state, chain_index, state.points[node])
+            if chain_index >= 0
+            else None
+        )
+        source_coordinate = (
+            state.source_points[lineage]
+            if 0 <= lineage < len(state.source_points)
+            else None
+        )
+        moved = bool(
+            source_coordinate is not None
+            and not np.allclose(state.points[node], source_coordinate, atol=1.0e-9, rtol=0.0)
+        )
+        if lineage in source_set:
+            status = "slid" if moved else "retained"
+        elif lineage >= 0:
+            status = "redistributed"
+        else:
+            status = "inserted"
+        candidates = [
+            (abs(float(source_s) - float(projection[0])), source_node)
+            for source_node, (source_chain, source_s, _) in source_positions.items()
+            if projection is not None and int(source_chain) == chain_index
+        ]
+        nearest = [int(value[1]) for value in sorted(candidates)[:2]]
+        entries.append(
+            {
+                "delivered_order_zero_based": int(order),
+                "delivered_node_index_zero_based": int(node),
+                "status": status,
+                "source_node_lineage": lineage if lineage >= 0 else None,
+                "bracketing_original_obc_lineage": nearest,
+                "constraint_chain_id": chain_index,
+                "source_arc_position_m": float(projection[0]) if projection is not None else None,
+                "source_arc_fraction": (
+                    float(projection[0] / _source_chain_curve(state, chain_index)[2])
+                    if projection is not None and _source_chain_curve(state, chain_index) is not None
+                    else None
+                ),
+                "coordinate_xy": [float(state.points[node, 0]), float(state.points[node, 1])],
+            }
+        )
+    compatible = bool(
+        len(delivered) == len(source_open)
+        and delivered_lineage == source_open
+        and all(entry["status"] == "retained" for entry in entries)
+    )
+    return {
+        "schema_version": "fvcom_obc_remap_manifest_v1",
+        "original_obc_count": int(len(source_open)),
+        "delivered_obc_count": int(len(delivered)),
+        "obc_forcing_compatible": compatible,
+        "forcing_invalidation_required": not compatible,
+        "orientation_preserved": bool(
+            not source_open
+            or not delivered_lineage
+            or (
+                delivered_lineage[0] == source_open[0]
+                and delivered_lineage[-1] == source_open[-1]
+            )
+        ),
+        "removed_original_obc_lineage": [
+            int(node) for node in source_open if int(node) not in set(delivered_lineage)
+        ],
+        "delivered_nodes": entries,
+    }
 
 
 def _cyclic_chain_window(chain: list[int], edge_position: int, radius: int) -> set[int]:
