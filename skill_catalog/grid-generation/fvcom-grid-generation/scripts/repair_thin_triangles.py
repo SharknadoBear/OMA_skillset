@@ -24,6 +24,7 @@ from fvcom_grid_generation.regional_conditioning import (  # noqa: E402
     repair_thin_triangles,
 )
 from fvcom_grid_generation.sms_2dm import read_2dm, write_2dm  # noqa: E402
+from fvcom_grid_generation.systematic_v6 import SystematicV6LoopConfig, run_systematic_v6_loop  # noqa: E402
 from condition_mesh_local import (  # noqa: E402
     _boundary_geojson,
     _boundary_metadata,
@@ -41,7 +42,7 @@ def main() -> int:
     parser.add_argument("--name", help="Output MESHNAME; defaults to <input-name>_thin_repaired.")
     parser.add_argument(
         "--thin-repair-profile",
-        choices=("guarded-v1", "systematic-v2", "systematic-v3", "systematic-v5", "none"),
+        choices=("guarded-v1", "systematic-v2", "systematic-v3", "systematic-v5", "systematic-v6", "none"),
         default="guarded-v1",
         help="Choose guarded-v1, systematic-v2, boundary-adaptive systematic-v3, locked-star systematic-v5, or none.",
     )
@@ -63,6 +64,11 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument("--systematic-v6-total-iterations", type=int, default=1000)
+    parser.add_argument("--systematic-v6-max-cycles", type=int, default=12)
+    parser.add_argument("--systematic-v6-max-closure-rounds", type=int, default=8)
+    parser.add_argument("--systematic-v6-wall-time-s", type=float, default=28800.0)
+    parser.add_argument("--systematic-v6-final-audit-reserve-s", type=float, default=3600.0)
     parser.add_argument("--boundary-nodes-geojson")
     parser.add_argument("--output-boundary-nodes")
     parser.add_argument("--output-obc-remap-manifest")
@@ -123,7 +129,7 @@ def main() -> int:
     fixed = _fixed_boundary_mask(len(nodes_xy), chains)
     region_bbox_xy = _project_bbox(args.region_bbox, projection) if args.region_bbox else None
 
-    if args.thin_repair_profile in {"systematic-v2", "systematic-v3", "systematic-v5"}:
+    if args.thin_repair_profile in {"systematic-v2", "systematic-v3", "systematic-v5", "systematic-v6"}:
         systematic_profile = str(args.thin_repair_profile)
         if args.region_bbox:
             parser.error(f"--region-bbox is not supported by {systematic_profile}; connected components define local patches")
@@ -142,20 +148,11 @@ def main() -> int:
             targets[:] = float(args.target_spacing_m)
         explicit = np.isfinite(explicit_targets) & (explicit_targets > 0.0)
         targets[explicit] = explicit_targets[explicit]
-        systematic = condition_mesh_aggressive(
-            nodes_xy,
-            triangles_zero,
-            fixed,
-            chains,
-            open_zero,
-            target_spacing_m=targets,
-            boundary_kinds=kinds,
-            hard_anchor_mask=hard,
-            config=AggressiveConditioningConfig(
+        topology_config = AggressiveConditioningConfig(
                 thin_repair_profile=systematic_profile,
                 systematic_v3_obc_policy=str(args.systematic_v3_obc_policy),
                 systematic_gate_scope=(
-                    "loop-end" if systematic_profile == "systematic-v5" else "candidate"
+                    "loop-end" if systematic_profile in {"systematic-v5", "systematic-v6"} else "candidate"
                 ),
                 systematic_v5_max_star_transactions_per_round=int(
                     args.systematic_v5_max_star_transactions
@@ -171,17 +168,59 @@ def main() -> int:
                 ),
                 deadline_monotonic_s=(
                     time.perf_counter() + float(args.systematic_v5_wall_time_s)
-                    if systematic_profile == "systematic-v5"
+                    if systematic_profile in {"systematic-v5", "systematic-v6"}
                     else None
                 ),
                 max_rounds=int(args.max_passes),
                 enable_pruning=False,
                 enable_thin_repair=True,
-                enable_valence_repair=False,
+                enable_valence_repair=bool(systematic_profile == "systematic-v6"),
                 max_prunes_per_round=0,
-                max_valence_removals_per_round=0,
-            ),
-        )
+                max_valence_removals_per_round=(
+                    500 if systematic_profile == "systematic-v6" else 0
+                ),
+            )
+        if systematic_profile == "systematic-v6":
+            systematic = run_systematic_v6_loop(
+                nodes_xy,
+                triangles_zero,
+                fixed,
+                chains,
+                open_zero,
+                target_spacing_m=targets,
+                boundary_kinds=kinds,
+                hard_anchor_mask=hard,
+                topology_config=topology_config,
+                loop_config=SystematicV6LoopConfig(
+                    maximum_closure_rounds=int(
+                        args.systematic_v6_max_closure_rounds
+                    ),
+                    maximum_relaxation_cycles=int(
+                        args.systematic_v6_max_cycles
+                    ),
+                    total_relaxation_iterations=int(
+                        args.systematic_v6_total_iterations
+                    ),
+                    wall_clock_seconds=float(
+                        args.systematic_v6_wall_time_s
+                    ),
+                    final_audit_reserve_seconds=float(
+                        args.systematic_v6_final_audit_reserve_s
+                    ),
+                ),
+            )
+        else:
+            systematic = condition_mesh_aggressive(
+                nodes_xy,
+                triangles_zero,
+                fixed,
+                chains,
+                open_zero,
+                target_spacing_m=targets,
+                boundary_kinds=kinds,
+                hard_anchor_mask=hard,
+                config=topology_config,
+            )
         depths = _remap_depths(mesh.depths, nodes_xy, systematic.nodes_xy, systematic.node_lineage)
         output_name = args.name or f"{mesh.mesh_name}_{systematic_profile.replace('-', '_')}"
         output_mesh = write_2dm(
@@ -493,6 +532,14 @@ def _validate_controls(args: argparse.Namespace, parser: argparse.ArgumentParser
         parser.error(
             "--systematic-v5-max-connectivity-transactions must be nonnegative"
         )
+    if (
+        args.systematic_v6_total_iterations < 0
+        or args.systematic_v6_max_cycles < 0
+        or args.systematic_v6_max_closure_rounds < 0
+        or args.systematic_v6_wall_time_s <= 0.0
+        or args.systematic_v6_final_audit_reserve_s < 0.0
+    ):
+        parser.error("systematic-v6 controls must be nonnegative with positive wall time")
     if args.split_target_factor <= 0.0 or args.relax_max_step_fraction <= 0.0 or args.relax_force_tolerance <= 0.0:
         parser.error("split factor, relaxation step fraction, and force tolerance must be positive")
     if not 0.0 < args.relax_damping <= 1.0 or args.relax_shape_weight < 0.0:

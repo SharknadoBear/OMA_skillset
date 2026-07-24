@@ -11,6 +11,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fvcom_grid_generation import GridConfig, run_fvcom_grid  # noqa: E402
+from fvcom_grid_generation.systematic_v6_policy import (  # noqa: E402
+    FIXED_GATE_POLICIES,
+)
 
 
 def main() -> int:
@@ -70,9 +73,13 @@ def main() -> int:
     parser.add_argument("--thin-triangle-repair", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--thin-repair-profile",
-        choices=("guarded-v1", "systematic-v2", "systematic-v3", "systematic-v5", "none"),
+        choices=("guarded-v1", "systematic-v2", "systematic-v3", "systematic-v5", "systematic-v6", "none"),
         default="guarded-v1",
-        help="Extreme-tail topology profile. systematic-v2, boundary-adaptive v3, and locked-star relaxation v5 are opt-in.",
+        help=(
+            "Extreme-tail topology profile. Systematic v2/v3, "
+            "connectivity-restricted v5, and coupled exact-zero v6 are "
+            "opt-in; auto behavior is unchanged."
+        ),
     )
     parser.add_argument(
         "--systematic-v3-obc-policy",
@@ -96,6 +103,31 @@ def main() -> int:
         "--systematic-v5-max-connectivity-transactions",
         type=int,
         default=32,
+    )
+    parser.add_argument("--systematic-v6-total-iterations", type=int, default=1000)
+    parser.add_argument("--systematic-v6-max-cycles", type=int, default=12)
+    parser.add_argument("--systematic-v6-max-closure-rounds", type=int, default=8)
+    parser.add_argument("--systematic-v6-max-burst", type=int, default=100)
+    parser.add_argument("--systematic-v6-checkpoint-interval", type=int, default=10)
+    parser.add_argument("--systematic-v6-wall-time-s", type=float, default=28800.0)
+    parser.add_argument("--systematic-v6-final-audit-reserve-s", type=float, default=3600.0)
+    parser.add_argument(
+        "--systematic-v6-gate-policy",
+        choices=FIXED_GATE_POLICIES,
+        default="strict-v6",
+        help=(
+            "Fixed whole-mesh V6 closure policy. Adaptive policy ladders "
+            "remain research-driver orchestration."
+        ),
+    )
+    parser.add_argument(
+        "--systematic-v6-passage-removal",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable research-only authorized whole-passage removal. "
+            "Disabled by default."
+        ),
     )
     parser.add_argument("--thin-triangle-quality-threshold", type=float, default=0.25)
     parser.add_argument("--thin-triangle-min-angle-deg", type=float, default=20.0)
@@ -190,6 +222,19 @@ def main() -> int:
             ),
             systematic_v5_max_connectivity_transactions=(
                 args.systematic_v5_max_connectivity_transactions
+            ),
+            systematic_v6_total_iterations=args.systematic_v6_total_iterations,
+            systematic_v6_max_cycles=args.systematic_v6_max_cycles,
+            systematic_v6_max_closure_rounds=args.systematic_v6_max_closure_rounds,
+            systematic_v6_max_burst=args.systematic_v6_max_burst,
+            systematic_v6_checkpoint_interval=args.systematic_v6_checkpoint_interval,
+            systematic_v6_wall_time_s=args.systematic_v6_wall_time_s,
+            systematic_v6_final_audit_reserve_s=(
+                args.systematic_v6_final_audit_reserve_s
+            ),
+            systematic_v6_gate_policy=args.systematic_v6_gate_policy,
+            systematic_v6_passage_removal=(
+                args.systematic_v6_passage_removal
             ),
             thin_triangle_quality_threshold=args.thin_triangle_quality_threshold,
             thin_triangle_min_angle_deg=args.thin_triangle_min_angle_deg,

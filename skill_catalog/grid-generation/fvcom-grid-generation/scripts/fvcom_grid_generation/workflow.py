@@ -38,6 +38,7 @@ from .size_field import (
     write_size_field,
 )
 from .sms_2dm import read_2dm, write_2dm
+from .systematic_v6_policy import FIXED_GATE_POLICIES
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,15 @@ class GridConfig:
     systematic_v5_wall_time_s: float = 21600.0
     systematic_v5_connectivity_restriction: bool = True
     systematic_v5_max_connectivity_transactions: int = 32
+    systematic_v6_total_iterations: int = 1000
+    systematic_v6_max_cycles: int = 12
+    systematic_v6_max_closure_rounds: int = 8
+    systematic_v6_max_burst: int = 100
+    systematic_v6_checkpoint_interval: int = 10
+    systematic_v6_wall_time_s: float = 28800.0
+    systematic_v6_final_audit_reserve_s: float = 3600.0
+    systematic_v6_gate_policy: str = "strict-v6"
+    systematic_v6_passage_removal: bool = False
     thin_triangle_quality_threshold: float = 0.25
     thin_triangle_min_angle_deg: float = 20.0
     thin_triangle_max_passes: int = 2
@@ -129,16 +139,32 @@ def run_fvcom_grid(
         "systematic-v2",
         "systematic-v3",
         "systematic-v5",
+        "systematic-v6",
         "none",
     }:
         raise ValueError(
-            "thin_repair_profile must be guarded-v1, systematic-v2, systematic-v3, systematic-v5, or none"
+            "thin_repair_profile must be guarded-v1, systematic-v2, systematic-v3, systematic-v5, systematic-v6, or none"
         )
     if config.systematic_v3_obc_policy not in {"preserve", "redistribute"}:
         raise ValueError("systematic_v3_obc_policy must be preserve or redistribute")
     if int(config.systematic_v5_max_connectivity_transactions) < 0:
         raise ValueError(
             "systematic_v5_max_connectivity_transactions must be nonnegative"
+        )
+    if (
+        int(config.systematic_v6_total_iterations) < 0
+        or int(config.systematic_v6_max_cycles) < 0
+        or int(config.systematic_v6_max_closure_rounds) < 0
+        or int(config.systematic_v6_max_burst) <= 0
+        or int(config.systematic_v6_checkpoint_interval) <= 0
+        or float(config.systematic_v6_wall_time_s) <= 0.0
+        or float(config.systematic_v6_final_audit_reserve_s) < 0.0
+    ):
+        raise ValueError("systematic_v6 controls are invalid")
+    if str(config.systematic_v6_gate_policy) not in FIXED_GATE_POLICIES:
+        raise ValueError(
+            "systematic_v6_gate_policy must be one of "
+            + ", ".join(FIXED_GATE_POLICIES)
         )
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -311,6 +337,27 @@ def run_fvcom_grid(
         ),
         systematic_v5_max_connectivity_transactions=int(
             config.systematic_v5_max_connectivity_transactions
+        ),
+        systematic_v6_total_iterations=int(
+            config.systematic_v6_total_iterations
+        ),
+        systematic_v6_max_cycles=int(config.systematic_v6_max_cycles),
+        systematic_v6_max_closure_rounds=int(
+            config.systematic_v6_max_closure_rounds
+        ),
+        systematic_v6_max_burst=int(config.systematic_v6_max_burst),
+        systematic_v6_checkpoint_interval=int(
+            config.systematic_v6_checkpoint_interval
+        ),
+        systematic_v6_wall_time_s=float(config.systematic_v6_wall_time_s),
+        systematic_v6_final_audit_reserve_s=float(
+            config.systematic_v6_final_audit_reserve_s
+        ),
+        systematic_v6_gate_policy=str(
+            config.systematic_v6_gate_policy
+        ),
+        systematic_v6_passage_removal=bool(
+            config.systematic_v6_passage_removal
         ),
         thin_triangle_quality_threshold=float(config.thin_triangle_quality_threshold),
         thin_triangle_min_angle_deg=float(config.thin_triangle_min_angle_deg),
@@ -527,6 +574,33 @@ def run_fvcom_grid(
             ),
             "systematic_v5_max_connectivity_transactions": int(
                 config.systematic_v5_max_connectivity_transactions
+            ),
+            "systematic_v6_total_iterations": int(
+                config.systematic_v6_total_iterations
+            ),
+            "systematic_v6_max_cycles": int(
+                config.systematic_v6_max_cycles
+            ),
+            "systematic_v6_max_closure_rounds": int(
+                config.systematic_v6_max_closure_rounds
+            ),
+            "systematic_v6_max_burst": int(
+                config.systematic_v6_max_burst
+            ),
+            "systematic_v6_checkpoint_interval": int(
+                config.systematic_v6_checkpoint_interval
+            ),
+            "systematic_v6_wall_time_s": float(
+                config.systematic_v6_wall_time_s
+            ),
+            "systematic_v6_final_audit_reserve_s": float(
+                config.systematic_v6_final_audit_reserve_s
+            ),
+            "systematic_v6_gate_policy": str(
+                config.systematic_v6_gate_policy
+            ),
+            "systematic_v6_passage_removal": bool(
+                config.systematic_v6_passage_removal
             ),
             "thin_triangle_min_angle_deg": float(config.thin_triangle_min_angle_deg),
             "thin_triangle_quality_threshold": float(config.thin_triangle_quality_threshold),

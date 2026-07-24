@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fvcom_grid_generation.local_topology import AggressiveConditioningConfig, condition_mesh_aggressive  # noqa: E402
 from fvcom_grid_generation.systematic_v5 import SystematicV5LoopConfig, run_systematic_v5_loop  # noqa: E402
+from fvcom_grid_generation.systematic_v6 import SystematicV6LoopConfig, run_systematic_v6_loop  # noqa: E402
 from fvcom_grid_generation.metrics import build_edge_topology, triangle_geometry  # noqa: E402
 from fvcom_grid_generation.postprocess import boundary_chains_from_mesh  # noqa: E402
 from fvcom_grid_generation.projection import local_utm_projection, project_points, unproject_points  # noqa: E402
@@ -39,7 +40,7 @@ def main_with_mode(forced_mode: str | None = None) -> int:
     parser.add_argument("--mode", choices=("all", "valence", "thin", "prune"), default=forced_mode or "all")
     parser.add_argument(
         "--thin-repair-profile",
-        choices=("guarded-v1", "systematic-v2", "systematic-v3", "systematic-v5", "none"),
+        choices=("guarded-v1", "systematic-v2", "systematic-v3", "systematic-v5", "systematic-v6", "none"),
         default="guarded-v1",
         help="Extreme-tail repair profile; none disables thin repair while leaving the selected non-thin conditioning mode active.",
     )
@@ -59,6 +60,19 @@ def main_with_mode(forced_mode: str | None = None) -> int:
         "--systematic-v5-max-connectivity-transactions",
         type=int,
         default=32,
+    )
+    parser.add_argument("--systematic-v6-total-iterations", type=int, default=1000)
+    parser.add_argument("--systematic-v6-max-cycles", type=int, default=12)
+    parser.add_argument("--systematic-v6-max-closure-rounds", type=int, default=8)
+    parser.add_argument("--systematic-v6-max-burst", type=int, default=100)
+    parser.add_argument("--systematic-v6-checkpoint-interval", type=int, default=10)
+    parser.add_argument("--systematic-v6-wall-time-s", type=float, default=28800.0)
+    parser.add_argument("--systematic-v6-final-audit-reserve-s", type=float, default=3600.0)
+    parser.add_argument(
+        "--systematic-v6-passage-removal",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable research-only authorized passage removal.",
     )
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--boundary-edit-policy", choices=("kind-aware-envelope", "split-only", "none"), default="kind-aware-envelope")
@@ -90,6 +104,16 @@ def main_with_mode(forced_mode: str | None = None) -> int:
         parser.error(
             "--systematic-v5-max-connectivity-transactions must be nonnegative"
         )
+    if (
+        args.systematic_v6_total_iterations < 0
+        or args.systematic_v6_max_cycles < 0
+        or args.systematic_v6_max_closure_rounds < 0
+        or args.systematic_v6_max_burst <= 0
+        or args.systematic_v6_checkpoint_interval <= 0
+        or args.systematic_v6_wall_time_s <= 0.0
+        or args.systematic_v6_final_audit_reserve_s < 0.0
+    ):
+        parser.error("systematic-v6 iteration, cycle, burst, and time controls are invalid")
     mesh_path = Path(args.mesh)
     output_path = Path(args.output_mesh)
     report_path = Path(args.report)
@@ -159,7 +183,36 @@ def main_with_mode(forced_mode: str | None = None) -> int:
         valence_node_lineage_filter=tuple(int(value) - 1 for value in args.only_node_id_1based) if mode in {"all", "valence"} else (),
         micro_relax_cycles=int(args.micro_relax_cycles),
     )
-    if str(args.thin_repair_profile) == "systematic-v5" and mode in {"all", "thin", "valence"}:
+    if str(args.thin_repair_profile) == "systematic-v6" and mode in {"all", "thin", "valence"}:
+        result = run_systematic_v6_loop(
+            points,
+            triangles,
+            fixed,
+            chains,
+            open_nodes,
+            target_spacing_m=targets,
+            boundary_kinds=kinds,
+            hard_anchor_mask=hard,
+            topology_config=config,
+            loop_config=SystematicV6LoopConfig(
+                maximum_closure_rounds=int(args.systematic_v6_max_closure_rounds),
+                maximum_relaxation_cycles=int(args.systematic_v6_max_cycles),
+                total_relaxation_iterations=int(args.systematic_v6_total_iterations),
+                maximum_burst=int(args.systematic_v6_max_burst),
+                checkpoint_interval=int(args.systematic_v6_checkpoint_interval),
+                wall_clock_seconds=float(args.systematic_v6_wall_time_s),
+                final_audit_reserve_seconds=float(
+                    args.systematic_v6_final_audit_reserve_s
+                ),
+                passage_removal_enabled=bool(
+                    args.systematic_v6_passage_removal
+                ),
+                allow_authorized_topology_delta=bool(
+                    args.systematic_v6_passage_removal
+                ),
+            ),
+        )
+    elif str(args.thin_repair_profile) == "systematic-v5" and mode in {"all", "thin", "valence"}:
         result = run_systematic_v5_loop(
             points,
             triangles,

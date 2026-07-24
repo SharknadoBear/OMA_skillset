@@ -16,6 +16,7 @@ from fvcom_grid_generation.connectivity_restriction import (  # noqa: E402
     AllowedEdgePolicy,
     ConnectivityRestrictionConfig,
     audit_superthin_connectivity,
+    restricted_edge_violation_records,
 )
 from fvcom_grid_generation.local_topology import (  # noqa: E402
     AggressiveConditioningConfig,
@@ -305,6 +306,23 @@ def test_restriction_is_exactly_repeatable() -> None:
     assert np.array_equal(first.nodes_xy, second.nodes_xy)
     assert np.array_equal(first.triangles, second.triangles)
     assert first.restricted_lineage_edges == second.restricted_lineage_edges
+
+
+def test_shared_restricted_edge_audit_is_lineage_stable() -> None:
+    triangles = np.asarray([[0, 1, 2], [0, 2, 3]], dtype=int)
+    lineage = np.asarray([100, 101, 102, 103], dtype=int)
+    records = restricted_edge_violation_records(
+        triangles,
+        lineage,
+        {(100, 102)},
+    )
+    assert records == [
+        {
+            "edge": [0, 2],
+            "lineage_edge": [100, 102],
+            "attached_triangle_indices": [0, 1],
+        }
+    ]
 
 
 def main() -> None:

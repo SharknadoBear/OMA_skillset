@@ -58,6 +58,50 @@ def _synthetic_boundary_package(path: Path) -> Path:
     return path
 
 
+def _simple_synthetic_boundary_package(path: Path) -> Path:
+    exterior = [
+        (-75.10, 39.00),
+        (-74.90, 39.00),
+        (-74.90, 39.16),
+        (-75.10, 39.16),
+        (-75.10, 39.00),
+    ]
+    domain = Polygon(exterior)
+    gpd.GeoDataFrame(
+        [{"geometry": domain}],
+        geometry="geometry",
+        crs="EPSG:4326",
+    ).to_file(path, layer="model_domain_polygon", driver="GPKG")
+    gpd.GeoDataFrame(
+        [
+            {
+                "segment_class": "land_outer_boundary",
+                "geometry": LineString([exterior[0], exterior[1]]),
+            },
+            {
+                "segment_class": "open_boundary",
+                "geometry": LineString([exterior[1], exterior[2]]),
+            },
+            {
+                "segment_class": "open_boundary",
+                "geometry": LineString([exterior[2], exterior[3]]),
+            },
+            {
+                "segment_class": "land_outer_boundary",
+                "geometry": LineString([exterior[3], exterior[4]]),
+            },
+        ],
+        geometry="geometry",
+        crs="EPSG:4326",
+    ).to_file(path, layer="model_outer_boundary_segments", driver="GPKG")
+    gpd.GeoDataFrame(
+        [{"geometry": LineString([exterior[1], exterior[2], exterior[3]])}],
+        geometry="geometry",
+        crs="EPSG:4326",
+    ).to_file(path, layer="source_open_boundary_arc", driver="GPKG")
+    return path
+
+
 def _synthetic_resolution_package(root: Path, loops: Path) -> Path:
     package = load_boundary_package(loops)
     nodes = prepare_boundary_nodes(package, BoundaryConfig(land_spacing_m=700.0, open_spacing_m=2500.0, island_spacing_m=700.0))
@@ -643,6 +687,73 @@ def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
         assert manifest["final_status"] in {"pass", "needs_review"}
 
 
+def test_full_synthetic_systematic_v6_workflow() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        gpkg = _simple_synthetic_boundary_package(root / "loops.gpkg")
+        bathy = write_synthetic_bathymetry(
+            root / "bathy.nc",
+            (-75.11, 38.99, -74.89, 39.17),
+            nx=35,
+            ny=35,
+        )
+        manifest = run_fvcom_grid(
+            root / "run",
+            "synthetic_systematic_v6",
+            config=GridConfig(
+                mode="test",
+                land_spacing_m=30000.0,
+                open_spacing_m=30000.0,
+                max_interior_points=100,
+                refine_iterations=0,
+                smooth_iterations=1,
+                conditioning_profile="aggressive-local-v2",
+                aggressive_conditioning_rounds=0,
+                aggressive_max_prunes_per_round=0,
+                aggressive_max_valence_repairs_per_round=25,
+                area_transition_relaxation=False,
+                thin_repair_profile="systematic-v6",
+                systematic_v6_total_iterations=0,
+                systematic_v6_max_cycles=0,
+                systematic_v6_max_closure_rounds=0,
+                systematic_v6_wall_time_s=30.0,
+                systematic_v6_final_audit_reserve_s=0.0,
+                systematic_v6_gate_policy="strict-v6",
+                systematic_v6_passage_removal=False,
+            ),
+            boundary_loops_gpkg=gpkg,
+            bathy_nc=bathy,
+        )
+        conditioning = manifest["mesh"]["conditioning"]
+        v6 = conditioning["terminal_systematic_thin_repair"]
+        roundtrip = manifest["quality"]["roundtrip"]
+        assert "systematic-v6-terminal" in conditioning["stage_order"]
+        assert v6["profile"] == "systematic-v6"
+        assert v6["settings"]["closure_gate_policy"] == "strict-v6"
+        assert v6["settings"]["passage_removal_enabled"] is False
+        assert not v6["settings"]["known_passage_node_ids_1based"]
+        assert v6["after"]["restricted_edge_violation_count"] == 0
+        assert v6["after"]["nonpositive_signed_area_count"] == 0, v6["after"]
+        assert v6["after"]["nonmanifold_edge_count"] == 0
+        assert (
+            manifest["quality"]["constraint_integrity"][
+                "all_protected_edges_present"
+            ]
+            is True
+        )
+        assert roundtrip["triangle_connectivity_match"] is True
+        assert roundtrip["open_boundary_order_match"] is True
+        assert roundtrip["coordinate_within_tolerance"] is True
+        assert (
+            manifest["settings"]["systematic_v6_gate_policy"]
+            == "strict-v6"
+        )
+        assert (
+            manifest["settings"]["systematic_v6_passage_removal"]
+            is False
+        )
+
+
 def test_adaptive_resolution_workflow_and_quadtree_seed() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -722,6 +833,7 @@ def main() -> int:
     test_aggressive_degree_three_pruning_is_target_guarded()
     test_aggressive_valence_repair_uses_distributed_steiner_nodes()
     test_full_synthetic_workflow_and_2dm_roundtrip()
+    test_full_synthetic_systematic_v6_workflow()
     test_adaptive_resolution_workflow_and_quadtree_seed()
     test_final_quality_requires_q_l3_sigma_above_075()
     print("fvcom-grid-generation selftests passed")

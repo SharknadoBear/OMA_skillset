@@ -10,7 +10,7 @@ legal again.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 
@@ -261,17 +261,56 @@ class AllowedEdgePolicy:
         self,
         triangles: np.ndarray,
     ) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = []
-        for edge in sorted(_mesh_edges(np.asarray(triangles, dtype=int))):
-            lineage = self.lineage_edge(edge)
-            if lineage in self.restricted_lineage_edges:
-                records.append(
-                    {
-                        "edge": list(map(int, edge)),
-                        "lineage_edge": list(map(int, lineage)),
-                    }
-                )
-        return records
+        return restricted_edge_violation_records(
+            triangles,
+            self.lineage,
+            self.restricted_lineage_edges,
+        )
+
+
+def restricted_edge_violation_records(
+    triangles: np.ndarray,
+    node_lineage: np.ndarray,
+    restricted_lineage_edges: Iterable[Iterable[int]],
+    *,
+    edge_to_triangles: Mapping[tuple[int, int], Iterable[int]] | None = None,
+) -> list[dict[str, Any]]:
+    """Audit forbidden source-lineage edges in one delivered mesh."""
+    triangles = np.asarray(triangles, dtype=int)
+    lineage = np.asarray(node_lineage, dtype=int)
+    restricted = {
+        _edge_key(int(values[0]), int(values[1]))
+        for values in restricted_lineage_edges
+        if len(values) >= 2 and int(values[0]) != int(values[1])
+    }
+    if not restricted:
+        return []
+    if edge_to_triangles is None:
+        attached: dict[tuple[int, int], list[int]] = {}
+        for triangle_index, triangle in enumerate(triangles):
+            for edge in _triangle_edges(triangle):
+                attached.setdefault(edge, []).append(int(triangle_index))
+    else:
+        attached = {
+            _edge_key(*map(int, edge)): list(map(int, triangle_indices))
+            for edge, triangle_indices in edge_to_triangles.items()
+        }
+    records: list[dict[str, Any]] = []
+    for edge in sorted(attached):
+        a, b = edge
+        lineage_edge = _edge_key(int(lineage[a]), int(lineage[b]))
+        if lineage_edge not in restricted:
+            continue
+        records.append(
+            {
+                "edge": list(map(int, edge)),
+                "lineage_edge": list(map(int, lineage_edge)),
+                "attached_triangle_indices": list(
+                    map(int, attached[edge])
+                ),
+            }
+        )
+    return records
 
 
 def audit_superthin_connectivity(

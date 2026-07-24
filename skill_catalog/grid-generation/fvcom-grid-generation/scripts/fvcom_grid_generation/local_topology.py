@@ -16,6 +16,7 @@ from shapely.geometry import LineString, Polygon
 from .connectivity_restriction import (
     AllowedEdgePolicy,
     ConnectivityRestrictionConfig,
+    restricted_edge_violation_records,
 )
 from .metrics import build_edge_topology, chain_edges, constraint_integrity, triangle_geometry
 from .regional_conditioning import SpringRelaxConfig, _edge_flip_candidate, relax_mesh_spring
@@ -52,6 +53,7 @@ class AggressiveConditioningConfig:
     systematic_gate_scope: str = "candidate"
     systematic_collapse_welds_per_round: int = 0
     systematic_v5_max_star_transactions_per_round: int = 256
+    systematic_v5_max_inward_front_support_points: int = 8
     systematic_v5_max_lawson_flips_per_transaction: int = 128
     systematic_v5_patch_ring_ladder: tuple[int, ...] = (1, 2, 4)
     systematic_v5_enable_boundary_window_fallback: bool = True
@@ -81,6 +83,10 @@ class AggressiveConditioningConfig:
     max_valence_cluster_merges_per_round: int = 25
     max_valence_l_over_h_count_increase: int = 0
     valence_node_lineage_filter: tuple[int, ...] = ()
+    topology_escrow_enabled: bool = False
+    topology_escrow_maximum_superthin_count: int = 25
+    topology_escrow_maximum_superthin_severity: float = 25.0
+    topology_escrow_maximum_valence: int = 12
     boundary_edit_policy: str = "kind-aware-envelope"
     land_boundary_max_deviation_m: float = 5.0
     open_boundary_max_deviation_m: float = 250.0
@@ -412,6 +418,31 @@ def _repair_valence_thin_atomic(
             "after": after,
         }
 
+    escrow_state: _State | None = None
+    escrow_ok = False
+    escrow_invariants: dict[str, Any] = {}
+    escrow_summary: dict[str, Any] = {}
+    escrow_rejected_gates: list[str] = []
+    if bool(config.topology_escrow_enabled):
+        escrow_state = state.clone()
+        (
+            escrow_ok,
+            escrow_invariants,
+            escrow_summary,
+        ) = _audit_state(
+            escrow_state,
+            config,
+            initial_components,
+        )
+        escrow_rejected_gates = _topology_escrow_failures(
+            escrow_state,
+            before,
+            escrow_summary,
+            escrow_ok,
+            escrow_invariants,
+            config,
+        )
+
     post = (
         _repair_superthin(state, config, initial_components)
         if config.enable_thin_repair and _thin_budget(config) > 0
@@ -420,6 +451,73 @@ def _repair_valence_thin_atomic(
     ok, invariants, after = _audit_state(state, config, initial_components)
     rejected_gates = _compound_valence_thin_failures(before, after, ok, invariants, config)
     accepted_edits = int(valence.get("accepted", 0)) + int(post.get("accepted", 0))
+    post_counterproductive = bool(
+        config.topology_escrow_enabled
+        and _post_thin_counterproductive(
+            escrow_summary,
+            after,
+            post,
+        )
+    )
+    escrow_trigger_reasons = [
+        *(
+            ["final_compound_transaction_failed"]
+            if rejected_gates
+            else []
+        ),
+        *(
+            ["post_thin_counterproductive"]
+            if post_counterproductive
+            else []
+        ),
+    ]
+    if (
+        escrow_state is not None
+        and escrow_trigger_reasons
+        and not escrow_rejected_gates
+    ):
+        attempted_thin = int(post.get("accepted", 0))
+        _restore(state, escrow_state)
+        valence = dict(valence)
+        valence.update(
+            {
+                "transaction_rolled_back": False,
+                "topology_escrow_retained": True,
+                "provisional_escrow_acceptance": True,
+                "after": _summary(state, config),
+            }
+        )
+        post = dict(post)
+        post.update(
+            {
+                "accepted": 0,
+                "rolled_back_operation_count": attempted_thin,
+                "transaction_rolled_back": True,
+                "topology_escrow_post_thin_rolled_back": True,
+                "provisional_escrow_acceptance": False,
+                "after": _summary(state, config),
+            }
+        )
+        return valence, post, {
+            "attempted": True,
+            "accepted": True,
+            "accepted_via": "valence_only_midpoint_escrow",
+            "provisional_escrow_accepted": True,
+            "rolled_back": False,
+            "post_thin_rolled_back": True,
+            "accepted_operation_count": int(
+                valence.get("accepted", 0)
+            ),
+            "rejected_gates": [],
+            "final_candidate_rejected_gates": rejected_gates,
+            "escrow_trigger_reasons": escrow_trigger_reasons,
+            "escrow_rejected_gates": [],
+            "escrow_invariants": escrow_invariants,
+            "before": before,
+            "valence_only_midpoint": escrow_summary,
+            "final_trial": after,
+            "after": _summary(state, config),
+        }
     if rejected_gates:
         attempted_valence = int(valence.get("accepted", 0))
         attempted_thin = int(post.get("accepted", 0))
@@ -452,6 +550,43 @@ def _repair_valence_thin_atomic(
             "before": before,
             "trial": after,
             "after": _summary(state, config),
+            **(
+                {
+                    "provisional_escrow_accepted": False,
+                    "escrow_trigger_reasons": (
+                        escrow_trigger_reasons
+                    ),
+                    "escrow_rejected_gates": (
+                        escrow_rejected_gates
+                    ),
+                    "escrow_invariants": escrow_invariants,
+                    "valence_only_midpoint": escrow_summary,
+                }
+                if bool(config.topology_escrow_enabled)
+                else {}
+            ),
+        }
+    if (
+        bool(config.topology_escrow_enabled)
+        and post_counterproductive
+    ):
+        # A counterproductive post-thin result can reach this branch only when
+        # the provisional midpoint itself failed its escrow contract.
+        # Preserve the ordinary compound result and retain the failed escrow
+        # evidence rather than silently changing strict behavior.
+        return valence, post, {
+            "attempted": True,
+            "accepted": True,
+            "rolled_back": False,
+            "accepted_operation_count": accepted_edits,
+            "rejected_gates": [],
+            "provisional_escrow_accepted": False,
+            "escrow_trigger_reasons": escrow_trigger_reasons,
+            "escrow_rejected_gates": escrow_rejected_gates,
+            "escrow_invariants": escrow_invariants,
+            "before": before,
+            "valence_only_midpoint": escrow_summary,
+            "after": after,
         }
     return valence, post, {
         "attempted": True,
@@ -463,6 +598,132 @@ def _repair_valence_thin_atomic(
         "before": before,
         "after": after,
     }
+
+
+def _topology_escrow_failures(
+    state: _State,
+    before: dict[str, Any],
+    midpoint: dict[str, Any],
+    invariants_ok: bool,
+    invariants: dict[str, Any],
+    config: AggressiveConditioningConfig,
+) -> list[str]:
+    """Audit an opt-in valence-only midpoint without requiring zero thin debt."""
+    failures: list[str] = []
+    if not invariants_ok:
+        failures.extend(_failed_invariant_names(invariants))
+    if int(midpoint["count_valence_above_limit"]) >= int(
+        before["count_valence_above_limit"]
+    ):
+        failures.append("escrow_valence_count_not_strictly_improved")
+    if int(midpoint["valence_excess_sum"]) >= int(
+        before["valence_excess_sum"]
+    ):
+        failures.append("escrow_valence_excess_not_strictly_improved")
+    maximum_valence = max(
+        int(before["maximum_valence"]),
+        max(0, int(config.topology_escrow_maximum_valence)),
+    )
+    if int(midpoint["maximum_valence"]) > maximum_valence:
+        failures.append("escrow_maximum_valence_exceeded")
+    if int(midpoint["superthin_triangle_count"]) > max(
+        0,
+        int(config.topology_escrow_maximum_superthin_count),
+    ):
+        failures.append("escrow_superthin_count_exceeded")
+    if float(midpoint["superthin_severity_sum"]) > max(
+        0.0,
+        float(config.topology_escrow_maximum_superthin_severity),
+    ):
+        failures.append("escrow_superthin_severity_exceeded")
+    if int(midpoint["singly_connected_triangle_count"]) > int(
+        before["singly_connected_triangle_count"]
+    ):
+        failures.append("escrow_singly_connected_regression")
+    if int(midpoint["boundary_component_count"]) != int(
+        before["boundary_component_count"]
+    ):
+        failures.append("escrow_boundary_component_change")
+    if int(midpoint["boundary_degree_anomaly_count"]) > int(
+        before["boundary_degree_anomaly_count"]
+    ):
+        failures.append("escrow_boundary_degree_regression")
+    if int(midpoint["connected_component_count"]) != int(
+        before["connected_component_count"]
+    ):
+        failures.append("escrow_wet_component_change")
+    if int(midpoint["protected_edge_not_boundary_count"]) > int(
+        before["protected_edge_not_boundary_count"]
+    ):
+        failures.append("escrow_protected_edge_regression")
+    if int(midpoint.get("restricted_edge_violation_count", 0)) != 0:
+        failures.append("escrow_restricted_edge_violation")
+    l_over_h_allowance = max(
+        0,
+        int(config.max_valence_l_over_h_count_increase),
+    )
+    if int(midpoint["l_over_h_count_above_1_55"]) > int(
+        before["l_over_h_count_above_1_55"]
+    ) + l_over_h_allowance:
+        failures.append("escrow_l_over_h_count_allowance_exceeded")
+    if float(midpoint["l_over_h_p95"]) > max(
+        1.55,
+        1.001
+        * max(float(before["l_over_h_p95"]), 1.0e-12),
+    ):
+        failures.append("escrow_l_over_h_p95_regression")
+    if _maximum_boundary_source_arc_deviation(state) > 1.0e-6:
+        failures.append("escrow_boundary_vertex_off_source_arc")
+    if not _boundary_loops_simple(state):
+        failures.append("escrow_boundary_self_intersection")
+    if len(state.source_open_nodes):
+        source_open = tuple(
+            map(
+                int,
+                np.asarray(state.source_open_nodes, dtype=int),
+            )
+        )
+        if _open_boundary_lineage_sequence(state) != source_open:
+            failures.append("escrow_open_boundary_lineage_changed")
+    return sorted(set(failures))
+
+
+def _post_thin_counterproductive(
+    midpoint: dict[str, Any],
+    after: dict[str, Any],
+    post: dict[str, Any],
+) -> bool:
+    """Return true when accepted thin work fails to improve its causal debt."""
+    if not midpoint or int(post.get("accepted", 0)) <= 0:
+        return False
+    thin_before = (
+        int(midpoint["superthin_triangle_count"]),
+        float(midpoint["superthin_severity_sum"]),
+    )
+    thin_after = (
+        int(after["superthin_triangle_count"]),
+        float(after["superthin_severity_sum"]),
+    )
+    valence_before = (
+        int(midpoint["count_valence_above_limit"]),
+        int(midpoint["valence_excess_sum"]),
+        int(midpoint["maximum_valence"]),
+    )
+    valence_after = (
+        int(after["count_valence_above_limit"]),
+        int(after["valence_excess_sum"]),
+        int(after["maximum_valence"]),
+    )
+    return bool(
+        not thin_after < thin_before
+        or valence_after > valence_before
+        or int(after["singly_connected_triangle_count"])
+        > int(midpoint["singly_connected_triangle_count"])
+        or int(after["boundary_degree_anomaly_count"])
+        > int(midpoint["boundary_degree_anomaly_count"])
+        or int(after["boundary_component_count"])
+        != int(midpoint["boundary_component_count"])
+    )
 
 
 def _compound_valence_thin_failures(
@@ -2679,8 +2940,38 @@ def _repair_superthin_locked_star_v5(
                         "ring_node_count": int(len(ring)),
                         "patch_rings": 1,
                     }
+                    if str(mode["name"]) == "inward-front-multi-support":
+                        requested_coordinates = np.asarray(
+                            mode.get(
+                                "coordinates",
+                                np.empty((0, 2), dtype=float),
+                            ),
+                            dtype=float,
+                        ).reshape((-1, 2))
+                        record.update(
+                            {
+                                "requested_support_node_count": int(
+                                    mode.get(
+                                        "requested_support_node_count",
+                                        len(requested_coordinates),
+                                    )
+                                ),
+                                "requested_support_coordinates_xy": [
+                                    list(map(float, point))
+                                    for point in requested_coordinates
+                                ],
+                                "support_generation_evidence": dict(
+                                    mode.get(
+                                        "support_generation_evidence",
+                                        {},
+                                    )
+                                ),
+                            }
+                        )
                     if not changed:
                         record["failures"] = construction or ["locked_star_construction_failed"]
+                        if evidence:
+                            record["construction_evidence"] = evidence
                         component_attempts.append(record)
                         continue
                     quick = _v5_quick_metrics_from_evidence(
@@ -2866,6 +3157,218 @@ def _repair_superthin_locked_star_v5(
     }
 
 
+def _locked_inward_front_support_modes(
+    state: _State,
+    center: int,
+    ring: list[int],
+    base: tuple[int, int],
+    config: AggressiveConditioningConfig,
+) -> list[dict[str, Any]]:
+    """Build deterministic multi-node wet-side fronts behind a protected base.
+
+    The complete locked ring is left unchanged.  Candidate points occupy one
+    line parallel to the causal protected edge and strictly inside the patch;
+    the caller evaluates every 2..N group on an independent state clone.
+    """
+    center = int(center)
+    base = tuple(sorted(map(int, base)))
+    requested_limit = max(
+        0,
+        int(config.systematic_v5_max_inward_front_support_points),
+    )
+    support_limit = min(8, requested_limit)
+    common: dict[str, Any] = {
+        "requested_max_support_point_count": int(requested_limit),
+        "bounded_max_support_point_count": int(support_limit),
+        "hard_support_point_cap": 8,
+        "base_node_indices_zero_based": list(map(int, base)),
+        "base_node_lineage": [
+            int(state.lineage[int(node)]) for node in base
+        ],
+        "base_coordinates_xy": [
+            list(map(float, state.points[int(node)])) for node in base
+        ],
+        "base_boundary_kinds": [
+            str(state.kinds[int(node)]) for node in base
+        ],
+        "triangulation_method": "deterministic-ear-plus-point-insertion",
+        "global_delaunay_used": False,
+    }
+    open_edges = {
+        tuple(sorted((int(left), int(right))))
+        for left, right in zip(
+            np.asarray(state.open_nodes, dtype=int)[:-1],
+            np.asarray(state.open_nodes, dtype=int)[1:],
+        )
+    }
+    common["base_is_open_boundary_edge"] = bool(base in open_edges)
+
+    def failed_mode(*failures: str) -> dict[str, Any]:
+        return {
+            "name": "inward-front-multi-support",
+            "coordinates": np.empty((0, 2), dtype=float),
+            "requested_support_node_count": 0,
+            "generation_failures": list(map(str, failures)),
+            "support_generation_evidence": dict(common),
+        }
+
+    if support_limit < 2:
+        return [failed_mode("inward_front_support_limit_below_two")]
+    if len(ring) < 3 or len(set(map(int, ring))) != len(ring):
+        return [failed_mode("invalid_locked_ring_for_inward_front")]
+    ring_edges = {
+        tuple(
+            sorted(
+                (
+                    int(ring[index]),
+                    int(ring[(index + 1) % len(ring)]),
+                )
+            )
+        )
+        for index in range(len(ring))
+    }
+    if base not in ring_edges:
+        return [failed_mode("protected_base_not_on_locked_ring")]
+    polygon = Polygon(state.points[np.asarray(ring, dtype=int)])
+    if not polygon.is_valid or polygon.area <= 0.0:
+        return [failed_mode("invalid_locked_ring_polygon")]
+    start = np.asarray(state.points[int(base[0])], dtype=float)
+    end = np.asarray(state.points[int(base[1])], dtype=float)
+    tangent = end - start
+    base_length = float(np.linalg.norm(tangent))
+    if not np.isfinite(base_length) or base_length <= 1.0e-12:
+        return [failed_mode("degenerate_protected_base")]
+    tangent /= base_length
+    normal = np.asarray([-tangent[1], tangent[0]], dtype=float)
+    midpoint = 0.5 * (start + end)
+    representative = np.asarray(
+        [
+            float(polygon.representative_point().x),
+            float(polygon.representative_point().y),
+        ],
+        dtype=float,
+    )
+    if float(np.dot(representative - midpoint, normal)) < 0.0:
+        normal *= -1.0
+    representative_depth = float(
+        np.dot(representative - midpoint, normal)
+    )
+    if representative_depth <= 1.0e-12:
+        center_depth = float(
+            np.dot(state.points[center] - midpoint, normal)
+        )
+        if center_depth < 0.0:
+            normal *= -1.0
+            center_depth *= -1.0
+        representative_depth = center_depth
+    positive_targets = state.targets[
+        np.asarray([*ring, center], dtype=int)
+    ]
+    positive_targets = positive_targets[
+        np.isfinite(positive_targets) & (positive_targets > 0.0)
+    ]
+    local_target = (
+        float(np.median(positive_targets))
+        if len(positive_targets)
+        else base_length
+    )
+    scale = max(
+        base_length,
+        float(np.sqrt(max(float(polygon.area), 1.0e-30))),
+        1.0,
+    )
+    tolerance = max(1.0e-10 * scale, 1.0e-9)
+    desired_depth = min(
+        0.30 * base_length,
+        0.65 * max(representative_depth, tolerance),
+        0.50 * max(local_target, tolerance),
+    )
+    desired_depth = max(desired_depth, 16.0 * tolerance)
+    common.update(
+        {
+            "base_length_m": float(base_length),
+            "wet_side_unit_normal": list(map(float, normal)),
+            "representative_point_xy": list(map(float, representative)),
+            "representative_normal_depth_m": float(
+                representative_depth
+            ),
+            "local_target_m": float(local_target),
+            "desired_front_depth_m": float(desired_depth),
+            "strict_inside_tolerance_m": float(tolerance),
+        }
+    )
+
+    modes: list[dict[str, Any]] = []
+    ring_points = state.points[np.asarray(ring, dtype=int)]
+    for support_count in range(2, support_limit + 1):
+        fractions = np.arange(
+            1,
+            support_count + 1,
+            dtype=float,
+        ) / float(support_count + 1)
+        depth = float(desired_depth)
+        coordinates = np.empty((0, 2), dtype=float)
+        generation_failures: list[str] = []
+        for _ in range(32):
+            base_points = (
+                (1.0 - fractions[:, None]) * start
+                + fractions[:, None] * end
+            )
+            trial = base_points + depth * normal
+            inside = np.asarray(
+                contains_xy(polygon, trial[:, 0], trial[:, 1]),
+                dtype=bool,
+            )
+            separated = bool(
+                len(trial) == 0
+                or np.all(
+                    np.min(
+                        np.linalg.norm(
+                            trial[:, None, :] - ring_points[None, :, :],
+                            axis=2,
+                        ),
+                        axis=1,
+                    )
+                    > tolerance
+                )
+            )
+            if bool(np.all(inside)) and separated:
+                coordinates = trial
+                break
+            depth *= 0.5
+            if depth <= 8.0 * tolerance:
+                break
+        if len(coordinates) != support_count:
+            generation_failures.append(
+                "unable_to_place_strictly_inside_inward_front"
+            )
+        evidence = {
+            **common,
+            "support_point_count": int(support_count),
+            "front_depth_m": float(depth),
+            "tangential_fractions": list(map(float, fractions)),
+            "support_coordinates_xy": [
+                list(map(float, point)) for point in coordinates
+            ],
+            "strictly_inside_locked_ring": bool(
+                len(coordinates) == support_count
+            ),
+        }
+        modes.append(
+            {
+                "name": "inward-front-multi-support",
+                "coordinates": np.asarray(
+                    coordinates,
+                    dtype=float,
+                ).reshape((-1, 2)),
+                "requested_support_node_count": int(support_count),
+                "generation_failures": generation_failures,
+                "support_generation_evidence": evidence,
+            }
+        )
+    return modes
+
+
 def _locked_star_modes(
     state: _State,
     center: int,
@@ -3018,6 +3521,21 @@ def _locked_star_modes(
                         "weld_distance_m": float(distance),
                     },
                 )
+    if (
+        base in protected
+        and not state.fixed[int(center)]
+        and not state.hard[int(center)]
+        and _find_chain_node(state.chains, int(center)) is None
+    ):
+        modes.extend(
+            _locked_inward_front_support_modes(
+                state,
+                int(center),
+                ring,
+                base,
+                config,
+            )
+        )
     modes.append({"name": "support-node-fallback", "coordinate": representative})
     return modes
 
@@ -3191,6 +3709,8 @@ def _reconstruct_locked_star_candidate(
         return False, ["deterministic_ear_triangulation_failed"], {}
     name = str(mode["name"])
     inserted_support = 0
+    support_coordinates = np.empty((0, 2), dtype=float)
+    support_front_evidence: dict[str, Any] = {}
     boundary_inserted = False
     replacement: np.ndarray
     if name.startswith("center-relocation"):
@@ -3265,6 +3785,206 @@ def _reconstruct_locked_star_candidate(
                 state.open_nodes = np.asarray(open_values, dtype=int)
                 break
         boundary_inserted = True
+    elif name == "inward-front-multi-support":
+        support_front_evidence = dict(
+            mode.get("support_generation_evidence", {})
+        )
+        generation_failures = list(
+            map(str, mode.get("generation_failures", []))
+        )
+        try:
+            support_coordinates = np.asarray(
+                mode.get(
+                    "coordinates",
+                    np.empty((0, 2), dtype=float),
+                ),
+                dtype=float,
+            ).reshape((-1, 2))
+        except ValueError:
+            support_coordinates = np.empty((0, 2), dtype=float)
+            generation_failures.append(
+                "invalid_inward_front_support_coordinate_shape"
+            )
+        requested_count = int(
+            mode.get(
+                "requested_support_node_count",
+                len(support_coordinates),
+            )
+        )
+        support_cap = min(
+            8,
+            max(
+                0,
+                int(
+                    config.systematic_v5_max_inward_front_support_points
+                ),
+            ),
+        )
+        failure_evidence = {
+            "candidate": name,
+            "requested_support_node_count": int(requested_count),
+            "support_coordinate_count": int(len(support_coordinates)),
+            "support_coordinates_xy": [
+                list(map(float, point))
+                for point in support_coordinates
+            ],
+            "bounded_max_support_point_count": int(support_cap),
+            "support_generation_evidence": support_front_evidence,
+            "triangulation_method": (
+                "deterministic-ear-plus-point-insertion"
+            ),
+            "global_delaunay_used": False,
+        }
+        if generation_failures:
+            return False, sorted(set(generation_failures)), failure_evidence
+        if requested_count != len(support_coordinates):
+            return False, [
+                "inward_front_support_count_mismatch"
+            ], failure_evidence
+        if not 2 <= len(support_coordinates) <= support_cap:
+            return False, [
+                "inward_front_support_count_out_of_bounds"
+            ], failure_evidence
+        if not np.all(np.isfinite(support_coordinates)):
+            return False, [
+                "nonfinite_inward_front_support_coordinate"
+            ], failure_evidence
+        polygon = Polygon(state.points[np.asarray(ring, dtype=int)])
+        if not polygon.is_valid or polygon.area <= 0.0:
+            return False, [
+                "invalid_locked_ring_for_inward_front_support"
+            ], failure_evidence
+        strictly_inside = np.asarray(
+            contains_xy(
+                polygon,
+                support_coordinates[:, 0],
+                support_coordinates[:, 1],
+            ),
+            dtype=bool,
+        )
+        if not bool(np.all(strictly_inside)):
+            failure_evidence[
+                "strictly_inside_locked_ring"
+            ] = list(map(bool, strictly_inside))
+            return False, [
+                "inward_front_support_outside_locked_ring"
+            ], failure_evidence
+        span = np.ptp(
+            state.points[np.asarray(ring, dtype=int)],
+            axis=0,
+        )
+        coordinate_tolerance = max(
+            1.0e-10 * max(float(np.max(span)), 1.0),
+            1.0e-9,
+        )
+        pair_distances = np.linalg.norm(
+            support_coordinates[:, None, :]
+            - support_coordinates[None, :, :],
+            axis=2,
+        )
+        np.fill_diagonal(pair_distances, np.inf)
+        if float(np.min(pair_distances)) <= coordinate_tolerance:
+            return False, [
+                "duplicate_inward_front_support_coordinate"
+            ], failure_evidence
+        support_start = len(state.points)
+        support_ids = np.arange(
+            support_start,
+            support_start + len(support_coordinates),
+            dtype=int,
+        )
+        fallback_target = float(
+            np.median(state.targets[np.asarray(ring, dtype=int)])
+        )
+        support_targets = np.asarray(
+            [
+                _sample_target_at(
+                    state,
+                    point,
+                    fallback=fallback_target,
+                )
+                for point in support_coordinates
+            ],
+            dtype=float,
+        )
+        state.points = np.vstack(
+            [state.points, support_coordinates]
+        )
+        state.fixed = np.concatenate(
+            [
+                state.fixed,
+                np.zeros(len(support_coordinates), dtype=bool),
+            ]
+        )
+        state.targets = np.concatenate(
+            [state.targets, support_targets]
+        )
+        state.kinds.extend(
+            ["interior"] * len(support_coordinates)
+        )
+        state.hard = np.concatenate(
+            [
+                state.hard,
+                np.zeros(len(support_coordinates), dtype=bool),
+            ]
+        )
+        state.lineage = np.concatenate(
+            [
+                state.lineage,
+                _new_lineage_ids(
+                    state,
+                    len(support_coordinates),
+                ),
+            ]
+        )
+        allowed_policy = _allowed_edge_policy(state, config)
+        replacement, insertion_failures = (
+            _insert_existing_patch_nodes_v1(
+                state.points,
+                base_replacement,
+                support_ids,
+                edge_allowed=lambda edge: allowed_policy.is_allowed(
+                    edge,
+                    reject_same_chain_shortcuts=False,
+                ),
+            )
+        )
+        if insertion_failures:
+            failure_evidence["point_insertion_failures"] = list(
+                map(str, insertion_failures)
+            )
+            return False, [
+                f"inward_front_{failure}"
+                for failure in insertion_failures
+            ], failure_evidence
+        disallowed_edges = [
+            list(map(int, edge))
+            for edge in sorted(_edge_set(replacement))
+            if not allowed_policy.is_allowed(
+                edge,
+                reject_same_chain_shortcuts=False,
+            )
+        ]
+        if disallowed_edges:
+            failure_evidence[
+                "disallowed_replacement_edges"
+            ] = disallowed_edges
+            return False, [
+                "inward_front_support_creates_restricted_edge"
+            ], failure_evidence
+        used_support = set(map(int, np.unique(replacement))) & set(
+            map(int, support_ids)
+        )
+        if used_support != set(map(int, support_ids)):
+            failure_evidence[
+                "unused_support_node_indices_zero_based"
+            ] = sorted(
+                set(map(int, support_ids)) - used_support
+            )
+            return False, [
+                "inward_front_support_node_unused"
+            ], failure_evidence
+        inserted_support = int(len(support_coordinates))
     elif name == "support-node-fallback":
         coordinate = np.asarray(mode["coordinate"], dtype=float)
         polygon = Polygon(state.points[np.asarray(ring, dtype=int)])
@@ -3384,6 +4104,17 @@ def _reconstruct_locked_star_candidate(
         ),
         "lawson_flip_count": int(flip_count),
         "inserted_support_node_count": int(inserted_support),
+        "support_coordinates_xy": [
+            list(map(float, point))
+            for point in support_coordinates
+        ],
+        "support_generation_evidence": support_front_evidence,
+        "support_triangulation_method": (
+            "deterministic-ear-plus-point-insertion"
+            if name == "inward-front-multi-support"
+            else None
+        ),
+        "global_delaunay_used": False,
         "boundary_node_inserted": bool(boundary_inserted),
         "old_coordinate_xy": list(map(float, old_coordinate)),
         "new_coordinate_xy": (
@@ -3882,7 +4613,8 @@ def _v5_mode_order(name: str) -> int:
         "center-relocation-offcenter": 7,
         "center-relocation-monitor-centroid": 8,
         "expanded-ring-elimination": 9,
-        "support-node-fallback": 10,
+        "inward-front-multi-support": 10,
+        "support-node-fallback": 11,
     }.get(str(name), 99)
 
 
@@ -6882,46 +7614,14 @@ def _restricted_edge_violation_records(
     *,
     topology: Any | None = None,
 ) -> list[dict[str, Any]]:
-    if not state.restricted_lineage_edges:
-        return []
-    topology = (
-        topology
-        if topology is not None
-        else build_edge_topology(
-            len(state.points),
-            state.triangles,
-        )
+    return restricted_edge_violation_records(
+        state.triangles,
+        state.lineage,
+        state.restricted_lineage_edges,
+        edge_to_triangles=(
+            None if topology is None else topology.edge_to_triangles
+        ),
     )
-    records: list[dict[str, Any]] = []
-    for edge in sorted(topology.edge_to_triangles):
-        a, b = map(int, edge)
-        lineage_edge = tuple(
-            sorted(
-                (
-                    int(state.lineage[a]),
-                    int(state.lineage[b]),
-                )
-            )
-        )
-        if lineage_edge in state.restricted_lineage_edges:
-            records.append(
-                {
-                    "edge": [a, b],
-                    "lineage_edge": list(
-                        map(int, lineage_edge)
-                    ),
-                    "attached_triangle_indices": list(
-                        map(
-                            int,
-                            topology.edge_to_triangles.get(
-                                edge,
-                                [],
-                            ),
-                        )
-                    ),
-                }
-            )
-    return records
 
 
 def _summary(

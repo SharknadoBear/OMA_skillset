@@ -14,6 +14,11 @@ from .boundary import BoundaryNodes
 from .metrics import build_edge_topology, constraint_integrity, triangle_geometry
 from .local_topology import AggressiveConditioningConfig, condition_mesh_aggressive
 from .systematic_v5 import SystematicV5LoopConfig, run_systematic_v5_loop
+from .systematic_v6 import SystematicV6LoopConfig, run_systematic_v6_loop
+from .systematic_v6_policy import (
+    loop_policy_overrides,
+    topology_policy_overrides,
+)
 from .projection import unproject_points
 from .regional_conditioning import (
     AreaTransitionRelaxConfig,
@@ -54,6 +59,15 @@ class MeshConfig:
     systematic_v5_wall_time_s: float = 21600.0
     systematic_v5_connectivity_restriction: bool = True
     systematic_v5_max_connectivity_transactions: int = 32
+    systematic_v6_total_iterations: int = 1000
+    systematic_v6_max_cycles: int = 12
+    systematic_v6_max_closure_rounds: int = 8
+    systematic_v6_max_burst: int = 100
+    systematic_v6_checkpoint_interval: int = 10
+    systematic_v6_wall_time_s: float = 28800.0
+    systematic_v6_final_audit_reserve_s: float = 3600.0
+    systematic_v6_gate_policy: str = "strict-v6"
+    systematic_v6_passage_removal: bool = False
     thin_triangle_quality_threshold: float = 0.25
     thin_triangle_min_angle_deg: float = 20.0
     thin_triangle_max_passes: int = 2
@@ -101,10 +115,12 @@ def generate_mesh(
         "systematic-v2",
         "systematic-v3",
         "systematic-v5",
+        "systematic-v6",
         "none",
     }:
         raise ValueError(
-            "thin_repair_profile must be guarded-v1, systematic-v2, systematic-v3, systematic-v5, or none"
+            "thin_repair_profile must be guarded-v1, systematic-v2, "
+            "systematic-v3, systematic-v5, systematic-v6, or none"
         )
     if str(config.systematic_v3_obc_policy) not in {"preserve", "redistribute"}:
         raise ValueError("systematic_v3_obc_policy must be preserve or redistribute")
@@ -345,7 +361,13 @@ def generate_mesh(
                 enabled=True,
                 enable_thin_repair=str(config.thin_repair_profile) != "none",
                 thin_repair_profile=(
-                    "guarded-v1" if str(config.thin_repair_profile) == "none" else str(config.thin_repair_profile)
+                    "guarded-v1"
+                    if str(config.thin_repair_profile) == "none"
+                    else (
+                        "systematic-v5"
+                        if str(config.thin_repair_profile) == "systematic-v6"
+                        else str(config.thin_repair_profile)
+                    )
                 ),
                 systematic_v3_obc_policy=str(config.systematic_v3_obc_policy),
                 systematic_v5_enable_connectivity_restriction=bool(
@@ -405,10 +427,18 @@ def generate_mesh(
         "systematic-v2",
         "systematic-v3",
         "systematic-v5",
+        "systematic-v6",
     }:
         terminal_profile = str(config.thin_repair_profile)
         _progress(progress_callback, "terminal_systematic_thin_repair", 0.975, {"profile": terminal_profile})
         previous_lineage = np.asarray(node_lineage, dtype=int).copy()
+        terminal_topology_policy = (
+            topology_policy_overrides(
+                str(config.systematic_v6_gate_policy)
+            )
+            if terminal_profile == "systematic-v6"
+            else {}
+        )
         terminal_config = AggressiveConditioningConfig(
             enabled=True,
             thin_repair_profile=terminal_profile,
@@ -422,11 +452,60 @@ def generate_mesh(
             max_rounds=1,
             enable_pruning=False,
             enable_thin_repair=True,
-            enable_valence_repair=False,
+            enable_valence_repair=bool(terminal_profile == "systematic-v6"),
             max_prunes_per_round=0,
-            max_valence_removals_per_round=0,
+            max_valence_removals_per_round=(
+                int(config.aggressive_max_valence_repairs_per_round)
+                if terminal_profile == "systematic-v6"
+                else 0
+            ),
+            **terminal_topology_policy,
         )
-        if terminal_profile == "systematic-v5":
+        if terminal_profile == "systematic-v6":
+            terminal_thin_result = run_systematic_v6_loop(
+                points_arr,
+                triangles,
+                fixed_mask,
+                chains,
+                np.asarray(open_nodes, dtype=int),
+                target_spacing_m=conditioning_targets,
+                boundary_kinds=kinds,
+                hard_anchor_mask=np.asarray(hard_anchors, dtype=bool),
+                target_spacing_sampler=_sample_conditioning_targets,
+                restricted_lineage_edges=restricted_edges_current,
+                topology_config=terminal_config,
+                loop_config=SystematicV6LoopConfig(
+                    maximum_closure_rounds=int(
+                        config.systematic_v6_max_closure_rounds
+                    ),
+                    maximum_relaxation_cycles=int(
+                        config.systematic_v6_max_cycles
+                    ),
+                    total_relaxation_iterations=int(
+                        config.systematic_v6_total_iterations
+                    ),
+                    maximum_burst=int(config.systematic_v6_max_burst),
+                    checkpoint_interval=int(
+                        config.systematic_v6_checkpoint_interval
+                    ),
+                    wall_clock_seconds=float(
+                        config.systematic_v6_wall_time_s
+                    ),
+                    final_audit_reserve_seconds=float(
+                        config.systematic_v6_final_audit_reserve_s
+                    ),
+                    passage_removal_enabled=bool(
+                        config.systematic_v6_passage_removal
+                    ),
+                    allow_authorized_topology_delta=bool(
+                        config.systematic_v6_passage_removal
+                    ),
+                    **loop_policy_overrides(
+                        str(config.systematic_v6_gate_policy)
+                    ),
+                ),
+            )
+        elif terminal_profile == "systematic-v5":
             terminal_thin_result = run_systematic_v5_loop(
                 points_arr,
                 triangles,
