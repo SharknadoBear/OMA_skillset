@@ -29,6 +29,7 @@ from shapely.prepared import prep
 from shapely.ops import linemerge, nearest_points, polygonize, unary_union
 
 from .boundary_loops import build_model_boundary_loops
+from .boundary_resolution import boundary_resolution_config, build_boundary_resolution
 from .projection import LocalProjection, local_utm_projection, project_geometry, unproject_geometry, unwrap_geometry_longitudes, unwrap_longitude
 
 
@@ -57,6 +58,7 @@ class BdryArcConfig:
     progress_interval_s: float = 30.0
     heuristic_mode: str = "auto"
     topology_time_budget_s: float = 900.0
+    boundary_resolution_profile: str = "legacy"
 
 
 def _resolve_heuristic_mode(cli_mode: str, run_mode: str) -> tuple[str, bool]:
@@ -89,6 +91,8 @@ def run_bdry_arc(
         raise ValueError("--topology-mode must be gshhs-vector, island-loop, iterative-raster, or vector-only")
     if config.heuristic_mode not in {"auto", "memory", "unknown"}:
         raise ValueError("--heuristic-mode must be auto, memory, or unknown")
+    if config.boundary_resolution_profile not in {"legacy", "adaptive-coastal-v1", "adaptive-coastal-v2"}:
+        raise ValueError("--boundary-resolution-profile must be legacy, adaptive-coastal-v1, or adaptive-coastal-v2")
     if config.topology_mode == "gshhs-vector" and config.coastline_source == "cusp-legacy":
         raise ValueError("--topology-mode gshhs-vector requires GSHHS/generic polygon-capable coastline input")
     resolved_heuristic_mode, place_memory_enabled = _resolve_heuristic_mode(config.heuristic_mode, config.mode)
@@ -106,6 +110,7 @@ def run_bdry_arc(
             "gshhs_resolution_requested": config.gshhs_resolution,
             "heuristic_mode": resolved_heuristic_mode,
             "resolution_policy": "use requested GSHHS resolution only; do not downshift unless explicitly requested",
+            "boundary_resolution_profile": config.boundary_resolution_profile,
         },
     )
     visual_dir = run_dir / "intermediate" / "visual_review"
@@ -401,6 +406,7 @@ def run_bdry_arc(
             "convergence_anchor_m": float(config.convergence_anchor_m or 2.0 * config.target_resolution_m),
             "progress_interval_s": float(config.progress_interval_s),
             "topology_time_budget_s": float(config.topology_time_budget_s),
+            "boundary_resolution_profile": config.boundary_resolution_profile,
         },
         "region_bpoly": {
             "domain_type": region.get("domain_type"),
@@ -533,6 +539,49 @@ def run_bdry_arc(
         "run_bdry_arc automatically builds continuous model-boundary loops; "
         "the main manifest needs review when the loop package needs review"
     )
+    if config.boundary_resolution_profile in {"adaptive-coastal-v1", "adaptive-coastal-v2"} and loop_outputs.get("model_boundary_loops_gpkg"):
+        resolution_dir = run_dir / "boundary_resolution"
+        _write_progress(run_dir, "boundary-resolution", "start", {"run_dir": str(resolution_dir)})
+        try:
+            resolution_manifest = build_boundary_resolution(
+                loop_outputs["model_boundary_loops_gpkg"],
+                loop_manifest_path,
+                region_bpoly_json,
+                coastline_gpkg,
+                resolution_dir,
+                name,
+                boundary_resolution_config(config.boundary_resolution_profile),
+            )
+            manifest["boundary_resolution"] = resolution_manifest
+            manifest["outputs"].update(resolution_manifest.get("outputs", {}))
+            if resolution_manifest.get("final_status") != "pass":
+                manifest["final_status"] = "needs_review"
+                if "adaptive_boundary_resolution_needs_review" not in manifest["failure_taxonomy"]:
+                    manifest["failure_taxonomy"].append("adaptive_boundary_resolution_needs_review")
+            _write_progress(run_dir, "boundary-resolution", "done", {"final_status": resolution_manifest.get("final_status")})
+        except Exception as exc:
+            manifest["boundary_resolution"] = {
+                "schema_version": (
+                    "fvcom_boundary_resolution_manifest_v2"
+                    if config.boundary_resolution_profile == "adaptive-coastal-v2"
+                    else "fvcom_boundary_resolution_manifest_v1"
+                ),
+                "profile": config.boundary_resolution_profile,
+                "final_status": "needs_review",
+                "failure_taxonomy": ["adaptive_boundary_resolution_failed"],
+                "error": str(exc),
+                "outputs": {},
+            }
+            manifest["final_status"] = "needs_review"
+            if "adaptive_boundary_resolution_failed" not in manifest["failure_taxonomy"]:
+                manifest["failure_taxonomy"].append("adaptive_boundary_resolution_failed")
+            _write_progress(run_dir, "boundary-resolution", "failed", {"error": str(exc)})
+    else:
+        manifest["boundary_resolution"] = {
+            "profile": "legacy",
+            "enabled": False,
+            "reason": "legacy_profile_preserves_existing_boundary_workflow",
+        }
     manifest_path.write_text(json.dumps(_json_safe(manifest), indent=2), encoding="utf-8")
     _write_progress(run_dir, "complete", "done", {"final_status": manifest["final_status"]})
     return manifest
@@ -2351,6 +2400,7 @@ def _write_unresolved_upstream_manifest(
             "gshhs_levels": config.gshhs_levels,
             "heuristic_mode": resolved_heuristic_mode,
             "place_memory_enabled": bool(place_memory_enabled),
+            "boundary_resolution_profile": config.boundary_resolution_profile,
         },
         "inputs": {
             "region_name": region.get("name"),

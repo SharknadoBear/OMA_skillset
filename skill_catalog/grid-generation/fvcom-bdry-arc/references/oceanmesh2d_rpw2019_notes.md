@@ -53,3 +53,19 @@ The installed `cusp-coastline` skill writes useful EPSG:4326 `LineString` and `M
 ## Delaware / Chesapeake Separation
 
 For Delaware River / Delaware Bay cases, use GSHHS land polygons to make Delaware/Chesapeake separation a land/topology question rather than a fragmented-line connectivity question. The seed should be in the intended Delaware wet component; CUSP should not decide broad-region connectivity in this workflow.
+
+## Adaptive Coastal Resolution Contract
+
+Keep the legacy boundary workflow unchanged unless `adaptive-coastal-v1` is explicit. Write adaptive products separately from legacy layers.
+
+Use dimensionless shape and mesh-relative measures rather than raw perimeter/area alone: equivalent diameter, compactness, normalized complexity, minimum-rectangle width and aspect, solidity, and nearest wet gap divided by local target spacing.
+
+Protect mission-region islands and gaps. Preserve protected polygon geometry exactly and propagate a target no larger than one quarter of a protected gap width. Outside protected regions, merge or drop only subgrid candidates under a cumulative absolute area budget. A candidate that requires spacing below the permitted minimum must be refined, merged, dropped, or reported; never retain an unresolved constraint silently.
+
+Repair a coastal OBC against GSHHS land with fixed anchors before assigning nodes. Grade target spacing by arclength and build one continuous chain rather than sampling each source segment independently. Split a graded interval when its chord deviates from the repaired polyline by more than ten percent of local target size. Validate anchor equality, land avoidance for repaired and sampled paths, measured exterior overlap, chain order, and local `L/h` before downstream meshing.
+
+## Adaptive Coastal V2 Prevention Extension
+
+The v2 sampler is an opt-in clean-room extension; it does not change legacy or v1 behavior. Preserve both coastline/OBC landfalls as explicit hard anchors. Detect additional sharp-turn and spit-tip anchors from local and wider-scale turn evidence, suppress nearby duplicate candidates, and equidistribute `integral(ds/h)` independently between retained anchors.
+
+Use the same target spacing on both sides of each land/OBC junction and grade toward the land-boundary target. Inventory only conservative connectors whose interiors are covered by the accepted wet domain and whose bank tangents are compatible. A passage may lower targets on both banks, but this boundary-stage tool must not close the passage. If the required elements across imply spacing below the permitted minimum, retain the geometry and mark it for review, with protected/mission passages treated as a hard review gate.

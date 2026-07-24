@@ -1,157 +1,84 @@
 ---
 name: fvcom-bdry-arc
-description: Create QA-ready FVCOM boundary-arc and continuous model-boundary-loop packages from fvcom-region-bpoly RegionBPoly outputs and GSHHG/GSHHS coastline polygons. Use when Codex needs to convert a regional polygon, offshore-side artifact, and robust shoreline topology into a gridding-ready model-domain polygon, classified land/model outer boundary, island boundaries, and smooth offshore open-boundary arc artifacts before fvcom-grid-generation.
+description: Create QA-ready FVCOM open-boundary arcs, continuous model loops, and optional adaptive coastal boundary-resolution packages from RegionBPoly and GSHHG/GSHHS topology. Use when Codex needs coastline-anchor arc construction, mainland/island topology, island shape and gap diagnostics, mission-protected island generalization, graded OBC nodes, or gridding-ready boundary chains before fvcom-grid-generation.
 ---
 
 # fvcom-bdry-arc
 
-Use this skill as the second OMA gridding step after `fvcom-region-bpoly` and before `fvcom-grid-generation`.
+Use this skill after `fvcom-region-bpoly` and before `fvcom-grid-generation`.
 
-`fvcom-region-bpoly` chooses the broad four-sided modeling envelope and offshore-side intent. `fvcom-bdry-arc` turns that intent plus GSHHS/GSHHG coastline topology into an explicit boundary package and continuous model-boundary loop package. Mesh generation and SMS `.2dm` writing remain downstream in `fvcom-grid-generation`.
+## Core Rules
 
-## Core Rule
+- Treat the bpoly offshore point as a side selector, not a final endpoint.
+- Build coastal OBC anchors at coastline intersections on the two bpoly sides adjacent to the selected offshore side.
+- Use GSHHS/GSHHG polygons as the topology base. Keep CUSP as an explicit legacy/debug input.
+- Preserve lake and island/archipelago branches; do not apply mainland anchor logic to them.
+- Keep `--boundary-resolution-profile legacy` as the default and preserve all legacy outputs.
+- Treat the GPL OceanMesh2D snapshot as a method reference only; do not translate its MATLAB code.
 
-The bpoly offshore point is a side selector and anchor-search seed. It is not a final boundary endpoint.
-
-The two open-boundary anchors are coastline-on-bpoly points. For the selected offshore bpoly side, find the two adjacent bpoly sides, intersect each adjacent side with the GSHHS coastline/land boundary, and choose the crossing closest to the adjacent offshore corner. If GSHHS does not intersect exactly because of projection or resolution, snap/node only within the target-resolution tolerance; otherwise mark `needs_review`.
-
-The selected offshore side's original two corners are control points, not final anchors. The default coastal/estuary GSHHS workflow splits the adjacent bpoly sides at the coastline anchors, builds the seaward chain `start_coast_anchor -> start_offshore_corner -> offshore_side -> end_offshore_corner -> end_coast_anchor`, and deforms that chain into a smooth open boundary.
-
-Island and archipelago bpoly products use a separate offshore-loop branch. Do not force Hawaii State, Aleutian, or other island-chain domains through coastline-on-bpoly mainland anchor logic. The island branch builds a smooth closed offshore loop from the bpoly frame, subtracts GSHHS land, keeps resolved island boundaries, and records any loop-blocking island contact as a classified `land_patch_boundary` rather than a missing-anchor failure.
-
-Lake bpoly products use a closed lake-domain branch. Do not create a false red ocean/open-boundary arc for Lake Superior or other no-ocean domains; subtract GSHHS land from the bpoly frame, keep the seed-containing lake water component, and record `closure_method: lake_closed_boundary_no_open_arc`.
-
-Use GSHHS/GSHHG land polygons as the default topology base. CUSP is not the default boundary topology source; use it only through the explicit legacy/debug path when Bear asks for CUSP linework testing.
+Read `references/oceanmesh2d_rpw2019_notes.md` before changing topology, arc repair, or island filtering.
 
 ## Primary Workflow
 
-Run `scripts/run_bdry_arc.py` by default:
+Legacy behavior:
 
 ```powershell
-python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --fetch-coastline --run-dir runs/case --name case --mode test --target-resolution-m 250
+python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --coastline-gpkg gshhs_land.gpkg --coastline-source gshhs --run-dir runs/case --name case --mode test
 ```
 
-Use an existing GSHHS GeoPackage when already fetched:
+Opt-in adaptive coastal resolution:
 
 ```powershell
-python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --coastline-gpkg case_gshhs_land.gpkg --coastline-source gshhs --topology-mode gshhs-vector --run-dir runs/case --name case --mode test
+python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --coastline-gpkg gshhs_land.gpkg --coastline-source gshhs --run-dir runs/case --name case --mode test --boundary-resolution-profile adaptive-coastal-v1
 ```
 
-Important options:
+Feature-anchored, passage-aware prevention profile:
 
-- `--mode execute|test`, default `execute`. Test mode retains `intermediate/visual_review/`.
-- `--heuristic-mode auto|memory|unknown`, default `auto`: execute resolves to `memory`; test resolves to `unknown`.
-- `--coastline-source gshhs|generic-gpkg|cusp-legacy`, default `gshhs`.
-- `--fetch-coastline` calls `gshhs-coastline` unless `--coastline-source cusp-legacy` is set.
-- `--gshhs-resolution auto|c|l|i|h|f`, default `f`. Do not downshift from `f` to `h`/`i`/`l`/`c` unless the prompt or CLI explicitly requests lower resolution.
-- `--gshhs-levels`, default `1`.
-- `--topology-mode gshhs-vector|island-loop|iterative-raster|vector-only`, default `gshhs-vector`. Island bpoly products auto-route to the island-loop branch; `island-loop` is an explicit debug override.
-- `--target-resolution-m`, default `250`.
-- `--coastline-buffer-km`, default `10`.
-- `--seed-mode auto|manual-json`, default `auto`.
-- `--progress-interval-s`, default `30`. Slow fetch/topology stages update `bdry_arc_progress.jsonl` and `bdry_arc_progress_state.json`; agents should audit these files rather than silently changing resolution.
-- `--topology-time-budget-s`, default `900`. If a full-resolution GSHHS topology stage exceeds this budget, write a bounded `needs_review` with `large_gshhs_topology_budget_exceeded`; do not silently downgrade resolution.
+```powershell
+python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --coastline-gpkg gshhs_land.gpkg --coastline-source gshhs --run-dir runs/case --name case --mode test --boundary-resolution-profile adaptive-coastal-v2
+```
 
-## Memory Hygiene
+`adaptive-coastal-v1`:
 
-Heuristic memory is enabled for practical execute runs and disabled by default for test runs. In memory-off test mode, do not route from text or canonical region names alone. Preserve upstream artifact-driven behavior: `domain_type: island`, `boundary_policy: offshore_loop_no_land_anchors`, `domain_type: lake`, or `boundary_policy: no_open_boundary` still select the correct topology branch because those are explicit bpoly/offshore artifacts.
+1. Derive the continuous OBC portion of the accepted exterior loop.
+2. Repair unintended land contact with fixed endpoints and a 250 m deterministic water-side route.
+3. Grade OBC spacing from 500 m at anchors to 8 km offshore with gradation 0.15.
+4. Compute island area, perimeter, equivalent diameter, compactness, complexity, aspect, solidity, gap, and scale-stability metrics.
+5. Protect target-water-body and upstream-river feature polygons plus 10 km; retain protected island geometry exactly and impose `h <= gap/4` in a protected wet gap.
+6. Merge or drop only unprotected subgrid candidates and stop at 0.5% cumulative absolute island-area change.
+7. Generalize retained islands with area, centroid, Hausdorff, validity, principal-orientation, and mission-gap guards; split OBC chords when curvature error exceeds 10% of local target size.
+8. Write a separate explicit-chain resolution package; never overwrite legacy loop layers.
 
-If the upstream `fvcom-region-bpoly` output is unresolved or unknown, do not infer or repair geographic scope from the prompt text inside this skill. Report the upstream uncertainty and write `needs_review` rather than choosing a different coastline branch from memory.
+`adaptive-coastal-v2` retains the v1 topology and island safeguards, then adds:
 
-Antimeridian bpoly products must be processed in a compact longitude frame before projection and layer clipping so Aleutian-style domains do not collapse into a world-spanning topology problem.
+1. Exact hard anchors at both OBC landfalls plus stable sharp turns and spit tips.
+2. Anchor-to-anchor metric equidistribution, avoiding an isolated short remainder edge.
+3. One shared land/OBC junction target with the configured gradation into the land chain.
+4. A conservative wet-passage inventory with paired-bank spacing harmonization.
+5. A `needs_review` gate for protected passages that cannot fit four elements across at the permitted minimum spacing.
+6. Explicit anchor, junction, and passage metadata in diagnostics and boundary-node products.
+
+V2 never closes a channel automatically. An unresolved unprotected passage is also retained and reported for review; geographic topology changes require a separate, evidence-backed workflow.
+
+## Standalone Tools
+
+- `scripts/analyze_boundary_resolution.py`: analyze an existing loop package without changing it.
+- `scripts/refine_boundary_resolution.py`: write an adaptive resolution package from existing loop, mission, and GSHHS artifacts.
+- `scripts/build_model_boundary_loops.py`: rebuild legacy loop classification for debugging.
 
 ## Outputs
 
-Final outputs from every normal `run_bdry_arc.py` run:
+Every normal run retains the legacy boundary-arc and model-loop outputs. Adaptive runs additionally write:
 
-- `bdry_arc_manifest.json`
-- `bdry_arc_package.gpkg`
-- `bdry_arc_segments.geojson`
-- `bdry_arc_review_map.png`
-- `model_boundary_loop_manifest.json`
-- `model_boundary_loops.gpkg`
-- `model_boundary_segments.geojson`
-- `model_boundary_colored_map.png`
+- `boundary_resolution/boundary_resolution_manifest.json`
+- `boundary_resolution/boundary_resolution.gpkg`
+- `boundary_resolution/boundary_resolution_diagnostics.json`
+- `boundary_resolution/boundary_resolution_nodes.geojson`
+- `boundary_resolution/boundary_resolution_review_map.png`
 
-Test-mode visual outputs:
-
-- `intermediate/visual_review/preliminary_arc_map.png`
-- `intermediate/visual_review/gshhs_polygon_topology_map.png` for GSHHS-vector mode
-- `intermediate/visual_review/gshhs_anchor_arc_map.png` for GSHHS-vector mode
-- `intermediate/visual_review/arc_candidate_contact_sheet.png`
-
-Legacy iterative-raster mode may also write `raster_connectivity_iter_XX.png` and `component_classification_iter_XX.png`.
-
-GeoPackage layers:
-
-- `wet_domain`
-- `open_boundary_arc`
-- `land_boundary_arcs`
-- `frame_clip_boundary_arcs`
-- `land_patch_boundary_arcs`
-- `island_holes`
-- `anchor_points`
-- `candidate_arcs`
-- `coastline_raw`
-- `coastline_repaired`
-- `topology_diagnostics`
-- `forbidden_regions`
-
-`run_bdry_arc.py` automatically calls the model-boundary loop builder after `bdry_arc_package.gpkg` is written. Keep `scripts/build_model_boundary_loops.py` as a standalone debug/rebuild utility when an existing package must be reclassified without rerunning coastline fetch or arc selection.
-
-The loop package writes these layers:
-
-- `model_domain_polygon`
-- `model_outer_boundary`
-- `model_outer_boundary_segments`
-- `island_boundary_polygons`
-- `island_boundary_lines`
-- `source_open_boundary_arc`
-
-## QA Behavior
-
-Mark `final_status: pass` only when the selected arc keeps the coastline/bpoly anchor endpoints, avoids extra coastline/land intersections, is present on the final wet-domain boundary, and creates a seed-containing wet-domain polygon.
-
-Mark `final_status: needs_review` rather than forcing a false pass when:
-
-- GSHHS land polygons are missing;
-- the coastline-on-bpoly anchors are missing or beyond snap tolerance;
-- the deformed seaward-chain frame cannot create a seed-containing water component;
-- the offshore arc crosses GSHHS land away from its endpoints;
-- the open arc is not present on the accepted wet-domain exterior;
-- the seed is not inside the accepted wet domain.
-- an explicit `GSHHS f` request produces a lower-resolution GSHHS product.
-- full-resolution topology exceeds the configured time budget.
-
-For island-loop domains, a small island blocker can be represented by `land_patch_boundary_arcs` under the land-patch policy. Excessive land-patch length still marks the case `needs_review`.
-
-## Topology Method
-
-The default workflow is GSHHS-first:
-
-1. Load `region_bpoly.json` and `offshore_boundary_artifacts.json`.
-2. Fetch or load GSHHS `land_polygons` and `coastline_lines`.
-3. Project bpoly, coastline, arcs, and land polygons to a local UTM CRS.
-4. Find coastline/bpoly intersection anchors on the two bpoly sides adjacent to the selected offshore side.
-5. Split the adjacent bpoly sides at those anchors and build the seaward control chain through the two offshore-side corners.
-6. Generate smooth fixed-endpoint arc candidates by bowing/deforming that full seaward chain along the offshore azimuth.
-7. Build a closed deformed bpoly frame from the selected open arc plus the non-seaward bpoly path between anchors.
-8. Compute `deformed_frame - GSHHS land_union`, then choose the seed-containing water component.
-9. Classify `open_boundary_arc`, GSHHS-overlapping `land_boundary_arcs`, remaining `frame_clip_boundary_arcs`, and `island_holes`.
-10. Write classified boundary layers and visual-review artifacts.
-11. Automatically build the continuous model exterior loop, classify exterior segments as open/land/frame/unclassified boundary, and convert wet-domain interior rings into island polygons.
-
-The island/archipelago branch is selected from bpoly metadata when `domain_type: island` or `boundary_policy: offshore_loop_no_land_anchors`. It writes a closed open-boundary loop, classifies GSHHS land patches where the loop meets island blockers, and avoids coastline-anchor missing failures that are meaningful only for coastal/estuary domains.
-
-The lake branch is selected from bpoly/offshore metadata when `domain_type: lake` or `boundary_policy: no_open_boundary`. It writes no usable `open_boundary_arc`, keeps lake boundaries as model-domain boundary segments, and annotates the loop manifest with `lake_no_open_boundary: true`.
-
-Use `--topology-mode iterative-raster --coastline-source cusp-legacy` only for legacy CUSP/debug cases. Do not make CUSP the normal topology source until a later refinement workflow explicitly controls it as a local-detail overlay.
-
-Read `references/oceanmesh2d_rpw2019_notes.md` before changing shoreline classification, island filtering, or seeded wet-domain extraction. Treat the local OceanMesh2D snapshot as a method reference only; do not copy GPL MATLAB code into this skill implementation without explicit licensing review.
+Require fixed OBC anchors, measured complete exterior overlap, no non-endpoint land intersection in either repaired or sampled geometry, a valid resolved wet domain, zero protected-region topology operations, and area change within budget. For v2, additionally require exactly two OBC-landfall hard anchors, boundary edge-to-target ratio no greater than 1.55, and explicit review of every unresolved passage. Keep artifacts and mark `needs_review` when a guard fails.
 
 ## Validation
-
-From the skill folder:
 
 ```powershell
 python scripts/selftest_bdry_arc.py

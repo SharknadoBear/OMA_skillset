@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM Grid Generation"
-  short_description: "Build FVCOM 2DM meshes from boundary arcs and fallback bathymetry"
-  default_prompt: "Use $fvcom-grid-generation to consume fvcom-bdry-arc model-boundary-loop artifacts, fetch or reuse CUDEM/NBS/CRM/ETOPO fallback bathymetry, write progress heartbeat artifacts, create OceanMesh/RPW-style Python size fields, generate a pure-Python constrained Delaunay FVCOM mesh, write .2dm with ordered NS nodestrings, and report FVCOM quality gates."
+  short_description: "Generate and condition adaptive FVCOM meshes"
+  default_prompt: "Use $fvcom-grid-generation to generate or condition an FVCOM 2DM mesh with protected boundaries, superthin connectivity closure, and FVCOM quality gates."

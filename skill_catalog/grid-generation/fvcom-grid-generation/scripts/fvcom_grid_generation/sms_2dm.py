@@ -38,7 +38,7 @@ def write_2dm(
         for idx, tri in enumerate(triangles, start=1):
             handle.write(f"E3T {idx} {int(tri[0])} {int(tri[1])} {int(tri[2])} 1\n")
         for idx, ((lon, lat), depth) in enumerate(zip(nodes_lonlat, depths), start=1):
-            handle.write(f"ND {idx} {lon:.10f} {lat:.10f} {float(depth):.4f}\n")
+            handle.write(f"ND {idx} {lon:.12f} {lat:.12f} {float(depth):.4f}\n")
         if open_boundary_nodes.size:
             ids = [int(v) for v in open_boundary_nodes if int(v) > 0]
             for start in range(0, len(ids), 10):
