@@ -40,6 +40,9 @@ projected CRS is local WGS84 UTM selected from the mask centroid; pass
 the caller intentionally needs a different square working-cell size;
 otherwise the source-derived resolution is preserved. The default GIS launcher is
 `C:/OSGeo4W/OSGeo4W.bat`, with `grass85` inside that environment.
+On Windows, the runner loads the trusted OSGeo4W environment and invokes GDAL
+executables or the GRASS Python launcher directly; run and input paths never
+pass through nested batch `%*` expansion.
 
 ## Review
 

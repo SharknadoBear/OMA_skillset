@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import math
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -60,9 +62,127 @@ def absolute_paths(out_dir: Path) -> dict[str, Path]:
     return {name: (root / filename).resolve() for name, filename in OUTPUT_NAMES.items()}
 
 
-def osgeo_command(osgeo_shell: Path, args: Sequence[str]) -> list[str]:
-    command = "call " + subprocess.list2cmdline([str(osgeo_shell), *map(str, args)])
-    return ["cmd", "/d", "/s", "/c", command]
+def _environment_value(environment: dict[str, str], name: str) -> str | None:
+    expected = name.casefold()
+    return next((value for key, value in environment.items() if key.casefold() == expected), None)
+
+
+@functools.lru_cache(maxsize=8)
+def _batch_environment(batch_paths: tuple[str, ...]) -> dict[str, str]:
+    """Capture environment changes from trusted OSGeo4W batch scripts."""
+    if not batch_paths:
+        raise ValueError("At least one OSGeo4W environment batch file is required")
+    command_argv = ["cmd", "/d", "/v:off", "/c"]
+    for raw_path in batch_paths:
+        path = Path(raw_path).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"OSGeo4W environment script not found: {path}")
+        if any(character in str(path) for character in {'"', "\r", "\n"}):
+            raise ValueError(f"Unsafe OSGeo4W environment-script path: {path}")
+        command_argv.extend(["call", str(path), "&&"])
+    command_argv.append("set")
+    result = subprocess.run(
+        command_argv,
+        text=True,
+        capture_output=True,
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Could not load OSGeo4W environment from {batch_paths}: "
+            f"{result.stderr[-2000:] or result.stdout[-2000:]}"
+        )
+    environment: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key and not key.startswith("="):
+            environment[key] = value
+    if not _environment_value(environment, "PATH"):
+        raise RuntimeError("OSGeo4W environment did not define PATH")
+    return environment
+
+
+def build_grass_direct_argv(
+    logical_args: Sequence[str],
+    *,
+    grass_python: str | Path,
+    grass_script: str | Path,
+) -> list[str]:
+    """Preserve every GRASS logical argument outside a batch/cmd boundary."""
+    if not logical_args:
+        raise ValueError("GRASS logical argument list must not be empty")
+    return [str(grass_python), str(grass_script), *[str(value) for value in logical_args[1:]]]
+
+
+def osgeo_process(
+    osgeo_shell: Path,
+    args: Sequence[str],
+) -> tuple[list[str], dict[str, str], dict[str, Any]]:
+    """Resolve OSGeo4W tools to direct executable argv.
+
+    User and run paths are never interpolated into a cmd.exe command string.
+    cmd.exe is used only to read trusted installation environment scripts.
+    """
+    if not args:
+        raise ValueError("OSGeo command must contain an executable name")
+    shell = osgeo_shell.resolve()
+    osgeo_root = shell.parent
+    base_environment_script = osgeo_root / "bin" / "o4w_env.bat"
+    base_environment = _batch_environment((str(base_environment_script.resolve()),))
+    search_path = _environment_value(base_environment, "PATH")
+    resolved_launcher = shutil.which(str(args[0]), path=search_path)
+    if not resolved_launcher:
+        raise FileNotFoundError(f"OSGeo4W command not found in configured PATH: {args[0]}")
+    launcher_path = Path(resolved_launcher).resolve()
+    logical_args = [str(value) for value in args]
+
+    if launcher_path.suffix.casefold() in {".bat", ".cmd"}:
+        grass_name = launcher_path.stem
+        grass_environment_script = osgeo_root / "apps" / "grass" / grass_name / "etc" / "env.bat"
+        if not grass_name.casefold().startswith("grass") or not grass_environment_script.is_file():
+            raise RuntimeError(
+                f"Refusing unsupported OSGeo4W batch launcher {launcher_path}; "
+                "only a resolved GRASS launcher is translated to direct Python argv"
+            )
+        environment_scripts = (
+            str(base_environment_script.resolve()),
+            str(grass_environment_script.resolve()),
+        )
+        process_environment = _batch_environment(environment_scripts)
+        grass_python = _environment_value(process_environment, "GRASS_PYTHON")
+        gisbase = _environment_value(process_environment, "GISBASE")
+        if not grass_python or not gisbase:
+            raise RuntimeError(f"GRASS environment for {grass_name} lacks GRASS_PYTHON or GISBASE")
+        grass_script = Path(gisbase) / "etc" / f"{grass_name}.py"
+        if not Path(grass_python).is_file() or not grass_script.is_file():
+            raise FileNotFoundError(
+                f"Resolved GRASS direct launcher is incomplete: python={grass_python}, script={grass_script}"
+            )
+        process_argv = build_grass_direct_argv(
+            logical_args,
+            grass_python=grass_python,
+            grass_script=grass_script,
+        )
+        launcher = {
+            "mode": "osgeo4w_direct_grass_python_v1",
+            "osgeo_shell": str(shell),
+            "resolved_batch_launcher": str(launcher_path),
+            "resolved_executable": process_argv[0],
+            "resolved_script": process_argv[1],
+            "environment_scripts": list(environment_scripts),
+        }
+        return process_argv, dict(process_environment), launcher
+
+    process_argv = [str(launcher_path), *logical_args[1:]]
+    launcher = {
+        "mode": "osgeo4w_direct_executable_v1",
+        "osgeo_shell": str(shell),
+        "resolved_executable": str(launcher_path),
+        "environment_scripts": [str(base_environment_script.resolve())],
+    }
+    return process_argv, dict(base_environment), launcher
 
 
 def run_osgeo(
@@ -75,9 +195,11 @@ def run_osgeo(
 ) -> dict[str, Any]:
     started = now_utc()
     start_clock = time.perf_counter()
+    process_argv, process_environment, launcher = osgeo_process(osgeo_shell, args)
     result = subprocess.run(
-        osgeo_command(osgeo_shell, args),
+        process_argv,
         cwd=cwd,
+        env=process_environment,
         text=True,
         capture_output=True,
         errors="replace",
@@ -88,6 +210,8 @@ def run_osgeo(
         "finished_utc": now_utc(),
         "duration_seconds": round(time.perf_counter() - start_clock, 6),
         "args": [str(value) for value in args],
+        "executed_argv": process_argv,
+        "launcher": launcher,
         "returncode": result.returncode,
         "stdout_tail": result.stdout[-4000:],
         "stderr_tail": result.stderr[-4000:],
@@ -102,9 +226,11 @@ def run_osgeo(
 
 def probe_version(osgeo_shell: Path, args: Sequence[str], cwd: Path) -> str | None:
     try:
+        process_argv, process_environment, _ = osgeo_process(osgeo_shell, args)
         result = subprocess.run(
-            osgeo_command(osgeo_shell, args),
+            process_argv,
             cwd=cwd,
+            env=process_environment,
             text=True,
             capture_output=True,
             errors="replace",

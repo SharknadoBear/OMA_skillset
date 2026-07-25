@@ -183,6 +183,27 @@ def test_regular_lonlat_netcdf_ascending_lat_and_sign() -> None:
         assert float(projected_values.max()) < 0.0
 
 
+def test_windows_grass_argv_preserves_spaced_paths() -> None:
+    surface = r"C:\Users\Bear\OneDrive - PNNL\A&B (test)\projected surface.tif"
+    location = r"C:\Users\Bear\OneDrive - PNNL\run folder\grassdata\topobathy_flownet"
+    logical = ["grass85", "-c", surface, location, "-e"]
+    process_argv = runner.build_grass_direct_argv(
+        logical,
+        grass_python=r"C:\OSGeo4W\bin\python3.exe",
+        grass_script=r"C:\OSGeo4W\apps\grass\grass85\etc\grass85.py",
+    )
+    assert process_argv == [
+        r"C:\OSGeo4W\bin\python3.exe",
+        r"C:\OSGeo4W\apps\grass\grass85\etc\grass85.py",
+        "-c",
+        surface,
+        location,
+        "-e",
+    ]
+    assert process_argv[3] == surface
+    assert process_argv[4] == location
+
+
 def main() -> None:
     tests = [
         test_physical_threshold,
@@ -191,6 +212,7 @@ def main() -> None:
         test_downhill_reorientation_and_deterministic_ids,
         test_manifest_schema_literal,
         test_regular_lonlat_netcdf_ascending_lat_and_sign,
+        test_windows_grass_argv_preserves_spaced_paths,
     ]
     for test in tests:
         test()
