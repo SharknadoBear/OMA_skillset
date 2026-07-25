@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import struct
 import tempfile
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from topobathy_flownet_core import (
     affine_cell_area_m2,
     automatic_utm_epsg,
     build_arc_records,
+    decode_wkb_line_parts,
     network_dat_rows,
     source_area_to_cells,
 )
@@ -204,6 +206,30 @@ def test_windows_grass_argv_preserves_spaced_paths() -> None:
     assert process_argv[4] == location
 
 
+def test_raw_wkb_reader_skips_one_point_line_and_preserves_valid_part() -> None:
+    def line_wkb(points):
+        return (
+            struct.pack("<BI", 1, 2)
+            + struct.pack("<I", len(points))
+            + b"".join(struct.pack("<dd", x, y) for x, y in points)
+        )
+
+    valid = line_wkb([(0.0, 0.0), (1.0, 1.0)])
+    invalid_one_point = line_wkb([(9.0, 9.0)])
+    mixed_multiline = struct.pack("<BII", 1, 5, 2) + valid + invalid_one_point
+    parts, geometry_type, reasons = decode_wkb_line_parts(mixed_multiline)
+    assert geometry_type == "MultiLineString"
+    assert parts == [[(0.0, 0.0), (1.0, 1.0)]]
+    assert reasons["fewer_than_two_coordinates"] == 1
+    assert sum(reasons.values()) == 1
+
+    point = struct.pack("<BI", 1, 1) + struct.pack("<dd", 2.0, 3.0)
+    point_parts, point_type, point_reasons = decode_wkb_line_parts(point)
+    assert point_type == "Point"
+    assert not point_parts
+    assert point_reasons["non_line_geometry"] == 1
+
+
 def main() -> None:
     tests = [
         test_physical_threshold,
@@ -213,6 +239,7 @@ def main() -> None:
         test_manifest_schema_literal,
         test_regular_lonlat_netcdf_ascending_lat_and_sign,
         test_windows_grass_argv_preserves_spaced_paths,
+        test_raw_wkb_reader_skips_one_point_line_and_preserves_valid_part,
     ]
     for test in tests:
         test()

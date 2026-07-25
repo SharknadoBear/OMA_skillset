@@ -90,3 +90,9 @@ versions, topology counts, and final status.
 
 Multiple terminal arcs are reported for interpretation but do not change the
 health verdict.
+
+GRASS may export point and line primitives in one raw layer. The raw reader
+uses per-feature WKB decoding so a null, empty, non-line, nonfinite,
+one-coordinate, repeated-coordinate, or malformed primitive is recorded and
+skipped without discarding other valid line parts. The same sanitization
+ledger is written to topology QA, the manifest summary, and health diagnostics.

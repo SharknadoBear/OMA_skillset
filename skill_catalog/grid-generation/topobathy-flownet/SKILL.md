@@ -52,6 +52,9 @@ pass through nested batch `%*` expansion.
   does not pass.
 - Review both hillshade-backed QA maps and confirm that high SegOrder arcs and
   accumulation paths follow the intended terrain or topobathymetry.
+- Review `topology_qa.json.raw_stream_reader`. Mixed GRASS point primitives
+  and degenerate line exports are skipped per primitive with reason counts;
+  valid line parts remain the only topology inputs.
 - Treat multiple terminals or sinks as a diagnostic, not a failure. This keeps
   closed analysis domains valid.
 - Use `topobathy_flownet.gpkg`, layer `topobathy_flownet`, as the stable

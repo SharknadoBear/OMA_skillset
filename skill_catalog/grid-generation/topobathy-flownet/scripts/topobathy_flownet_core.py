@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import struct
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -15,6 +16,162 @@ SCHEMA_VERSION = "topobathy_flownet_v1"
 Point = tuple[float, float]
 Line = list[Point]
 Sampler = Callable[[Sequence[Point]], Sequence[float]]
+
+
+class WkbDecodeError(ValueError):
+    """Raised for structurally unreadable WKB."""
+
+
+def _wkb_header(data: bytes, offset: int) -> tuple[str, int, int, int]:
+    if offset + 5 > len(data):
+        raise WkbDecodeError("truncated WKB header")
+    byte_order = data[offset]
+    if byte_order == 0:
+        endian = ">"
+    elif byte_order == 1:
+        endian = "<"
+    else:
+        raise WkbDecodeError(f"invalid WKB byte order {byte_order}")
+    type_code = struct.unpack_from(f"{endian}I", data, offset + 1)[0]
+    cursor = offset + 5
+    has_z = bool(type_code & 0x80000000)
+    has_m = bool(type_code & 0x40000000)
+    has_srid = bool(type_code & 0x20000000)
+    base_type = type_code & 0x000000FF if type_code & 0xE0000000 else type_code
+    dimensions = 2 + int(has_z) + int(has_m)
+    if not type_code & 0xE0000000:
+        dimension_class, base_type = divmod(type_code, 1000)
+        if dimension_class == 1:
+            dimensions = 3
+        elif dimension_class == 2:
+            dimensions = 3
+        elif dimension_class == 3:
+            dimensions = 4
+        elif dimension_class != 0:
+            raise WkbDecodeError(f"unsupported WKB type code {type_code}")
+    if has_srid:
+        if cursor + 4 > len(data):
+            raise WkbDecodeError("truncated EWKB SRID")
+        cursor += 4
+    return endian, int(base_type), dimensions, cursor
+
+
+def _wkb_uint32(data: bytes, offset: int, endian: str) -> tuple[int, int]:
+    if offset + 4 > len(data):
+        raise WkbDecodeError("truncated WKB count")
+    return struct.unpack_from(f"{endian}I", data, offset)[0], offset + 4
+
+
+def _wkb_coordinates(
+    data: bytes,
+    offset: int,
+    endian: str,
+    dimensions: int,
+    count: int,
+) -> tuple[list[Point], bool, int]:
+    coordinate_bytes = count * dimensions * 8
+    if count > len(data) or offset + coordinate_bytes > len(data):
+        raise WkbDecodeError("truncated or unreasonable WKB coordinate array")
+    points: list[Point] = []
+    all_finite = True
+    format_string = f"{endian}{dimensions}d"
+    for _ in range(count):
+        values = struct.unpack_from(format_string, data, offset)
+        offset += dimensions * 8
+        all_finite = all_finite and all(math.isfinite(value) for value in values)
+        points.append((float(values[0]), float(values[1])))
+    return points, all_finite, offset
+
+
+def decode_wkb_line_parts(raw_wkb: bytes | None) -> tuple[list[Line], str, dict[str, int]]:
+    """Decode valid line parts without bulk GEOS construction.
+
+    The decoder supports standard/EWKB Point, LineString, MultiLineString, and
+    GeometryCollection records. Non-line primitives are counted and skipped.
+    Malformed line parts never discard valid parts already decoded.
+    """
+    reasons = {
+        "null_geometry": 0,
+        "empty_geometry": 0,
+        "non_line_geometry": 0,
+        "fewer_than_two_coordinates": 0,
+        "fewer_than_two_distinct_coordinates": 0,
+        "nonfinite_coordinate": 0,
+        "invalid_wkb": 0,
+    }
+    if raw_wkb is None:
+        reasons["null_geometry"] = 1
+        return [], "Null", reasons
+    data = bytes(raw_wkb)
+    if not data:
+        reasons["empty_geometry"] = 1
+        return [], "Empty", reasons
+
+    type_names = {
+        1: "Point",
+        2: "LineString",
+        3: "Polygon",
+        4: "MultiPoint",
+        5: "MultiLineString",
+        6: "MultiPolygon",
+        7: "GeometryCollection",
+    }
+    parts: list[Line] = []
+
+    def skip_geometry(offset: int) -> int:
+        endian, base_type, dimensions, cursor = _wkb_header(data, offset)
+        if base_type == 1:
+            _, _, cursor = _wkb_coordinates(data, cursor, endian, dimensions, 1)
+            return cursor
+        if base_type == 2:
+            count, cursor = _wkb_uint32(data, cursor, endian)
+            _, _, cursor = _wkb_coordinates(data, cursor, endian, dimensions, count)
+            return cursor
+        if base_type == 3:
+            ring_count, cursor = _wkb_uint32(data, cursor, endian)
+            for _ in range(ring_count):
+                count, cursor = _wkb_uint32(data, cursor, endian)
+                _, _, cursor = _wkb_coordinates(data, cursor, endian, dimensions, count)
+            return cursor
+        if base_type in {4, 5, 6, 7}:
+            geometry_count, cursor = _wkb_uint32(data, cursor, endian)
+            for _ in range(geometry_count):
+                cursor = skip_geometry(cursor)
+            return cursor
+        raise WkbDecodeError(f"unsupported WKB geometry type {base_type}")
+
+    def collect_geometry(offset: int) -> int:
+        endian, base_type, dimensions, cursor = _wkb_header(data, offset)
+        if base_type == 2:
+            count, cursor = _wkb_uint32(data, cursor, endian)
+            points, all_finite, cursor = _wkb_coordinates(data, cursor, endian, dimensions, count)
+            if count == 0:
+                reasons["empty_geometry"] += 1
+            elif count < 2:
+                reasons["fewer_than_two_coordinates"] += 1
+            elif not all_finite:
+                reasons["nonfinite_coordinate"] += 1
+            elif len(set(points)) < 2:
+                reasons["fewer_than_two_distinct_coordinates"] += 1
+            else:
+                parts.append(points)
+            return cursor
+        if base_type in {5, 7}:
+            geometry_count, cursor = _wkb_uint32(data, cursor, endian)
+            for _ in range(geometry_count):
+                cursor = collect_geometry(cursor)
+            return cursor
+        reasons["non_line_geometry"] += 1
+        return skip_geometry(offset)
+
+    try:
+        _, top_type, _, _ = _wkb_header(data, 0)
+        top_type_name = type_names.get(top_type, f"Type{top_type}")
+        collect_geometry(0)
+    except (WkbDecodeError, struct.error, OverflowError, ValueError):
+        reasons["invalid_wkb"] += 1
+        top_type_name = "InvalidWKB"
+    return parts, top_type_name, reasons
 
 
 def sha256_file(path: Path, chunk_bytes: int = 1024 * 1024) -> str:
@@ -307,4 +464,3 @@ def network_dat_rows(records: Sequence[dict[str, Any]]) -> list[str]:
         )
         for record in sorted(records, key=lambda item: item["arcid"])
     ]
-

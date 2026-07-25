@@ -22,6 +22,7 @@ from topobathy_flownet_core import (
     affine_cell_area_m2,
     automatic_utm_epsg,
     build_arc_records,
+    decode_wkb_line_parts,
     network_dat_rows,
     sha256_file,
     source_area_to_cells,
@@ -762,26 +763,74 @@ def raster_sampler(path: Path):
 
 
 def read_raw_lines(path: Path):
-    import geopandas as gpd
+    import pyogrio.raw
+    from pyproj import CRS
 
-    frame = gpd.read_file(path, layer="stream_vector_raw")
+    metadata, feature_ids, raw_geometries, _ = pyogrio.raw.read(
+        path,
+        layer="stream_vector_raw",
+        columns=[],
+        read_geometry=True,
+        return_fids=True,
+    )
     lines: list[list[tuple[float, float]]] = []
-    for geometry in frame.geometry:
-        if geometry is None or geometry.is_empty:
-            continue
-        if geometry.geom_type == "LineString":
-            parts = [geometry]
-        elif geometry.geom_type == "MultiLineString":
-            parts = list(geometry.geoms)
-        else:
-            # GRASS stream vectors can include point primitives in the same
-            # layer; only line primitives define DHSVM arcs.
-            continue
-        for part in parts:
-            coordinates = [(float(x), float(y)) for x, y, *_ in part.coords]
-            if len(coordinates) >= 2:
-                lines.append(coordinates)
-    return lines, frame.crs
+    reason_counts = {
+        "null_geometry": 0,
+        "empty_geometry": 0,
+        "non_line_geometry": 0,
+        "fewer_than_two_coordinates": 0,
+        "fewer_than_two_distinct_coordinates": 0,
+        "nonfinite_coordinate": 0,
+        "invalid_wkb": 0,
+    }
+    geometry_type_counts: dict[str, int] = {}
+    skipped_feature_examples: list[dict[str, Any]] = []
+    feature_count_with_accepted_lines = 0
+    feature_count_with_skips = 0
+    for index, raw_geometry in enumerate(raw_geometries):
+        parts, geometry_type, reasons = decode_wkb_line_parts(raw_geometry)
+        geometry_type_counts[geometry_type] = geometry_type_counts.get(geometry_type, 0) + 1
+        lines.extend(parts)
+        if parts:
+            feature_count_with_accepted_lines += 1
+        active_reasons = {name: count for name, count in reasons.items() if count}
+        if active_reasons:
+            feature_count_with_skips += 1
+            if len(skipped_feature_examples) < 20:
+                feature_id = feature_ids[index] if feature_ids is not None else index
+                skipped_feature_examples.append(
+                    {
+                        "fid": int(feature_id),
+                        "geometry_type": geometry_type,
+                        "reasons": active_reasons,
+                    }
+                )
+        for name, count in reasons.items():
+            reason_counts[name] += count
+    candidate_line_part_count = (
+        len(lines)
+        + reason_counts["fewer_than_two_coordinates"]
+        + reason_counts["fewer_than_two_distinct_coordinates"]
+        + reason_counts["nonfinite_coordinate"]
+    )
+    crs_text = metadata.get("crs")
+    raw_crs = CRS.from_user_input(crs_text) if crs_text else None
+    diagnostics = {
+        "reader": "pyogrio_raw_wkb_sanitized_v1",
+        "layer": "stream_vector_raw",
+        "source_path": str(path.resolve()),
+        "source_crs": raw_crs.to_string() if raw_crs else None,
+        "feature_count_total": int(len(raw_geometries)),
+        "feature_count_with_accepted_lines": feature_count_with_accepted_lines,
+        "feature_count_with_skips": feature_count_with_skips,
+        "geometry_type_counts": dict(sorted(geometry_type_counts.items())),
+        "candidate_line_part_count": candidate_line_part_count,
+        "accepted_line_part_count": len(lines),
+        "skipped_primitive_count": int(sum(reason_counts.values())),
+        "skipped_reason_counts": reason_counts,
+        "skipped_feature_examples": skipped_feature_examples,
+    }
+    return lines, raw_crs, diagnostics
 
 
 def write_network_products(records: list[dict[str, Any]], crs, paths: dict[str, Path]) -> None:
@@ -898,6 +947,7 @@ def validate_outputs(
     paths: dict[str, Path],
     prep: dict[str, Any],
     topology_qa: dict[str, Any],
+    raw_stream_qa: dict[str, Any],
     records: list[dict[str, Any]],
     min_finite_coverage: float,
 ) -> dict[str, Any]:
@@ -926,6 +976,11 @@ def validate_outputs(
     add("downstream_order_increase", not topology_qa["segorder_errors"], topology_qa["segorder_errors"])
     network_rows = [line for line in paths["stream_network_dat"].read_text(encoding="utf-8").splitlines() if line.strip()]
     add("network_row_count", len(network_rows) == len(records), {"rows": len(network_rows), "arcs": len(records)})
+    add(
+        "raw_stream_sanitized_read",
+        raw_stream_qa["accepted_line_part_count"] > 0,
+        raw_stream_qa,
+    )
 
     readable_errors: list[str] = []
     for name in (
@@ -943,10 +998,8 @@ def validate_outputs(
         except Exception as error:
             readable_errors.append(f"{name}: {error}")
     try:
-        raw_frame = gpd.read_file(paths["raw_stream_vector"], layer="stream_vector_raw")
-        raw_line_count = int(raw_frame.geom_type.isin(["LineString", "MultiLineString"]).sum())
-        if raw_line_count < 1:
-            readable_errors.append("raw_stream_vector_empty")
+        if not paths["raw_stream_vector"].is_file() or paths["raw_stream_vector"].stat().st_size == 0:
+            readable_errors.append("raw_stream_vector_missing")
         if len(gpd.read_file(paths["dhsvm_gpkg"], layer="topobathy_flownet")) != len(records):
             readable_errors.append("dhsvm_gpkg_row_count")
     except Exception as error:
@@ -972,6 +1025,7 @@ def validate_outputs(
         "diagnostics": {
             "terminal_segments": topology_qa["terminal_segments"],
             "multiple_terminal_segments": topology_qa["multiple_terminal_segments_diagnostic"],
+            "raw_stream_reader": raw_stream_qa,
             "note": "Multiple terminals/sinks are diagnostic and do not fail closed-domain networks.",
         },
     }
@@ -1035,7 +1089,16 @@ def main() -> int:
             "executable": sys.executable,
             "packages": {
                 name: package_version(name)
-                for name in ("geopandas", "matplotlib", "numpy", "pyproj", "rasterio", "shapely", "xarray")
+                for name in (
+                    "geopandas",
+                    "matplotlib",
+                    "numpy",
+                    "pyogrio",
+                    "pyproj",
+                    "rasterio",
+                    "shapely",
+                    "xarray",
+                )
             },
         },
     }
@@ -1119,7 +1182,7 @@ def main() -> int:
             command_records=manifest["commands"],
         )
 
-        lines, raw_crs = read_raw_lines(paths["raw_stream_vector"])
+        lines, raw_crs, raw_stream_qa = read_raw_lines(paths["raw_stream_vector"])
         records, topology_qa = build_arc_records(
             lines,
             raster_sampler(paths["projected_surface"]),
@@ -1131,6 +1194,7 @@ def main() -> int:
             {
                 "schema": SCHEMA_VERSION,
                 "timestamp_utc": now_utc(),
+                "raw_stream_reader": raw_stream_qa,
                 "required_fields": [
                     "arcid",
                     "from_node",
@@ -1160,6 +1224,7 @@ def main() -> int:
             paths=paths,
             prep=prep,
             topology_qa=topology_qa,
+            raw_stream_qa=raw_stream_qa,
             records=records,
             min_finite_coverage=args.min_finite_coverage,
         )
@@ -1176,6 +1241,7 @@ def main() -> int:
                 "multiple_terminal_segments_diagnostic",
             )
         }
+        manifest["topology_summary"]["raw_stream_reader"] = raw_stream_qa
         return_code = 0 if health["status"] == "pass" else 2
     except Exception as error:
         manifest["status"] = "failed"
