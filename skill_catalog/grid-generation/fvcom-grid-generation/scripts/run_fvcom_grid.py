@@ -25,13 +25,37 @@ def main() -> int:
     parser.add_argument("--boundary-loops-gpkg")
     parser.add_argument("--boundary-resolution-manifest")
     parser.add_argument("--bathy-nc")
+    parser.add_argument(
+        "--channel-flownet-manifest",
+        help="Optional passing topobathy-flownet manifest to consume instead of generating a run-local network.",
+    )
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--mode", choices=("execute", "test"), default="execute")
     parser.add_argument("--coarse-smoke", action="store_true")
     parser.add_argument("--land-spacing-m", type=float, default=50.0)
     parser.add_argument("--open-spacing-m", type=float, default=3000.0)
-    parser.add_argument("--gradation", type=float, default=0.15)
+    parser.add_argument("--gradation", type=float, default=0.20)
+    parser.add_argument("--slope-elements", type=float, default=10.0)
+    parser.add_argument("--coastal-distance-m", type=float, default=12_000.0)
+    parser.add_argument("--feature-elements", type=float, default=3.0)
+    parser.add_argument("--wavelength-period-s", type=float, default=44_714.0)
+    parser.add_argument("--wavelength-elements", type=float, default=20.0)
+    parser.add_argument("--channel-reslope-angle-deg", type=float, default=60.0)
+    parser.add_argument("--channel-elements-per-depth", type=float, default=1.0)
+    parser.add_argument(
+        "--channel-min-size-m",
+        type=float,
+        help="Minimum channel-controlled size; defaults to --land-spacing-m.",
+    )
+    parser.add_argument(
+        "--channel-flownet",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Generate a run-local topobathy-flownet package when no manifest is supplied.",
+    )
+    parser.add_argument("--channel-flownet-source-area-km2", type=float, default=1.0)
+    parser.add_argument("--channel-flownet-target-resolution-m", type=float)
     parser.add_argument("--target-timestep-s", default="auto")
     parser.add_argument("--max-interior-points", type=int, default=80_000)
     parser.add_argument("--max-total-nodes", type=int, default=120_000)
@@ -57,13 +81,6 @@ def main() -> int:
         choices=("legacy", "adaptive-coastal-v1", "adaptive-coastal-v2"),
         default="legacy",
     )
-    parser.add_argument(
-        "--bathy-gradient-policy",
-        choices=("auto", "global", "coastal", "off"),
-        default="auto",
-        help="Bathymetric-gradient sizing policy; auto uses coastal gating for adaptive boundaries and global behavior for legacy grids.",
-    )
-    parser.add_argument("--coastal-gradient-distance-m", type=float, default=25_000.0)
     parser.add_argument("--regional-spring-relaxation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--spring-relax-iterations", type=int, default=20)
     parser.add_argument("--spring-relax-quality-threshold", type=float, default=0.40)
@@ -187,6 +204,21 @@ def main() -> int:
             open_spacing_m=args.open_spacing_m,
             coarse_smoke=args.coarse_smoke,
             gradation=args.gradation,
+            slope_elements=args.slope_elements,
+            coastal_distance_m=args.coastal_distance_m,
+            feature_elements=args.feature_elements,
+            wavelength_period_s=args.wavelength_period_s,
+            wavelength_elements=args.wavelength_elements,
+            channel_reslope_angle_deg=args.channel_reslope_angle_deg,
+            channel_elements_per_depth=args.channel_elements_per_depth,
+            channel_min_size_m=args.channel_min_size_m,
+            channel_flownet=args.channel_flownet,
+            channel_flownet_source_area_km2=(
+                args.channel_flownet_source_area_km2
+            ),
+            channel_flownet_target_resolution_m=(
+                args.channel_flownet_target_resolution_m
+            ),
             target_timestep_s=args.target_timestep_s,
             max_interior_points=args.max_interior_points,
             max_total_nodes=args.max_total_nodes,
@@ -200,8 +232,6 @@ def main() -> int:
             progress_interval_s=args.progress_interval_s,
             size_field_max_cells=args.size_field_max_cells,
             boundary_resolution_profile=args.boundary_resolution_profile,
-            bathymetry_gradient_policy=args.bathy_gradient_policy,
-            coastal_gradient_distance_m=args.coastal_gradient_distance_m,
             regional_spring_relaxation=args.regional_spring_relaxation,
             spring_relax_iterations=args.spring_relax_iterations,
             spring_relax_quality_threshold=args.spring_relax_quality_threshold,
@@ -262,6 +292,7 @@ def main() -> int:
         boundary_loops_gpkg=args.boundary_loops_gpkg,
         boundary_resolution_manifest=args.boundary_resolution_manifest,
         bathy_nc=args.bathy_nc,
+        channel_flownet_manifest=args.channel_flownet_manifest,
     )
     print(json.dumps({"final_status": manifest["final_status"], "outputs": manifest["outputs"]}, indent=2))
     return 0

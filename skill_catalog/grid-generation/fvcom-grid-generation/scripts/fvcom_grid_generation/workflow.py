@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -12,8 +13,9 @@ import sys
 import time
 from typing import Any
 
+import geopandas as gpd
 import numpy as np
-from shapely import contains_xy
+from shapely.geometry import LineString, MultiLineString, mapping
 
 from .bathymetry import coarsen_for_size_field, load_bathymetry
 from .boundary import (
@@ -31,8 +33,8 @@ from .progress import ProgressTracker
 from .projection import project_points, unproject_points
 from .quality import evaluate_mesh_quality
 from .size_field import (
+    ChannelFlowline,
     SizeFieldConfig,
-    SizeFieldSemantics,
     boundary_front_seed_points,
     build_size_field,
     write_size_field,
@@ -49,7 +51,18 @@ class GridConfig:
     land_spacing_m: float = 50.0
     open_spacing_m: float = 3000.0
     coarse_smoke: bool = False
-    gradation: float = 0.15
+    gradation: float = 0.20
+    slope_elements: float = 10.0
+    coastal_distance_m: float = 12_000.0
+    feature_elements: float = 3.0
+    wavelength_period_s: float = 44_714.0
+    wavelength_elements: float = 20.0
+    channel_reslope_angle_deg: float = 60.0
+    channel_elements_per_depth: float = 1.0
+    channel_min_size_m: float | None = None
+    channel_flownet: bool = True
+    channel_flownet_source_area_km2: float = 1.0
+    channel_flownet_target_resolution_m: float | None = None
     target_timestep_s: str = "auto"
     max_interior_points: int = 80_000
     max_total_nodes: int = 120_000
@@ -64,8 +77,6 @@ class GridConfig:
     progress_interval_s: float = 10.0
     size_field_max_cells: int = 1_500_000
     boundary_resolution_profile: str = "legacy"
-    bathymetry_gradient_policy: str = "auto"
-    coastal_gradient_distance_m: float = 25_000.0
     regional_spring_relaxation: bool = True
     spring_relax_iterations: int = 20
     spring_relax_quality_threshold: float = 0.40
@@ -123,6 +134,7 @@ def run_fvcom_grid(
     boundary_loops_gpkg: str | Path | None = None,
     boundary_resolution_manifest: str | Path | None = None,
     bathy_nc: str | Path | None = None,
+    channel_flownet_manifest: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run the complete mesh workflow and write artifacts."""
     config = config or GridConfig()
@@ -130,8 +142,52 @@ def run_fvcom_grid(
         raise ValueError("Integrated post-generation cleanup is disabled; run postprocess_fvcom_mesh.py explicitly on the finished .2dm")
     if config.boundary_resolution_profile not in {"legacy", "adaptive-coastal-v1", "adaptive-coastal-v2"}:
         raise ValueError("boundary_resolution_profile must be legacy, adaptive-coastal-v1, or adaptive-coastal-v2")
-    if config.bathymetry_gradient_policy not in {"auto", "global", "coastal", "off"}:
-        raise ValueError("bathymetry_gradient_policy must be auto, global, coastal, or off")
+    if not np.isfinite(float(config.gradation)) or float(config.gradation) < 0.0:
+        raise ValueError("gradation must be nonnegative")
+    if not np.isfinite(float(config.slope_elements)) or float(config.slope_elements) <= 0.0:
+        raise ValueError("slope_elements must be positive")
+    if (
+        not np.isfinite(float(config.coastal_distance_m))
+        or float(config.coastal_distance_m) < 0.0
+    ):
+        raise ValueError("coastal_distance_m must be nonnegative")
+    if not np.isfinite(float(config.feature_elements)) or float(config.feature_elements) <= 0.0:
+        raise ValueError("feature_elements must be positive")
+    if (
+        not np.isfinite(float(config.wavelength_period_s))
+        or not np.isfinite(float(config.wavelength_elements))
+        or float(config.wavelength_period_s) <= 0.0
+        or float(config.wavelength_elements) <= 0.0
+    ):
+        raise ValueError("wavelength controls must be positive")
+    if (
+        not np.isfinite(float(config.channel_reslope_angle_deg))
+        or not (0.0 <= float(config.channel_reslope_angle_deg) < 90.0)
+    ):
+        raise ValueError("channel_reslope_angle_deg must be in [0, 90) degrees")
+    if (
+        not np.isfinite(float(config.channel_elements_per_depth))
+        or float(config.channel_elements_per_depth) <= 0.0
+    ):
+        raise ValueError("channel_elements_per_depth must be positive")
+    if config.channel_min_size_m is not None and (
+        not np.isfinite(float(config.channel_min_size_m))
+        or float(config.channel_min_size_m) <= 0.0
+    ):
+        raise ValueError("channel_min_size_m must be positive when supplied")
+    if (
+        not np.isfinite(float(config.channel_flownet_source_area_km2))
+        or float(config.channel_flownet_source_area_km2) <= 0.0
+    ):
+        raise ValueError("channel_flownet_source_area_km2 must be positive")
+    if (
+        config.channel_flownet_target_resolution_m is not None
+        and (
+            not np.isfinite(float(config.channel_flownet_target_resolution_m))
+            or float(config.channel_flownet_target_resolution_m) <= 0.0
+        )
+    ):
+        raise ValueError("channel_flownet_target_resolution_m must be positive when supplied")
     if config.conditioning_profile not in {"auto", "guarded-v1", "aggressive-local-v2", "none"}:
         raise ValueError("conditioning_profile must be auto, guarded-v1, aggressive-local-v2, or none")
     if config.thin_repair_profile not in {
@@ -244,6 +300,82 @@ def run_fvcom_grid(
 
     progress.update("load_bathymetry", 28.0, message="Loading positive-down bathymetry grid.", artifact=bathy_nc)
     bathy = load_bathymetry(bathy_nc)
+    channel_flowlines: list[ChannelFlowline] = []
+    channel_flownet_report: dict[str, Any] = {
+        "enabled": bool(config.channel_flownet),
+        "source": "disabled",
+        "manifest": None,
+        "flowline_count": 0,
+        "arc_count": 0,
+        "order_counts": {},
+    }
+    resolved_channel_manifest: Path | None = None
+    if channel_flownet_manifest is not None:
+        resolved_channel_manifest = Path(channel_flownet_manifest).resolve()
+        progress.update(
+            "load_channel_flownet",
+            29.0,
+            message="Validating supplied topobathy flow-network package.",
+            artifact=resolved_channel_manifest,
+        )
+        channel_flowlines, channel_flownet_report = _load_channel_flownet_manifest(
+            resolved_channel_manifest,
+            boundary_nodes,
+        )
+        channel_flownet_report["enabled"] = True
+        channel_flownet_report["source"] = "supplied_manifest"
+    elif config.channel_flownet:
+        channel_root = run_dir / "upstream" / "topobathy_flownet"
+        channel_root.mkdir(parents=True, exist_ok=True)
+        analysis_mask_path = channel_root / "analysis_mask.geojson"
+        channel_products_dir = channel_root / "products"
+        _write_analysis_mask(
+            analysis_mask_path,
+            boundary_package.domain_polygon_lonlat,
+            name=name,
+        )
+        flownet_skill = _find_skill(
+            "topobathy-flownet",
+            catalog_relative=("grid-generation", "topobathy-flownet"),
+        )
+        surface_variable, surface_positive = _select_channel_surface(
+            Path(bathy_nc),
+            bathy,
+        )
+        resolved_channel_manifest = channel_products_dir / "run_manifest.json"
+        progress.update(
+            "run_channel_flownet",
+            29.0,
+            message="Running topobathy-flownet on the original bathymetry product.",
+            artifact=channel_root,
+        )
+        _run(
+            _channel_flownet_command(
+                flownet_skill,
+                Path(bathy_nc),
+                analysis_mask_path,
+                channel_products_dir,
+                surface_variable,
+                surface_positive,
+                config,
+            ),
+            progress=progress,
+            stage="run_channel_flownet",
+            percent=30.0,
+        )
+        channel_flowlines, channel_flownet_report = _load_channel_flownet_manifest(
+            resolved_channel_manifest,
+            boundary_nodes,
+        )
+        channel_flownet_report["enabled"] = True
+        channel_flownet_report["source"] = "generated_run_local"
+        channel_flownet_report["analysis_mask_geojson"] = str(analysis_mask_path)
+        channel_flownet_report["analysis_mask"] = {
+            "path": str(analysis_mask_path),
+            "sha256": _sha256_file(analysis_mask_path),
+        }
+        channel_flownet_report["surface_variable"] = surface_variable
+        channel_flownet_report["surface_positive"] = surface_positive
     progress.update(
         "prepare_size_field_bathymetry",
         31.0,
@@ -256,59 +388,73 @@ def run_fvcom_grid(
         open_spacing_m=open_spacing,
         max_size_m=8000.0 if boundary_nodes.adaptive_resolution else 20_000.0,
         gradation=float(config.gradation),
-        target_timestep_s=str(config.target_timestep_s),
-        adaptive_boundary=bool(boundary_nodes.adaptive_resolution),
-        bathymetry_gradient_policy=str(config.bathymetry_gradient_policy),
-        coastal_gradient_distance_m=float(config.coastal_gradient_distance_m),
-        size_field_profile=(
-            "adaptive-coastal-v2" if config.boundary_resolution_profile == "adaptive-coastal-v2" else "v1"
+        slope_elements=float(config.slope_elements),
+        coastal_distance_m=float(config.coastal_distance_m),
+        feature_elements=float(config.feature_elements),
+        wavelength_period_s=float(config.wavelength_period_s),
+        wavelength_elements=float(config.wavelength_elements),
+        channel_reslope_angle_deg=float(config.channel_reslope_angle_deg),
+        channel_elements_per_depth=float(config.channel_elements_per_depth),
+        channel_min_size_m=(
+            float(config.channel_min_size_m)
+            if config.channel_min_size_m is not None
+            else float(land_spacing)
         ),
-        coverage_policy=("raise" if config.boundary_resolution_profile == "adaptive-coastal-v2" else "auto"),
+        target_timestep_s=str(config.target_timestep_s),
     )
     progress.update("build_size_field", 34.0, message="Building bathymetry and shoreline-based mesh-size field.")
-    size_semantics = (
-        _size_field_semantics_v2(size_bathy, boundary_nodes)
-        if config.boundary_resolution_profile == "adaptive-coastal-v2"
-        else None
+    size_field = build_size_field(
+        size_bathy,
+        boundary_nodes,
+        size_config,
+        flowlines=channel_flowlines,
     )
-    size_field = build_size_field(size_bathy, boundary_nodes, size_config, semantics=size_semantics)
-    node_budget_path = None
-    if config.boundary_resolution_profile == "adaptive-coastal-v2":
-        _, boundary_front_report = boundary_front_seed_points(boundary_nodes)
-        interior_estimate = int(
-            size_field.report.get("node_budget_estimate", {}).get("estimated_interior_node_count", 0)
+    _, boundary_front_report = boundary_front_seed_points(boundary_nodes)
+    interior_estimate = int(
+        size_field.report.get("node_budget_estimate", {}).get("estimated_interior_node_count", 0)
+    )
+    boundary_front_count = int(boundary_front_report.get("accepted_count", 0))
+    estimated_total = int(interior_estimate + len(boundary_nodes.xy) + boundary_front_count)
+    enforce_node_budget = config.boundary_resolution_profile == "adaptive-coastal-v2"
+    node_budget = {
+        "schema_version": "fvcom_node_budget_preflight_v3",
+        "size_field_schema_version": str(
+            size_field.report.get("schema_version", "unknown")
+        ),
+        "size_field_method": str(size_field.report.get("method", "unknown")),
+        "boundary_resolution_profile": str(config.boundary_resolution_profile),
+        "estimated_interior_node_count": interior_estimate,
+        "explicit_boundary_node_count": int(len(boundary_nodes.xy)),
+        "boundary_front_seed_count": boundary_front_count,
+        "estimated_total_node_count": estimated_total,
+        "maximum_total_nodes": int(config.max_total_nodes),
+        "stop_fraction": float(config.node_budget_stop_fraction),
+        "stop_threshold": int(float(config.node_budget_stop_fraction) * int(config.max_total_nodes)),
+        "passed": bool(
+            estimated_total <= float(config.node_budget_stop_fraction) * int(config.max_total_nodes)
+        ),
+        "hard_gate_enforced": bool(enforce_node_budget),
+        "boundary_front": boundary_front_report,
+    }
+    node_budget_path = run_dir / "node_budget_preflight.json"
+    node_budget_path.write_text(json.dumps(_json_safe(node_budget), indent=2), encoding="utf-8")
+    progress.update(
+        "node_budget_preflight",
+        42.0,
+        message="Estimating boundary, front, and interior node demand.",
+        artifact=node_budget_path,
+        extra={
+            "passed": node_budget["passed"],
+            "hard_gate_enforced": bool(enforce_node_budget),
+            "estimated_total": estimated_total,
+        },
+    )
+    if enforce_node_budget and not node_budget["passed"]:
+        raise ValueError(
+            "adaptive-coastal-v2 node-budget preflight failed: "
+            f"estimated {estimated_total} nodes exceeds the stop threshold "
+            f"{node_budget['stop_threshold']}"
         )
-        boundary_front_count = int(boundary_front_report.get("accepted_count", 0))
-        estimated_total = int(interior_estimate + len(boundary_nodes.xy) + boundary_front_count)
-        node_budget = {
-            "schema_version": "fvcom_node_budget_preflight_v2",
-            "estimated_interior_node_count": interior_estimate,
-            "explicit_boundary_node_count": int(len(boundary_nodes.xy)),
-            "boundary_front_seed_count": boundary_front_count,
-            "estimated_total_node_count": estimated_total,
-            "maximum_total_nodes": int(config.max_total_nodes),
-            "stop_fraction": float(config.node_budget_stop_fraction),
-            "stop_threshold": int(float(config.node_budget_stop_fraction) * int(config.max_total_nodes)),
-            "passed": bool(
-                estimated_total <= float(config.node_budget_stop_fraction) * int(config.max_total_nodes)
-            ),
-            "boundary_front": boundary_front_report,
-        }
-        node_budget_path = run_dir / "node_budget_preflight_v2.json"
-        node_budget_path.write_text(json.dumps(_json_safe(node_budget), indent=2), encoding="utf-8")
-        progress.update(
-            "node_budget_preflight_v2",
-            42.0,
-            message="Estimating adaptive-v2 boundary, front, and interior node demand.",
-            artifact=node_budget_path,
-            extra={"passed": node_budget["passed"], "estimated_total": estimated_total},
-        )
-        if not node_budget["passed"]:
-            raise ValueError(
-                "adaptive-coastal-v2 node-budget preflight failed: "
-                f"estimated {estimated_total} nodes exceeds the stop threshold "
-                f"{node_budget['stop_threshold']}"
-            )
     progress.update("write_size_field", 46.0, message="Writing size-field artifacts.")
     size_nc, size_png = write_size_field(size_field, run_dir / "size_field.nc", run_dir / "size_field.png")
 
@@ -548,6 +694,27 @@ def run_fvcom_grid(
             "open_spacing_m": float(open_spacing),
             "coarse_smoke": bool(config.coarse_smoke),
             "gradation": float(config.gradation),
+            "slope_elements": float(config.slope_elements),
+            "coastal_distance_m": float(config.coastal_distance_m),
+            "feature_elements": float(config.feature_elements),
+            "wavelength_period_s": float(config.wavelength_period_s),
+            "wavelength_elements": float(config.wavelength_elements),
+            "channel_reslope_angle_deg": float(config.channel_reslope_angle_deg),
+            "channel_elements_per_depth": float(config.channel_elements_per_depth),
+            "channel_min_size_m": (
+                float(config.channel_min_size_m)
+                if config.channel_min_size_m is not None
+                else float(land_spacing)
+            ),
+            "channel_flownet": bool(config.channel_flownet),
+            "channel_flownet_source_area_km2": float(
+                config.channel_flownet_source_area_km2
+            ),
+            "channel_flownet_target_resolution_m": (
+                float(config.channel_flownet_target_resolution_m)
+                if config.channel_flownet_target_resolution_m is not None
+                else None
+            ),
             "target_timestep_s": str(config.target_timestep_s),
             "max_interior_points": int(config.max_interior_points),
             "bathy_fallback_policy": config.bathy_fallback_policy,
@@ -556,8 +723,6 @@ def run_fvcom_grid(
             "bathy_max_sources": int(config.bathy_max_sources),
             "size_field_max_cells": int(config.size_field_max_cells),
             "boundary_resolution_profile": config.boundary_resolution_profile,
-            "bathymetry_gradient_policy": str(config.bathymetry_gradient_policy),
-            "coastal_gradient_distance_m": float(config.coastal_gradient_distance_m),
             "regional_spring_relaxation": bool(config.regional_spring_relaxation),
             "spring_relax_iterations": int(config.spring_relax_iterations),
             "thin_triangle_repair": bool(config.thin_triangle_repair),
@@ -622,6 +787,9 @@ def run_fvcom_grid(
             "boundary_loops_gpkg": str(boundary_loops_gpkg),
             "boundary_resolution_manifest": str(boundary_resolution_manifest) if boundary_resolution_manifest else None,
             "bathy_nc": str(bathy_nc),
+            "channel_flownet_manifest": (
+                str(resolved_channel_manifest) if resolved_channel_manifest else None
+            ),
             "upstream": upstream,
         },
         "bathymetry": {
@@ -637,6 +805,7 @@ def run_fvcom_grid(
         },
         "mesh": mesh.report,
         "boundary_resolution": resolution_doc,
+        "channel_flownet": channel_flownet_report,
         "postprocess": {
             "enabled": False,
             "profile": "none",
@@ -656,9 +825,17 @@ def run_fvcom_grid(
             "mesh_review_map": str(review_map),
             "size_field_nc": str(size_nc),
             "size_field_png": str(size_png),
+            "channel_flownet_manifest_json": (
+                str(resolved_channel_manifest) if resolved_channel_manifest else None
+            ),
+            "channel_flownet_gpkg": (
+                channel_flownet_report.get("gpkg", {}).get("path")
+                if isinstance(channel_flownet_report.get("gpkg"), dict)
+                else None
+            ),
             "boundary_nodes_geojson": str(boundary_nodes_path),
             "boundary_contract_v2_json": str(boundary_contract_path) if boundary_contract_path else None,
-            "node_budget_preflight_v2_json": str(node_budget_path) if node_budget_path else None,
+            "node_budget_preflight_json": str(node_budget_path),
             "delivered_boundary_nodes_geojson": str(delivered_boundary_nodes_path),
             "mesh_nodes_elements_gpkg": str(mesh_gpkg),
             "mesh_quality_elements_gpkg": str(mesh_quality_gpkg),
@@ -672,69 +849,323 @@ def run_fvcom_grid(
     return manifest
 
 
-def _size_field_semantics_v2(bathy: Any, boundary: Any) -> SizeFieldSemantics:
-    """Rasterize adaptive-v2 junction and retained-channel semantics."""
-    lon2, lat2 = np.meshgrid(np.asarray(bathy.lon, dtype=float), np.asarray(bathy.lat, dtype=float))
-    query_xy = project_points(np.column_stack([lon2.ravel(), lat2.ravel()]), boundary.projection)
-    shape = lon2.shape
-    domain = boundary.domain_polygon_xy
-    domain_mask = np.asarray(
-        contains_xy(domain, query_xy[:, 0], query_xy[:, 1]),
-        dtype=bool,
-    ).reshape(shape)
-    coverage_mask = np.isfinite(np.asarray(bathy.depth, dtype=float))
+def _write_analysis_mask(path: Path, domain_polygon_lonlat: Any, *, name: str) -> Path:
+    """Write the exact WGS84 model polygon, including interior rings."""
+    if domain_polygon_lonlat is None or domain_polygon_lonlat.is_empty:
+        raise ValueError("Cannot build a channel flow network without a model-domain polygon")
+    if domain_polygon_lonlat.geom_type not in {"Polygon", "MultiPolygon"}:
+        raise ValueError("The channel analysis mask must be a Polygon or MultiPolygon")
+    payload = {
+        "type": "FeatureCollection",
+        "name": f"{name}_topobathy_flownet_analysis_mask",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {
+                    "name": str(name),
+                    "purpose": "fvcom_grid_channel_flownet_analysis_mask",
+                },
+                "geometry": mapping(domain_polygon_lonlat),
+            }
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
 
-    channel_size_flat = np.full(len(query_xy), np.inf, dtype=float)
-    for record in boundary.passage_diagnostics or []:
-        action = str(record.get("action", "")).strip().lower()
-        resolvable = bool(record.get("resolvable_at_minimum_spacing", False))
-        geometry = record.get("geometry_xy")
-        target = _finite_positive(record.get("required_target_spacing_m"))
-        width = _finite_positive(record.get("width_m"))
-        if geometry is None or geometry.is_empty or target is None or width is None:
-            continue
-        if not resolvable or action not in {"harmonize_paired_spacing", "retain", "keep", "resolved"}:
-            continue
-        distance = _point_to_polyline_distance(query_xy, np.asarray(geometry.coords, dtype=float))
-        active = distance <= max(float(width), 1_000.0)
-        channel_size_flat[active] = np.minimum(channel_size_flat[active], float(target))
-    channel_size = channel_size_flat.reshape(shape)
-    channel_size[~np.isfinite(channel_size)] = np.nan
-    channel_size[~domain_mask] = np.nan
 
-    return SizeFieldSemantics(
-        channel_size_m=channel_size,
-        coverage_mask=coverage_mask,
-        domain_mask=domain_mask,
+def _select_channel_surface(
+    surface_path: Path,
+    bathy: Any,
+) -> tuple[str | None, str]:
+    """Select an explicit surface variable and vertical sign for flownet routing."""
+    if surface_path.suffix.lower() not in {".nc", ".nc4", ".cdf"}:
+        raise ValueError(
+            "Automatic channel-flow extraction requires the original bathymetry NetCDF; "
+            "supply --channel-flownet-manifest for another surface format"
+        )
+    variables = {
+        str(value).casefold(): str(value)
+        for value in (bathy.metadata or {}).get("variables", [])
+    }
+    for preferred in ("elevation_m", "elevation", "z"):
+        if preferred in variables:
+            return variables[preferred], "up"
+    depth_name = str((bathy.metadata or {}).get("depth_name", "")).strip()
+    if not depth_name:
+        raise ValueError(
+            "Cannot identify the original NetCDF surface variable for topobathy-flownet"
+        )
+    lower = depth_name.casefold()
+    if lower in {"elevation_m", "elevation", "z", "band1"}:
+        return depth_name, "up"
+    if lower in {
+        "depth_m",
+        "depth",
+        "fvcom_depth",
+        "positive_down_depth",
+        "bathymetry",
+    }:
+        return depth_name, "down"
+    raise ValueError(
+        "Cannot determine the vertical sign of the selected surface variable "
+        f"{depth_name!r}; provide a validated --channel-flownet-manifest"
     )
 
 
-def _finite_positive(value: Any) -> float | None:
-    try:
-        result = float(value)
-    except (TypeError, ValueError):
-        return None
-    return result if np.isfinite(result) and result > 0.0 else None
+def _channel_flownet_command(
+    skill_dir: Path,
+    surface_path: Path,
+    mask_path: Path,
+    output_dir: Path,
+    surface_variable: str | None,
+    surface_positive: str,
+    config: GridConfig,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(skill_dir / "scripts" / "run_topobathy_flownet.py"),
+        "--surface",
+        str(surface_path),
+        "--surface-positive",
+        str(surface_positive),
+        "--mask",
+        str(mask_path),
+        "--out-dir",
+        str(output_dir),
+        "--source-area-km2",
+        str(float(config.channel_flownet_source_area_km2)),
+    ]
+    if surface_variable:
+        command.extend(["--surface-variable", str(surface_variable)])
+    if config.channel_flownet_target_resolution_m is not None:
+        command.extend(
+            [
+                "--target-resolution-m",
+                str(float(config.channel_flownet_target_resolution_m)),
+            ]
+        )
+    return command
 
 
-def _point_to_polyline_distance(points: np.ndarray, line: np.ndarray) -> np.ndarray:
-    """Return vectorized Euclidean distance from points to a short polyline."""
-    values = np.asarray(points, dtype=float)
-    vertices = np.asarray(line, dtype=float)
-    if len(vertices) < 2:
-        return np.full(len(values), np.inf, dtype=float)
-    best = np.full(len(values), np.inf, dtype=float)
-    for start, end in zip(vertices[:-1], vertices[1:]):
-        segment = end - start
-        denominator = float(np.dot(segment, segment))
-        if denominator <= 1.0e-20:
-            candidate = np.linalg.norm(values - start, axis=1)
+def _load_channel_flownet_manifest(
+    manifest_path: str | Path,
+    boundary: Any,
+) -> tuple[list[ChannelFlowline], dict[str, Any]]:
+    """Validate and load the stable topobathy-flownet vector contract."""
+    path = Path(manifest_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Channel flownet manifest not found: {path}")
+    document = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(document, dict):
+        raise ValueError("Channel flownet manifest must contain a JSON object")
+    if document.get("schema") != "topobathy_flownet_v1":
+        raise ValueError(
+            "Unsupported channel flownet schema: "
+            f"{document.get('schema')!r}; expected 'topobathy_flownet_v1'"
+        )
+    if document.get("status") != "complete":
+        raise ValueError(
+            f"Channel flownet manifest status must be complete, got {document.get('status')!r}"
+        )
+    if document.get("structural_status") != "pass":
+        raise ValueError(
+            "Channel flownet structural_status must be pass, got "
+            f"{document.get('structural_status')!r}"
+        )
+    outputs = document.get("outputs")
+    if not isinstance(outputs, dict):
+        raise ValueError("Channel flownet manifest outputs must be an object")
+    health_path = _manifest_output_path(path, outputs, "health_check")
+    health = json.loads(health_path.read_text(encoding="utf-8-sig"))
+    if not isinstance(health, dict):
+        raise ValueError("Channel flownet health check must contain a JSON object")
+    if health.get("schema") != "topobathy_flownet_v1":
+        raise ValueError(
+            "Channel flownet health schema must be topobathy_flownet_v1"
+        )
+    if health.get("status") != "pass":
+        failures = health.get("failed_checks", [])
+        raise ValueError(
+            "Channel flownet health check did not pass"
+            + (f": {failures}" if failures else "")
+        )
+    if list(health.get("failed_checks", [])):
+        raise ValueError(
+            "Channel flownet health check reports failed checks despite pass status: "
+            f"{health.get('failed_checks')}"
+        )
+    gpkg_path = _manifest_output_path(path, outputs, "dhsvm_gpkg")
+    layers = set(gpd.list_layers(gpkg_path)["name"])
+    layer = "topobathy_flownet"
+    if layer not in layers:
+        raise ValueError(
+            f"Channel flownet GeoPackage does not contain required layer {layer!r}"
+        )
+    frame = gpd.read_file(gpkg_path, layer=layer)
+    if frame.empty:
+        raise ValueError("Channel flownet layer contains no arcs")
+    if frame.crs is None:
+        raise ValueError("Channel flownet layer has no CRS")
+    required = {
+        "arcid",
+        "from_node",
+        "to_node",
+        "local",
+        "downarc",
+        "uparc",
+        "SELEV",
+        "EELEV",
+        "MAXGRID",
+        "dz",
+        "slope",
+        "meanmsq",
+        "segorder",
+        "drainage_area_m2",
+        "chanclass",
+        "hyddepth",
+        "hydwidth",
+        "effwidth",
+        "effdepth",
+        "segdepth",
+        "Shape_Leng",
+    }
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(
+            "Channel flownet layer is missing required field(s): "
+            + ", ".join(missing)
+        )
+
+    arc_ids: list[int] = []
+    arc_orders: list[int] = []
+    for index, row in frame.iterrows():
+        try:
+            arc_id_float = float(row["arcid"])
+            order_float = float(row["segorder"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Channel flownet arc {index!r} has nonnumeric arcid/segorder"
+            ) from exc
+        if (
+            not np.isfinite(arc_id_float)
+            or not arc_id_float.is_integer()
+            or arc_id_float <= 0
+        ):
+            raise ValueError(f"Channel flownet arc {index!r} has invalid arcid")
+        if (
+            not np.isfinite(order_float)
+            or not order_float.is_integer()
+            or order_float < 1
+        ):
+            raise ValueError(f"Channel flownet arc {index!r} has invalid segorder")
+        arc_ids.append(int(arc_id_float))
+        arc_orders.append(int(order_float))
+    if len(set(arc_ids)) != len(arc_ids):
+        raise ValueError("Channel flownet arcid values must be unique")
+
+    topology_summary = document.get("topology_summary", {})
+    declared_arc_count = topology_summary.get("arc_count")
+    if declared_arc_count is not None and int(declared_arc_count) != len(frame):
+        raise ValueError(
+            "Channel flownet manifest arc count does not match its GeoPackage: "
+            f"{declared_arc_count} != {len(frame)}"
+        )
+
+    source_crs = frame.crs
+    projected = frame.to_crs(boundary.projection.crs)
+    flowlines: list[ChannelFlowline] = []
+    arc_order_counts: dict[str, int] = {}
+    for order in arc_orders:
+        key = str(int(order))
+        arc_order_counts[key] = arc_order_counts.get(key, 0) + 1
+    flowline_order_counts: dict[str, int] = {}
+    multiline_arc_count = 0
+    segment_count = 0
+    for geometry, order in zip(projected.geometry, arc_orders):
+        if geometry is None or geometry.is_empty:
+            raise ValueError("Channel flownet contains an empty arc geometry")
+        if isinstance(geometry, LineString):
+            parts = [geometry]
+        elif isinstance(geometry, MultiLineString):
+            parts = list(geometry.geoms)
+            multiline_arc_count += 1
         else:
-            fraction = np.clip(((values - start) @ segment) / denominator, 0.0, 1.0)
-            closest = start + fraction[:, None] * segment
-            candidate = np.linalg.norm(values - closest, axis=1)
-        best = np.minimum(best, candidate)
-    return best
+            raise ValueError(
+                "Channel flownet geometries must be LineString or MultiLineString, "
+                f"got {geometry.geom_type}"
+            )
+        for part in parts:
+            if (
+                part.is_empty
+                or len(part.coords) < 2
+                or not np.isfinite(part.length)
+                or float(part.length) <= 0.0
+            ):
+                raise ValueError("Channel flownet contains an invalid line part")
+            flowlines.append(
+                ChannelFlowline(geometry_xy=part, seg_order=int(order))
+            )
+            key = str(int(order))
+            flowline_order_counts[key] = flowline_order_counts.get(key, 0) + 1
+            segment_count += len(part.coords) - 1
+    if not flowlines:
+        raise ValueError("Channel flownet contains no usable line parts")
+
+    return flowlines, {
+        "schema": str(document["schema"]),
+        "manifest_status": str(document["status"]),
+        "structural_status": str(document["structural_status"]),
+        "health_status": str(health["status"]),
+        "manifest": {
+            "path": str(path),
+            "sha256": _sha256_file(path),
+        },
+        "health_check": {
+            "path": str(health_path),
+            "sha256": _sha256_file(health_path),
+        },
+        "gpkg": {
+            "path": str(gpkg_path),
+            "sha256": _sha256_file(gpkg_path),
+            "layer": layer,
+        },
+        "source_crs": str(source_crs),
+        "target_crs": str(boundary.projection.crs),
+        "field_names": sorted(str(value) for value in frame.columns),
+        "arc_count": int(len(frame)),
+        "flowline_count": int(len(flowlines)),
+        "multiline_arc_count": int(multiline_arc_count),
+        "line_segment_count": int(segment_count),
+        "order_counts": arc_order_counts,
+        "flowline_order_counts": flowline_order_counts,
+        "topology_summary": topology_summary,
+    }
+
+
+def _manifest_output_path(
+    manifest_path: Path,
+    outputs: dict[str, Any],
+    key: str,
+) -> Path:
+    value = outputs.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Channel flownet manifest is missing outputs.{key}")
+    result = Path(value).expanduser()
+    if not result.is_absolute():
+        result = manifest_path.parent / result
+    result = result.resolve()
+    if not result.is_file():
+        raise FileNotFoundError(f"Channel flownet output not found: {result}")
+    return result
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _resolve_upstream_artifacts(

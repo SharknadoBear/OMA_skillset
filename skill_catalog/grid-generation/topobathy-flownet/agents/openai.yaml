@@ -1,0 +1,4 @@
+interface:
+  display_name: "Topobathy Flownet"
+  short_description: "Detect DEM channels and bathymetric thalwegs"
+  default_prompt: "Use $topobathy-flownet to extract a DHSVM SegOrder channel or thalweg network from a DEM or topobathymetry surface."

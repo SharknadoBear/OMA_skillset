@@ -5,10 +5,11 @@ description: Generate FVCOM-ready SMS 2DM meshes from legacy or adaptive fvcom-b
 
 # fvcom-grid-generation
 
-Use this skill as the third OMA gridding step:
+Use this skill after the boundary and bathymetry steps. Channel/thalweg
+extraction is a reusable upstream analysis:
 
 ```text
-fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> fvcom-grid-generation
+fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> topobathy-flownet -> fvcom-grid-generation
 ```
 
 ## Core Rules
@@ -16,7 +17,8 @@ fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> fvcom-grid-generation
 - Reuse upstream domain and boundary artifacts; do not redesign the region here.
 - Prefer an adaptive boundary-resolution manifest when supplied. Otherwise preserve the legacy loop workflow.
 - Keep full bathymetry for final node sampling and bound only the in-memory size-field grid.
-- In adaptive mode, let explicit OBC/boundary targets control offshore resolution; apply bathymetric-gradient refinement only in the configured coastal/estuarine influence zone unless the user explicitly selects global behavior.
+- Use the same unified size algorithm for open and closed domains. Open domains blend the open- and land-boundary targets; closed domains use the land-distance background. Apply slope, feature, wavelength, and optional flow-network channel candidates only inside the coastal/estuarine influence zone.
+- Accept a passing `topobathy-flownet` manifest or generate it under the FVCOM run's `upstream/topobathy_flownet/` directory. Disabling flow-network extraction omits only the channel candidate.
 - End normal adaptive generation after guarded shape relaxation, first-pass thin repair, aggressive local topology conditioning, target-aware area-transition relaxation, and a terminal constraint audit. Do not run the broad legacy postprocessor implicitly.
 - Keep depths finite and positive down and treat OceanMesh2D GPL material as a method reference only.
 
@@ -34,8 +36,10 @@ Important controls:
 
 - `--boundary-resolution-profile legacy|adaptive-coastal-v1|adaptive-coastal-v2`, default `legacy`. V2 is opt-in and requires an upstream `pass` manifest before gridding.
 - `--boundary-resolution-manifest`, optional; explicit nodes and chains take precedence over legacy densification.
-- `--bathy-gradient-policy auto|global|coastal|off`; `auto` means `coastal` for adaptive packages and preserves `global` legacy behavior.
-- `--coastal-gradient-distance-m`, default 25 km; controls where bathymetric slope may refine an adaptive mesh.
+- `--gradation`, default `0.20`; limits adjacent size growth after all candidates are combined.
+- `--slope-elements 10`, `--coastal-distance-m 12000`, `--feature-elements 3`, `--wavelength-period-s 44714`, and `--wavelength-elements 20` control the unified coastal OceanMesh-style candidates.
+- `--channel-flownet-manifest` consumes an existing passing `topobathy-flownet` package. Otherwise `--channel-flownet` (enabled by default) runs that skill on the original bathymetry NetCDF and the exact model-domain polygon, including holes. Use `--no-channel-flownet` only when the channel candidate is intentionally unavailable.
+- `--channel-flownet-source-area-km2`, default `1.0`, and optional `--channel-flownet-target-resolution-m` control extraction. `--channel-reslope-angle-deg 60`, `--channel-elements-per-depth 1`, and optional `--channel-min-size-m` control how accepted DHSVM `SegOrder` arcs become a channel-size candidate.
 - `--regional-spring-relaxation|--no-regional-spring-relaxation`; normal generation applies one guarded, defect-selected spring-equilibrium stage by default.
 - `--thin-triangle-repair|--no-thin-triangle-repair`; normal generation applies local protected-edge-safe flips/splits and patch relaxation by default.
 - `--thin-repair-profile guarded-v1|systematic-v2|systematic-v3|systematic-v5|systematic-v6|none`, default `guarded-v1`; `systematic-v2` keeps boundary coordinates fixed, opt-in `systematic-v3` adds source-arc-only welding/sliding/redistribution, research-only `systematic-v5` couples persistent connectivity restriction and complete locked-star reconstruction to fixed-connectivity interaction bursts, and research-only `systematic-v6` adds coupled valence closure plus exact-zero relaxation entry.
@@ -51,10 +55,19 @@ Important controls:
 - `--area-transition-relaxation|--no-area-transition-relaxation`; normal generation applies sequential target-aware spring patches after thin repair.
 - `--area-transition-max-patches`, default 12; bounds accepted local transition patches. The raw adjacent-area trigger defaults to `0.50`, equivalent to an area ratio of two.
 - `--postprocess-profile`, compatibility default `none`; non-`none` integrated requests are rejected with standalone-tool guidance.
-- `--max-total-nodes` and `--node-budget-stop-fraction` bound the v2 pre-triangulation estimate, including explicit boundary and boundary-front seeds.
-- `--land-spacing-m`, `--open-spacing-m`, `--gradation`, `--max-interior-points`, and `--size-field-max-cells` retain their legacy meanings.
+- `--max-total-nodes` and `--node-budget-stop-fraction` audit the pre-triangulation estimate, including explicit boundary and boundary-front seeds. The audit is recorded for every boundary package and remains a hard gate for adaptive-coastal-v2.
+- `--land-spacing-m`, `--open-spacing-m`, `--max-interior-points`, and `--size-field-max-cells` set the boundary targets and execution limits.
 
-Adaptive v2 audits the upstream anchor/spacing contract before bathymetry work and uses `segment_lower_envelope_hard_soft_priority`, the production method verified against the Delaware v2 reference field. It interpolates targets from the nearest boundary segment, then applies the eight-neighbor lower gradation envelope to bridge land/island and OBC resolution regimes without retaining a family-switch discontinuity. It also applies a graded land–OBC junction floor and treats retained narrow-passage targets as hard constraints. It rejects uncovered raster queries instead of silently substituting a coarse value, estimates node demand before triangulation, and adds inward segment-normal plus hard-anchor-bisector front seeds. Persist raw/limited, soft/hard, junction, domain, coverage, boundary-source, and final-source attribution in the size-field NetCDF and report. Do not replace this method with a distance-ratio family blend under the same profile; any alternate size-field formulation requires a new explicit profile. V1 behavior remains available unchanged.
+The unified background is continuous. For an open domain, compute exact segment
+distances and targets for the open and non-open boundary families, form
+`phi = d_open / (d_open + d_land)`, apply cubic smoothstep, and blend the two
+targets in log space. For a closed domain, grade outward from the non-open
+boundary target. Inside the coastal mask, take the minimum of this background
+and the bathymetric slope, distance-gradient medial-axis feature size, M2
+wavelength, and optional DHSVM flow-network channel candidates. Outside that mask, retain only
+the boundary background. Finally clip to physical bounds and apply the
+eight-neighbor lower gradation envelope. CFL remains diagnostic and never
+controls the size.
 
 ## Generation-Time Conditioning
 
@@ -113,7 +126,8 @@ Hard anchors and all boundary nodes not explicitly handled by the kind-aware edi
 - `boundary_nodes.geojson` (input boundary-node package)
 - `delivered_boundary_nodes.geojson` (terminal constraint chains, including any recovery nodes)
 - `size_field.nc` and `size_field.png`
-- `boundary_contract_v2.json` and `node_budget_preflight_v2.json` for adaptive v2
+- `node_budget_preflight.json` for every run and `boundary_contract_v2.json` for adaptive v2
+- `upstream/topobathy_flownet/products/run_manifest.json` and its DHSVM flow-line package when run-local extraction is enabled
 - `mesh_nodes_elements.gpkg`
 - `mesh_quality_elements.gpkg`
 - `mesh_review_map.png`
@@ -134,7 +148,7 @@ For a human-approved whole-passage deletion, replace the ordinary one-wet-compon
 ```powershell
 python scripts/selftest_fvcom_grid.py
 python scripts/selftest_boundary_contract_v2.py
-python scripts/selftest_size_field_v2.py
+python scripts/selftest_size_field.py
 python scripts/selftest_local_topology_v2.py
 python scripts/selftest_connectivity_restriction.py
 python scripts/selftest_local_topology_v5_extensions.py

@@ -1361,7 +1361,7 @@ def _run_validation_suite(journal: Journal) -> list[dict[str, Any]]:
         "selftest_local_topology_v5_extensions.py",
         "selftest_visual_superthin.py",
         "selftest_boundary_contract_v2.py",
-        "selftest_size_field_v2.py",
+        "selftest_size_field.py",
         "selftest_fvcom_grid.py",
         "selftest_systematic_v6.py",
     )

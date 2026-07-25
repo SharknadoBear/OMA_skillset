@@ -29,7 +29,15 @@ When any gate fails, retain all artifacts and set `final_status: needs_review`. 
 
 Adaptive boundary packages additionally require ordered explicit chains, per-node target spacing, and OBC size compatibility: 95th-percentile `L/h <= 1.55` and maximum `L/h <= 2.0`.
 
-Adaptive size fields use the production `segment_lower_envelope_hard_soft_priority` method: segment-interpolated boundary targets provide the raw control and the eight-neighbor lower envelope supplies the continuous nearshore-to-offshore transition. OBC/boundary target propagation remains the offshore control. With the default `coastal` bathymetric-gradient policy, slope-based refinement is active only within the configured distance of land/island nodes; `global` must be an explicit choice for adaptive grids.
+All boundary profiles use the single `fvcom_size_field_v3` production method.
+For open domains, exact nearest-segment distances to the open and non-open
+families define a cubic-smoothstep, log-space transition between their
+interpolated boundary targets. Closed domains use the non-open target plus the
+land-distance gradation background. OceanMesh-style feature, M2 wavelength,
+bathymetric-slope, and optional supplied SegOrder channel candidates act only
+inside the coastal/estuary mask. The pointwise minimum is clipped and then
+passed through the eight-neighbour lower gradation envelope, which may refine
+but never coarsen a cell. CFL is diagnostic only.
 
 ## Conditioning Transaction Gates
 
