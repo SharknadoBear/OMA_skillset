@@ -179,7 +179,7 @@ def test_size_field_limiter_never_coarsens_fine_cells() -> None:
         assert size.report["gradation"]["max_neighbor_gradation"] <= 0.151
 
 
-def test_unified_oceanmesh_candidates_are_coastal_only() -> None:
+def test_unified_slope_candidate_is_coastal_only() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         gpkg = _synthetic_boundary_package(root / "loops.gpkg")
@@ -212,7 +212,7 @@ def test_unified_oceanmesh_candidates_are_coastal_only() -> None:
             ),
         )
         center = (int(np.argmin(np.abs(lat - 39.08))), int(np.argmin(np.abs(lon + 74.902))))
-        assert narrow.report["method"] == "unified_oceanmesh_coastal_lower_envelope"
+        assert narrow.report["method"] == "open_solid_transition_slope_channel_lower_envelope"
         assert not bool(narrow.coastal_mask[center])
         assert np.isnan(narrow.slope_size[center])
         assert bool(wide.coastal_mask[center])
@@ -949,7 +949,7 @@ def test_adaptive_resolution_workflow_and_quadtree_seed() -> None:
             bathy_nc=bathy,
         )
         assert manifest["mesh"]["node_count"] > len(nodes.xy)
-        assert manifest["size_field"]["method"] == "unified_oceanmesh_coastal_lower_envelope"
+        assert manifest["size_field"]["method"] == "open_solid_transition_slope_channel_lower_envelope"
         assert manifest["size_field"]["background"]["method"] == "open_land_log_smoothstep"
         assert manifest["quality"]["open_boundary_size_error"]["p95_l_over_h"] <= 1.55
         assert manifest["mesh"]["constraint_recovery"]["final_recovery_applied"] is True
@@ -982,7 +982,7 @@ def test_final_quality_requires_q_l3_sigma_above_075() -> None:
 def main() -> int:
     test_boundary_ingestion_and_densification()
     test_size_field_limiter_never_coarsens_fine_cells()
-    test_unified_oceanmesh_candidates_are_coastal_only()
+    test_unified_slope_candidate_is_coastal_only()
     test_regional_spring_relaxation_preserves_boundary_and_improves_quality()
     test_area_transition_relaxation_is_eulerian_guarded_and_boundary_fixed()
     test_area_transition_high_gradient_trigger_requires_normalized_excess()

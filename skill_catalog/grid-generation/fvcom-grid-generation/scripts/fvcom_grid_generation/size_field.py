@@ -1,12 +1,12 @@
-"""Unified OceanMesh-style mesh-size field for FVCOM grids.
+"""Unified transition-and-slope mesh-size field for FVCOM grids.
 
 The production field has one path:
 
 * blend exact open- and solid-boundary targets through a smooth logarithmic
   distance-ratio transition (or use the traditional solid-boundary distance
   field for a closed domain);
-* evaluate feature-size, M2 wavelength, bathymetric-slope, and optional
-  supplied-channel candidates only in the coastal/estuary mask;
+* evaluate the bathymetric-slope and optional supplied-channel candidates only
+  in the coastal/estuary mask;
 * take the pointwise lower envelope, clip it, and apply an eight-neighbour
   lower-envelope gradation pass; and
 * report CFL stability without allowing CFL to change the mesh size.
@@ -29,8 +29,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
-from scipy.ndimage import distance_transform_edt
-from scipy.spatial import cKDTree
 from shapely import contains_xy, points
 from shapely.geometry import LineString, MultiLineString, Point
 from shapely.geometry.base import BaseGeometry
@@ -46,11 +44,9 @@ EARTH_RADIUS_M = 6_371_000.0
 OPEN_KINDS = {"open", "open_boundary"}
 SOURCE_CODES = {
     0: "uncovered",
-    1: "open_land_background",
-    2: "oceanmesh_feature",
-    3: "m2_wavelength",
-    4: "bathymetry_slope",
-    5: "channel_stencil",
+    1: "open_solid_transition_background",
+    2: "bathymetry_slope",
+    3: "channel_stencil",
 }
 
 
@@ -65,9 +61,6 @@ class SizeFieldConfig:
     slope_elements: float = 10.0
     min_gradient: float = 1.0e-5
     coastal_distance_m: float = 12_000.0
-    feature_elements: float = 3.0
-    wavelength_period_s: float = 44_714.0
-    wavelength_elements: float = 20.0
     channel_reslope_angle_deg: float = 60.0
     channel_elements_per_depth: float = 1.0
     channel_min_size_m: float | None = None
@@ -98,8 +91,6 @@ class SizeField:
     slope: np.ndarray
     report: dict[str, Any]
     boundary_size: np.ndarray
-    feature_size: np.ndarray
-    wavelength_size: np.ndarray
     slope_size: np.ndarray
     channel_size: np.ndarray
     open_boundary_distance_m: np.ndarray
@@ -190,21 +181,7 @@ def build_size_field(
 
     coastal = active & (land_distance <= float(config.coastal_distance_m))
     slope = bathymetric_gradient(bathy)
-    wet = active & (depth > 0.0)
-
-    feature_size, feature_report = oceanmesh_feature_size(
-        bathy,
-        boundary,
-        wet,
-        background,
-        config,
-    )
     safe_depth = np.maximum(depth, 1.0)
-    wavelength_size = (
-        float(config.wavelength_period_s)
-        * np.sqrt(9.807 * safe_depth)
-        / float(config.wavelength_elements)
-    )
     slope_size = (
         (2.0 * np.pi / float(config.slope_elements))
         * safe_depth
@@ -218,16 +195,12 @@ def build_size_field(
         evaluation_mask=coastal,
     )
 
-    candidates = [
-        np.asarray(background, dtype=float),
-        np.where(coastal, feature_size, np.inf),
-        np.where(coastal, wavelength_size, np.inf),
-        np.where(coastal, slope_size, np.inf),
-        np.where(coastal, channel_size, np.inf),
-    ]
-    raw = candidates[0].copy()
+    raw = np.asarray(background, dtype=float).copy()
     source = np.where(coverage, 1, 0).astype(np.int16)
-    for code, candidate in enumerate(candidates[1:], start=2):
+    for code, candidate in (
+        (2, np.where(coastal, slope_size, np.inf)),
+        (3, np.where(coastal, channel_size, np.inf)),
+    ):
         selected = coverage & np.isfinite(candidate) & (candidate < raw)
         raw[selected] = candidate[selected]
         source[selected] = code
@@ -260,7 +233,7 @@ def build_size_field(
     }
     report = {
         "schema_version": "fvcom_size_field_v3",
-        "method": "unified_oceanmesh_coastal_lower_envelope",
+        "method": "open_solid_transition_slope_channel_lower_envelope",
         "coverage": {
             "policy": "strict",
             "covered_cell_count": int(np.count_nonzero(coverage)),
@@ -274,10 +247,8 @@ def build_size_field(
             "coastal_distance_m": float(config.coastal_distance_m),
         },
         "background": background_report,
-        "feature": feature_report,
         "channel": channel_report,
         "candidate_formulas": {
-            "wavelength": "T*sqrt(g*max(depth,1))/N_w",
             "slope": "(2*pi/N_s)*max(depth,1)/max(abs(grad_b),epsilon)",
             "channel": "max(channel_min_size,depth/channel_elements_per_depth)",
         },
@@ -306,8 +277,6 @@ def build_size_field(
         slope=slope,
         report=report,
         boundary_size=background,
-        feature_size=np.where(coastal, feature_size, np.nan),
-        wavelength_size=np.where(coastal, wavelength_size, np.nan),
         slope_size=np.where(coastal, slope_size, np.nan),
         channel_size=np.where(coastal & np.isfinite(channel_size), channel_size, np.nan),
         open_boundary_distance_m=open_distance,
@@ -407,73 +376,6 @@ def boundary_background_size(
     )
 
 
-def oceanmesh_feature_size(
-    bathy: BathymetryGrid,
-    boundary: BoundaryNodes,
-    wet_mask: np.ndarray,
-    fallback_size: np.ndarray,
-    config: SizeFieldConfig,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """Approximate wet-feature width using OceanMesh medial-axis geometry.
-
-    The wet-domain distance gradient identifies medial singularities.  Isolated
-    singularities are pruned with the same four-neighbour continuity idea used
-    by OceanMesh2D.  The candidate is ``2*(d_medial+d_wet_boundary)/N_f``.
-    If fewer than thirteen continuous medial points survive, the deterministic
-    fallback is the supplied land-distance background.
-    """
-    wet = _grid_mask(wet_mask, np.asarray(bathy.depth).shape, "wet_mask")
-    fallback = np.asarray(fallback_size, dtype=float)
-    if fallback.shape != wet.shape:
-        raise ValueError(f"fallback_size must have shape {wet.shape}; got {fallback.shape}")
-    dx_m, dy_m = _grid_spacing_m(bathy.lon, bathy.lat)
-    padded = np.pad(wet, 1, mode="constant", constant_values=False)
-    wet_distance = distance_transform_edt(padded, sampling=(dy_m, dx_m))[1:-1, 1:-1]
-    grad_y, grad_x = np.gradient(wet_distance, dy_m, dx_m)
-    grad_mag = np.hypot(grad_x, grad_y)
-    support = max(dx_m, dy_m)
-    medial_mask = wet & (wet_distance > 0.5 * support) & (grad_mag < 0.90)
-
-    lon2, lat2 = np.meshgrid(bathy.lon, bathy.lat)
-    query_xy = project_points(
-        np.column_stack([lon2.ravel(), lat2.ravel()]),
-        boundary.projection,
-    )
-    medial_xy = query_xy[medial_mask.ravel()]
-    initial_count = int(len(medial_xy))
-    if len(medial_xy) > 12:
-        tree = cKDTree(medial_xy)
-        distances = np.asarray(tree.query(medial_xy, k=4, workers=-1)[0], dtype=float)
-        cutoff = 2.0 * np.sqrt(2.0) * support
-        keep = (
-            (distances[:, 1] <= cutoff)
-            & (distances[:, 2] <= 2.0 * cutoff)
-            & (distances[:, 3] <= 3.0 * cutoff)
-        )
-        medial_xy = medial_xy[keep]
-    final_count = int(len(medial_xy))
-
-    if final_count <= 12:
-        result = fallback.copy()
-        fallback_used = True
-    else:
-        distance_to_medial = cKDTree(medial_xy).query(query_xy, workers=-1)[0].reshape(wet.shape)
-        width = distance_to_medial + wet_distance
-        result = 2.0 * width / float(config.feature_elements)
-        result[~wet] = np.inf
-        fallback_used = False
-    return result, {
-        "method": "oceanmesh_distance_gradient_medial_axis",
-        "formula": "2*(distance_to_medial+distance_to_wet_boundary)/feature_elements",
-        "initial_medial_point_count": initial_count,
-        "retained_medial_point_count": final_count,
-        "fallback_used": fallback_used,
-        "fallback_method": "open_land_background",
-        "feature_elements": float(config.feature_elements),
-        "grid_support_m": float(support),
-    }
-
-
 def channel_stencil_size(
     bathy: BathymetryGrid,
     boundary: BoundaryNodes,
@@ -482,13 +384,13 @@ def channel_stencil_size(
     *,
     evaluation_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    """Rasterize supplied flow lines with the OceanMesh channel stencil."""
+    """Rasterize supplied DHSVM SegOrder flow lines with the channel stencil."""
     shape = np.asarray(bathy.depth).shape
     candidate = np.full(shape, np.inf, dtype=float)
     attribution = np.zeros(shape, dtype=np.int32)
     if not flowlines:
         return candidate, attribution, {
-            "method": "supplied_segorder_oceanmesh_stencil",
+            "method": "supplied_segorder_channel_stencil",
             "flowline_count": 0,
             "active_cell_count": 0,
             "seg_orders": [],
@@ -505,7 +407,7 @@ def channel_stencil_size(
         segments_by_order.setdefault(order, []).extend(segments)
     if not segments_by_order:
         return candidate, attribution, {
-            "method": "supplied_segorder_oceanmesh_stencil",
+            "method": "supplied_segorder_channel_stencil",
             "flowline_count": int(len(flowlines)),
             "active_cell_count": 0,
             "seg_orders": [],
@@ -563,7 +465,7 @@ def channel_stencil_size(
     attribution.ravel()[evaluation_indices] = evaluation_attribution
     candidate[union_grid] = target[union_grid]
     return candidate, attribution, {
-        "method": "supplied_segorder_oceanmesh_stencil",
+        "method": "supplied_segorder_channel_stencil",
         "formula": {
             "radius": "max(grid_support,tan(reslope_angle)*depth)",
             "target": "max(channel_min_size,depth/channel_elements_per_depth)",
@@ -586,9 +488,6 @@ def _validate_config(config: SizeFieldConfig) -> None:
         "max_size_m": config.max_size_m,
         "slope_elements": config.slope_elements,
         "min_gradient": config.min_gradient,
-        "feature_elements": config.feature_elements,
-        "wavelength_period_s": config.wavelength_period_s,
-        "wavelength_elements": config.wavelength_elements,
         "channel_elements_per_depth": config.channel_elements_per_depth,
         "cfl": config.cfl,
     }
@@ -1159,8 +1058,6 @@ def write_size_field(
         "depth_m": (("lat", "lon"), size_field.depth),
         "slope": (("lat", "lon"), size_field.slope),
         "background_mesh_size_m": (("lat", "lon"), size_field.boundary_size),
-        "oceanmesh_feature_mesh_size_m": (("lat", "lon"), size_field.feature_size),
-        "m2_wavelength_mesh_size_m": (("lat", "lon"), size_field.wavelength_size),
         "bathymetry_slope_mesh_size_m": (("lat", "lon"), size_field.slope_size),
         "channel_mesh_size_m": (("lat", "lon"), size_field.channel_size),
         "open_boundary_distance_m": (

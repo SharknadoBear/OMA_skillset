@@ -7,7 +7,6 @@ from pathlib import Path
 import sys
 
 import numpy as np
-from scipy.ndimage import distance_transform_edt
 from shapely.geometry import LineString, Point, Polygon
 import xarray as xr
 
@@ -25,13 +24,11 @@ from fvcom_grid_generation.projection import (
 from fvcom_grid_generation.size_field import (
     ChannelFlowline,
     SizeFieldConfig,
-    _grid_spacing_m,
     apply_gradation_limit,
     boundary_background_size,
     boundary_front_seed_points,
     build_size_field,
     estimate_node_budget,
-    oceanmesh_feature_size,
     write_size_field,
 )
 
@@ -91,9 +88,6 @@ def _config(**overrides: object) -> SizeFieldConfig:
         "gradation": 0.20,
         "slope_elements": 10.0,
         "coastal_distance_m": 20_000.0,
-        "feature_elements": 3.0,
-        "wavelength_period_s": 44_714.0,
-        "wavelength_elements": 20.0,
     }
     values.update(overrides)
     return SizeFieldConfig(**values)
@@ -181,44 +175,7 @@ def test_coastal_mask_excludes_offshore_candidates() -> None:
     middle = len(bathy.lat) // 2
     assert not field.coastal_mask[middle, middle]
     assert field.source_attribution[middle, middle] == 1
-    assert np.isnan(field.feature_size[middle, middle])
     assert np.isnan(field.slope_size[middle, middle])
-
-
-def test_feature_and_wavelength_formulas() -> None:
-    count = 41
-    bathy, boundary = _square_case(count=count)
-    wet = np.zeros((count, count), dtype=bool)
-    wet[2:-2, 8:-8] = True
-    fallback = np.full((count, count), 5000.0, dtype=float)
-    feature, report = oceanmesh_feature_size(
-        bathy,
-        boundary,
-        wet,
-        fallback,
-        _config(feature_elements=3.0),
-    )
-    assert report["fallback_used"] is False
-    dx_m, dy_m = _grid_spacing_m(bathy.lon, bathy.lat)
-    wet_distance = distance_transform_edt(
-        np.pad(wet, 1, constant_values=False),
-        sampling=(dy_m, dx_m),
-    )[1:-1, 1:-1]
-    row = count // 2
-    col = count // 2
-    assert abs(feature[row, col] - 2.0 * wet_distance[row, col] / 3.0) < 1.0e-6
-
-    field = build_size_field(
-        bathy,
-        boundary,
-        _config(),
-        domain_mask=np.ones_like(bathy.depth, dtype=bool),
-    )
-    expected = 44_714.0 * np.sqrt(9.807 * 20.0) / 20.0
-    assert np.allclose(
-        field.wavelength_size[field.coastal_mask],
-        expected,
-    )
 
 
 def test_optional_channel_and_highest_order_attribution() -> None:
@@ -241,7 +198,7 @@ def test_optional_channel_and_highest_order_attribution() -> None:
     col = len(bathy.lon) // 2
     assert field.channel_size[row, col] == 75.0
     assert field.channel_seg_order[row, col] == 5
-    assert field.source_attribution[row, col] == 5
+    assert field.source_attribution[row, col] == 3
     assert field.report["channel"]["segorder_changes_size"] is False
 
 
@@ -336,8 +293,12 @@ def test_netcdf_roundtrip_and_schema() -> None:
             assert dataset.attrs["schema_version"] == "fvcom_size_field_v3"
             assert dataset.attrs["coverage_policy"] == "strict"
             assert "background_mesh_size_m" in dataset
-            assert "oceanmesh_feature_mesh_size_m" in dataset
-            assert "m2_wavelength_mesh_size_m" in dataset
+            obsolete_candidates = (
+                "oceanmesh_" + "feature_mesh_size_m",
+                "m2_" + "wavelength_mesh_size_m",
+            )
+            assert all(name not in dataset for name in obsolete_candidates)
+            assert "bathymetry_slope_mesh_size_m" in dataset
             assert "channel_seg_order" in dataset
             assert "raw_size_source_attribution" in dataset
             assert np.allclose(dataset["mesh_size_m"].values, field.size)
@@ -351,7 +312,6 @@ def main() -> None:
         test_closed_domain_land_distance_background,
         test_shallow_slope_is_active,
         test_coastal_mask_excludes_offshore_candidates,
-        test_feature_and_wavelength_formulas,
         test_optional_channel_and_highest_order_attribution,
         test_cfl_is_report_only,
         test_strict_coverage_sampling,

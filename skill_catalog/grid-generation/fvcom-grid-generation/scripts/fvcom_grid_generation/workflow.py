@@ -54,9 +54,6 @@ class GridConfig:
     gradation: float = 0.20
     slope_elements: float = 10.0
     coastal_distance_m: float = 12_000.0
-    feature_elements: float = 3.0
-    wavelength_period_s: float = 44_714.0
-    wavelength_elements: float = 20.0
     channel_reslope_angle_deg: float = 60.0
     channel_elements_per_depth: float = 1.0
     channel_min_size_m: float | None = None
@@ -151,15 +148,6 @@ def run_fvcom_grid(
         or float(config.coastal_distance_m) < 0.0
     ):
         raise ValueError("coastal_distance_m must be nonnegative")
-    if not np.isfinite(float(config.feature_elements)) or float(config.feature_elements) <= 0.0:
-        raise ValueError("feature_elements must be positive")
-    if (
-        not np.isfinite(float(config.wavelength_period_s))
-        or not np.isfinite(float(config.wavelength_elements))
-        or float(config.wavelength_period_s) <= 0.0
-        or float(config.wavelength_elements) <= 0.0
-    ):
-        raise ValueError("wavelength controls must be positive")
     if (
         not np.isfinite(float(config.channel_reslope_angle_deg))
         or not (0.0 <= float(config.channel_reslope_angle_deg) < 90.0)
@@ -390,9 +378,6 @@ def run_fvcom_grid(
         gradation=float(config.gradation),
         slope_elements=float(config.slope_elements),
         coastal_distance_m=float(config.coastal_distance_m),
-        feature_elements=float(config.feature_elements),
-        wavelength_period_s=float(config.wavelength_period_s),
-        wavelength_elements=float(config.wavelength_elements),
         channel_reslope_angle_deg=float(config.channel_reslope_angle_deg),
         channel_elements_per_depth=float(config.channel_elements_per_depth),
         channel_min_size_m=(
@@ -696,9 +681,6 @@ def run_fvcom_grid(
             "gradation": float(config.gradation),
             "slope_elements": float(config.slope_elements),
             "coastal_distance_m": float(config.coastal_distance_m),
-            "feature_elements": float(config.feature_elements),
-            "wavelength_period_s": float(config.wavelength_period_s),
-            "wavelength_elements": float(config.wavelength_elements),
             "channel_reslope_angle_deg": float(config.channel_reslope_angle_deg),
             "channel_elements_per_depth": float(config.channel_elements_per_depth),
             "channel_min_size_m": (

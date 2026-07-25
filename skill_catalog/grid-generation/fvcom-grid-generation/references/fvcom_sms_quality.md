@@ -33,11 +33,11 @@ All boundary profiles use the single `fvcom_size_field_v3` production method.
 For open domains, exact nearest-segment distances to the open and non-open
 families define a cubic-smoothstep, log-space transition between their
 interpolated boundary targets. Closed domains use the non-open target plus the
-land-distance gradation background. OceanMesh-style feature, M2 wavelength,
-bathymetric-slope, and optional supplied SegOrder channel candidates act only
-inside the coastal/estuary mask. The pointwise minimum is clipped and then
-passed through the eight-neighbour lower gradation envelope, which may refine
-but never coarsen a cell. CFL is diagnostic only.
+land-distance gradation background. Only the bathymetric-slope and optional
+supplied SegOrder channel candidates act inside the coastal/estuary mask. The
+pointwise minimum is clipped and then passed through the eight-neighbour lower
+gradation envelope, which may refine but never coarsen a cell. CFL is
+diagnostic only.
 
 ## Conditioning Transaction Gates
 

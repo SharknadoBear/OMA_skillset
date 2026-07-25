@@ -38,9 +38,6 @@ def main() -> int:
     parser.add_argument("--gradation", type=float, default=0.20)
     parser.add_argument("--slope-elements", type=float, default=10.0)
     parser.add_argument("--coastal-distance-m", type=float, default=12_000.0)
-    parser.add_argument("--feature-elements", type=float, default=3.0)
-    parser.add_argument("--wavelength-period-s", type=float, default=44_714.0)
-    parser.add_argument("--wavelength-elements", type=float, default=20.0)
     parser.add_argument("--channel-reslope-angle-deg", type=float, default=60.0)
     parser.add_argument("--channel-elements-per-depth", type=float, default=1.0)
     parser.add_argument(
@@ -206,9 +203,6 @@ def main() -> int:
             gradation=args.gradation,
             slope_elements=args.slope_elements,
             coastal_distance_m=args.coastal_distance_m,
-            feature_elements=args.feature_elements,
-            wavelength_period_s=args.wavelength_period_s,
-            wavelength_elements=args.wavelength_elements,
             channel_reslope_angle_deg=args.channel_reslope_angle_deg,
             channel_elements_per_depth=args.channel_elements_per_depth,
             channel_min_size_m=args.channel_min_size_m,

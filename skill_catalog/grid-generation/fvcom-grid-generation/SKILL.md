@@ -17,7 +17,7 @@ fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> topobathy-flownet -> fvco
 - Reuse upstream domain and boundary artifacts; do not redesign the region here.
 - Prefer an adaptive boundary-resolution manifest when supplied. Otherwise preserve the legacy loop workflow.
 - Keep full bathymetry for final node sampling and bound only the in-memory size-field grid.
-- Use the same unified size algorithm for open and closed domains. Open domains blend the open- and land-boundary targets; closed domains use the land-distance background. Apply slope, feature, wavelength, and optional flow-network channel candidates only inside the coastal/estuarine influence zone.
+- Use the same unified size algorithm for open and closed domains. Open domains blend the open- and solid-boundary targets; closed domains use the solid-boundary distance background. Apply only the bathymetric-slope and optional flow-network channel candidates inside the coastal/estuarine influence zone.
 - Accept a passing `topobathy-flownet` manifest or generate it under the FVCOM run's `upstream/topobathy_flownet/` directory. Disabling flow-network extraction omits only the channel candidate.
 - End normal adaptive generation after guarded shape relaxation, first-pass thin repair, aggressive local topology conditioning, target-aware area-transition relaxation, and a terminal constraint audit. Do not run the broad legacy postprocessor implicitly.
 - Keep depths finite and positive down and treat OceanMesh2D GPL material as a method reference only.
@@ -37,7 +37,7 @@ Important controls:
 - `--boundary-resolution-profile legacy|adaptive-coastal-v1|adaptive-coastal-v2`, default `legacy`. V2 is opt-in and requires an upstream `pass` manifest before gridding.
 - `--boundary-resolution-manifest`, optional; explicit nodes and chains take precedence over legacy densification.
 - `--gradation`, default `0.20`; limits adjacent size growth after all candidates are combined.
-- `--slope-elements 10`, `--coastal-distance-m 12000`, `--feature-elements 3`, `--wavelength-period-s 44714`, and `--wavelength-elements 20` control the unified coastal OceanMesh-style candidates.
+- `--slope-elements 10` and `--coastal-distance-m 12000` control the nearshore bathymetric-slope candidate.
 - `--channel-flownet-manifest` consumes an existing passing `topobathy-flownet` package. Otherwise `--channel-flownet` (enabled by default) runs that skill on the original bathymetry NetCDF and the exact model-domain polygon, including holes. Use `--no-channel-flownet` only when the channel candidate is intentionally unavailable.
 - `--channel-flownet-source-area-km2`, default `1.0`, and optional `--channel-flownet-target-resolution-m` control extraction. `--channel-reslope-angle-deg 60`, `--channel-elements-per-depth 1`, and optional `--channel-min-size-m` control how accepted DHSVM `SegOrder` arcs become a channel-size candidate.
 - `--regional-spring-relaxation|--no-regional-spring-relaxation`; normal generation applies one guarded, defect-selected spring-equilibrium stage by default.
@@ -59,15 +59,14 @@ Important controls:
 - `--land-spacing-m`, `--open-spacing-m`, `--max-interior-points`, and `--size-field-max-cells` set the boundary targets and execution limits.
 
 The unified background is continuous. For an open domain, compute exact segment
-distances and targets for the open and non-open boundary families, form
-`phi = d_open / (d_open + d_land)`, apply cubic smoothstep, and blend the two
-targets in log space. For a closed domain, grade outward from the non-open
-boundary target. Inside the coastal mask, take the minimum of this background
-and the bathymetric slope, distance-gradient medial-axis feature size, M2
-wavelength, and optional DHSVM flow-network channel candidates. Outside that mask, retain only
-the boundary background. Finally clip to physical bounds and apply the
-eight-neighbor lower gradation envelope. CFL remains diagnostic and never
-controls the size.
+distances and targets for the open and solid boundary families, form
+`phi = d_open / (d_open + d_solid)`, apply cubic smoothstep, and blend the two
+targets in log space. For a closed domain, grade outward from the solid
+boundary target. Inside the coastal mask, take the minimum of this background,
+the bathymetric-slope candidate, and the optional DHSVM flow-network channel
+candidate. Outside that mask, retain only the boundary background. Finally clip
+to physical bounds and apply the eight-neighbor lower gradation envelope. CFL
+remains diagnostic and never controls the size.
 
 ## Generation-Time Conditioning
 
