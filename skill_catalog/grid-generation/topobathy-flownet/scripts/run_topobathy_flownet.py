@@ -1187,7 +1187,11 @@ def main() -> int:
                 f"{args.min_finite_coverage:.6f}"
             )
 
-        grass_location = out_dir / "grassdata" / "topobathy_flownet"
+        # Keep the run-local GRASS scratch path compact. GRASS appends names
+        # such as PERMANENT/cell_misc/surface_positive_up; the former
+        # grassdata/topobathy_flownet path crossed the Windows 260-character
+        # boundary in nested FVCOM run folders.
+        grass_location = out_dir / "_grass" / "tf"
         manifest["runtime"]["gdal"] = probe_version(args.osgeo_shell, ["gdalinfo", "--version"], out_dir)
         manifest["runtime"]["grass"] = probe_version(args.osgeo_shell, [args.grass_command, "--version"], out_dir)
         run_grass(

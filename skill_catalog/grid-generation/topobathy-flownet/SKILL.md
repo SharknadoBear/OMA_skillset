@@ -42,7 +42,9 @@ otherwise the source-derived resolution is preserved. The default GIS launcher i
 `C:/OSGeo4W/OSGeo4W.bat`, with `grass85` inside that environment.
 On Windows, the runner loads the trusted OSGeo4W environment and invokes GDAL
 executables or the GRASS Python launcher directly; run and input paths never
-pass through nested batch `%*` expansion.
+pass through nested batch `%*` expansion. GRASS scratch state uses the compact
+run-local `_grass/tf` location so nested consumer runs stay below legacy
+Windows path-length boundaries.
 
 ## Review
 
