@@ -828,7 +828,7 @@ def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
         assert manifest["postprocess"]["enabled"] is False
         assert manifest["settings"]["postprocess_profile"] == "none"
         assert manifest["settings"]["gradation"] == 0.20
-        assert manifest["settings"]["coastal_distance_m"] == 12_000.0
+        assert manifest["settings"]["coastal_distance_m"] == 25_000.0
         assert manifest["channel_flownet"]["source"] == "disabled"
         assert manifest["settings"]["area_transition_relaxation"] is True
         assert manifest["quality"]["constraint_integrity"]["all_protected_edges_present"] is True

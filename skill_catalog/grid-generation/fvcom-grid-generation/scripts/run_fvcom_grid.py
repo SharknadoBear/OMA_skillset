@@ -37,7 +37,7 @@ def main() -> int:
     parser.add_argument("--open-spacing-m", type=float, default=3000.0)
     parser.add_argument("--gradation", type=float, default=0.20)
     parser.add_argument("--slope-elements", type=float, default=10.0)
-    parser.add_argument("--coastal-distance-m", type=float, default=12_000.0)
+    parser.add_argument("--coastal-distance-m", type=float, default=25_000.0)
     parser.add_argument("--channel-reslope-angle-deg", type=float, default=60.0)
     parser.add_argument("--channel-elements-per-depth", type=float, default=1.0)
     parser.add_argument(

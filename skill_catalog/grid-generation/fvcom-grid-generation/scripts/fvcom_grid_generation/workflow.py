@@ -53,7 +53,7 @@ class GridConfig:
     coarse_smoke: bool = False
     gradation: float = 0.20
     slope_elements: float = 10.0
-    coastal_distance_m: float = 12_000.0
+    coastal_distance_m: float = 25_000.0
     channel_reslope_angle_deg: float = 60.0
     channel_elements_per_depth: float = 1.0
     channel_min_size_m: float | None = None

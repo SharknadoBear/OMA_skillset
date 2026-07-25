@@ -37,7 +37,7 @@ Important controls:
 - `--boundary-resolution-profile legacy|adaptive-coastal-v1|adaptive-coastal-v2`, default `legacy`. V2 is opt-in and requires an upstream `pass` manifest before gridding.
 - `--boundary-resolution-manifest`, optional; explicit nodes and chains take precedence over legacy densification.
 - `--gradation`, default `0.20`; limits adjacent size growth after all candidates are combined.
-- `--slope-elements 10` and `--coastal-distance-m 12000` control the nearshore bathymetric-slope candidate.
+- `--slope-elements 10` and `--coastal-distance-m 25000` control the nearshore bathymetric-slope candidate.
 - `--channel-flownet-manifest` consumes an existing passing `topobathy-flownet` package. Otherwise `--channel-flownet` (enabled by default) runs that skill on the original bathymetry NetCDF and the exact model-domain polygon, including holes. Use `--no-channel-flownet` only when the channel candidate is intentionally unavailable.
 - `--channel-flownet-source-area-km2`, default `1.0`, and optional `--channel-flownet-target-resolution-m` control extraction. `--channel-reslope-angle-deg 60`, `--channel-elements-per-depth 1`, and optional `--channel-min-size-m` control how accepted DHSVM `SegOrder` arcs become a channel-size candidate.
 - `--regional-spring-relaxation|--no-regional-spring-relaxation`; normal generation applies one guarded, defect-selected spring-equilibrium stage by default.
