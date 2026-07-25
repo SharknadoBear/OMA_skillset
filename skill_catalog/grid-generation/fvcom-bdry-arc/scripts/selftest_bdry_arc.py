@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 
 import geopandas as gpd
-from shapely.geometry import LineString, Point, Polygon, box
+from shapely.geometry import LineString, MultiLineString, Point, Polygon, box
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -24,6 +24,7 @@ from fvcom_bdry_arc import (  # noqa: E402
 )
 from fvcom_bdry_arc.boundary_resolution import (  # noqa: E402
     _inventory_narrow_passages,
+    _passage_gate_taxonomy,
     _sample_landward_v2,
     _sample_open_arc_v2,
 )
@@ -33,6 +34,8 @@ from fvcom_bdry_arc.workflow import (  # noqa: E402
     _coastline_bpoly_anchor_points,
     _final_status,
     _gshhs_resolution_policy,
+    _normalize_open_arc_to_wet_exterior,
+    _promote_delivered_open_arc_landfalls,
     _raster_connectivity_fill,
     _uses_island_loop_branch,
     extract_gshhs_vector_wet_domain,
@@ -369,6 +372,15 @@ def test_island_loop_branch_avoids_coastline_anchor_failures() -> None:
 def test_gshhs_resolution_policy_no_silent_downgrade() -> None:
     policy = _gshhs_resolution_policy(BdryArcConfig(gshhs_resolution="f"), {"gshhs_selected_resolution": "h"})
     assert policy["downgraded_without_explicit_request"] is True
+    policy = _gshhs_resolution_policy(
+        BdryArcConfig(gshhs_resolution="f"),
+        {
+            "gshhs_requested_resolution": "h",
+            "gshhs_selected_resolution": "h",
+        },
+    )
+    assert policy["downgraded_without_explicit_request"] is False
+    assert policy["explicit_lower_resolution_requested"] is True
     policy = _gshhs_resolution_policy(BdryArcConfig(gshhs_resolution="h"), {"gshhs_selected_resolution": "h"})
     assert policy["downgraded_without_explicit_request"] is False
     assert policy["explicit_lower_resolution_requested"] is True
@@ -499,6 +511,84 @@ def test_open_arc_crossing_land_needs_review() -> None:
     )
     assert status == "needs_review"
     assert "gshhs_open_arc_crosses_land" in failures
+
+
+def test_source_arc_tail_trims_to_delivered_landfalls() -> None:
+    source_arc = LineString([(-2.0, 0.0), (0.0, 0.0), (10.0, 0.0), (12.0, 0.0)])
+    wet_domain = box(0.0, -5.0, 10.0, 0.0)
+    land_boundary = MultiLineString(
+        [
+            LineString([(0.0, -2.0), (0.0, 2.0)]),
+            LineString([(10.0, -2.0), (10.0, 2.0)]),
+        ]
+    )
+    delivered, report = _normalize_open_arc_to_wet_exterior(
+        source_arc,
+        wet_domain,
+        land_boundary,
+        10.0,
+    )
+    assert report["open_arc_trimmed_to_wet_exterior"] is True
+    assert report["discarded_source_open_arc_length_m"] == 4.0
+    assert list(delivered.coords)[0] == (0.0, 0.0)
+    assert list(delivered.coords)[-1] == (10.0, 0.0)
+
+    anchors = _promote_delivered_open_arc_landfalls(
+        {
+            "source": "coastline_bpoly_intersection",
+            "start_xy": (-2.0, 0.0),
+            "end_xy": (12.0, 0.0),
+            "selected_side_start_corner_xy": (-2.0, 0.0),
+            "selected_side_end_corner_xy": (12.0, 0.0),
+            "start_distance_m": 0.0,
+            "end_distance_m": 0.0,
+        },
+        delivered,
+        land_boundary,
+        10.0,
+    )
+    assert anchors["start_xy"] == (0.0, 0.0)
+    assert anchors["end_xy"] == (10.0, 0.0)
+    assert anchors["start_anchor_method"] == "wet_exterior_land_intersection"
+    status, failures = _final_status(
+        {"selected": {"metrics": {"extra_coastline_intersection": True}}},
+        {
+            "metadata": {
+                "source": "coastline_anchor_seaward_bpoly_chain",
+                "closure_method": "coastline_anchor_seaward_bpoly_chain",
+                "deformed_frame_valid": True,
+                "open_arc_boundary_overlap_fraction": 1.0,
+                "open_arc_trimmed_to_wet_exterior": True,
+                "arc_land_intersection": False,
+                "seed_inside": True,
+                "forbidden_overlap": [],
+            }
+        },
+        anchors,
+        [],
+    )
+    assert status == "pass"
+    assert "open_arc_intersects_extra_coastline" not in failures
+
+
+def test_unprotected_passage_is_advisory_only() -> None:
+    failures, advisories = _passage_gate_taxonomy(
+        {
+            "protected_unresolved_count": 0,
+            "unprotected_unresolved_count": 3,
+        }
+    )
+    assert failures == []
+    assert advisories == ["unprotected_passage_underresolved"]
+
+    failures, advisories = _passage_gate_taxonomy(
+        {
+            "protected_unresolved_count": 1,
+            "unprotected_unresolved_count": 3,
+        }
+    )
+    assert failures == ["protected_passage_underresolved"]
+    assert advisories == ["unprotected_passage_underresolved"]
 
 
 def test_endpoint_repair_is_conservative() -> None:
@@ -795,6 +885,8 @@ def main() -> int:
     test_unresolved_upstream_bpoly_stops_before_coastline_load()
     test_coastline_anchor_seaward_chain_closes_boundary()
     test_open_arc_crossing_land_needs_review()
+    test_source_arc_tail_trims_to_delivered_landfalls()
+    test_unprotected_passage_is_advisory_only()
     test_endpoint_repair_is_conservative()
     test_raster_fill_respects_connectivity_barrier()
     test_component_classification_drops_disconnected_lines()

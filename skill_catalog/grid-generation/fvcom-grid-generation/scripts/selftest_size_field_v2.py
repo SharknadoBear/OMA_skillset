@@ -178,6 +178,24 @@ def test_eight_neighbor_metric_gradation() -> None:
     assert limited[0, 0] < raw[0, 0]
 
 
+def test_production_lower_envelope_bridges_land_open_switch() -> None:
+    """Lock the Delaware-v2 production transition across boundary families."""
+    bathy, boundary = _square_case()
+    field = build_size_field(
+        bathy,
+        boundary,
+        _v2_config(junction_floor_m=0.0),
+    )
+    boundary_transect = np.asarray(field.boundary_size[:, 2], dtype=float)
+    final_transect = np.asarray(field.size[:, 2], dtype=float)
+    assert boundary_transect[3] - boundary_transect[2] > 500.0
+    assert np.all(np.diff(final_transect) >= -1.0e-9)
+    assert np.max(np.diff(final_transect)) < 50.0
+    assert field.report["method"] == "segment_lower_envelope_hard_soft_priority"
+    assert field.report["gradation"]["method"] == "priority_queue_8_neighbor_lower_envelope"
+    assert field.report["gradation"]["max_neighbor_gradation"] <= 0.150000001
+
+
 def test_node_budget_scaling() -> None:
     lon = np.linspace(-75.0, -74.9, 11)
     lat = np.linspace(39.0, 39.1, 11)
@@ -234,6 +252,7 @@ def main() -> None:
         test_automatic_land_open_junction_grade,
         test_passage_layer_becomes_hard_channel_constraint,
         test_eight_neighbor_metric_gradation,
+        test_production_lower_envelope_bridges_land_open_switch,
         test_node_budget_scaling,
         test_boundary_front_and_anchor_seeds,
         test_v2_persistence_and_v1_default,

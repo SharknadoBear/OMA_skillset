@@ -77,6 +77,22 @@ def boundary_resolution_config(profile: str) -> BoundaryResolutionConfig:
     raise ValueError(f"Unsupported adaptive boundary-resolution profile: {profile}")
 
 
+def _passage_gate_taxonomy(
+    passage_report: dict[str, Any],
+    use_v2: bool = True,
+) -> tuple[list[str], list[str]]:
+    """Separate topology-critical protected passages from review-only findings."""
+    failures: list[str] = []
+    advisories: list[str] = []
+    if not use_v2:
+        return failures, advisories
+    if int(passage_report.get("protected_unresolved_count", 0)) > 0:
+        failures.append("protected_passage_underresolved")
+    if int(passage_report.get("unprotected_unresolved_count", 0)) > 0:
+        advisories.append("unprotected_passage_underresolved")
+    return failures, advisories
+
+
 def analyze_boundary_resolution(
     model_boundary_loops_gpkg: str | Path,
     region_bpoly_json: str | Path | None = None,
@@ -355,10 +371,8 @@ def build_boundary_resolution(
     )
     if use_v2 and landfall_hard_anchor_count != 2:
         failures.append("open_landfall_hard_anchor_count_invalid")
-    if use_v2 and passage_report["protected_unresolved_count"]:
-        failures.append("protected_passage_underresolved")
-    if use_v2 and passage_report["unprotected_unresolved_count"]:
-        failures.append("unprotected_passage_requires_review")
+    passage_failures, advisories = _passage_gate_taxonomy(passage_report, use_v2=use_v2)
+    failures.extend(passage_failures)
     if use_v2 and float(spacing_qa.get("maximum_edge_to_target_ratio", 0.0)) > 1.55 + 1.0e-9:
         failures.append("boundary_edge_to_target_ratio_exceeded")
     if use_v2 and float(spacing_qa.get("maximum_target_gradation", 0.0)) > float(config.gradation) + 1.0e-9:
@@ -371,6 +385,7 @@ def build_boundary_resolution(
         "profile": config.profile,
         "final_status": "pass" if not failures else "needs_review",
         "failure_taxonomy": failures,
+        "advisory_taxonomy": advisories,
         "inputs": {
             "model_boundary_loops_gpkg": str(source_path),
             "model_boundary_loop_manifest": str(model_boundary_loop_manifest) if model_boundary_loop_manifest else None,

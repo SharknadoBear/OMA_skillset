@@ -26,7 +26,7 @@ from rasterio import features as rio_features
 from scipy import ndimage
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, Point, Polygon, box, mapping, shape
 from shapely.prepared import prep
-from shapely.ops import linemerge, nearest_points, polygonize, unary_union
+from shapely.ops import linemerge, nearest_points, polygonize, substring, unary_union
 
 from .boundary_loops import build_model_boundary_loops
 from .boundary_resolution import boundary_resolution_config, build_boundary_resolution
@@ -326,7 +326,19 @@ def run_bdry_arc(
             forbidden_regions_xy,
             config.target_resolution_m,
         )
+    if wet_result.get("metadata", {}).get("open_arc_trimmed_to_wet_exterior"):
+        anchors = _promote_delivered_open_arc_landfalls(
+            anchors,
+            selected_arc_xy,
+            land_boundary_xy,
+            config.target_resolution_m,
+        )
     final_status, failure_taxonomy = _final_status(scored, wet_result, anchors, forbidden_regions_xy)
+    advisory_taxonomy: list[str] = []
+    if wet_result.get("metadata", {}).get("open_arc_trimmed_to_wet_exterior"):
+        advisory_taxonomy.append("source_open_arc_tail_trimmed_to_wet_exterior")
+        if scored["selected"].get("metrics", {}).get("extra_coastline_intersection"):
+            advisory_taxonomy.append("discarded_source_arc_tail_intersects_extra_coastline")
     resolution_policy = _gshhs_resolution_policy(config, coastline_load_meta)
     if resolution_policy["downgraded_without_explicit_request"]:
         final_status = "needs_review"
@@ -378,6 +390,7 @@ def run_bdry_arc(
         "created_by": "fvcom-bdry-arc",
         "final_status": final_status,
         "failure_taxonomy": failure_taxonomy,
+        "advisory_taxonomy": advisory_taxonomy,
         "inputs": {
             "region_bpoly_json": str(region_bpoly_json),
             "offshore_artifacts_json": str(offshore_artifacts_json),
@@ -1289,27 +1302,56 @@ def extract_gshhs_vector_wet_domain(
         selected = _choose_seed_component(domain, water_seed_xy)
         domain = selected if selected is not None else deformed_frame.buffer(0)
 
+    source_open_arc_xy = offshore_arc_xy
+    delivered_open_arc_xy, trim_report = _normalize_open_arc_to_wet_exterior(
+        source_open_arc_xy,
+        domain,
+        land_boundary,
+        target_resolution_m,
+    )
+
     tolerance = max(2.0, 0.02 * target_resolution_m)
-    arc_land = offshore_arc_xy.difference(
-        Point(offshore_arc_xy.coords[0]).buffer(max(500.0, 3.0 * target_resolution_m)).union(
-            Point(offshore_arc_xy.coords[-1]).buffer(max(500.0, 3.0 * target_resolution_m))
+    source_arc_land = source_open_arc_xy.difference(
+        Point(source_open_arc_xy.coords[0]).buffer(max(500.0, 3.0 * target_resolution_m)).union(
+            Point(source_open_arc_xy.coords[-1]).buffer(max(500.0, 3.0 * target_resolution_m))
+        )
+    )
+    source_arc_land_intersection = False
+    source_arc_land_intersection_length_m = 0.0
+    if not land_union.is_empty and not source_arc_land.is_empty:
+        inter = source_arc_land.intersection(land_union.buffer(tolerance))
+        source_arc_land_intersection = not inter.is_empty
+        source_arc_land_intersection_length_m = float(getattr(inter, "length", 0.0))
+
+    delivered_arc_land = delivered_open_arc_xy.difference(
+        Point(delivered_open_arc_xy.coords[0]).buffer(max(500.0, 3.0 * target_resolution_m)).union(
+            Point(delivered_open_arc_xy.coords[-1]).buffer(max(500.0, 3.0 * target_resolution_m))
         )
     )
     arc_land_intersection = False
     arc_land_intersection_length_m = 0.0
-    if not land_union.is_empty and not arc_land.is_empty:
-        inter = arc_land.intersection(land_union.buffer(tolerance))
+    if not land_union.is_empty and not delivered_arc_land.is_empty:
+        inter = delivered_arc_land.intersection(land_union.buffer(tolerance))
         arc_land_intersection = not inter.is_empty
         arc_land_intersection_length_m = float(getattr(inter, "length", 0.0))
 
     boundary_segments = _classify_domain_boundary_segments(
         domain,
-        offshore_arc_xy,
+        delivered_open_arc_xy,
         land_boundary,
         deformed_frame,
         target_resolution_m,
     )
-    open_overlap_fraction = _line_fraction_near_boundary(offshore_arc_xy, domain.boundary, max(tolerance, 0.1 * target_resolution_m))
+    open_overlap_fraction = _line_fraction_near_boundary(
+        delivered_open_arc_xy,
+        domain.boundary,
+        max(tolerance, 0.1 * target_resolution_m),
+    )
+    source_open_overlap_fraction = _line_fraction_near_boundary(
+        source_open_arc_xy,
+        domain.boundary,
+        max(tolerance, 0.1 * target_resolution_m),
+    )
 
     metadata: dict[str, Any] = {
         "target_resolution_m": float(target_resolution_m),
@@ -1329,7 +1371,11 @@ def extract_gshhs_vector_wet_domain(
             "fallback_reason": fallback_reason,
             "arc_land_intersection": bool(arc_land_intersection),
             "arc_land_intersection_length_m": float(arc_land_intersection_length_m),
+            "source_arc_land_intersection": bool(source_arc_land_intersection),
+            "source_arc_land_intersection_length_m": float(source_arc_land_intersection_length_m),
             "open_arc_boundary_overlap_fraction": float(open_overlap_fraction),
+            "source_open_arc_boundary_overlap_fraction": float(source_open_overlap_fraction),
+            **trim_report,
             "land_boundary_overlap_fraction": float(boundary_segments["land_boundary_overlap_fraction"]),
             "frame_clip_boundary_length_m": float(boundary_segments["frame_clip_boundary_length_m"]),
             "area_m2": float(domain.area),
@@ -1344,7 +1390,7 @@ def extract_gshhs_vector_wet_domain(
     )
     return {
         "wet_domain_xy": domain,
-        "open_arc_xy": offshore_arc_xy,
+        "open_arc_xy": delivered_open_arc_xy,
         "deformed_frame_xy": deformed_frame,
         "boundary_segments_xy": boundary_segments,
         "metadata": metadata,
@@ -1666,6 +1712,187 @@ def _line_fraction_near_boundary(line: LineString, boundary, tolerance_m: float)
         return float(min(1.0, max(0.0, getattr(near, "length", 0.0) / max(line.length, 1.0))))
     except Exception:
         return 0.0
+
+
+def _normalize_open_arc_to_wet_exterior(
+    source_open_arc: LineString,
+    domain: Polygon,
+    land_boundary,
+    target_resolution_m: float,
+) -> tuple[LineString, dict[str, Any]]:
+    """Trim landward source-arc tails to the contiguous delivered wet exterior."""
+    report: dict[str, Any] = {
+        "open_arc_trimmed_to_wet_exterior": False,
+        "open_arc_trim_reason": "no_eligible_exterior_landfall_interval",
+        "source_open_arc_length_m": float(getattr(source_open_arc, "length", 0.0)),
+        "delivered_open_arc_length_m": float(getattr(source_open_arc, "length", 0.0)),
+        "discarded_source_open_arc_length_m": 0.0,
+        "delivered_start_landfall_distance_m": None,
+        "delivered_end_landfall_distance_m": None,
+    }
+    if (
+        source_open_arc is None
+        or source_open_arc.is_empty
+        or float(source_open_arc.length) <= 0.0
+        or domain is None
+        or domain.is_empty
+        or land_boundary is None
+        or land_boundary.is_empty
+    ):
+        return source_open_arc, report
+
+    tolerance = max(2.0, 0.02 * float(target_resolution_m))
+    landfall_tolerance = max(2.0 * tolerance, 0.10 * float(target_resolution_m))
+    positions = [0.0, float(source_open_arc.length)]
+    try:
+        intersection = source_open_arc.intersection(land_boundary)
+        positions.extend(_line_intersection_positions(source_open_arc, intersection))
+    except Exception:
+        pass
+    positions = _unique_sorted_positions(positions, float(source_open_arc.length))
+    candidates: list[dict[str, Any]] = []
+    for start, end in zip(positions[:-1], positions[1:]):
+        if end - start <= max(1.0e-6, 0.01 * tolerance):
+            continue
+        try:
+            part = substring(source_open_arc, start, end)
+        except Exception:
+            continue
+        if not isinstance(part, LineString) or part.is_empty or float(part.length) <= tolerance:
+            continue
+        overlap = _line_fraction_near_boundary(part, domain.boundary, tolerance)
+        start_distance = float(Point(part.coords[0]).distance(land_boundary))
+        end_distance = float(Point(part.coords[-1]).distance(land_boundary))
+        candidates.append(
+            {
+                "line": part,
+                "start_position_m": float(start),
+                "end_position_m": float(end),
+                "overlap_fraction": float(overlap),
+                "start_landfall_distance_m": start_distance,
+                "end_landfall_distance_m": end_distance,
+                "landfall_pair": bool(
+                    start_distance <= landfall_tolerance
+                    and end_distance <= landfall_tolerance
+                ),
+            }
+        )
+    eligible = [
+        item
+        for item in candidates
+        if item["landfall_pair"] and item["overlap_fraction"] >= 0.98
+    ]
+    if not eligible:
+        report["open_arc_trim_candidate_count"] = int(len(candidates))
+        return source_open_arc, report
+
+    selected = max(
+        eligible,
+        key=lambda item: (
+            float(item["line"].length),
+            float(item["overlap_fraction"]),
+        ),
+    )
+    delivered = selected["line"]
+    discarded = max(0.0, float(source_open_arc.length) - float(delivered.length))
+    trimmed = bool(discarded > tolerance)
+    report.update(
+        {
+            "open_arc_trimmed_to_wet_exterior": trimmed,
+            "open_arc_trim_reason": (
+                "longest_contiguous_source_interval_on_wet_exterior_between_landfalls"
+                if trimmed
+                else "source_arc_already_matches_wet_exterior"
+            ),
+            "source_open_arc_length_m": float(source_open_arc.length),
+            "delivered_open_arc_length_m": float(delivered.length),
+            "discarded_source_open_arc_length_m": float(discarded),
+            "delivered_source_start_position_m": float(selected["start_position_m"]),
+            "delivered_source_end_position_m": float(selected["end_position_m"]),
+            "delivered_open_arc_boundary_overlap_fraction": float(selected["overlap_fraction"]),
+            "delivered_start_landfall_distance_m": float(selected["start_landfall_distance_m"]),
+            "delivered_end_landfall_distance_m": float(selected["end_landfall_distance_m"]),
+            "open_arc_trim_candidate_count": int(len(candidates)),
+        }
+    )
+    return delivered, report
+
+
+def _line_intersection_positions(line: LineString, geom) -> list[float]:
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, Point):
+        return [float(line.project(geom))]
+    if isinstance(geom, LineString):
+        coords = list(geom.coords)
+        if not coords:
+            return []
+        return [
+            float(line.project(Point(coords[0]))),
+            float(line.project(Point(coords[-1]))),
+        ]
+    if hasattr(geom, "geoms"):
+        positions: list[float] = []
+        for part in geom.geoms:
+            positions.extend(_line_intersection_positions(line, part))
+        return positions
+    return []
+
+
+def _unique_sorted_positions(values: list[float], length: float) -> list[float]:
+    ordered = sorted(min(max(float(value), 0.0), float(length)) for value in values)
+    unique: list[float] = []
+    for value in ordered:
+        if not unique or abs(value - unique[-1]) > 1.0e-6:
+            unique.append(value)
+    return unique
+
+
+def _promote_delivered_open_arc_landfalls(
+    anchors: dict[str, Any],
+    delivered_open_arc: LineString,
+    land_boundary,
+    target_resolution_m: float,
+) -> dict[str, Any]:
+    """Replace provisional frame-side anchors with delivered wet-exterior landfalls."""
+    if delivered_open_arc is None or delivered_open_arc.is_empty:
+        return anchors
+    out = dict(anchors)
+    start = Point(delivered_open_arc.coords[0])
+    end = Point(delivered_open_arc.coords[-1])
+    tolerance = max(2.0, 0.10 * float(target_resolution_m))
+    start_landfall_distance = float(start.distance(land_boundary)) if land_boundary is not None and not land_boundary.is_empty else float("inf")
+    end_landfall_distance = float(end.distance(land_boundary)) if land_boundary is not None and not land_boundary.is_empty else float("inf")
+    original_start = Point(out["start_xy"])
+    original_end = Point(out["end_xy"])
+    out.update(
+        {
+            "source_start_xy": out.get("start_xy"),
+            "source_end_xy": out.get("end_xy"),
+            "source_start_to_delivered_landfall_m": float(original_start.distance(start)),
+            "source_end_to_delivered_landfall_m": float(original_end.distance(end)),
+            "start_xy": (float(start.x), float(start.y)),
+            "end_xy": (float(end.x), float(end.y)),
+            "start_role": "wet_exterior_start_landfall",
+            "end_role": "wet_exterior_end_landfall",
+            "start_anchor_found": bool(start_landfall_distance <= tolerance),
+            "end_anchor_found": bool(end_landfall_distance <= tolerance),
+            "start_anchor_method": "wet_exterior_land_intersection",
+            "end_anchor_method": "wet_exterior_land_intersection",
+            "start_snap_distance_m": float(start_landfall_distance),
+            "end_snap_distance_m": float(end_landfall_distance),
+            "anchor_tolerance_m": float(tolerance),
+            "seaward_chain_xy": [
+                (float(start.x), float(start.y)),
+                (float(end.x), float(end.y)),
+            ],
+        }
+    )
+    if out.get("selected_side_start_corner_xy") is not None:
+        out["start_distance_m"] = float(start.distance(Point(out["selected_side_start_corner_xy"])))
+    if out.get("selected_side_end_corner_xy") is not None:
+        out["end_distance_m"] = float(end.distance(Point(out["selected_side_end_corner_xy"])))
+    return out
 
 
 def _classify_domain_boundary_segments(
@@ -2573,6 +2800,7 @@ def _load_coastline_product(
     if manifest_path:
         try:
             gshhs_manifest = _read_json(manifest_path)
+            metadata["gshhs_requested_resolution"] = gshhs_manifest.get("request", {}).get("resolution")
             metadata["gshhs_selected_resolution"] = gshhs_manifest.get("source", {}).get("selected_resolution")
             metadata["gshhs_selected_levels"] = gshhs_manifest.get("source", {}).get("selected_levels")
         except Exception:
@@ -2677,15 +2905,26 @@ def _gshhs_resolution_policy(config: BdryArcConfig, coastline_load_meta: dict[st
         or coastline_load_meta.get("fetch", {}).get("gshhs_selected_resolution")
         or requested
     ).lower()
-    explicit_lower_requested = requested not in {"auto", "f"}
-    downgraded_without_request = requested == "f" and selected not in {"f", "full", ""}
+    manifest_requested = str(coastline_load_meta.get("gshhs_requested_resolution") or "").lower()
+    explicit_manifest_selection = bool(
+        manifest_requested
+        and manifest_requested not in {"auto"}
+        and manifest_requested == selected
+    )
+    explicit_lower_requested = requested not in {"auto", "f"} or explicit_manifest_selection
+    downgraded_without_request = (
+        requested == "f"
+        and selected not in {"f", "full", ""}
+        and not explicit_manifest_selection
+    )
     return {
         "requested_resolution": requested,
+        "upstream_manifest_requested_resolution": manifest_requested or None,
         "selected_resolution": selected,
         "default_resolution": "f",
         "explicit_lower_resolution_requested": bool(explicit_lower_requested),
         "downgraded_without_explicit_request": bool(downgraded_without_request),
-        "policy": "default to GSHHS full resolution and never downshift to h/i/l/c unless the prompt or CLI explicitly requests it",
+        "policy": "default to GSHHS full resolution and never downshift to h/i/l/c unless the CLI or supplied GSHHS fetch manifest explicitly requested it",
     }
 
 
@@ -3658,7 +3897,7 @@ def _final_status(
     failures: list[str] = []
     metrics = scored["selected"]["metrics"]
     metadata = wet_result["metadata"]
-    if metrics.get("extra_coastline_intersection"):
+    if metrics.get("extra_coastline_intersection") and not metadata.get("open_arc_trimmed_to_wet_exterior"):
         failures.append("open_arc_intersects_extra_coastline")
     if metadata.get("source") == "fallback_bpoly_polygon":
         failures.append("seeded_wet_domain_polygonize_failed")

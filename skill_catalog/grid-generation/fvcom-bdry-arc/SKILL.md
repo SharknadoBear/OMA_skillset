@@ -10,7 +10,7 @@ Use this skill after `fvcom-region-bpoly` and before `fvcom-grid-generation`.
 ## Core Rules
 
 - Treat the bpoly offshore point as a side selector, not a final endpoint.
-- Build coastal OBC anchors at coastline intersections on the two bpoly sides adjacent to the selected offshore side.
+- Build provisional coastal OBC anchors at coastline intersections on the two bpoly sides adjacent to the selected offshore side. If GSHHS wet-domain extraction shows that the source arc continues beyond the delivered exterior, trim only those source tails and promote the two delivered land/exterior intersections to the final OBC anchors.
 - Use GSHHS/GSHHG polygons as the topology base. Keep CUSP as an explicit legacy/debug input.
 - Preserve lake and island/archipelago branches; do not apply mainland anchor logic to them.
 - Keep `--boundary-resolution-profile legacy` as the default and preserve all legacy outputs.
@@ -55,10 +55,10 @@ python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-
 2. Anchor-to-anchor metric equidistribution, avoiding an isolated short remainder edge.
 3. One shared land/OBC junction target with the configured gradation into the land chain.
 4. A conservative wet-passage inventory with paired-bank spacing harmonization.
-5. A `needs_review` gate for protected passages that cannot fit four elements across at the permitted minimum spacing.
-6. Explicit anchor, junction, and passage metadata in diagnostics and boundary-node products.
+5. A `needs_review` gate for protected passages that cannot fit four elements across at the permitted minimum spacing; unresolved unprotected passages are retained and reported as advisories.
+6. Explicit anchor, junction, source-tail, and passage metadata in diagnostics and boundary-node products.
 
-V2 never closes a channel automatically. An unresolved unprotected passage is also retained and reported for review; geographic topology changes require a separate, evidence-backed workflow.
+V2 never closes a channel automatically. An unresolved unprotected passage remains unchanged and advisory-only; protected underresolution remains a hard gate, and geographic topology changes require a separate, evidence-backed workflow.
 
 ## Standalone Tools
 
@@ -76,7 +76,7 @@ Every normal run retains the legacy boundary-arc and model-loop outputs. Adaptiv
 - `boundary_resolution/boundary_resolution_nodes.geojson`
 - `boundary_resolution/boundary_resolution_review_map.png`
 
-Require fixed OBC anchors, measured complete exterior overlap, no non-endpoint land intersection in either repaired or sampled geometry, a valid resolved wet domain, zero protected-region topology operations, and area change within budget. For v2, additionally require exactly two OBC-landfall hard anchors, boundary edge-to-target ratio no greater than 1.55, and explicit review of every unresolved passage. Keep artifacts and mark `needs_review` when a guard fails.
+Require final OBC anchors at the delivered land/exterior intersections, measured complete delivered-exterior overlap, no non-endpoint land intersection in the delivered or sampled geometry, a valid resolved wet domain, zero protected-region topology operations, and area change within budget. Preserve any discarded source-arc tail and its intersections as provenance advisories rather than applying delivered-boundary gates to it. For v2, additionally require exactly two OBC-landfall hard anchors, boundary edge-to-target ratio no greater than 1.55, and no unresolved protected passage. Keep artifacts and mark `needs_review` when a hard guard fails; record unresolved unprotected passages as advisories.
 
 ## Validation
 

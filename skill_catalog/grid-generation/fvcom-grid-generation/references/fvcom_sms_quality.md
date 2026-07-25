@@ -29,7 +29,7 @@ When any gate fails, retain all artifacts and set `final_status: needs_review`. 
 
 Adaptive boundary packages additionally require ordered explicit chains, per-node target spacing, and OBC size compatibility: 95th-percentile `L/h <= 1.55` and maximum `L/h <= 2.0`.
 
-Adaptive size fields use OBC/boundary target propagation as the offshore control. With the default `coastal` bathymetric-gradient policy, slope-based refinement is active only within the configured distance of land/island nodes; `global` must be an explicit choice for adaptive grids.
+Adaptive size fields use the production `segment_lower_envelope_hard_soft_priority` method: segment-interpolated boundary targets provide the raw control and the eight-neighbor lower envelope supplies the continuous nearshore-to-offshore transition. OBC/boundary target propagation remains the offshore control. With the default `coastal` bathymetric-gradient policy, slope-based refinement is active only within the configured distance of land/island nodes; `global` must be an explicit choice for adaptive grids.
 
 ## Conditioning Transaction Gates
 
