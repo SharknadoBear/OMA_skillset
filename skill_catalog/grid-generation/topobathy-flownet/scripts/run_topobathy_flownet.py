@@ -132,7 +132,8 @@ def resolve_surface_dataset(surface: Path, variable: str | None) -> str:
         subdatasets = list(dataset.subdatasets)
         if dataset.count >= 1 and dataset.width > 0 and dataset.height > 0 and not subdatasets:
             if variable:
-                raise ValueError("--surface-variable is only valid for a NetCDF/HDF subdataset container")
+                if surface.suffix.casefold() not in {".nc", ".nc4", ".cdf"}:
+                    raise ValueError("--surface-variable is only valid for a NetCDF/HDF input")
             return str(surface)
     if not subdatasets:
         raise ValueError(f"No readable raster band found in {surface}")
@@ -150,6 +151,142 @@ def resolve_surface_dataset(surface: Path, variable: str | None) -> str:
         return subdatasets[0]
     available = [candidate.rsplit(":", 1)[-1].strip('"') for candidate in subdatasets]
     raise ValueError(f"Surface contains multiple raster variables; pass --surface-variable from {available}")
+
+
+def load_regular_lonlat_netcdf(surface: Path, variable: str) -> tuple[Any, Any, Any, dict[str, Any]]:
+    """Load a strict regular lon/lat NetCDF variable as a north-up raster.
+
+    This adapter is deliberately narrow. It only assigns EPSG:4326 after
+    validating explicit one-dimensional longitude and latitude coordinates.
+    """
+    import numpy as np
+    import xarray as xr
+    from pyproj import CRS
+    from rasterio.transform import from_origin
+
+    def coordinate_role(name: str, coordinate) -> str | None:
+        lowered_name = name.casefold()
+        standard_name = str(coordinate.attrs.get("standard_name", "")).casefold()
+        axis = str(coordinate.attrs.get("axis", "")).casefold()
+        units = str(coordinate.attrs.get("units", "")).casefold().replace(" ", "_")
+        longitude = (
+            lowered_name in {"lon", "longitude"}
+            or standard_name == "longitude"
+            or axis == "x" and units in {"degree_east", "degrees_east"}
+        )
+        latitude = (
+            lowered_name in {"lat", "latitude"}
+            or standard_name == "latitude"
+            or axis == "y" and units in {"degree_north", "degrees_north"}
+        )
+        if longitude and latitude:
+            raise ValueError(f"Coordinate {name!r} is ambiguously marked as both longitude and latitude")
+        return "longitude" if longitude else "latitude" if latitude else None
+
+    def regular_axis(values, name: str) -> tuple[np.ndarray, str, float]:
+        axis_values = np.asarray(values, dtype="float64")
+        if axis_values.ndim != 1 or axis_values.size < 2 or not np.all(np.isfinite(axis_values)):
+            raise ValueError(f"NetCDF {name} coordinate must be a finite one-dimensional axis with at least two cells")
+        differences = np.diff(axis_values)
+        if np.all(differences > 0):
+            direction = "ascending"
+        elif np.all(differences < 0):
+            direction = "descending"
+        else:
+            raise ValueError(f"NetCDF {name} coordinate must be strictly monotonic")
+        spacing = float(np.median(np.abs(differences)))
+        tolerance = max(1.0e-12, spacing * 1.0e-6)
+        if not np.allclose(np.abs(differences), spacing, rtol=1.0e-6, atol=tolerance):
+            raise ValueError(f"NetCDF {name} coordinate is not regularly spaced")
+        return axis_values, direction, spacing
+
+    with xr.open_dataset(surface, decode_coords="all", mask_and_scale=True) as dataset:
+        if variable not in dataset.data_vars:
+            raise ValueError(
+                f"NetCDF variable {variable!r} not found; available data variables={list(dataset.data_vars)}"
+            )
+        data_array = dataset[variable]
+        if data_array.ndim != 2:
+            raise ValueError(f"NetCDF variable {variable!r} must be two-dimensional, found dims={data_array.dims}")
+        candidates: dict[str, list[tuple[str, Any]]] = {"longitude": [], "latitude": []}
+        for name, coordinate in data_array.coords.items():
+            role = coordinate_role(name, coordinate)
+            if role and coordinate.ndim == 1 and coordinate.dims[0] in data_array.dims:
+                candidates[role].append((name, coordinate))
+        for role in ("longitude", "latitude"):
+            if len(candidates[role]) != 1:
+                names = [name for name, _ in candidates[role]]
+                raise ValueError(
+                    f"NetCDF fallback requires exactly one validated 1-D {role} coordinate; found={names}"
+                )
+        lon_name, lon_coordinate = candidates["longitude"][0]
+        lat_name, lat_coordinate = candidates["latitude"][0]
+        lon_dimension = lon_coordinate.dims[0]
+        lat_dimension = lat_coordinate.dims[0]
+        if lon_dimension == lat_dimension or set(data_array.dims) != {lat_dimension, lon_dimension}:
+            raise ValueError(
+                f"NetCDF lon/lat dimensions must exactly match the 2-D variable; "
+                f"variable_dims={data_array.dims}, lat_dim={lat_dimension}, lon_dim={lon_dimension}"
+            )
+        longitudes, longitude_order, longitude_spacing = regular_axis(lon_coordinate.values, "longitude")
+        latitudes, latitude_order, latitude_spacing = regular_axis(lat_coordinate.values, "latitude")
+        if float(longitudes.min()) < -180.0 or float(longitudes.max()) > 180.0:
+            raise ValueError("NetCDF longitude coordinates must lie within [-180, 180] before assigning EPSG:4326")
+        if float(latitudes.min()) < -90.0 or float(latitudes.max()) > 90.0:
+            raise ValueError("NetCDF latitude coordinates must lie within [-90, 90] before assigning EPSG:4326")
+
+        values = np.asarray(data_array.transpose(lat_dimension, lon_dimension).values, dtype="float64")
+        if values.shape != (latitudes.size, longitudes.size):
+            raise ValueError(
+                f"NetCDF coordinate lengths do not match variable shape: "
+                f"shape={values.shape}, lat={latitudes.size}, lon={longitudes.size}"
+            )
+        longitude_reversed = longitude_order == "descending"
+        latitude_reversed = latitude_order == "ascending"
+        if longitude_reversed:
+            longitudes = longitudes[::-1]
+            values = values[:, ::-1]
+        if latitude_reversed:
+            latitudes = latitudes[::-1]
+            values = values[::-1, :]
+        transform = from_origin(
+            float(longitudes[0] - longitude_spacing / 2.0),
+            float(latitudes[0] + latitude_spacing / 2.0),
+            longitude_spacing,
+            latitude_spacing,
+        )
+        nonfinite_count = int((~np.isfinite(values)).sum())
+        source_fill_value = data_array.encoding.get("_FillValue")
+        if hasattr(source_fill_value, "item"):
+            source_fill_value = source_fill_value.item()
+        if isinstance(source_fill_value, float) and not math.isfinite(source_fill_value):
+            source_fill_value = None
+        adapter = {
+            "name": "xarray_regular_lonlat_netcdf_v1",
+            "reason": "selected NetCDF GDAL subdataset lacked usable CRS/georeferencing",
+            "source_path": str(surface.resolve()),
+            "selected_variable": variable,
+            "variable_dims_original": list(data_array.dims),
+            "variable_shape_original": [int(size) for size in data_array.shape],
+            "longitude_coordinate": lon_name,
+            "latitude_coordinate": lat_name,
+            "longitude_order_original": longitude_order,
+            "latitude_order_original": latitude_order,
+            "axis_normalization": {
+                "longitude_reversed": longitude_reversed,
+                "latitude_reversed": latitude_reversed,
+                "output_order": "north-to-south rows, west-to-east columns",
+            },
+            "longitude_spacing_degrees": longitude_spacing,
+            "latitude_spacing_degrees": latitude_spacing,
+            "assigned_crs": "EPSG:4326",
+            "crs_assignment_basis": "validated regular 1-D lon/lat pixel-center coordinates",
+            "affine_gdal": list(transform.to_gdal()),
+            "finite_value_count": int(np.isfinite(values).sum()),
+            "nonfinite_nodata_count": nonfinite_count,
+            "source_fill_value": source_fill_value,
+        }
+    return values, transform, CRS.from_epsg(4326), adapter
 
 
 def load_mask(mask_path: Path, layer: str | None):
@@ -203,14 +340,14 @@ def prepare_projected_inputs(
     import numpy as np
     import rasterio
     from rasterio.features import rasterize
+    from rasterio.io import MemoryFile
     from rasterio.mask import mask as raster_mask
     from rasterio.transform import array_bounds
     from rasterio.warp import Resampling, calculate_default_transform, reproject
 
     dataset_name = resolve_surface_dataset(surface_path, surface_variable)
-    with rasterio.open(dataset_name) as source:
-        if source.crs is None:
-            raise ValueError("Input surface has no CRS")
+
+    def crop_source(source):
         source_mask = mask.to_crs(source.crs)
         source_geometry = source_mask.geometry.iloc[0]
         clipped, clipped_transform = raster_mask(
@@ -220,34 +357,85 @@ def prepare_projected_inputs(
             crop=True,
             filled=False,
         )
-        source_values = clipped.astype("float64").filled(np.nan)
-        if surface_positive == "down":
-            source_values = -source_values
-        source_height, source_width = source_values.shape
-        left, bottom, right, top = array_bounds(source_height, source_width, clipped_transform)
-        target_transform, target_width, target_height = calculate_default_transform(
-            source.crs,
-            target_crs,
-            source_width,
-            source_height,
-            left,
-            bottom,
-            right,
-            top,
-            resolution=target_resolution_m,
+        return clipped.astype("float64").filled(np.nan), clipped_transform, source.crs
+
+    with rasterio.open(dataset_name) as detected_source:
+        transform_values = tuple(detected_source.transform)
+        transform_determinant = (
+            detected_source.transform.a * detected_source.transform.e
+            - detected_source.transform.b * detected_source.transform.d
         )
-        target = np.full((target_height, target_width), np.nan, dtype="float64")
-        reproject(
-            source_values,
-            target,
-            src_transform=clipped_transform,
-            src_crs=source.crs,
-            src_nodata=np.nan,
-            dst_transform=target_transform,
-            dst_crs=target_crs,
-            dst_nodata=np.nan,
-            resampling=Resampling.bilinear,
+        usable_georeferencing = (
+            detected_source.crs is not None
+            and all(math.isfinite(value) for value in transform_values)
+            and math.isfinite(transform_determinant)
+            and not math.isclose(transform_determinant, 0.0)
         )
+        if usable_georeferencing:
+            source_values, clipped_transform, source_crs = crop_source(detected_source)
+            input_adapter = {
+                "name": "rasterio_georeferenced_raster_v1",
+                "source_dataset": dataset_name,
+                "driver": detected_source.driver,
+                "source_crs": detected_source.crs.to_string(),
+                "source_affine_gdal": list(detected_source.transform.to_gdal()),
+                "source_width": int(detected_source.width),
+                "source_height": int(detected_source.height),
+                "source_nodata": detected_source.nodata,
+            }
+        else:
+            netcdf_suffixes = {".nc", ".nc4", ".cdf"}
+            if surface_path.suffix.casefold() not in netcdf_suffixes or not surface_variable:
+                raise ValueError(
+                    "Input surface lacks usable CRS/georeferencing. The only fallback is an explicitly selected "
+                    "regular lon/lat NetCDF variable; GeoTIFF and non-lon/lat inputs are never assigned a CRS."
+                )
+            netcdf_values, netcdf_transform, netcdf_crs, input_adapter = load_regular_lonlat_netcdf(
+                surface_path, surface_variable
+            )
+            memory_values = np.where(np.isfinite(netcdf_values), netcdf_values, NODATA)
+            with MemoryFile() as memory_file:
+                with memory_file.open(
+                    driver="GTiff",
+                    width=memory_values.shape[1],
+                    height=memory_values.shape[0],
+                    count=1,
+                    dtype="float64",
+                    crs=netcdf_crs,
+                    transform=netcdf_transform,
+                    nodata=NODATA,
+                ) as memory_writer:
+                    memory_writer.write(memory_values, 1)
+                with memory_file.open() as memory_source:
+                    source_values, clipped_transform, source_crs = crop_source(memory_source)
+
+    if surface_positive == "down":
+        source_values = -source_values
+    source_height, source_width = source_values.shape
+    left, bottom, right, top = array_bounds(source_height, source_width, clipped_transform)
+    target_transform, target_width, target_height = calculate_default_transform(
+        source_crs,
+        target_crs,
+        source_width,
+        source_height,
+        left,
+        bottom,
+        right,
+        top,
+        resolution=target_resolution_m,
+    )
+    target = np.full((target_height, target_width), np.nan, dtype="float64")
+    reproject(
+        source_values,
+        target,
+        src_transform=clipped_transform,
+        src_crs=source_crs,
+        src_nodata=np.nan,
+        dst_transform=target_transform,
+        dst_crs=target_crs,
+        dst_nodata=np.nan,
+        resampling=Resampling.bilinear,
+    )
 
     projected_mask_frame = gpd.GeoDataFrame(
         {"mask_id": [1]},
@@ -288,6 +476,7 @@ def prepare_projected_inputs(
             vertical_positive="up",
             source_surface=str(surface_path.resolve()),
             source_variable=surface_variable or "",
+            input_adapter=input_adapter["name"],
         )
     projected_mask.unlink(missing_ok=True)
     projected_mask_frame.to_file(projected_mask, layer="analysis_mask", driver="GPKG")
@@ -300,6 +489,7 @@ def prepare_projected_inputs(
     finite_values = target[finite_inside]
     return {
         "surface_dataset": dataset_name,
+        "input_adapter": input_adapter,
         "target_crs": target_crs.to_string(),
         "target_crs_wkt": target_crs.to_wkt(),
         "width": int(target.shape[1]),
@@ -719,7 +909,7 @@ def main() -> int:
             "executable": sys.executable,
             "packages": {
                 name: package_version(name)
-                for name in ("geopandas", "matplotlib", "numpy", "pyproj", "rasterio", "shapely")
+                for name in ("geopandas", "matplotlib", "numpy", "pyproj", "rasterio", "shapely", "xarray")
             },
         },
     }

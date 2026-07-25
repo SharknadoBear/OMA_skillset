@@ -19,19 +19,25 @@ removes Haines, HUC12, UTM zone 8, 10 m cell, and ArcPy assumptions.
 ## Fixed Hydrology Method
 
 1. Normalize input values to positive-up elevation.
-2. Reproject the surface and explicit polygon mask to a projected metre CRS.
+2. Read an already georeferenced raster directly. For an explicitly selected
+   NetCDF variable whose GDAL subdataset lacks georeferencing, accept only
+   regular monotonic one-dimensional lon/lat pixel-center axes, normalize them
+   to west-east columns and north-south rows, and assign EPSG:4326 with the
+   adapter evidence recorded in the manifest. Never infer a CRS for other
+   inputs.
+3. Reproject the surface and explicit polygon mask to a projected metre CRS.
    Preserve source-derived resolution unless an explicit projected cell size
    is supplied.
-3. Convert `source_area_km2` to cells with
+4. Convert `source_area_km2` to cells with
    `ceil(source_area_km2 * 1e6 / abs(det(A)))`, where `A` is the projected
    raster's 2-D affine matrix.
-4. Run GRASS 8 D8/SFD routing with `r.watershed -s -a`.
-5. Run `r.stream.extract` with the same cell threshold, `mexp=0`, and
+5. Run GRASS 8 D8/SFD routing with `r.watershed -s -a`.
+6. Run `r.stream.extract` with the same cell threshold, `mexp=0`, and
    `stream_length=0`.
-6. Orient each vector arc from higher to lower endpoint elevation. Accumulation
+7. Orient each vector arc from higher to lower endpoint elevation. Accumulation
    is only a fallback when endpoint elevation is missing.
-7. Connect coincident endpoints and assign stable integer IDs.
-8. Assign longest-upstream-path SegOrder: headwater arcs are 1; an arc
+8. Connect coincident endpoints and assign stable integer IDs.
+9. Assign longest-upstream-path SegOrder: headwater arcs are 1; an arc
    downstream of one or more arcs is `1 + max(upstream SegOrder)`.
 
 This SegOrder is deliberately not Strahler order. At every downstream

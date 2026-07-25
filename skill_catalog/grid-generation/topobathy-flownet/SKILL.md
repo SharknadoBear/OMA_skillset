@@ -30,11 +30,15 @@ python scripts/run_topobathy_flownet.py `
   --out-dir <new-run-folder>
 ```
 
-For a multi-variable NetCDF, pass `--surface-variable`. The default projected
-CRS is local WGS84 UTM selected from the mask centroid; pass `--target-crs`
-when UTM is unsuitable. Pass `--target-resolution-m` only when the caller
-intentionally needs a different square working-cell size; otherwise the
-source-derived resolution is preserved. The default GIS launcher is
+For a NetCDF, pass `--surface-variable` explicitly. If GDAL lacks
+georeferencing, the runner accepts only a two-dimensional variable backed by
+regular, monotonic one-dimensional lon/lat coordinates; it normalizes those
+pixel-center axes and records the xarray adapter in the manifest. It never
+assigns a CRS to an ungeoreferenced GeoTIFF or non-lon/lat dataset. The default
+projected CRS is local WGS84 UTM selected from the mask centroid; pass
+`--target-crs` when UTM is unsuitable. Pass `--target-resolution-m` only when
+the caller intentionally needs a different square working-cell size;
+otherwise the source-derived resolution is preserved. The default GIS launcher is
 `C:/OSGeo4W/OSGeo4W.bat`, with `grass85` inside that environment.
 
 ## Review

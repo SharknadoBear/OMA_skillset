@@ -7,6 +7,8 @@ import math
 import tempfile
 from pathlib import Path
 
+import run_topobathy_flownet as runner
+
 from topobathy_flownet_core import (
     SCHEMA_VERSION,
     affine_cell_area_m2,
@@ -115,6 +117,72 @@ def test_manifest_schema_literal() -> None:
         assert json.loads(path.read_text(encoding="utf-8"))["schema"] == "topobathy_flownet_v1"
 
 
+def test_regular_lonlat_netcdf_ascending_lat_and_sign() -> None:
+    import geopandas as gpd
+    import numpy as np
+    import rasterio
+    import xarray as xr
+    from pyproj import CRS
+    from shapely.geometry import box
+
+    longitudes = np.array([-123.2, -123.1, -123.0, -122.9], dtype="float64")
+    latitudes = np.array([37.0, 37.1, 37.2, 37.3], dtype="float64")
+    positive_down_depth = np.arange(1, 17, dtype="float32").reshape(4, 4)
+    positive_down_depth[1, 2] = np.nan
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        netcdf_path = root / "ascending_lat.nc"
+        xr.Dataset(
+            {
+                "depth": (
+                    ("lat", "lon"),
+                    positive_down_depth,
+                    {"units": "m", "positive": "down"},
+                )
+            },
+            coords={"lat": latitudes, "lon": longitudes},
+        ).to_netcdf(netcdf_path)
+
+        values, transform, crs, adapter = runner.load_regular_lonlat_netcdf(netcdf_path, "depth")
+        assert values.shape == positive_down_depth.shape
+        assert math.isclose(values[0, 0], positive_down_depth[-1, 0])
+        assert np.isnan(values[-2, 2])
+        center_x, center_y = transform * (0.5, 0.5)
+        assert math.isclose(center_x, longitudes[0])
+        assert math.isclose(center_y, latitudes[-1])
+        assert crs.to_epsg() == 4326
+        assert adapter["axis_normalization"]["latitude_reversed"]
+        assert not adapter["axis_normalization"]["longitude_reversed"]
+        assert adapter["nonfinite_nodata_count"] == 1
+        assert adapter["source_fill_value"] is None
+
+        mask_path = root / "mask.gpkg"
+        mask = gpd.GeoDataFrame(
+            {"id": [1]},
+            geometry=[box(-123.24, 36.96, -122.86, 37.34)],
+            crs="EPSG:4326",
+        )
+        mask.to_file(mask_path, layer="mask", driver="GPKG")
+        projected_surface = root / "projected.tif"
+        projected_mask = root / "projected_mask.gpkg"
+        prep = runner.prepare_projected_inputs(
+            surface_path=netcdf_path,
+            surface_variable="depth",
+            surface_positive="down",
+            mask=runner.load_mask(mask_path, "mask"),
+            target_crs=CRS.from_epsg(32610),
+            target_resolution_m=2_000.0,
+            projected_surface=projected_surface,
+            projected_mask=projected_mask,
+        )
+        assert prep["input_adapter"]["name"] == "xarray_regular_lonlat_netcdf_v1"
+        assert prep["input_adapter"]["selected_variable"] == "depth"
+        with rasterio.open(projected_surface) as dataset:
+            projected_values = dataset.read(1, masked=True).compressed()
+        assert projected_values.size > 0
+        assert float(projected_values.max()) < 0.0
+
+
 def main() -> None:
     tests = [
         test_physical_threshold,
@@ -122,6 +190,7 @@ def main() -> None:
         test_topology_and_longest_path_order,
         test_downhill_reorientation_and_deterministic_ids,
         test_manifest_schema_literal,
+        test_regular_lonlat_netcdf_ascending_lat_and_sign,
     ]
     for test in tests:
         test()
