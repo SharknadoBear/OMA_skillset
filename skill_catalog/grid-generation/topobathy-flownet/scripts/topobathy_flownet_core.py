@@ -263,12 +263,17 @@ def build_arc_records(
     *,
     cell_area_m2: float,
     node_tolerance_m: float,
+    accumulation_absolute_tolerance_cells: float = 1.0e-6,
+    accumulation_relative_tolerance: float = 1.0e-12,
+    elevation_tolerance_m: float = 1.0e-6,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Orient, connect, and order GRASS stream arcs.
 
-    SegOrder is the DHSVM longest-upstream-path order: every headwater has order
-    one and a downstream arc receives one plus the maximum order of all direct
-    upstream arcs.
+    Orientation follows increasing GRASS accumulation first, because
+    r.stream.extract adjusts D8 direction to the supplied accumulation field.
+    Elevation is a tolerance-aware tie fallback. SegOrder is the DHSVM
+    longest-upstream-path order: every headwater has order one and a downstream
+    arc receives one plus the maximum order of all direct upstream arcs.
     """
     normalized = [
         [(float(x), float(y)) for x, y in line]
@@ -287,25 +292,59 @@ def build_arc_records(
 
     oriented: list[dict[str, Any]] = []
     invalid_endpoint_elevation_count = 0
-    for line, selev, eelev, sacc, eacc in zip(
-        normalized,
-        start_elevations,
-        end_elevations,
-        start_accumulations,
-        end_accumulations,
+    orientation_counts: dict[str, int] = defaultdict(int)
+    orientation_examples: list[dict[str, Any]] = []
+    for source_index, (line, selev, eelev, sacc, eacc) in enumerate(
+        zip(
+            normalized,
+            start_elevations,
+            end_elevations,
+            start_accumulations,
+            end_accumulations,
+        ),
+        start=1,
     ):
         selev = float(selev)
         eelev = float(eelev)
         sacc = float(sacc)
         eacc = float(eacc)
         reverse = False
-        if _finite_sample(selev) and _finite_sample(eelev):
+        accumulation_valid = _finite_sample(sacc) and _finite_sample(eacc)
+        elevation_valid = _finite_sample(selev) and _finite_sample(eelev)
+        if accumulation_valid:
+            accumulation_tolerance = max(
+                accumulation_absolute_tolerance_cells,
+                accumulation_relative_tolerance * max(1.0, abs(sacc), abs(eacc)),
+            )
+            if abs(eacc - sacc) > accumulation_tolerance:
+                orientation_method = "accumulation_primary"
+                reverse = sacc > eacc
+            elif elevation_valid and abs(selev - eelev) > elevation_tolerance_m:
+                orientation_method = "accumulation_tie_elevation_fallback"
+                reverse = selev < eelev
+            else:
+                orientation_method = "accumulation_tie_raw_grass_fallback"
+        elif elevation_valid and abs(selev - eelev) > elevation_tolerance_m:
+            orientation_method = "invalid_accumulation_elevation_fallback"
             reverse = selev < eelev
-        elif _finite_sample(sacc) and _finite_sample(eacc):
-            reverse = sacc > eacc
-            invalid_endpoint_elevation_count += 1
         else:
+            orientation_method = "invalid_accumulation_raw_grass_fallback"
+        if not elevation_valid:
             invalid_endpoint_elevation_count += 1
+        orientation_counts[orientation_method] += 1
+        orientation_counts["reversed" if reverse else "preserved"] += 1
+        if (reverse or "fallback" in orientation_method) and len(orientation_examples) < 20:
+            orientation_examples.append(
+                {
+                    "source_line_index": source_index,
+                    "method": orientation_method,
+                    "reversed": reverse,
+                    "start_accumulation_cells": sacc if _finite_sample(sacc) else None,
+                    "end_accumulation_cells": eacc if _finite_sample(eacc) else None,
+                    "start_elevation_m": selev if _finite_sample(selev) else None,
+                    "end_elevation_m": eelev if _finite_sample(eelev) else None,
+                }
+            )
         if reverse:
             line = list(reversed(line))
             selev, eelev = eelev, selev
@@ -381,7 +420,9 @@ def build_arc_records(
                 }
             )
         upstream = ends.get(record["from_node"], [])
-        record["downarc"] = downstream[0]["arcid"] if downstream else -1
+        # Never manufacture a routing choice. Any remaining multi-candidate
+        # node is retained in QA and fails the structural gate.
+        record["downarc"] = downstream[0]["arcid"] if len(downstream) == 1 else -1
         record["uparc"] = max(upstream, key=lambda candidate: (candidate["MAXGRID"], -candidate["arcid"]))["arcid"] if upstream else -1
         upstream_sum = sum(candidate["MAXGRID"] for candidate in upstream)
         record["local"] = max(0, record["MAXGRID"] - upstream_sum)
@@ -447,6 +488,14 @@ def build_arc_records(
         "terminal_segments": sum(1 for record in records if record["downarc"] == -1),
         "multiple_terminal_segments_diagnostic": sum(1 for record in records if record["downarc"] == -1) > 1,
         "invalid_endpoint_elevation_count": invalid_endpoint_elevation_count,
+        "orientation": {
+            "policy": "accumulation_first_then_elevation_tie_then_raw_grass_v1",
+            "accumulation_absolute_tolerance_cells": accumulation_absolute_tolerance_cells,
+            "accumulation_relative_tolerance": accumulation_relative_tolerance,
+            "elevation_tolerance_m": elevation_tolerance_m,
+            "counts": dict(sorted(orientation_counts.items())),
+            "examples": orientation_examples,
+        },
         "ambiguous_downstream_nodes": ambiguous_downstream_nodes,
         "invalid_references": invalid_references,
         "unassigned_segorder_arcids": unassigned,

@@ -55,6 +55,9 @@ pass through nested batch `%*` expansion.
 - Review `topology_qa.json.raw_stream_reader`. Mixed GRASS point primitives
   and degenerate line exports are skipped per primitive with reason counts;
   valid line parts remain the only topology inputs.
+- Review `topology_qa.json.orientation`. Increasing accumulation is the
+  primary routing direction; elevation is only a tolerance-aware tie fallback,
+  and unresolved ties retain GRASS vector direction.
 - Treat multiple terminals or sinks as a diagnostic, not a failure. This keeps
   closed analysis domains valid.
 - Use `topobathy_flownet.gpkg`, layer `topobathy_flownet`, as the stable

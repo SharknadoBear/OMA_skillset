@@ -34,8 +34,13 @@ removes Haines, HUC12, UTM zone 8, 10 m cell, and ArcPy assumptions.
 5. Run GRASS 8 D8/SFD routing with `r.watershed -s -a`.
 6. Run `r.stream.extract` with the same cell threshold, `mexp=0`, and
    `stream_length=0`.
-7. Orient each vector arc from higher to lower endpoint elevation. Accumulation
-   is only a fallback when endpoint elevation is missing.
+7. Orient each vector arc toward increasing GRASS accumulation. Use decreasing
+   endpoint elevation only when accumulation is tied within the recorded
+   tolerance or unavailable; if both are unresolved, preserve the directed
+   GRASS vector order. This respects the accumulation-adjusted D8 routing on
+   flats and noisy topobathymetry instead of manufacturing false forks from a
+   local elevation reversal. If more than one downstream candidate still
+   remains, do not choose one: record the ambiguity and fail structural health.
 8. Connect coincident endpoints and assign stable integer IDs.
 9. Assign longest-upstream-path SegOrder: headwater arcs are 1; an arc
    downstream of one or more arcs is `1 + max(upstream SegOrder)`.

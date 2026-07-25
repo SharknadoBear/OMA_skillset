@@ -230,6 +230,55 @@ def test_raw_wkb_reader_skips_one_point_line_and_preserves_valid_part() -> None:
     assert point_reasons["non_line_geometry"] == 1
 
 
+def test_accumulation_first_orientation_prevents_false_fork() -> None:
+    # The first tributary climbs locally in the sampled elevation field, but
+    # GRASS accumulation increases toward the junction. Elevation-first
+    # reversal would create two outgoing arcs at the junction.
+    lines = [
+        [(0.0, 1.0), (1.0, 0.0)],
+        [(0.0, -1.0), (1.0, 0.0)],
+        [(1.0, 0.0), (2.0, 0.0)],
+    ]
+    elevations = {
+        (0.0, 1.0): 0.0,
+        (0.0, -1.0): 20.0,
+        (1.0, 0.0): 10.0,
+        (2.0, 0.0): 5.0,
+    }
+    accumulations = {
+        (0.0, 1.0): 1.0,
+        (0.0, -1.0): 1.0,
+        (1.0, 0.0): 5.0,
+        (2.0, 0.0): 10.0,
+    }
+    records, qa = build_arc_records(
+        lines,
+        lookup(elevations),
+        lookup(accumulations),
+        cell_area_m2=100.0,
+        node_tolerance_m=0.01,
+    )
+    climbing_tributary = next(record for record in records if record["points"][0] == (0.0, 1.0))
+    assert climbing_tributary["points"][-1] == (1.0, 0.0)
+    assert not qa["ambiguous_downstream_nodes"]
+    assert not qa["has_cycle_or_unresolved_topology"]
+    assert not qa["segorder_errors"]
+    assert qa["orientation"]["counts"]["accumulation_primary"] == 3
+    assert qa["orientation"]["counts"]["preserved"] == 3
+    assert qa["orientation"]["counts"].get("reversed", 0) == 0
+
+    tie_records, tie_qa = build_arc_records(
+        [[(1.0, 0.0), (0.0, 0.0)]],
+        lookup({(1.0, 0.0): 0.0, (0.0, 0.0): 10.0}),
+        lookup({(1.0, 0.0): 2.0, (0.0, 0.0): 2.0}),
+        cell_area_m2=100.0,
+        node_tolerance_m=0.01,
+    )
+    assert tie_records[0]["points"][0] == (0.0, 0.0)
+    assert tie_qa["orientation"]["counts"]["accumulation_tie_elevation_fallback"] == 1
+    assert tie_qa["orientation"]["counts"]["reversed"] == 1
+
+
 def main() -> None:
     tests = [
         test_physical_threshold,
@@ -240,6 +289,7 @@ def main() -> None:
         test_regular_lonlat_netcdf_ascending_lat_and_sign,
         test_windows_grass_argv_preserves_spaced_paths,
         test_raw_wkb_reader_skips_one_point_line_and_preserves_valid_part,
+        test_accumulation_first_orientation_prevents_false_fork,
     ]
     for test in tests:
         test()
