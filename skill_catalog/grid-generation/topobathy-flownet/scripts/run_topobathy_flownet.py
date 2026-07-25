@@ -879,7 +879,7 @@ def create_qa_maps(records: list[dict[str, Any]], paths: dict[str, Path]) -> Non
     import matplotlib.pyplot as plt
     import numpy as np
     import rasterio
-    from matplotlib.colors import LogNorm
+    from matplotlib.colors import LogNorm, Normalize
 
     with rasterio.open(paths["projected_surface"]) as dataset:
         surface = dataset.read(1, masked=True).astype("float64")
@@ -900,18 +900,38 @@ def create_qa_maps(records: list[dict[str, Any]], paths: dict[str, Path]) -> Non
     fig, axis = plt.subplots(figsize=(10, 8), constrained_layout=True)
     axis.imshow(shade, extent=extent, origin="upper", cmap="gray", alpha=0.8)
     orders = sorted({record["segorder"] for record in records})
-    cmap = plt.get_cmap("viridis", max(1, len(orders)))
-    for index, order in enumerate(orders):
+    if orders:
+        minimum_order = min(orders)
+        maximum_order = max(orders)
+        if minimum_order == maximum_order:
+            order_norm = Normalize(vmin=minimum_order - 0.5, vmax=maximum_order + 0.5)
+            colorbar_ticks = [minimum_order]
+        else:
+            order_norm = Normalize(vmin=minimum_order, vmax=maximum_order)
+            colorbar_ticks = sorted(
+                {
+                    int(round(value))
+                    for value in np.linspace(minimum_order, maximum_order, num=min(7, len(orders)))
+                }
+            )
+        cmap = plt.get_cmap("viridis")
+        order_span = max(1, maximum_order - minimum_order)
         for record in records:
-            if record["segorder"] != order:
-                continue
+            order = int(record["segorder"])
+            relative_order = (order - minimum_order) / order_span
             coordinates = np.asarray(record["points"])
-            axis.plot(coordinates[:, 0], coordinates[:, 1], color=cmap(index), linewidth=0.7 + 0.35 * order)
-        axis.plot([], [], color=cmap(index), linewidth=2, label=f"SegOrder {order}")
+            axis.plot(
+                coordinates[:, 0],
+                coordinates[:, 1],
+                color=cmap(order_norm(order)),
+                linewidth=0.55 + 2.45 * math.sqrt(relative_order),
+            )
+        scalar_map = plt.cm.ScalarMappable(norm=order_norm, cmap=cmap)
+        scalar_map.set_array([])
+        colorbar = fig.colorbar(scalar_map, ax=axis, label="DHSVM SegOrder")
+        colorbar.set_ticks(colorbar_ticks)
     axis.set_title("DHSVM longest-upstream-path SegOrder")
     axis.set_aspect("equal")
-    if orders:
-        axis.legend(loc="best", fontsize=8)
     fig.savefig(paths["segorder_map"], dpi=180)
     plt.close(fig)
 
