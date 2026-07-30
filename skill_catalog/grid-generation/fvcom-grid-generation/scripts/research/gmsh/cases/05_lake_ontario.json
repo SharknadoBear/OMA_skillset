@@ -1,0 +1,65 @@
+{
+  "$schema": "../case-manifest.schema.json",
+  "schema_version": "gmsh_fvcom_case_v1",
+  "case_id": "lake_ontario",
+  "display_name": "Lake Ontario",
+  "execution_order": 5,
+  "experiment_status": "proposed",
+  "domain_type": "closed_lake",
+  "projected_crs": "EPSG:32618",
+  "boundary": {
+    "input_kind": "adaptive_v2",
+    "resolution_manifest": "Workspace/Preprocessing/fvcom-grid-generation/runs/gmsh_six_case_20260729T2150PDT/05_lake_ontario/prep_boundary/boundary_resolution_manifest.json",
+    "model_boundary_loops_gpkg": null,
+    "model_boundary_loop_manifest": null,
+    "expected_open_boundary_count": 0,
+    "open_boundaries": [],
+    "expected_island_holes": 12,
+    "preserve_source_vertices": true,
+    "allow_gmsh_boundary_insertion": true,
+    "negative_rejection_fixtures": [],
+    "build_policy": [
+      "build a full-lake closed wet domain",
+      "use GSHHG/GSHHS levels 1, 2, and 3 deliberately",
+      "preserve lake islands as hole loops",
+      "retain outlet context without creating an ocean OBC",
+      "emit zero SMS nodestrings"
+    ]
+  },
+  "bathymetry": {
+    "netcdf": "Workspace/Preprocessing/fvcom-cudem-bathy/runs/gmsh_six_case_20260729T2150PDT/lake_ontario/full_v2/lake_ontario_gmsh_lake_depth_v3.nc",
+    "source_policy": [
+      "ETOPO 15 arcsecond full lake"
+    ],
+    "coverage_requirement": "finite positive depth over the complete lake; partial CRM is not an acceptable primary source",
+    "status": "available"
+  },
+  "budget": {
+    "preflight_node_threshold": 135000,
+    "hard_node_cap": 150000,
+    "hu_increment_m": 25,
+    "overflow_reruns": 1
+  },
+  "sizing": {
+    "mode": "uniform",
+    "near_obc_size_m": null,
+    "near_obc_distance_m": null,
+    "far_obc_distance_m": null,
+    "bathymetry_floor_multiplier": 3,
+    "bathymetry_floor_roundup_m": 25
+  },
+  "preparation": [
+    "Build a new GSHHG L1/L2/L3 closed-lake boundary package.",
+    "Fetch full-lake ETOPO 15 arcsecond bathymetry."
+  ],
+  "readiness": {
+    "status": "ready",
+    "boundary_status": "available",
+    "bathymetry_status": "available",
+    "blockers": []
+  },
+  "notes": [
+    "This is the zero-OBC contract case and must write no NS records.",
+    "ETOPO bed elevation is converted to positive-down lake depth using the NOAA 74.2 m IGLD 1985 chart datum; no EGM2008-to-IGLD85 transformation is claimed."
+  ]
+}

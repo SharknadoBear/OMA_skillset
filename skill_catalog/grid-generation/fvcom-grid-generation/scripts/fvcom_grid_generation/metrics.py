@@ -127,24 +127,102 @@ def constraint_integrity(
     topology: EdgeTopology,
     constraint_chains: Iterable[Iterable[int]] | None,
     open_boundary_nodes_zero_based: Iterable[int] | None,
+    open_boundary_chains_zero_based: Iterable[Iterable[int]] | None = None,
+    open_boundary_cyclic: Iterable[bool] | None = None,
 ) -> dict[str, Any]:
-    """Audit all protected chains and the ordered, non-cyclic ocean OBC."""
+    """Audit protected chains and zero, one, or many ordered ocean OBCs."""
     mesh_edges = set(topology.edge_to_triangles)
-    protected = chain_edges(constraint_chains or [])
+    mesh_boundary_edges = set(topology.boundary_edges)
+    protected = chain_edges(
+        constraint_chains if constraint_chains is not None else []
+    )
     missing = sorted(protected - mesh_edges)
-    open_nodes = [int(value) for value in (open_boundary_nodes_zero_based or [])]
-    open_pairs = [tuple(sorted((a, b))) for a, b in zip(open_nodes[:-1], open_nodes[1:])]
-    missing_open = [edge for edge in open_pairs if edge not in mesh_edges]
+    if open_boundary_chains_zero_based is None:
+        legacy_nodes = [
+            int(value)
+            for value in (
+                open_boundary_nodes_zero_based
+                if open_boundary_nodes_zero_based is not None
+                else []
+            )
+        ]
+        open_chains = [legacy_nodes] if legacy_nodes else []
+    else:
+        open_chains = [
+            [int(value) for value in chain_values]
+            for chain_values in open_boundary_chains_zero_based
+        ]
+    cyclic_values = [
+        bool(value)
+        for value in (
+            open_boundary_cyclic
+            if open_boundary_cyclic is not None
+            else []
+        )
+    ]
+    if len(cyclic_values) < len(open_chains):
+        cyclic_values.extend([False] * (len(open_chains) - len(cyclic_values)))
+
+    chain_reports: list[dict[str, Any]] = []
+    all_missing_open: list[tuple[int, int]] = []
+    node_chain_membership: dict[int, list[int]] = defaultdict(list)
+    for chain_index, open_nodes in enumerate(open_chains):
+        cyclic = bool(cyclic_values[chain_index])
+        minimum_node_count = 3 if cyclic else 2
+        for node in set(open_nodes):
+            node_chain_membership[node].append(chain_index)
+        pairs = [tuple(sorted((a, b))) for a, b in zip(open_nodes[:-1], open_nodes[1:])]
+        closing_edge: tuple[int, int] | None = None
+        if cyclic and len(open_nodes) > 1:
+            closing_edge = tuple(sorted((open_nodes[-1], open_nodes[0])))
+            pairs.append(closing_edge)
+        # An OBC pair must be an exterior mesh edge (one attached triangle);
+        # accepting an arbitrary interior edge would hide a topology error.
+        missing_open = [edge for edge in pairs if edge not in mesh_boundary_edges]
+        all_missing_open.extend(missing_open)
+        chain_reports.append(
+            {
+                "chain_index": int(chain_index),
+                "cyclic": cyclic,
+                "node_count": int(len(open_nodes)),
+                "unique_node_count": int(len(set(open_nodes))),
+                "minimum_node_count": minimum_node_count,
+                "minimum_node_count_satisfied": bool(
+                    len(open_nodes) >= minimum_node_count
+                ),
+                "missing_pair_count": int(len(missing_open)),
+                "missing_pairs": [list(edge) for edge in missing_open[:100]],
+                "cyclic_closure_edge": list(closing_edge) if closing_edge else None,
+                "cyclic_closure_present": bool(
+                    closing_edge is None or closing_edge in mesh_boundary_edges
+                ),
+                "ordered": bool(
+                    len(open_nodes) >= minimum_node_count
+                    and len(open_nodes) == len(set(open_nodes))
+                    and not missing_open
+                ),
+            }
+        )
+    flattened_open = [node for chain in open_chains for node in chain]
+    shared_open_nodes = sorted(
+        node for node, memberships in node_chain_membership.items() if len(memberships) > 1
+    )
     return {
         "protected_edge_count": int(len(protected)),
         "missing_protected_edge_count": int(len(missing)),
         "missing_protected_edges": [list(edge) for edge in missing[:100]],
-        "open_boundary_node_count": int(len(open_nodes)),
-        "open_boundary_unique_node_count": int(len(set(open_nodes))),
-        "open_boundary_missing_pair_count": int(len(missing_open)),
-        "open_boundary_missing_pairs": [list(edge) for edge in missing_open[:100]],
+        "open_boundary_chain_count": int(len(open_chains)),
+        "open_boundary_chains": chain_reports,
+        "open_boundary_node_count": int(len(flattened_open)),
+        "open_boundary_unique_node_count": int(len(set(flattened_open))),
+        "open_boundary_missing_pair_count": int(len(all_missing_open)),
+        "open_boundary_missing_pairs": [list(edge) for edge in all_missing_open[:100]],
+        "open_boundary_shared_node_count": int(len(shared_open_nodes)),
+        "open_boundary_shared_nodes": shared_open_nodes[:100],
         "all_protected_edges_present": bool(not missing),
-        "open_boundary_ordered": bool(len(open_nodes) >= 2 and len(open_nodes) == len(set(open_nodes)) and not missing_open),
+        "open_boundary_ordered": bool(
+            not shared_open_nodes and all(report["ordered"] for report in chain_reports)
+        ),
     }
 
 
@@ -155,6 +233,8 @@ def compute_mesh_metrics(
     depths: np.ndarray | None = None,
     constraint_chains: Iterable[Iterable[int]] | None = None,
     open_boundary_nodes_zero_based: Iterable[int] | None = None,
+    open_boundary_chains_zero_based: Iterable[Iterable[int]] | None = None,
+    open_boundary_cyclic: Iterable[bool] | None = None,
     target_size_by_triangle: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Compute OceanMesh, FVCOM, topology, and constraint metrics."""
@@ -234,7 +314,13 @@ def compute_mesh_metrics(
         },
         "max_adjacent_area_change": float(max(area_changes, default=0.0)),
         "max_bathymetric_slope": float(max(bathy_slopes, default=0.0)) if depths is not None else None,
-        "constraint_integrity": constraint_integrity(topology, constraint_chains, open_boundary_nodes_zero_based),
+        "constraint_integrity": constraint_integrity(
+            topology,
+            constraint_chains,
+            open_boundary_nodes_zero_based,
+            open_boundary_chains_zero_based,
+            open_boundary_cyclic,
+        ),
     }
     if depth_values is not None:
         result["depths"] = {
@@ -242,14 +328,32 @@ def compute_mesh_metrics(
             "positive": bool(len(depth_values) and float(np.nanmin(depth_values)) > 0.0),
             "minimum_m": float(np.nanmin(depth_values)) if len(depth_values) else None,
         }
-    if target_size_by_triangle is not None and len(triangles):
-        target = np.maximum(np.asarray(target_size_by_triangle, dtype=float), 1.0e-30)
-        size_error = np.max(geometry["edge_lengths"], axis=1) / target
+    if target_size_by_triangle is not None:
+        target = np.asarray(target_size_by_triangle, dtype=float)
+        valid_target = bool(
+            target.ndim == 1
+            and len(target) == len(triangles)
+            and np.all(np.isfinite(target))
+            and np.all(target > 0.0)
+        )
         result["size_error_l_over_h"] = {
-            "maximum": _maximum(size_error),
-            "quantiles": _quantiles(size_error),
-            "count_above_1_55": int(np.sum(size_error > 1.55)),
+            "valid": valid_target,
+            "target_count": int(target.size),
+            "maximum": 0.0,
+            "quantiles": _quantiles(np.empty(0)),
+            "count_above_1_55": 0,
+            "count_above_2_0": 0,
         }
+        if valid_target and len(triangles):
+            size_error = np.max(geometry["edge_lengths"], axis=1) / target
+            result["size_error_l_over_h"].update(
+                {
+                    "maximum": _maximum(size_error),
+                    "quantiles": _quantiles(size_error),
+                    "count_above_1_55": int(np.sum(size_error > 1.55)),
+                    "count_above_2_0": int(np.sum(size_error > 2.0)),
+                }
+            )
     return result
 
 

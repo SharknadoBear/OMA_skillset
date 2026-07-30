@@ -1,0 +1,17 @@
+# Gmsh is the only dependency intentionally pinned to an exact distribution.
+# Every resolved version is captured in each run manifest.
+gmsh==4.15.2
+geopandas>=1.0,<2
+matplotlib>=3.9,<4
+netCDF4>=1.7,<2
+numpy>=2.1,<2.5
+pyogrio>=0.10,<1
+pydap>=3.5,<4
+pyproj>=3.7,<4
+PyYAML>=6.0,<7
+rasterio>=1.4,<2
+requests>=2.32,<3
+scipy>=1.14,<2
+shapely>=2.0,<3
+triangle==20250106
+xarray>=2024.10,<2027

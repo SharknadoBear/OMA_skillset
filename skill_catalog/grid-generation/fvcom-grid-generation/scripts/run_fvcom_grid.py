@@ -25,10 +25,6 @@ def main() -> int:
     parser.add_argument("--boundary-loops-gpkg")
     parser.add_argument("--boundary-resolution-manifest")
     parser.add_argument("--bathy-nc")
-    parser.add_argument(
-        "--channel-flownet-manifest",
-        help="Optional passing topobathy-flownet manifest to consume instead of generating a run-local network.",
-    )
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--mode", choices=("execute", "test"), default="execute")
@@ -38,21 +34,13 @@ def main() -> int:
     parser.add_argument("--gradation", type=float, default=0.20)
     parser.add_argument("--slope-elements", type=float, default=10.0)
     parser.add_argument("--coastal-distance-m", type=float, default=25_000.0)
-    parser.add_argument("--channel-reslope-angle-deg", type=float, default=60.0)
-    parser.add_argument("--channel-elements-per-depth", type=float, default=1.0)
-    parser.add_argument(
-        "--channel-min-size-m",
-        type=float,
-        help="Minimum channel-controlled size; defaults to --land-spacing-m.",
-    )
-    parser.add_argument(
-        "--channel-flownet",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Generate a run-local topobathy-flownet package when no manifest is supplied.",
-    )
-    parser.add_argument("--channel-flownet-source-area-km2", type=float, default=1.0)
-    parser.add_argument("--channel-flownet-target-resolution-m", type=float)
+    parser.add_argument("--hydraulic-elements-across-min", type=float, default=3.0)
+    parser.add_argument("--hydraulic-elements-across-max", type=float, default=8.0)
+    parser.add_argument("--hydraulic-max-width-m", type=float, default=20_000.0)
+    parser.add_argument("--hydraulic-bank-angle-deg", type=float, default=110.0)
+    parser.add_argument("--hydraulic-longitudinal-gradation", type=float, default=0.10)
+    parser.add_argument("--obc-hold-distance-m", type=float, default=10_000.0)
+    parser.add_argument("--obc-transition-distance-m", type=float, default=60_000.0)
     parser.add_argument("--target-timestep-s", default="auto")
     parser.add_argument("--max-interior-points", type=int, default=80_000)
     parser.add_argument("--max-total-nodes", type=int, default=120_000)
@@ -203,16 +191,15 @@ def main() -> int:
             gradation=args.gradation,
             slope_elements=args.slope_elements,
             coastal_distance_m=args.coastal_distance_m,
-            channel_reslope_angle_deg=args.channel_reslope_angle_deg,
-            channel_elements_per_depth=args.channel_elements_per_depth,
-            channel_min_size_m=args.channel_min_size_m,
-            channel_flownet=args.channel_flownet,
-            channel_flownet_source_area_km2=(
-                args.channel_flownet_source_area_km2
+            hydraulic_elements_across_min=args.hydraulic_elements_across_min,
+            hydraulic_elements_across_max=args.hydraulic_elements_across_max,
+            hydraulic_max_width_m=args.hydraulic_max_width_m,
+            hydraulic_bank_angle_deg=args.hydraulic_bank_angle_deg,
+            hydraulic_longitudinal_gradation=(
+                args.hydraulic_longitudinal_gradation
             ),
-            channel_flownet_target_resolution_m=(
-                args.channel_flownet_target_resolution_m
-            ),
+            obc_hold_distance_m=args.obc_hold_distance_m,
+            obc_transition_distance_m=args.obc_transition_distance_m,
             target_timestep_s=args.target_timestep_s,
             max_interior_points=args.max_interior_points,
             max_total_nodes=args.max_total_nodes,
@@ -286,7 +273,6 @@ def main() -> int:
         boundary_loops_gpkg=args.boundary_loops_gpkg,
         boundary_resolution_manifest=args.boundary_resolution_manifest,
         bathy_nc=args.bathy_nc,
-        channel_flownet_manifest=args.channel_flownet_manifest,
     )
     print(json.dumps({"final_status": manifest["final_status"], "outputs": manifest["outputs"]}, indent=2))
     return 0

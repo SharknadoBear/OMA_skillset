@@ -1,0 +1,91 @@
+{
+  "$schema": "../case-manifest.schema.json",
+  "schema_version": "gmsh_fvcom_case_v1",
+  "case_id": "long_island_sound",
+  "display_name": "Long Island Sound",
+  "execution_order": 4,
+  "experiment_status": "proposed",
+  "domain_type": "coastal_open",
+  "projected_crs": "EPSG:32618",
+  "boundary": {
+    "input_kind": "adaptive_v2",
+    "resolution_manifest": "Workspace/Preprocessing/fvcom-grid-generation/runs/gmsh_six_case_20260729T2150PDT/04_long_island_sound/preparation/boundary_resolution_manifest.json",
+    "model_boundary_loops_gpkg": null,
+    "model_boundary_loop_manifest": null,
+    "expected_open_boundary_count": 2,
+    "open_boundaries": [
+      {
+        "id": "east_race",
+        "kind": "exchange_gate",
+        "cyclic": false,
+        "orientation": "determine_wet_left_during_rebuild",
+        "selection": "shortest valid shoreline-snapped water cross-section at the Race/Block Island Sound exchange"
+      },
+      {
+        "id": "west_east_river",
+        "kind": "exchange_gate",
+        "cyclic": false,
+        "orientation": "determine_wet_left_during_rebuild",
+        "selection": "shortest valid shoreline-snapped water cross-section at the East River exchange"
+      }
+    ],
+    "expected_island_holes": 54,
+    "preserve_source_vertices": true,
+    "allow_gmsh_boundary_insertion": true,
+    "negative_rejection_fixtures": [
+      {
+        "id": "land_crossing_lis_e",
+        "path": "Workspace/Preprocessing/fvcom-bdry-arc/runs/subagent_series_bdry_arc_16case_20260702/cases/long_island_sound_bdry_arc/e/model_boundary_loops/model_boundary_loops.gpkg",
+        "expected_result": "reject",
+        "reason": "Existing package has about 226.8 km of GSHHS land intersection and only about 0.592 exterior overlap."
+      }
+    ],
+    "build_policy": [
+      "select exactly two exchange gates automatically",
+      "shoreline-snap both endpoints",
+      "require zero land crossing",
+      "require at least 0.98 exterior overlap",
+      "require one connected wet component",
+      "require required-feature containment",
+      "use maps as evidence rather than interactive approval gates"
+    ]
+  },
+  "bathymetry": {
+    "netcdf": "Workspace/Preprocessing/fvcom-cudem-bathy/runs/gmsh_six_case_20260729T2150PDT/long_island_sound/full/long_island_sound_gmsh_bathy_sources.nc",
+    "source_policy": [
+      "CUDEM full footprint",
+      "NBS BlueTopo",
+      "CRM",
+      "ETOPO fallback"
+    ],
+    "coverage_requirement": "finite positive depth over the complete rebuilt two-gate wet domain",
+    "status": "available"
+  },
+  "budget": {
+    "preflight_node_threshold": 135000,
+    "hard_node_cap": 150000,
+    "hu_increment_m": 25,
+    "overflow_reruns": 1
+  },
+  "sizing": {
+    "mode": "obc_distance_threshold",
+    "near_obc_size_m": 8000,
+    "near_obc_distance_m": 10000,
+    "far_obc_distance_m": 70000,
+    "bathymetry_floor_multiplier": 3,
+    "bathymetry_floor_roundup_m": 25
+  },
+  "preparation": [
+    "Automatically rebuild the domain with exactly the east_race and west_east_river exchange gates.",
+    "Fetch full-footprint CUDEM-first bathymetry after the rebuilt footprint is fixed."
+  ],
+  "readiness": {
+    "status": "ready",
+    "boundary_status": "available",
+    "bathymetry_status": "available",
+    "blockers": []
+  },
+  "notes": [
+    "The gate decision is automatic from the scientific objective and water connectivity."
+  ]
+}

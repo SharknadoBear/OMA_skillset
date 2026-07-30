@@ -11,13 +11,13 @@ import sys
 
 import geopandas as gpd
 import numpy as np
-from shapely.geometry import LineString, MultiLineString, Point, Polygon
+from shapely.geometry import LineString, Point, Polygon
 import xarray as xr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fvcom_grid_generation.bathymetry import BathymetryGrid, coarsen_for_size_field, write_synthetic_bathymetry  # noqa: E402
-from fvcom_grid_generation.boundary import BoundaryConfig, load_boundary_package, load_boundary_resolution, prepare_boundary_nodes  # noqa: E402
+from fvcom_grid_generation.boundary import BoundaryConfig, _resolve_manifest_output, load_boundary_package, load_boundary_resolution, prepare_boundary_nodes  # noqa: E402
 from fvcom_grid_generation.mesh import _ordered_boundary_kind_group  # noqa: E402
 from fvcom_grid_generation.local_topology import AggressiveConditioningConfig, condition_mesh_aggressive, inventory_high_valence  # noqa: E402
 from fvcom_grid_generation.metrics import compute_mesh_metrics, triangle_geometry  # noqa: E402
@@ -37,11 +37,7 @@ from fvcom_grid_generation.sms_2dm import read_2dm, write_2dm  # noqa: E402
 from fvcom_grid_generation.workflow import (  # noqa: E402
     GridConfig,
     _bathy_fetch_command,
-    _channel_flownet_command,
-    _load_channel_flownet_manifest,
     _parse_required_source_count,
-    _select_channel_surface,
-    _write_analysis_mask,
     run_fvcom_grid,
 )
 
@@ -212,7 +208,8 @@ def test_unified_slope_candidate_is_coastal_only() -> None:
             ),
         )
         center = (int(np.argmin(np.abs(lat - 39.08))), int(np.argmin(np.abs(lon + 74.902))))
-        assert narrow.report["method"] == "open_solid_transition_slope_channel_lower_envelope"
+        assert narrow.report["schema_version"] == "fvcom_size_field_v4"
+        assert narrow.report["method"] == "solid_slope_hydraulic_skeleton_obc_log_transition"
         assert not bool(narrow.coastal_mask[center])
         assert np.isnan(narrow.slope_size[center])
         assert bool(wide.coastal_mask[center])
@@ -429,161 +426,6 @@ def test_generated_chain_uses_fallback_bathy_command() -> None:
     assert _parse_required_source_count("641 sources intersect bbox, exceeding max_sources=256.") == 641
 
 
-def test_channel_flownet_manifest_loader_and_command_contract() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        root = Path(tmp)
-        loops = _synthetic_boundary_package(root / "loops.gpkg")
-        package = load_boundary_package(loops)
-        nodes = prepare_boundary_nodes(
-            package,
-            BoundaryConfig(
-                land_spacing_m=700.0,
-                open_spacing_m=2500.0,
-                island_spacing_m=700.0,
-            ),
-        )
-        mask_path = _write_analysis_mask(
-            root / "analysis_mask.geojson",
-            package.domain_polygon_lonlat,
-            name="loader_test",
-        )
-        mask = gpd.read_file(mask_path)
-        assert len(mask.geometry.iloc[0].interiors) == 1
-
-        projected = np.asarray(nodes.xy, dtype=float)
-        network_path = root / "topobathy_flownet.gpkg"
-        geometry = MultiLineString(
-            [
-                LineString([projected[0], projected[1]]),
-                LineString([projected[2], projected[3]]),
-            ]
-        )
-        network_row = {
-            "arcid": 1,
-            "from_node": 1,
-            "to_node": 2,
-            "local": 1,
-            "downarc": -1,
-            "uparc": -1,
-            "SELEV": 10.0,
-            "EELEV": 5.0,
-            "MAXGRID": 100,
-            "dz": 5.0,
-            "slope": 0.01,
-            "meanmsq": 1_000_000.0,
-            "segorder": 3,
-            "drainage_area_m2": 1_000_000.0,
-            "chanclass": 1,
-            "hyddepth": 0.05,
-            "hydwidth": 1.0,
-            "effwidth": 0.2,
-            "effdepth": -9999.0,
-            "segdepth": -9999.0,
-            "Shape_Leng": float(geometry.length),
-            "geometry": geometry,
-        }
-        gpd.GeoDataFrame(
-            [network_row],
-            geometry="geometry",
-            crs=nodes.projection.crs,
-        ).to_file(network_path, layer="topobathy_flownet", driver="GPKG")
-        health_path = root / "health_check.json"
-        health_path.write_text(
-            json.dumps(
-                {
-                    "schema": "topobathy_flownet_v1",
-                    "status": "pass",
-                    "failed_checks": [],
-                }
-            ),
-            encoding="utf-8",
-        )
-        manifest_path = root / "run_manifest.json"
-        manifest = {
-            "schema": "topobathy_flownet_v1",
-            "status": "complete",
-            "structural_status": "pass",
-            "topology_summary": {"arc_count": 1},
-            "outputs": {
-                "dhsvm_gpkg": str(network_path),
-                "health_check": str(health_path),
-            },
-        }
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-        flowlines, report = _load_channel_flownet_manifest(
-            manifest_path,
-            nodes,
-        )
-        assert len(flowlines) == 2
-        assert all(flowline.seg_order == 3 for flowline in flowlines)
-        assert report["arc_count"] == 1
-        assert report["flowline_count"] == 2
-        assert report["order_counts"] == {"3": 1}
-        assert report["flowline_order_counts"] == {"3": 2}
-        assert len(report["manifest"]["sha256"]) == 64
-        assert len(report["gpkg"]["sha256"]) == 64
-
-        invalid = deepcopy(manifest)
-        invalid["status"] = "failed"
-        invalid_path = root / "invalid_manifest.json"
-        invalid_path.write_text(json.dumps(invalid), encoding="utf-8")
-        try:
-            _load_channel_flownet_manifest(invalid_path, nodes)
-        except ValueError as exc:
-            assert "status must be complete" in str(exc)
-        else:
-            raise AssertionError("A failed channel flownet manifest was accepted")
-
-        surface = root / "surface.nc"
-        xr.Dataset(
-            {
-                "elevation_m": (
-                    ("lat", "lon"),
-                    np.asarray([[-2.0, -3.0], [-4.0, -5.0]]),
-                    {"positive": "up"},
-                ),
-                "depth_m": (
-                    ("lat", "lon"),
-                    np.asarray([[2.0, 3.0], [4.0, 5.0]]),
-                    {"positive": "down"},
-                ),
-            },
-            coords={"lon": [-75.1, -75.0], "lat": [39.0, 39.1]},
-        ).to_netcdf(surface)
-        bathy = load_bathymetry(surface)
-        variable, positive = _select_channel_surface(surface, bathy)
-        assert (variable, positive) == ("elevation_m", "up")
-        command = _channel_flownet_command(
-            Path("C:/fake/topobathy-flownet"),
-            surface,
-            mask_path,
-            root / "products",
-            variable,
-            positive,
-            GridConfig(
-                channel_flownet_source_area_km2=1.25,
-                channel_flownet_target_resolution_m=50.0,
-            ),
-        )
-        assert "run_topobathy_flownet.py" in " ".join(command)
-        assert command[command.index("--surface-variable") + 1] == "elevation_m"
-        assert command[command.index("--surface-positive") + 1] == "up"
-        assert command[command.index("--source-area-km2") + 1] == "1.25"
-        assert command[command.index("--target-resolution-m") + 1] == "50.0"
-
-        depth_only = write_synthetic_bathymetry(
-            root / "depth_only.nc",
-            (-75.1, 39.0, -75.0, 39.1),
-            nx=4,
-            ny=4,
-        )
-        depth_bathy = load_bathymetry(depth_only)
-        assert _select_channel_surface(depth_only, depth_bathy) == (
-            "depth",
-            "down",
-        )
-
-
 def test_oceanmesh_metrics_and_true_neighbor_valence() -> None:
     height = np.sqrt(3.0) / 2.0
     points = np.asarray([[0.0, 0.0], [1.0, 0.0], [0.5, height]])
@@ -782,13 +624,12 @@ def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
                 max_interior_points=800,
                 refine_iterations=1,
                 smooth_iterations=2,
-                channel_flownet=False,
             ),
             boundary_loops_gpkg=gpkg,
             bathy_nc=bathy,
         )
         outputs = manifest["outputs"]
-        assert manifest["schema_version"] == "fvcom_grid_generation_manifest_v7"
+        assert manifest["schema_version"] == "fvcom_grid_generation_manifest_v8"
         assert Path(manifest["outputs"]["obc_remap_manifest_json"]).is_file()
         for key in (
             "fvcom_grid_2dm",
@@ -799,6 +640,7 @@ def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
             "mesh_review_map",
             "size_field_nc",
             "size_field_png",
+            "size_field_components_png",
             "node_budget_preflight_json",
             "boundary_nodes_geojson",
             "delivered_boundary_nodes_geojson",
@@ -829,7 +671,25 @@ def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
         assert manifest["settings"]["postprocess_profile"] == "none"
         assert manifest["settings"]["gradation"] == 0.20
         assert manifest["settings"]["coastal_distance_m"] == 25_000.0
-        assert manifest["channel_flownet"]["source"] == "disabled"
+        assert manifest["size_field"]["schema_version"] == "fvcom_size_field_v4"
+        assert (
+            manifest["size_field"]["method"]
+            == "solid_slope_hydraulic_skeleton_obc_log_transition"
+        )
+        assert (
+            manifest["hydraulic_skeleton"]["method"]
+            == "solid_only_raster_voronoi_medial_skeleton"
+        )
+        assert (
+            manifest["hydraulic_skeleton"]["method"]
+            == manifest["size_field"]["hydraulic_skeleton"]["method"]
+        )
+        assert (
+            manifest["size_field"]["boundary"][
+                "open_segments_excluded_from_medial_skeleton"
+            ]
+            is True
+        )
         assert manifest["settings"]["area_transition_relaxation"] is True
         assert manifest["quality"]["constraint_integrity"]["all_protected_edges_present"] is True
         assert manifest["quality"]["roundtrip"]["triangle_connectivity_match"] is True
@@ -886,7 +746,6 @@ def test_full_synthetic_systematic_v6_workflow() -> None:
                 systematic_v6_final_audit_reserve_s=0.0,
                 systematic_v6_gate_policy="strict-v6",
                 systematic_v6_passage_removal=False,
-                channel_flownet=False,
             ),
             boundary_loops_gpkg=gpkg,
             bathy_nc=bathy,
@@ -942,20 +801,48 @@ def test_adaptive_resolution_workflow_and_quadtree_seed() -> None:
                 smooth_iterations=1,
                 boundary_resolution_profile="adaptive-coastal-v1",
                 postprocess_profile="none",
-                channel_flownet=False,
             ),
             boundary_loops_gpkg=loops,
             boundary_resolution_manifest=resolution,
             bathy_nc=bathy,
         )
         assert manifest["mesh"]["node_count"] > len(nodes.xy)
-        assert manifest["size_field"]["method"] == "open_solid_transition_slope_channel_lower_envelope"
-        assert manifest["size_field"]["background"]["method"] == "open_land_log_smoothstep"
+        assert manifest["size_field"]["schema_version"] == "fvcom_size_field_v4"
+        assert (
+            manifest["size_field"]["method"]
+            == "solid_slope_hydraulic_skeleton_obc_log_transition"
+        )
+        assert (
+            manifest["size_field"]["boundary"]["method"]
+            == "solid_segment_target_plus_metric_distance"
+        )
+        assert (
+            manifest["size_field"]["boundary"][
+                "adaptive_boundary_targets_used_directly"
+            ]
+            is True
+        )
+        assert Path(manifest["outputs"]["size_field_components_png"]).is_file()
         assert manifest["quality"]["open_boundary_size_error"]["p95_l_over_h"] <= 1.55
         assert manifest["mesh"]["constraint_recovery"]["final_recovery_applied"] is True
         assert manifest["quality"]["constraint_integrity"]["all_protected_edges_present"] is True
         assert manifest["postprocess"]["enabled"] is False
         assert read_2dm(manifest["outputs"]["fvcom_grid_2dm"]).triangles.size > 0
+
+
+def test_manifest_output_resolution_is_cwd_independent() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        package = Path(temporary) / "portable_package"
+        package.mkdir()
+        manifest = package / "boundary_resolution_manifest.json"
+        manifest.write_text("{}", encoding="utf-8")
+        artifact = package / "boundary_resolution.gpkg"
+        artifact.write_bytes(b"portable fixture")
+        resolved = _resolve_manifest_output(
+            manifest,
+            "Workspace/stale/archive/boundary_resolution.gpkg",
+        )
+        assert resolved == artifact.resolve()
 
 
 def test_final_quality_requires_q_l3_sigma_above_075() -> None:
@@ -981,6 +868,7 @@ def test_final_quality_requires_q_l3_sigma_above_075() -> None:
 
 def main() -> int:
     test_boundary_ingestion_and_densification()
+    test_manifest_output_resolution_is_cwd_independent()
     test_size_field_limiter_never_coarsens_fine_cells()
     test_unified_slope_candidate_is_coastal_only()
     test_regional_spring_relaxation_preserves_boundary_and_improves_quality()
@@ -992,7 +880,6 @@ def main() -> int:
     test_elevation_m_only_is_positive_up()
     test_size_field_bathy_coarsening_caps_cells()
     test_generated_chain_uses_fallback_bathy_command()
-    test_channel_flownet_manifest_loader_and_command_contract()
     test_oceanmesh_metrics_and_true_neighbor_valence()
     test_ordered_open_boundary_group_is_contiguous()
     test_constraint_preserving_rpw2019_postprocess()

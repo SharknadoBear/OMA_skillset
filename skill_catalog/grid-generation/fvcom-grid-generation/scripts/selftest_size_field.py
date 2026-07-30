@@ -1,13 +1,13 @@
-"""Synthetic regression tests for the unified FVCOM size-field algorithm."""
+"""Synthetic regression tests for the FVCOM hydraulic-skeleton size field."""
 
 from __future__ import annotations
 
+import sys
 import tempfile
 from pathlib import Path
-import sys
 
 import numpy as np
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, Polygon
 import xarray as xr
 
 
@@ -22,233 +22,242 @@ from fvcom_grid_generation.projection import (
     project_points,
 )
 from fvcom_grid_generation.size_field import (
-    ChannelFlowline,
     SizeFieldConfig,
+    _wet_graph_distance_and_labels,
     apply_gradation_limit,
-    boundary_background_size,
-    boundary_front_seed_points,
     build_size_field,
-    estimate_node_budget,
     write_size_field,
 )
 
 
-def _square_case(
+def _rectangular_estuary_case(
     *,
-    kinds: list[str] | None = None,
-    targets: np.ndarray | None = None,
     depth: np.ndarray | None = None,
-    count: int = 21,
+    nx: int = 61,
+    ny: int = 31,
 ) -> tuple[BathymetryGrid, BoundaryNodes]:
-    lon = np.linspace(-75.01, -74.99, count)
-    lat = np.linspace(39.0, 39.02, count)
+    """Return a long wet rectangle with a western OBC and three solid sides."""
+    west, east = -122.60, -122.42
+    south, north = 37.78, 37.82
+    lon = np.linspace(west, east, nx)
+    lat = np.linspace(south, north, ny)
     if depth is None:
-        depth = np.full((count, count), 20.0, dtype=float)
-    bathy = BathymetryGrid(lon=lon, lat=lat, depth=np.asarray(depth, dtype=float))
-    projection = local_utm_projection((-75.01, 39.0, -74.99, 39.02))
+        depth = np.full((ny, nx), 20.0, dtype=float)
+    bathy = BathymetryGrid(
+        lon=lon,
+        lat=lat,
+        depth=np.asarray(depth, dtype=float),
+    )
+
     corners_lonlat = np.asarray(
-        [[-75.01, 39.0], [-74.99, 39.0], [-74.99, 39.02], [-75.01, 39.02]],
+        [
+            [west, south],
+            [east, south],
+            [east, north],
+            [west, north],
+        ],
         dtype=float,
     )
+    projection = local_utm_projection((west, south, east, north))
     xy = project_points(corners_lonlat, projection)
     polygon_lonlat = Polygon(corners_lonlat)
-    polygon_xy = project_geometry(polygon_lonlat, projection)
-    boundary_kinds = kinds or ["land", "open", "open", "land"]
-    boundary_targets = (
-        np.asarray(targets, dtype=float)
-        if targets is not None
-        else np.asarray([100.0, 1000.0, 1000.0, 100.0], dtype=float)
-    )
-    open_indices = [
-        index for index, kind in enumerate(boundary_kinds) if kind == "open"
-    ]
     return bathy, BoundaryNodes(
         xy=xy,
         lonlat=corners_lonlat,
-        kinds=boundary_kinds,
-        target_spacing_m=boundary_targets,
+        kinds=["open", "land", "land", "open"],
+        target_spacing_m=np.asarray([3000.0, 250.0, 250.0, 3000.0]),
         exterior_indices=[0, 1, 2, 3],
-        open_boundary_indices=open_indices,
+        open_boundary_indices=[3, 0],
         constraint_chains=[[0, 1, 2, 3]],
-        domain_polygon_xy=polygon_xy,
-        open_boundary_xy=LineString(xy[[1, 2]]) if open_indices else LineString(),
-        land_boundary_xy=LineString(xy[[3, 0]]),
+        domain_polygon_xy=project_geometry(polygon_lonlat, projection),
+        open_boundary_xy=LineString(xy[[3, 0]]),
+        land_boundary_xy=LineString(xy[[0, 1, 2, 3]]),
         island_polygons_xy=[],
         projection=projection,
-        hard_anchor_mask=np.asarray([False, True, True, False], dtype=bool),
+        hard_anchor_mask=np.asarray([True, False, False, True], dtype=bool),
         adaptive_resolution=True,
     )
 
 
 def _config(**overrides: object) -> SizeFieldConfig:
     values: dict[str, object] = {
-        "land_spacing_m": 100.0,
-        "open_spacing_m": 1000.0,
+        "land_spacing_m": 250.0,
+        "open_spacing_m": 3000.0,
         "max_size_m": 5000.0,
         "gradation": 0.20,
         "slope_elements": 10.0,
         "coastal_distance_m": 20_000.0,
+        "hydraulic_elements_across_min": 3.0,
+        "hydraulic_elements_across_max": 8.0,
+        "hydraulic_max_width_m": 10_000.0,
+        "hydraulic_bank_angle_deg": 110.0,
+        "hydraulic_longitudinal_gradation": 0.10,
+        "hydraulic_corridor_width_factor": 0.55,
+        "obc_hold_distance_m": 1000.0,
+        "obc_transition_distance_m": 6000.0,
     }
     values.update(overrides)
     return SizeFieldConfig(**values)
 
 
-def test_open_land_endpoint_and_monotone_transition() -> None:
-    bathy, boundary = _square_case()
-    background, d_open, d_land, phi, report = boundary_background_size(
+def _build(
+    bathy: BathymetryGrid,
+    boundary: BoundaryNodes,
+    **config_overrides: object,
+):
+    return build_size_field(
         bathy,
         boundary,
-        _config(),
+        _config(**config_overrides),
+        domain_mask=np.ones_like(bathy.depth, dtype=bool),
     )
-    middle = len(bathy.lat) // 2
-    transect = background[middle, :]
-    assert abs(transect[0] - 100.0) < 1.0e-6
-    assert abs(transect[-1] - 1000.0) < 1.0e-6
-    assert np.all(np.diff(transect) >= -1.0e-9)
-    assert abs(phi[middle, 0] - 1.0) < 1.0e-7
-    assert abs(phi[middle, -1]) < 1.0e-7
-    assert np.all(np.isfinite(d_open))
-    assert np.all(np.isfinite(d_land))
-    assert report["method"] == "open_land_log_smoothstep"
 
 
-def test_coincident_landfall_definition() -> None:
-    bathy, boundary = _square_case()
-    background, _, _, phi, report = boundary_background_size(
-        bathy,
-        boundary,
-        _config(),
+def test_hydraulic_skeleton_follows_opposing_solid_banks() -> None:
+    bathy, boundary = _rectangular_estuary_case()
+    flat = _build(bathy, boundary)
+
+    lon2, lat2 = np.meshgrid(bathy.lon, bathy.lat)
+    displaced_trough = 12.0 + 45.0 * (
+        1.0
+        - np.exp(
+            -(
+                (lat2 - 37.811) / 0.0025
+            )
+            ** 2
+        )
     )
-    bottom = 0
-    open_landfall = len(bathy.lon) - 1
-    assert abs(phi[bottom, open_landfall] - 0.5) < 1.0e-12
-    assert abs(background[bottom, open_landfall] - 1000.0) < 1.0e-6
-    assert report["open_segment_count"] > 0
-    assert report["land_segment_count"] > 0
-
-
-def test_closed_domain_land_distance_background() -> None:
-    bathy, boundary = _square_case(
-        kinds=["land"] * 4,
-        targets=np.full(4, 200.0),
+    displaced_bathy, displaced_boundary = _rectangular_estuary_case(
+        depth=displaced_trough
     )
-    background, d_open, d_land, phi, report = boundary_background_size(
-        bathy,
-        boundary,
-        _config(land_spacing_m=150.0),
+    displaced = _build(displaced_bathy, displaced_boundary)
+
+    assert flat.report["hydraulic_skeleton"]["status"] == "complete"
+    assert flat.report["hydraulic_skeleton"]["open_boundary_used_as_bank"] is False
+    assert np.count_nonzero(flat.hydraulic_skeleton_mask) >= 3
+    assert np.array_equal(
+        flat.hydraulic_skeleton_mask,
+        displaced.hydraulic_skeleton_mask,
     )
-    assert report["method"] == "closed_domain_land_distance"
-    assert np.all(np.isinf(d_open))
-    assert np.all(np.isnan(phi))
-    assert abs(background[0, len(bathy.lon) // 2] - 200.0) < 0.1
-    assert background[len(bathy.lat) // 2, len(bathy.lon) // 2] > 200.0
-    assert np.all(np.isfinite(d_land))
+    skeleton_rows, _ = np.nonzero(flat.hydraulic_skeleton_mask)
+    skeleton_lat = bathy.lat[skeleton_rows]
+    assert abs(float(np.median(skeleton_lat)) - float(np.mean(bathy.lat))) <= (
+        1.5 * float(np.diff(bathy.lat).mean())
+    )
+    assert np.all(
+        np.isfinite(
+            flat.hydraulic_cross_section_area_m2[
+                flat.hydraulic_skeleton_mask
+            ]
+        )
+    )
+    assert np.any(flat.hydraulic_corridor_mask)
+    assert np.any(flat.source_attribution == 3)
 
 
-def test_shallow_slope_is_active() -> None:
-    count = 21
-    x = np.linspace(0.0, 1.0, count)
-    depth = np.tile(2.0 + 18.0 * x, (count, 1))
-    bathy, boundary = _square_case(depth=depth, count=count)
-    field = build_size_field(
-        bathy,
-        boundary,
-        _config(),
-        domain_mask=np.ones_like(depth, dtype=bool),
-    )
-    shallow = field.coastal_mask & (field.depth <= 20.0)
+def test_bathymetric_slope_target_is_active() -> None:
+    _, baseline_boundary = _rectangular_estuary_case()
+    ny, nx = 31, 61
+    depth = np.repeat(np.linspace(1.0, 81.0, ny)[:, None], nx, axis=1)
+    bathy, boundary = _rectangular_estuary_case(depth=depth, nx=nx, ny=ny)
+    assert np.allclose(boundary.xy, baseline_boundary.xy)
+    field = _build(bathy, boundary)
+
+    shallow = field.coastal_mask & (field.depth <= 50.0)
     assert np.any(shallow)
     assert np.all(np.isfinite(field.slope_size[shallow]))
     assert field.report["shallow_slope_active_cell_count"] == int(
         np.count_nonzero(shallow)
     )
+    assert np.any(field.source_attribution == 2)
 
 
-def test_coastal_mask_excludes_offshore_candidates() -> None:
-    bathy, boundary = _square_case()
-    field = build_size_field(
-        bathy,
-        boundary,
-        _config(coastal_distance_m=100.0),
-        domain_mask=np.ones_like(bathy.depth, dtype=bool),
-    )
+def test_wet_obc_target_hold_and_quintic_log_transfer() -> None:
+    bathy, boundary = _rectangular_estuary_case()
+    field = _build(bathy, boundary)
+    active = field.domain_mask & field.coverage_mask
+
+    assert np.all(np.isfinite(field.wet_obc_distance_m[active]))
+    assert np.allclose(field.wet_obc_target_m[active], 3000.0)
     middle = len(bathy.lat) // 2
-    assert not field.coastal_mask[middle, middle]
-    assert field.source_attribution[middle, middle] == 1
-    assert np.isnan(field.slope_size[middle, middle])
+    row_distance = field.wet_obc_distance_m[middle]
+    row_fraction = field.transition_fraction[middle]
+    assert np.all(np.diff(row_distance) >= -1.0e-9)
+    assert np.all(np.diff(row_fraction) >= -1.0e-12)
 
-
-def test_optional_channel_and_highest_order_attribution() -> None:
-    bathy, boundary = _square_case()
-    center_y = float(np.mean(boundary.xy[:, 1]))
-    left_x = float(np.min(boundary.xy[:, 0]))
-    right_x = float(np.max(boundary.xy[:, 0]))
-    line = LineString([(left_x, center_y), (right_x, center_y)])
-    field = build_size_field(
-        bathy,
-        boundary,
-        _config(channel_min_size_m=75.0),
-        flowlines=[
-            ChannelFlowline(line, 2),
-            ChannelFlowline(line, 5),
-        ],
-        domain_mask=np.ones_like(bathy.depth, dtype=bool),
+    hold = active & (field.wet_obc_distance_m <= 1000.0 + 1.0e-9)
+    assert np.any(hold)
+    assert np.allclose(
+        field.obc_transition_size[hold],
+        field.wet_obc_target_m[hold],
     )
-    row = len(bathy.lat) // 2
-    col = len(bathy.lon) // 2
-    assert field.channel_size[row, col] == 75.0
-    assert field.channel_seg_order[row, col] == 5
-    assert field.source_attribution[row, col] == 3
-    assert field.report["channel"]["segorder_changes_size"] is False
 
-
-def test_cfl_is_report_only() -> None:
-    bathy, boundary = _square_case()
-    mask = np.ones_like(bathy.depth, dtype=bool)
-    baseline = build_size_field(
-        bathy,
-        boundary,
-        _config(target_timestep_s="auto"),
-        domain_mask=mask,
+    transferring = active & (field.transition_fraction > 0.0) & (
+        field.transition_fraction < 1.0
     )
-    diagnostic = build_size_field(
-        bathy,
-        boundary,
-        _config(target_timestep_s=1_000_000.0),
-        domain_mask=mask,
+    assert np.any(transferring)
+    index = int(np.flatnonzero(transferring.ravel())[len(np.flatnonzero(transferring)) // 2])
+    alpha = float(field.transition_fraction.ravel()[index])
+    expected = np.exp(
+        (1.0 - alpha) * np.log(field.wet_obc_target_m.ravel()[index])
+        + alpha * np.log(field.nearshore_size.ravel()[index])
     )
-    assert np.array_equal(baseline.size, diagnostic.size)
-    assert diagnostic.report["cfl"]["mode"] == "diagnostic_only"
-    assert diagnostic.report["cfl"]["cfl_modifies_size"] is False
-    assert diagnostic.report["cfl"]["cells_below_target_timestep"] > 0
-    expected_dt = (
-        diagnostic.report["cfl"]["cfl"]
-        * float(np.nanmin(diagnostic.size))
-        / np.sqrt(9.807 * 20.0)
+    assert abs(field.obc_transition_size.ravel()[index] - expected) < 1.0e-9
+
+    report = field.report["open_boundary_transition"]
+    assert report["method"] == "wet_distance_quintic_log_authority_transfer"
+    assert report["hold_distance_m"] == 1000.0
+    assert report["effective_transition_distance_m"] == 6000.0
+    assert report["wet_distance_reachable_cell_count"] == int(
+        np.count_nonzero(active)
     )
-    assert abs(diagnostic.report["cfl"]["recommended_timestep_s"] - expected_dt) < 1.0e-9
-    assert "external_mode_sqrt" in diagnostic.report["cfl"]["wave_speed_assumption"]
 
 
-def test_strict_coverage_sampling() -> None:
-    bathy, boundary = _square_case()
+def test_wet_distance_does_not_cross_a_dry_barrier() -> None:
+    wet = np.ones((7, 7), dtype=bool)
+    wet[:6, 3] = False
+    source = np.zeros_like(wet)
+    source[2, 0] = True
+    distance, labels = _wet_graph_distance_and_labels(
+        wet,
+        source,
+        1.0,
+        1.0,
+    )
+    assert np.all(np.isinf(distance[:6, 3]))
+    assert distance[2, 6] > 8.0
+    assert labels[2, 6] == 14
+
+
+def test_unreachable_raster_component_retains_nearshore_target() -> None:
+    bathy, boundary = _rectangular_estuary_case()
+    domain = np.ones_like(bathy.depth, dtype=bool)
+    domain[:, 30] = False
     field = build_size_field(
         bathy,
         boundary,
         _config(),
-        domain_mask=np.ones_like(bathy.depth, dtype=bool),
+        domain_mask=domain,
     )
-    try:
-        field.sample(np.asarray([-75.02]), np.asarray([39.01]))
-    except ValueError as exc:
-        assert "outside explicit coverage" in str(exc)
-    else:
-        raise AssertionError("Sampling outside the explicit grid must fail")
+    unreachable = domain & ~np.isfinite(field.wet_obc_distance_m)
+    assert np.any(unreachable)
+    assert np.all(np.isfinite(field.size[unreachable]))
+    assert np.allclose(
+        field.obc_transition_size[unreachable],
+        field.nearshore_size[unreachable],
+    )
+    report = field.report["open_boundary_transition"]
+    assert report["wet_distance_unreachable_cell_count"] == int(
+        np.count_nonzero(unreachable)
+    )
+    assert report["unreachable_cell_policy"].startswith(
+        "retain_nearshore_target"
+    )
 
 
 def test_gradation_never_coarsens_and_uses_eight_neighbors() -> None:
-    lon = np.asarray([-75.0, -74.99, -74.98], dtype=float)
-    lat = np.asarray([39.0, 39.01, 39.02], dtype=float)
+    lon = np.asarray([-122.60, -122.59, -122.58], dtype=float)
+    lat = np.asarray([37.78, 37.79, 37.80], dtype=float)
     raw = np.full((3, 3), 1000.0, dtype=float)
     raw[1, 1] = 100.0
     limited, report = apply_gradation_limit(lon, lat, raw, 0.10)
@@ -258,71 +267,71 @@ def test_gradation_never_coarsens_and_uses_eight_neighbors() -> None:
     assert np.all(limited <= raw + 1.0e-9)
 
 
-def test_node_budget_and_boundary_front_seeds() -> None:
-    lon = np.linspace(-75.0, -74.9, 11)
-    lat = np.linspace(39.0, 39.1, 11)
-    fine = estimate_node_budget(lon, lat, np.full((11, 11), 500.0))
-    coarse = estimate_node_budget(lon, lat, np.full((11, 11), 1000.0))
-    ratio = (
-        fine["estimated_interior_node_count_float"]
-        / coarse["estimated_interior_node_count_float"]
-    )
-    assert abs(ratio - 4.0) < 1.0e-12
-
-    _, boundary = _square_case()
-    boundary.target_spacing_m[:] = 200.0
-    seeds, report = boundary_front_seed_points(boundary)
-    assert len(seeds) >= 4
-    assert report["hard_anchor_bisector_count"] == 2
-    assert all(boundary.domain_polygon_xy.contains(Point(*point)) for point in seeds)
+def test_strict_coverage_sampling() -> None:
+    bathy, boundary = _rectangular_estuary_case()
+    field = _build(bathy, boundary)
+    try:
+        field.sample(np.asarray([-122.70]), np.asarray([37.80]))
+    except ValueError as exc:
+        assert "outside explicit coverage" in str(exc)
+    else:
+        raise AssertionError("Sampling outside explicit coverage must fail")
 
 
-def test_netcdf_roundtrip_and_schema() -> None:
-    bathy, boundary = _square_case()
-    field = build_size_field(
-        bathy,
-        boundary,
-        _config(),
-        domain_mask=np.ones_like(bathy.depth, dtype=bool),
-    )
-    with tempfile.TemporaryDirectory(prefix="size-field-v3-") as temp_dir:
+def test_netcdf_v4_and_component_maps() -> None:
+    bathy, boundary = _rectangular_estuary_case()
+    field = _build(bathy, boundary)
+    with tempfile.TemporaryDirectory(prefix="size-field-v4-") as temp_dir:
         nc_path = Path(temp_dir) / "size_field.nc"
         png_path = Path(temp_dir) / "size_field.png"
-        write_size_field(field, nc_path, png_path)
+        written_nc, written_png, components_png = write_size_field(
+            field,
+            nc_path,
+            png_path,
+        )
+        assert written_nc == nc_path
+        assert written_png == png_path
+        assert components_png == Path(temp_dir) / "size_field_components.png"
         with xr.open_dataset(nc_path) as dataset:
-            assert dataset.attrs["schema_version"] == "fvcom_size_field_v3"
+            assert dataset.attrs["schema_version"] == "fvcom_size_field_v4"
             assert dataset.attrs["coverage_policy"] == "strict"
-            assert "background_mesh_size_m" in dataset
-            obsolete_candidates = (
-                "oceanmesh_" + "feature_mesh_size_m",
-                "m2_" + "wavelength_mesh_size_m",
-            )
-            assert all(name not in dataset for name in obsolete_candidates)
-            assert "bathymetry_slope_mesh_size_m" in dataset
-            assert "channel_seg_order" in dataset
-            assert "raw_size_source_attribution" in dataset
+            expected_variables = {
+                "mesh_size_m",
+                "solid_boundary_background_mesh_size_m",
+                "bathymetry_slope_mesh_size_m",
+                "hydraulic_corridor_mesh_size_m",
+                "nearshore_mesh_size_m",
+                "obc_transition_mesh_size_m",
+                "wet_obc_distance_m",
+                "wet_obc_source_target_m",
+                "hydraulic_skeleton_mask",
+                "hydraulic_bank_width_m",
+                "hydraulic_importance",
+                "hydraulic_storage_ranking_area_m2",
+                "hydraulic_cross_section_area_m2",
+                "nearshore_size_source_attribution",
+            }
+            assert expected_variables.issubset(dataset.data_vars)
             assert np.allclose(dataset["mesh_size_m"].values, field.size)
-        assert png_path.exists() and png_path.stat().st_size > 0
+        for path in (png_path, components_png):
+            assert path.exists() and path.stat().st_size > 0
 
 
 def main() -> None:
     tests = [
-        test_open_land_endpoint_and_monotone_transition,
-        test_coincident_landfall_definition,
-        test_closed_domain_land_distance_background,
-        test_shallow_slope_is_active,
-        test_coastal_mask_excludes_offshore_candidates,
-        test_optional_channel_and_highest_order_attribution,
-        test_cfl_is_report_only,
-        test_strict_coverage_sampling,
+        test_hydraulic_skeleton_follows_opposing_solid_banks,
+        test_bathymetric_slope_target_is_active,
+        test_wet_obc_target_hold_and_quintic_log_transfer,
+        test_wet_distance_does_not_cross_a_dry_barrier,
+        test_unreachable_raster_component_retains_nearshore_target,
         test_gradation_never_coarsens_and_uses_eight_neighbors,
-        test_node_budget_and_boundary_front_seeds,
-        test_netcdf_roundtrip_and_schema,
+        test_strict_coverage_sampling,
+        test_netcdf_v4_and_component_maps,
     ]
     for test in tests:
         test()
         print(f"PASS {test.__name__}")
-    print("unified size-field self-test passed")
+    print("hydraulic-skeleton size-field self-test passed")
 
 
 if __name__ == "__main__":

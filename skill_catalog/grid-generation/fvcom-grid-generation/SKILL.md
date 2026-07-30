@@ -1,15 +1,14 @@
 ---
 name: fvcom-grid-generation
-description: Generate FVCOM-ready SMS 2DM meshes from legacy or adaptive fvcom-bdry-arc packages and CUDEM/NBS/CRM/ETOPO bathymetry using clean-room constrained refinement, offshore-efficient sizing, regional spring relaxation, aggressive local topology conditioning, target-aware area-transition conditioning, and boundary-aware thin-triangle repair. Use when Codex needs explicit boundary-chain ingestion, adaptive nearshore-to-offshore size fields, variable-density seeding, regional mesh conditioning, hard FVCOM valence repair, ordered OBC nodestrings, FVCOM mesh QA, or small synthetic grid smoke tests; standalone broad OceanMesh-style cleanup remains available for research.
+description: Generate FVCOM-ready SMS 2DM meshes from legacy or adaptive fvcom-bdry-arc packages and CUDEM/NBS/CRM/ETOPO bathymetry using a generator-neutral mesh-intent contract, clean-room constrained refinement or research Gmsh adapters, geometry-derived hydraulic-skeleton and bathymetric-gradient sizing, wet-domain offshore-to-nearshore log transitions, local topology conditioning, and FVCOM QA. Use when Codex needs explicit boundary-chain ingestion, adaptive nearshore-to-offshore size fields, controlled mesher bakeoffs, variable-density seeding, initial no-conditioning mesh smoke tests, ordered OBC nodestrings, boundary-aware thin-triangle repair, or hard FVCOM valence and readiness checks.
 ---
 
 # fvcom-grid-generation
 
-Use this skill after the boundary and bathymetry steps. Channel/thalweg
-extraction is a reusable upstream analysis:
+Use this skill after the boundary and bathymetry steps:
 
 ```text
-fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> topobathy-flownet -> fvcom-grid-generation
+fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> fvcom-grid-generation
 ```
 
 ## Core Rules
@@ -17,8 +16,11 @@ fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> topobathy-flownet -> fvco
 - Reuse upstream domain and boundary artifacts; do not redesign the region here.
 - Prefer an adaptive boundary-resolution manifest when supplied. Otherwise preserve the legacy loop workflow.
 - Keep full bathymetry for final node sampling and bound only the in-memory size-field grid.
-- Use the same unified size algorithm for open and closed domains. Open domains blend the open- and solid-boundary targets; closed domains use the solid-boundary distance background. Apply only the bathymetric-slope and optional flow-network channel candidates inside the coastal/estuarine influence zone.
-- Accept a passing `topobathy-flownet` manifest or generate it under the FVCOM run's `upstream/topobathy_flownet/` directory. Disabling flow-network extraction omits only the channel candidate.
+- Build nearshore sizing from the solid-boundary background, bathymetric gradient, and a geometry-derived paired-bank hydraulic skeleton. Detect the skeleton from land and island segments only; never use an open-boundary segment as a bank.
+- Do not consume or generate an external drainage/flow-network package. Infer hydraulic corridors directly from the wet model polygon, solid boundary geometry, and the supplied bathymetry.
+- For open domains, propagate the delivered OBC target and distance through connected wet cells, hold offshore authority near the OBC, then transfer smoothly in log space to the nearshore target. For closed domains, omit this transfer.
+- Apply all distance propagation and final gradation over the wet model domain so land and island holes cannot create shortcuts.
+- Treat boundary, bathymetry, `fvcom_size_field_v4`, node budget, and QA policy as generator-neutral mesh intent. Lock their hashes before a multi-mesher test, choose adapters by topology capability, and never flatten OBC chains to make an unsupported generator run.
 - End normal adaptive generation after guarded shape relaxation, first-pass thin repair, aggressive local topology conditioning, target-aware area-transition relaxation, and a terminal constraint audit. Do not run the broad legacy postprocessor implicitly.
 - Keep depths finite and positive down and treat OceanMesh2D GPL material as a method reference only.
 
@@ -32,14 +34,60 @@ python scripts/run_fvcom_grid.py --bdry-arc-manifest bdry_arc_manifest.json --bo
 
 Legacy packages continue to use `--boundary-loops-gpkg` without a resolution manifest.
 
+## Research Mesher Portfolio
+
+Keep the clean-room constrained-Delaunay route as the production reference.
+Use the isolated Gmsh adapter only for controlled research candidates:
+MeshAdapt algorithm 1, Delaunay algorithm 5, and Frontal-Delaunay algorithm 6.
+Feed every candidate the same immutable boundary, bathymetry,
+`fvcom_size_field_v4`, node budget, and QA policy. Separate the `RAW` generator
+result from `COMMON_CONDITIONED`; do not credit generator-specific cleanup as
+common conditioning.
+By default, resolve the bathymetry floor and the smallest 25 m
+budget-compatible uniform target `h_u` from the case manifest before building
+the bundle. Assign `h_u` to solid/island targets and the manifest's near-OBC
+target to open chains. Preserve shorter source chords but report them as
+`geometry_forced_subgrid`. Reconcile the immutable source boundary and rebuilt
+field to a fixed point. The portfolio default uses `sampled_field`, so delivered
+boundary targets follow the same pointwise `fvcom_size_field_v4` even when that
+coarsens a finer source target; the standalone reconciler retains an explicit
+`minimum` mode for source-target-lock workflows. Preserve every source vertex
+and its lineage in either mode. Restore a continuous gradated boundary trace
+over the cell-centred raster so every delivered endpoint and midpoint samples
+the same target used to discretize the arc. This trace uses straight Euclidean
+distance and must report possible through-land/island refinement leakage.
+Then require pointwise endpoint/midpoint factor-two compatibility and
+edge-aware boundary/first-ring/transition/interior `L/h` before triangulation.
+Record source and delivered boundary-node counts plus the adapter's boundary
+discretization mode. Treat unmatched discretization policies as a
+generator-plus-boundary-policy comparison, not an algorithm-only ranking, and
+flag any conflict between the one-dimensional boundary target and the
+two-dimensional `L/h` audit target.
+
+Route by capability. The current clean-room adapter supports zero or one
+noncyclic OBC, while the Gmsh adapter also supports plural and cyclic OBCs.
+The research raw default is Gmsh Frontal-Delaunay algorithm 6, followed by
+Delaunay algorithm 5 as the first hard-gate challenger, the clean-room route as
+the production reference where supported, and MeshAdapt algorithm 1 as a
+diagnostic. Treat this as routing policy rather than a composite quality
+winner; production promotion remains withheld until the six-case matrix passes.
+Record unsupported pairings as capability evidence rather than quality
+failures. Compare metrics without a composite winner, and do not promote a
+Gmsh candidate into the production path until the complete topology matrix
+passes. Read `references/mesher_portfolio.md` for bundle, stage, fairness,
+parallel-execution, and promotion rules.
+
 Important controls:
 
 - `--boundary-resolution-profile legacy|adaptive-coastal-v1|adaptive-coastal-v2`, default `legacy`. V2 is opt-in and requires an upstream `pass` manifest before gridding.
 - `--boundary-resolution-manifest`, optional; explicit nodes and chains take precedence over legacy densification.
 - `--gradation`, default `0.20`; limits adjacent size growth after all candidates are combined.
 - `--slope-elements 10` and `--coastal-distance-m 25000` control the nearshore bathymetric-slope candidate.
-- `--channel-flownet-manifest` consumes an existing passing `topobathy-flownet` package. Otherwise `--channel-flownet` (enabled by default) runs that skill on the original bathymetry NetCDF and the exact model-domain polygon, including holes. Use `--no-channel-flownet` only when the channel candidate is intentionally unavailable.
-- `--channel-flownet-source-area-km2`, default `1.0`, and optional `--channel-flownet-target-resolution-m` control extraction. `--channel-reslope-angle-deg 60`, `--channel-elements-per-depth 1`, and optional `--channel-min-size-m` control how accepted DHSVM `SegOrder` arcs become a channel-size candidate.
+- `--hydraulic-elements-across-min 3` and `--hydraulic-elements-across-max 8` set the paired-bank cross-corridor element range. Importance increases the requested count continuously between those limits.
+- `--hydraulic-max-width-m 20000` and `--hydraulic-bank-angle-deg 110` screen candidate bank pairs by span and opposition angle.
+- `--hydraulic-longitudinal-gradation 0.10` limits size change along the accepted skeleton.
+- `--obc-hold-distance-m 10000` holds the propagated OBC target over the first wet-domain reach. `--obc-transition-distance-m 60000` sets the following quintic log-space transfer length; the workflow reports an infeasible or derivative-limited transition instead of silently extending it.
+- `--refine-iterations` controls adaptive insertion and `--smooth-iterations` controls the initial, fixed-boundary geometric smoothing that is part of mesh construction. These are distinct from the post-generation conditioning stages below.
 - `--regional-spring-relaxation|--no-regional-spring-relaxation`; normal generation applies one guarded, defect-selected spring-equilibrium stage by default.
 - `--thin-triangle-repair|--no-thin-triangle-repair`; normal generation applies local protected-edge-safe flips/splits and patch relaxation by default.
 - `--thin-repair-profile guarded-v1|systematic-v2|systematic-v3|systematic-v5|systematic-v6|none`, default `guarded-v1`; `systematic-v2` keeps boundary coordinates fixed, opt-in `systematic-v3` adds source-arc-only welding/sliding/redistribution, research-only `systematic-v5` couples persistent connectivity restriction and complete locked-star reconstruction to fixed-connectivity interaction bursts, and research-only `systematic-v6` adds coupled valence closure plus exact-zero relaxation entry.
@@ -58,15 +106,32 @@ Important controls:
 - `--max-total-nodes` and `--node-budget-stop-fraction` audit the pre-triangulation estimate, including explicit boundary and boundary-front seeds. The audit is recorded for every boundary package and remains a hard gate for adaptive-coastal-v2.
 - `--land-spacing-m`, `--open-spacing-m`, `--max-interior-points`, and `--size-field-max-cells` set the boundary targets and execution limits.
 
-The unified background is continuous. For an open domain, compute exact segment
-distances and targets for the open and solid boundary families, form
-`phi = d_open / (d_open + d_solid)`, apply cubic smoothstep, and blend the two
-targets in log space. For a closed domain, grade outward from the solid
-boundary target. Inside the coastal mask, take the minimum of this background,
-the bathymetric-slope candidate, and the optional DHSVM flow-network channel
-candidate. Outside that mask, retain only the boundary background. Finally clip
-to physical bounds and apply the eight-neighbor lower gradation envelope. CFL
-remains diagnostic and never controls the size.
+To stop after the initial constrained mesh, explicitly use
+`--no-regional-spring-relaxation --no-thin-triangle-repair
+--thin-repair-profile none --conditioning-profile none
+--no-area-transition-relaxation --postprocess-profile none`. Retain a positive
+`--smooth-iterations` value when "initial mesh" includes the normal geometric
+smoothing pass; set it to zero only when an unsmoothed triangulation is
+specifically required. Verify every disabled stage's `reason` and operation
+counts in `mesh_conditioning.json`; stage names and an empty topology ledger
+alone are not proof that all movement stages were disabled.
+
+The `fvcom_size_field_v4` production path first forms a segment-interpolated
+solid-boundary background `h_S`. Inside the coastal mask it takes the pointwise
+minimum of `h_S`, the bathymetric-gradient target `h_G`, and the paired-bank
+hydraulic-corridor target `h_H`, then applies the lower gradation envelope to
+obtain `h_N`. The hydraulic target uses width divided by a continuous
+three-to-eight element count; the importance used in that count is a ranking
+proxy based on wet-distance storage over cross-section area, not a solved
+current velocity.
+
+For an open domain, wet-domain graph propagation carries both distance from the
+OBC and the originating delivered OBC target. The target is held for the
+configured offshore reach and then blended to `h_N` with a quintic smootherstep
+in log space. Apply the final eight-neighbor lower gradation envelope only over
+wet cells. CFL remains diagnostic and never controls the size. Read
+`references/fvcom_sms_quality.md` for the formulas, screening rules, diagnostics,
+and interpretation limits.
 
 ## Generation-Time Conditioning
 
@@ -77,7 +142,7 @@ Use this order after constrained seeding/refinement:
 3. Apply `thin-repair-v1` to residual severe elements. Try legal nonprotected edge flips, then budgeted long interior-edge splits; relax only the edited patch and its graph halo.
 4. In `aggressive-local-v2`, repeat local transactions in this order: remove target-redundant degree-3/4 interior vertices; process the selected thin-repair profile; repair every valence above eight with batched legal flips, connected zipper-cavity merges, or sequential cavity removal with distributed Steiner nodes. `guarded-v1` retains the quarantined flip/collapse/boundary-envelope ladder. Opt-in `systematic-v2` groups the extreme tail into lineage-stable components and tests two-to-four-ring local cavity reconstruction. `systematic-v3` retains v2, then projects boundary-directed interior apices onto their causal source arc, snaps them within `0.15h` or inserts them into the chain, tests deterministic 25/50/75/100-percent source-arc slides, and explicitly tests component boundary-node removal and protected-edge insertion. Research-only `systematic-v5` runs `connectivity restriction → locked-star V5 → component-cavity recovery → connectivity recheck → terminal locked-star closure`. The restriction stage ranks unprotected same-chain source-arc shortcuts, multi-superthin edges, and extreme `L/h`; reconstructs a complete constrained patch through the `1 → 2 → 4` ring ladder; and persists accepted forbidden edges by source lineage through compaction and later closure cycles. It never moves, inserts, or removes boundary nodes. Hard anchors never move, distinct passage banks never weld, and intermediate degenerate triangles are removed inside atomic transactions.
 5. Apply `area-transition-relax-v1` to the worst excessive adjacent-area pairs one patch at a time. Always consider raw area change above 0.50; preempt inside steep target-size bands only when raw and target-normalized area mismatch are both excessive. Re-sample the Eulerian target field before every outer patch.
-6. When `systematic-v2` or `systematic-v3` is selected, repeat it once after area-transition conditioning as terminal thin-debt closure. When V5 is selected, first establish a zero-superthin and zero-restricted-edge champion, then run bounded fixed-connectivity edge-angle-barrier bursts and the complete connectivity-restricted V5 closure after each selected checkpoint; compare quality only between zero-debt states and always finish with closure. V6 preserves the order `connectivity restriction → locked-star/multi-support repair → component cavity → connectivity recheck → terminal locked-star → optional authorized passage sweep → valence repair → immediate thin cleanup → second optional passage sweep → global audit`. Do not begin relaxation while superthin, valence-above-eight, or restricted-edge debt remains. `--no-systematic-v5-boundary-window-fallback` makes every V5/V6 topology-preserving transaction boundary- and OBC-membership-immutable. V2 requires exact surviving boundary coordinates. V3/V5/V6 require zero source-arc normal offset, exact hard anchors, simple loops, passage-clearance loss no larger than 0.5 m, and a valid OBC remap. Roll back a complete relaxation/closure cycle unless it returns to zero debt, adds no singly connected or boundary-anomaly elements, and improves `q_l3_sigma` by at least `1e-4`.
+6. When `systematic-v2` or `systematic-v3` is selected, repeat it once after area-transition conditioning as terminal thin-debt closure. When V5 is selected, first establish a zero-superthin and zero-restricted-edge champion, then run bounded fixed-connectivity edge-angle-barrier bursts and the complete connectivity-restricted V5 closure after each selected checkpoint; compare quality only between zero-debt states and always finish with closure. V6 preserves the order `connectivity restriction → locked-star/multi-support repair → component cavity → connectivity recheck → terminal locked-star → optional authorized passage sweep → valence repair → immediate thin cleanup → second optional passage sweep → global audit`. Do not begin relaxation while superthin, valence-above-eight, or restricted-edge debt remains. On the standalone thin-repair interface, `--no-systematic-v5-boundary-window-fallback` makes every V5/V6 topology-preserving transaction boundary- and OBC-membership-immutable; it is not an integrated `run_fvcom_grid.py` option. V2 requires exact surviving boundary coordinates. V3/V5/V6 require zero source-arc normal offset, exact hard anchors, simple loops, passage-clearance loss no larger than 0.5 m, and a valid OBC remap. Roll back a complete relaxation/closure cycle unless it returns to zero debt, adds no singly connected or boundary-anomaly elements, and improves `q_l3_sigma` by at least `1e-4`.
    - When deterministic V5 reaches a plateau and the residual set is visually manageable, enter the research-only visual fallback instead of repeating the same blind ladder. Run `diagnose_superthin_components.py`, inspect every component image, and record an agent-reviewed `fvcom_visual_superthin_repair_plan_v1` for exactly one component. A JSON classification without actual image inspection is not visual review.
    - Apply the plan with `apply_visual_superthin_plan.py`. The plan is bound to the exact input SHA-256, names a bounded topology-tool sequence, and commits at most one globally audited transaction. Regenerate the component atlas after every accepted transaction before planning the next component because connectivity and component identifiers may change.
    - Visual mode has no fixed element-count trigger. Record why the complete residual inventory can be inspected and assigned bounded routes within the remaining time. Stop with explicit evidence when it is not manageable.
@@ -91,6 +156,11 @@ Hard anchors and all boundary nodes not explicitly handled by the kind-aware edi
 
 ## Standalone Tools
 
+- `scripts/run_mesher_portfolio_case.py`: build one immutable regional `fvcom_size_field_v4` bundle and generate the clean-room plus Gmsh 1/5/6 `RAW` candidates under one node budget. It writes a metric-by-metric comparison and never claims common conditioning.
+- `scripts/plot_raw_mesh_transition.py`: read one raw portfolio 2DM and its locked boundary/field/quality artifacts, then write immutable whole-mesh and boundary/first-ring `L/h`, factor-two-interface, and adjacent-area-change maps without editing the mesh.
+- `scripts/run_portfolio_conditioning.py`: apply the generator-neutral fixed-boundary topology/area conditioner to an arbitrary raw 2DM, preserve zero/single/plural noncyclic NS chains through lineage, and resample final depths from the locked bathymetry. Treat cyclicity as unsupported because SMS 2DM does not encode it.
+- `scripts/diagnose_boundary_size_contract.py`: compare adaptive source-boundary targets with `fvcom_size_field_v4` at the same vertices and withhold triangle-algorithm attribution when the 1-D and 2-D targets conflict.
+- `scripts/research/mesher_bakeoff/run_mesher_bakeoff.py`: lock a generator-neutral input bundle, plan non-overwriting candidate stages, execute `RAW` or `COMMON_CONDITIONED`, and compare only identical bundle/QA hashes. Unsupported topology/adapter pairs remain explicit and unranked.
 - `scripts/analyze_mesh_quality.py`: analyze an existing `.2dm` without altering it.
 - `scripts/relax_mesh_region.py`: apply the boundary-fixed spring solver to automatic defect patches or a requested lon-lat bounding box.
 - `scripts/repair_thin_triangles.py`: apply `guarded-v1`, `systematic-v2`, `systematic-v3`, or closure-only `systematic-v5`/`systematic-v6`, or select `none` for a byte-preserving no-op copy. V3/V5/V6 use the shared connectivity-restriction policy and write an OBC remap/invalidation manifest.
@@ -124,15 +194,20 @@ Hard anchors and all boundary nodes not explicitly handled by the kind-aware edi
 - `obc_remap_manifest.json` (original/delivered OBC lineage, source-arc position, redistribution status, and forcing compatibility)
 - `boundary_nodes.geojson` (input boundary-node package)
 - `delivered_boundary_nodes.geojson` (terminal constraint chains, including any recovery nodes)
-- `size_field.nc` and `size_field.png`
+- `size_field.nc`, `size_field.png`, and `size_field_components.png`
 - `node_budget_preflight.json` for every run and `boundary_contract_v2.json` for adaptive v2
-- `upstream/topobathy_flownet/products/run_manifest.json` and its DHSVM flow-line package when run-local extraction is enabled
 - `mesh_nodes_elements.gpkg`
 - `mesh_quality_elements.gpkg`
 - `mesh_review_map.png`
 - progress JSON/JSONL artifacts
 
-The v7 manifest records the selected thin profile, aggressive local topology conditioning, area-transition conditioning, OBC remapping/forcing compatibility, hard valence status, and terminal lineage separately from `postprocess.enabled: false`.
+A mesher-portfolio run additionally writes the immutable input-bundle
+manifest/hash, capability routing, one isolated candidate manifest per
+generator/algorithm, and `raw_metric_comparison.json/.csv`. The generic
+bakeoff layer writes immutable `RAW` and `COMMON_CONDITIONED` stage results
+plus a no-composite comparison.
+
+The v8 manifest records the size-field method and hydraulic-skeleton diagnostics, selected thin profile, aggressive local topology conditioning, area-transition conditioning, OBC remapping/forcing compatibility, hard valence status, and terminal lineage separately from `postprocess.enabled: false`.
 
 ## Acceptance
 
@@ -148,6 +223,14 @@ For a human-approved whole-passage deletion, replace the ordinary one-wet-compon
 python scripts/selftest_fvcom_grid.py
 python scripts/selftest_boundary_contract_v2.py
 python scripts/selftest_size_field.py
+python scripts/selftest_gmsh_mesher_portfolio.py
+python scripts/selftest_mesher_bakeoff.py
+python scripts/selftest_portfolio_case.py
+python scripts/selftest_portfolio_conditioning.py
+python scripts/selftest_boundary_size_contract.py
+python scripts/selftest_boundary_size_reconciliation.py
+python scripts/selftest_edge_size_audit.py
+python scripts/selftest_raw_transition_diagnostics.py
 python scripts/selftest_local_topology_v2.py
 python scripts/selftest_connectivity_restriction.py
 python scripts/selftest_local_topology_v5_extensions.py

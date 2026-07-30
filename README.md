@@ -157,10 +157,12 @@ usable skill families at different maturity levels:
 - `grid-generation/` now contains active FVCOM preprocessing skills rather than
   only future placeholders. `fvcom-region-bpoly` is the first-stage regional
   domain selector, and `fvcom-bdry-arc` is the second-stage boundary-arc and
-  continuous model-boundary-loop package builder. `topobathy-flownet` provides
-  reusable GRASS/DHSVM SegOrder channel and bathymetric-thalweg extraction, and
-  `fvcom-grid-generation` consumes that optional product during downstream
-  mesh-size construction.
+  continuous model-boundary-loop package builder. `topobathy-flownet` remains a
+  standalone reusable drainage/thalweg analysis, while
+  `fvcom-grid-generation` now derives its hydraulic skeleton directly from the
+  wet polygon, solid boundary geometry, and bathymetry during mesh-size
+  construction and can lock that intent for controlled clean-room/Gmsh
+  generator portfolios without changing the production default.
 - `memory-control/` now contains the two active HTML project-memory workflow
   skills: `brain-dumping` for durable session memos and `brain-refreshing` for
   workspace reorientation before continuing work.

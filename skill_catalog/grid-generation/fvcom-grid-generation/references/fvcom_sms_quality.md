@@ -29,15 +29,55 @@ When any gate fails, retain all artifacts and set `final_status: needs_review`. 
 
 Adaptive boundary packages additionally require ordered explicit chains, per-node target spacing, and OBC size compatibility: 95th-percentile `L/h <= 1.55` and maximum `L/h <= 2.0`.
 
-All boundary profiles use the single `fvcom_size_field_v3` production method.
-For open domains, exact nearest-segment distances to the open and non-open
-families define a cubic-smoothstep, log-space transition between their
-interpolated boundary targets. Closed domains use the non-open target plus the
-land-distance gradation background. Only the bathymetric-slope and optional
-supplied SegOrder channel candidates act inside the coastal/estuary mask. The
-pointwise minimum is clipped and then passed through the eight-neighbour lower
-gradation envelope, which may refine but never coarsen a cell. CFL is
-diagnostic only.
+All boundary profiles use the single `fvcom_size_field_v4` production method.
+Construct its nearshore target as
+
+```text
+h_N = gradate_wet(min(h_S, h_G, h_H))
+```
+
+where `h_S` is the segment-interpolated solid-boundary target plus its
+land-distance background, `h_G` is the bathymetric-gradient target inside the
+coastal mask, and `h_H` is the geometry-derived hydraulic-corridor target.
+Use delivered adaptive solid-boundary targets directly; do not replace a finer
+delivered value with the configured legacy land-spacing default.
+
+Detect the hydraulic skeleton from raster Voronoi-label discontinuities between
+opposing, nonlocal solid-boundary segments. Never treat the OBC as a bank.
+Reject spans that exceed the configured width, fail the opposing-bank angle,
+connect locally adjacent contacts on the same boundary chain, or cross land or
+an island hole. Integrate depth across each accepted paired-bank chord to
+estimate cross-section area. Rank the wet-distance storage-over-cross-section
+proxy in log space to obtain `I` in `[0,1]`, then set
+
+```text
+N_perp = N_min + (N_max - N_min) I
+h_skeleton = clip(W / N_perp, h_min, h_max)
+```
+
+This importance is a tidal-exchange ranking proxy, not a solved velocity; its
+storage accumulation has branch and loop ambiguity. Limit longitudinal size
+change on the skeleton, propagate its target through connected wet cells, and
+blend transversely in log space from `h_S` at the bank to `h_skeleton` at the
+medial axis.
+
+For an open domain, propagate both distance `d_wet` and the originating
+delivered OBC target `h_open` through connected wet cells. Define
+
+```text
+xi    = clip((d_wet - L_hold) / L_transition, 0, 1)
+P(xi) = 6 xi^5 - 15 xi^4 + 10 xi^3
+h_T   = exp((1-P) log(h_open) + P log(h_N))
+```
+
+Hold OBC authority through `L_hold`, use the configured transition length
+without automatic extension, and report the theoretical derivative-limited
+length, available wet distance, and any post-gradation hold debt. Closed domains
+use `h_N` directly. Clip to physical bounds and apply the final eight-neighbour
+lower gradation envelope only over the wet domain; it may refine but never
+coarsen a cell. CFL remains diagnostic only. Preserve the component map,
+hydraulic masks and metrics, wet-OBC distance/target arrays, source attribution,
+and transition audit in `size_field.nc` and `size_field_components.png`.
 
 ## Conditioning Transaction Gates
 

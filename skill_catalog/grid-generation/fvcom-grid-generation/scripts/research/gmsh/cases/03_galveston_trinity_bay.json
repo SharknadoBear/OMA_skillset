@@ -1,0 +1,81 @@
+{
+  "$schema": "../case-manifest.schema.json",
+  "schema_version": "gmsh_fvcom_case_v1",
+  "case_id": "galveston_trinity_bay",
+  "display_name": "Galveston–Trinity Bay",
+  "execution_order": 3,
+  "experiment_status": "proposed",
+  "domain_type": "coastal_open",
+  "projected_crs": "EPSG:32615",
+  "boundary": {
+    "input_kind": "model_loops_v1",
+    "resolution_manifest": null,
+    "model_boundary_loops_gpkg": "Workspace/Preprocessing/fvcom-bdry-arc/runs/subagent_series_bdry_arc_16case_20260702/cases/galveston_trinity_bay_bdry_arc/g1/model_boundary_loops/model_boundary_loops.gpkg",
+    "model_boundary_loop_manifest": "Workspace/Preprocessing/fvcom-bdry-arc/runs/subagent_series_bdry_arc_16case_20260702/cases/galveston_trinity_bay_bdry_arc/g1/model_boundary_loops/model_boundary_loop_manifest.json",
+    "expected_open_boundary_count": 1,
+    "open_boundaries": [
+      {
+        "id": "gulf",
+        "kind": "ocean_exchange",
+        "cyclic": false,
+        "orientation": "preserve_source_order"
+      }
+    ],
+    "expected_island_holes": 68,
+    "preserve_source_vertices": true,
+    "allow_gmsh_boundary_insertion": true,
+    "negative_rejection_fixtures": [
+      {
+        "id": "stale_gtb",
+        "path": "Workspace/Preprocessing/fvcom-bdry-arc/runs/subagent_series_bdry_arc_16case_20260702/cases/galveston_trinity_bay_bdry_arc/gtb",
+        "expected_result": "reject",
+        "reason": "Stale package is not the corrected g1 geometry and must never be selected by fallback."
+      }
+    ],
+    "required_revalidation": [
+      "upstream final_status is pass",
+      "open-boundary exterior overlap is at least 0.98",
+      "open arc has zero land crossing",
+      "wet domain is one connected component",
+      "island-hole count is 68"
+    ]
+  },
+  "bathymetry": {
+    "netcdf": "Workspace/Preprocessing/fvcom-cudem-bathy/runs/gmsh_six_case_20260729T2150PDT/galveston_trinity_bay/full/galveston_trinity_gmsh_bathy_sources.nc",
+    "source_policy": [
+      "CUDEM",
+      "NBS BlueTopo",
+      "CRM",
+      "ETOPO fallback"
+    ],
+    "coverage_requirement": "finite positive depth over the complete Galveston–Trinity wet domain",
+    "status": "available"
+  },
+  "budget": {
+    "preflight_node_threshold": 135000,
+    "hard_node_cap": 150000,
+    "hu_increment_m": 25,
+    "overflow_reruns": 1
+  },
+  "sizing": {
+    "mode": "obc_distance_threshold",
+    "near_obc_size_m": 8000,
+    "near_obc_distance_m": 10000,
+    "far_obc_distance_m": 70000,
+    "bathymetry_floor_multiplier": 3,
+    "bathymetry_floor_roundup_m": 25
+  },
+  "preparation": [
+    "Automatically revalidate only the corrected g1 package.",
+    "Perform an estimate-first CUDEM bathymetry fetch with the declared fallback order."
+  ],
+  "readiness": {
+    "status": "ready",
+    "boundary_status": "conditional_revalidation",
+    "bathymetry_status": "available",
+    "blockers": []
+  },
+  "notes": [
+    "The stale gtb directory is a rejection fixture, not an alternative input."
+  ]
+}

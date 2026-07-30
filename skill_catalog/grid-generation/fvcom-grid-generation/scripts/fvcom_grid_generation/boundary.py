@@ -33,6 +33,17 @@ class BoundaryPackage:
     projection: LocalProjection
 
 
+@dataclass(frozen=True)
+class OpenBoundaryChain:
+    """Ordered open-boundary contract used by multi-gate research routes."""
+
+    chain_id: str
+    node_indices: tuple[int, ...]
+    kind: str = "exchange"
+    cyclic: bool = False
+    orientation: str = "forward"
+
+
 @dataclass
 class BoundaryNodes:
     xy: np.ndarray
@@ -53,6 +64,7 @@ class BoundaryNodes:
     resolution_profile: str = "legacy"
     metadata: dict[str, np.ndarray] | None = None
     passage_diagnostics: list[dict[str, Any]] | None = None
+    open_boundaries: list[OpenBoundaryChain] | None = None
 
 
 def load_boundary_package(path: str | Path) -> BoundaryPackage:
@@ -147,6 +159,8 @@ def prepare_boundary_nodes(package: BoundaryPackage, config: BoundaryConfig) -> 
 
     xy_arr = np.asarray(points, dtype=float)
     lonlat = unproject_points(xy_arr, projection) if len(xy_arr) else np.empty((0, 2), dtype=float)
+    hard_anchor_mask = _boundary_hard_anchor_mask(kinds, constraint_chains)
+    open_boundaries = _open_boundary_chains(exterior_chain, kinds)
     return BoundaryNodes(
         xy=xy_arr,
         lonlat=lonlat,
@@ -163,18 +177,22 @@ def prepare_boundary_nodes(package: BoundaryPackage, config: BoundaryConfig) -> 
         land_boundary_xy=land_xy,
         island_polygons_xy=islands_xy,
         projection=projection,
-        hard_anchor_mask=_boundary_hard_anchor_mask(kinds, constraint_chains),
+        hard_anchor_mask=hard_anchor_mask,
+        open_boundaries=open_boundaries,
     )
 
 
 def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage, BoundaryNodes, dict[str, Any]]:
     """Load an explicit adaptive boundary package emitted by fvcom-bdry-arc."""
-    manifest_path = Path(manifest_path)
+    manifest_path = Path(manifest_path).expanduser().resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
     profile = str(manifest.get("profile", ""))
     if profile not in {"adaptive-coastal-v1", "adaptive-coastal-v2"}:
         raise ValueError("Boundary resolution manifest must use profile adaptive-coastal-v1 or adaptive-coastal-v2")
-    gpkg = Path(manifest["outputs"]["boundary_resolution_gpkg"])
+    gpkg = _resolve_manifest_output(
+        manifest_path,
+        manifest["outputs"]["boundary_resolution_gpkg"],
+    )
     layers = set(gpd.list_layers(gpkg)["name"])
     required = {"resolved_domain_polygon", "resolved_open_boundary", "boundary_nodes"}
     missing = required - layers
@@ -264,14 +282,61 @@ def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage
         resolution_profile=profile,
         metadata=metadata,
         passage_diagnostics=passage_diagnostics,
+        open_boundaries=_open_boundary_chains(exterior, kinds),
     )
     return package, nodes, manifest
+
+
+def _resolve_manifest_output(
+    manifest_path: Path,
+    value: str | Path,
+) -> Path:
+    """Resolve a portable manifest artifact independently of process CWD."""
+
+    manifest_path = Path(manifest_path).expanduser().resolve()
+    artifact = Path(value).expanduser()
+    candidates: list[Path] = []
+    if artifact.is_absolute():
+        candidates.append(artifact)
+    else:
+        candidates.extend(
+            [
+                manifest_path.parent / artifact,
+                Path.cwd() / artifact,
+            ]
+        )
+        candidates.extend(parent / artifact for parent in manifest_path.parents)
+    # Archived manifests commonly contain a workspace-relative or stale
+    # absolute path even though the immutable artifact travels beside them.
+    candidates.append(manifest_path.parent / artifact.name)
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        key = str(resolved).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        if resolved.exists():
+            return resolved
+    attempted = ", ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(
+        f"Manifest output {value!s} is unavailable; tried: {attempted}"
+    )
 
 
 def boundary_nodes_geojson(nodes: BoundaryNodes) -> dict[str, Any]:
     """Return a GeoJSON FeatureCollection for boundary nodes."""
     features = []
     open_set = set(nodes.open_boundary_indices)
+    chain_membership: dict[int, tuple[str, int, bool, str]] = {}
+    for chain in normalized_open_boundaries(nodes):
+        for position, node_index in enumerate(chain.node_indices):
+            chain_membership[int(node_index)] = (
+                str(chain.chain_id),
+                int(position),
+                bool(chain.cyclic),
+                str(chain.orientation),
+            )
     hard = np.asarray(nodes.hard_anchor_mask if nodes.hard_anchor_mask is not None else np.zeros(len(nodes.lonlat), dtype=bool), dtype=bool)
     for idx, ((lon, lat), kind) in enumerate(zip(nodes.lonlat, nodes.kinds)):
         semantic = {}
@@ -293,6 +358,10 @@ def boundary_nodes_geojson(nodes: BoundaryNodes) -> dict[str, Any]:
                     "is_open_boundary": bool(idx in open_set),
                     "is_hard_anchor": bool(hard[idx]),
                     "resolution_profile": str(nodes.resolution_profile),
+                    "open_boundary_chain_id": chain_membership.get(idx, (None, None, False, None))[0],
+                    "open_boundary_chain_position": chain_membership.get(idx, (None, None, False, None))[1],
+                    "open_boundary_cyclic": chain_membership.get(idx, (None, None, False, None))[2],
+                    "open_boundary_orientation": chain_membership.get(idx, (None, None, False, None))[3],
                     **semantic,
                 },
                 "geometry": {"type": "Point", "coordinates": [float(lon), float(lat)]},
@@ -307,6 +376,7 @@ def evaluate_boundary_contract_v2(
     gradation: float = 0.15,
     maximum_l_over_h: float = 1.55,
     maximum_adjacent_target_ratio: float = 1.50,
+    expected_open_boundary_count: int | None = None,
 ) -> dict[str, Any]:
     """Audit the adaptive-v2 boundary contract before triangulation."""
     targets = np.asarray(nodes.target_spacing_m, dtype=float)
@@ -317,9 +387,36 @@ def evaluate_boundary_contract_v2(
     failures: list[str] = []
     if len(targets) != len(nodes.xy) or np.any(~np.isfinite(targets)) or np.any(targets <= 0.0):
         failures.append("boundary_target_spacing_invalid")
-    open_values = list(map(int, nodes.open_boundary_indices))
-    if len(open_values) < 2 or not hard[open_values[0]] or not hard[open_values[-1]]:
-        failures.append("open_boundary_landfall_anchor_missing")
+    open_boundaries = normalized_open_boundaries(nodes)
+    open_values = [node for chain in open_boundaries for node in chain.node_indices]
+    expected_count = 1 if expected_open_boundary_count is None else int(expected_open_boundary_count)
+    if len(open_boundaries) != expected_count:
+        failures.append("open_boundary_chain_count_mismatch")
+    chain_reports: list[dict[str, Any]] = []
+    for chain in open_boundaries:
+        values = [int(value) for value in chain.node_indices]
+        chain_failures: list[str] = []
+        if len(values) != len(set(values)):
+            chain_failures.append("duplicate_open_boundary_node")
+        if chain.cyclic:
+            if len(values) < 3:
+                chain_failures.append("cyclic_open_boundary_too_short")
+            if len(values) > 1 and values[0] == values[-1]:
+                chain_failures.append("cyclic_open_boundary_repeats_first_node")
+        elif len(values) < 2 or not hard[values[0]] or not hard[values[-1]]:
+            chain_failures.append("open_boundary_landfall_anchor_missing")
+        failures.extend(chain_failures)
+        chain_reports.append(
+            {
+                "chain_id": str(chain.chain_id),
+                "kind": str(chain.kind),
+                "cyclic": bool(chain.cyclic),
+                "orientation": str(chain.orientation),
+                "node_count": int(len(values)),
+                "passed": bool(not chain_failures),
+                "failure_taxonomy": chain_failures,
+            }
+        )
 
     maximum_lh = 0.0
     maximum_gradient = 0.0
@@ -364,6 +461,9 @@ def evaluate_boundary_contract_v2(
         "edge_count": int(edge_count),
         "hard_anchor_count": int(np.count_nonzero(hard)),
         "open_boundary_node_count": int(len(open_values)),
+        "open_boundary_chain_count": int(len(open_boundaries)),
+        "expected_open_boundary_chain_count": int(expected_count),
+        "open_boundaries": chain_reports,
         "maximum_l_over_h": float(maximum_lh),
         "maximum_spacing_gradient": float(maximum_gradient),
         "maximum_adjacent_target_ratio": float(maximum_ratio),
@@ -386,6 +486,55 @@ def _boundary_hard_anchor_mask(kinds: list[str], chains: list[list[int]]) -> np.
         following = exterior[(position + 1) % len(exterior)]
         hard[int(node)] = bool(kinds[int(previous)] != kinds[int(node)] or kinds[int(following)] != kinds[int(node)])
     return hard
+
+
+def normalized_open_boundaries(nodes: BoundaryNodes) -> list[OpenBoundaryChain]:
+    """Return plural OBCs while preserving the legacy flat single-chain input."""
+    if nodes.open_boundaries is not None:
+        return list(nodes.open_boundaries)
+    values = tuple(_ordered_unique([int(value) for value in nodes.open_boundary_indices]))
+    if not values:
+        return []
+    return [OpenBoundaryChain(chain_id="obc_001", node_indices=values)]
+
+
+def _open_boundary_chains(exterior: list[int], kinds: list[str]) -> list[OpenBoundaryChain]:
+    """Split ordered exterior nodes into distinct open runs, merging wraparound."""
+    values = [int(value) for value in exterior]
+    if not values:
+        return []
+    mask = [str(kinds[value]).lower() == "open" for value in values]
+    if all(mask):
+        return [
+            OpenBoundaryChain(
+                chain_id="obc_001",
+                node_indices=tuple(values),
+                kind="cyclic_offshore",
+                cyclic=True,
+            )
+        ]
+    runs: list[list[int]] = []
+    current: list[int] = []
+    for value, is_open in zip(values, mask):
+        if is_open:
+            current.append(value)
+        elif current:
+            runs.append(current)
+            current = []
+    if current:
+        runs.append(current)
+    if len(runs) > 1 and mask[0] and mask[-1]:
+        runs[0] = runs[-1] + runs[0]
+        runs.pop()
+    return [
+        OpenBoundaryChain(
+            chain_id=f"obc_{index:03d}",
+            node_indices=tuple(run),
+            kind="exchange",
+            cyclic=False,
+        )
+        for index, run in enumerate(runs, start=1)
+    ]
 
 
 def _sample_segment(seg: LineString, spacing: float, include_end: bool) -> list[tuple[float, float]]:

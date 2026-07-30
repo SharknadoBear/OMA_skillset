@@ -3,6 +3,14 @@
 Use this reference with `adaptive-coastal-v2`.  The profile is opt-in; legacy
 and `adaptive-coastal-v1` behavior remain compatibility paths.
 
+## Contents
+
+- [Prevention before repair](#prevention-before-repair)
+- [Mandatory anchors](#mandatory-anchors)
+- [Size-field priority](#size-field-priority)
+- [Compound local repair](#compound-local-repair)
+- [Acceptance gates](#acceptance-gates)
+
 ## Prevention before repair
 
 Thin-triangle control starts with a semantically sampled boundary.  Boundary
@@ -17,8 +25,9 @@ the land chain with
 h_land(s) = max(h_land_base, h_J - g s),  g <= 0.15.
 ```
 
-The junction floor may relax only soft shoreline/depth refiners.  Mission,
-retained-channel, and CFL constraints remain hard and may override it.
+The junction floor may relax only soft shoreline/depth refiners. Mission
+constraints and protected-passage representation remain hard and may override
+it. CFL is diagnostic and does not set the production size target.
 
 For opposing banks separated by wet width `W`, use the paired target
 
@@ -32,8 +41,8 @@ spacing is an upstream topology decision, never an arbitrary triangle deletion.
 
 ## Mandatory anchors
 
-Both OBC landfalls are hard anchors.  Stable sharp turns, spit tips, mission
-features, and channel-control points are also anchors.  Detect them from
+Both OBC landfalls are hard anchors. Stable sharp turns, spit tips, mission
+features, and protected-passage control points are also anchors. Detect them from
 multi-scale turn/curvature and chord-error evidence, then sample each
 anchor-to-anchor interval without a short terminal remainder.  Preserve anchor
 identity and coordinates through mesh serialization.
@@ -46,22 +55,30 @@ Use segment-interpolated boundary targets rather than nearest-vertex targets:
 h_b(x) = min_e((1-t) h_i + t h_j + g distance(x,e)).
 ```
 
-Separate candidates into
+Use the delivered solid-boundary targets directly and construct
 
 ```text
-h_soft = min(h_boundary, h_depth, h_slope)
-h_hard = min(h_mission, h_channel, h_CFL)
+h_N = gradate_wet(min(h_solid, h_gradient, h_hydraulic))
 ```
 
-and inside a junction mask apply
+Here `h_hydraulic` comes from the solid-only paired-bank medial skeleton, not an
+imported drainage or thalweg line. The skeleton width and its continuous
+importance-dependent element count control the medial target; a quintic
+log-space transverse blend joins that target to `h_solid` at the banks.
+
+For open domains, transfer from the propagated OBC target to `h_N` along
+wet-domain distance:
 
 ```text
-h_raw = min(h_hard, max(h_soft, h_junction_floor)).
+h_final = gradate_wet(exp((1-P(xi)) log(h_open) + P(xi) log(h_N)))
 ```
 
-Apply a metric-aware eight-neighbor gradation limiter and record the dominant
-source, coverage, junction, channel, and gradation-reduction arrays.  No
-out-of-coverage query may silently receive the domain maximum.
+Use `xi=clip((d_wet-L_hold)/L_transition,0,1)` and
+`P(xi)=6xi^5-15xi^4+10xi^3`. Apply the metric-aware eight-neighbor limiter only
+over wet cells and record source attribution, hydraulic skeleton/corridor
+metrics, propagated OBC target and wet distance, transition feasibility, and
+gradation reduction. No out-of-coverage query may silently receive the domain
+maximum.
 
 ## Compound local repair
 

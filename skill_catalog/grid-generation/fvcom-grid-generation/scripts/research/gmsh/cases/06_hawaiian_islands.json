@@ -1,0 +1,75 @@
+{
+  "$schema": "../case-manifest.schema.json",
+  "schema_version": "gmsh_fvcom_case_v1",
+  "case_id": "hawaiian_islands",
+  "display_name": "Hawaiian Islands",
+  "execution_order": 6,
+  "experiment_status": "proposed",
+  "domain_type": "cyclic_offshore",
+  "projected_crs": "EPSG:32604",
+  "boundary": {
+    "input_kind": "model_loops_v1",
+    "resolution_manifest": null,
+    "model_boundary_loops_gpkg": "Workspace/Preprocessing/fvcom-bdry-arc/runs/subagent_series_bdry_arc_16case_20260702/cases/hawaii_state_islands_bdry_arc/hi/model_boundary_loops/model_boundary_loops.gpkg",
+    "model_boundary_loop_manifest": "Workspace/Preprocessing/fvcom-bdry-arc/runs/subagent_series_bdry_arc_16case_20260702/cases/hawaii_state_islands_bdry_arc/hi/model_boundary_loops/model_boundary_loop_manifest.json",
+    "expected_open_boundary_count": 1,
+    "open_boundaries": [
+      {
+        "id": "hawaii_offshore_cycle",
+        "kind": "offshore_exchange",
+        "cyclic": true,
+        "orientation": "preserve_source_order"
+      }
+    ],
+    "expected_island_holes": 70,
+    "preserve_source_vertices": true,
+    "allow_gmsh_boundary_insertion": true,
+    "negative_rejection_fixtures": [],
+    "required_revalidation": [
+      "upstream final_status is pass",
+      "the complete exterior is classified open",
+      "open-boundary exterior overlap is at least 0.98",
+      "wet domain is one connected component",
+      "island-hole count is 70",
+      "the delivered cyclic chain omits a repeated first node",
+      "the last-to-first delivered edge exists"
+    ]
+  },
+  "bathymetry": {
+    "netcdf": "Workspace/Preprocessing/fvcom-cudem-bathy/runs/gmsh_six_case_20260729T2150PDT/hawaiian_islands/full/hawaii_gmsh_crm_first_bathy_sources_v2.nc",
+    "source_policy": [
+      "CRM",
+      "ETOPO fallback"
+    ],
+    "coverage_requirement": "finite positive depth over the complete Hawaii State chain footprint",
+    "status": "available"
+  },
+  "budget": {
+    "preflight_node_threshold": 135000,
+    "hard_node_cap": 150000,
+    "hu_increment_m": 25,
+    "overflow_reruns": 1
+  },
+  "sizing": {
+    "mode": "obc_distance_threshold",
+    "near_obc_size_m": 8000,
+    "near_obc_distance_m": 10000,
+    "far_obc_distance_m": 70000,
+    "bathymetry_floor_multiplier": 3,
+    "bathymetry_floor_roundup_m": 25
+  },
+  "preparation": [
+    "Automatically revalidate the hi island-loop geometry.",
+    "Perform an estimate-first CRM fetch and fill uncovered footprint with ETOPO.",
+    "Run this case last because its area controls the coarsest budget-limited h_u."
+  ],
+  "readiness": {
+    "status": "ready",
+    "boundary_status": "conditional_revalidation",
+    "bathymetry_status": "available",
+    "blockers": []
+  },
+  "notes": [
+    "The OBC is one cyclic chain around the entire exterior; do not repeat its first node in 2DM."
+  ]
+}

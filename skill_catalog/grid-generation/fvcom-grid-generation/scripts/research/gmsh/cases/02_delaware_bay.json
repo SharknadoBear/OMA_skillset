@@ -1,0 +1,68 @@
+{
+  "$schema": "../case-manifest.schema.json",
+  "schema_version": "gmsh_fvcom_case_v1",
+  "case_id": "delaware_bay",
+  "display_name": "Delaware Bay",
+  "execution_order": 2,
+  "experiment_status": "proposed",
+  "domain_type": "coastal_open",
+  "projected_crs": "EPSG:32618",
+  "boundary": {
+    "input_kind": "adaptive_v2",
+    "resolution_manifest": "Workspace/Preprocessing/fvcom-bdry-arc/runs/delaware_adaptive_coastal_v2_20260713_r11_prevention_only/boundary_resolution_manifest.json",
+    "model_boundary_loops_gpkg": "Workspace/Preprocessing/fvcom-grid-generation/runs/delaware_oceanmesh_arcrefine_smoke_20260710_20260710_145906Z/upstream/bdry_arc/model_boundary_loops/model_boundary_loops.gpkg",
+    "model_boundary_loop_manifest": "Workspace/Preprocessing/fvcom-grid-generation/runs/delaware_oceanmesh_arcrefine_smoke_20260710_20260710_145906Z/upstream/bdry_arc/model_boundary_loops/model_boundary_loop_manifest.json",
+    "expected_open_boundary_count": 1,
+    "open_boundaries": [
+      {
+        "id": "atlantic",
+        "kind": "ocean_exchange",
+        "cyclic": false,
+        "orientation": "preserve_source_order"
+      }
+    ],
+    "expected_island_holes": 149,
+    "preserve_source_vertices": true,
+    "allow_gmsh_boundary_insertion": true,
+    "negative_rejection_fixtures": []
+  },
+  "bathymetry": {
+    "netcdf": "Workspace/Preprocessing/fvcom-cudem-bathy/runs/delaware_v2_full_coverage_20260713/delaware_v2_full_coverage_20260713_bathy_sources.nc",
+    "source_policy": [
+      "reuse_frozen_full_coverage"
+    ],
+    "coverage_requirement": "finite positive depth over the complete accepted wet domain",
+    "status": "available"
+  },
+  "context": {
+    "archived_mesh_quality_json": "Workspace/Preprocessing/fvcom-grid-generation/runs/delaware_v2_prevention_only_20260713_r5/mesh_quality.json",
+    "comparison_policy": "metric_by_metric_no_composite_winner"
+  },
+  "budget": {
+    "preflight_node_threshold": 135000,
+    "hard_node_cap": 150000,
+    "hu_increment_m": 25,
+    "overflow_reruns": 1
+  },
+  "sizing": {
+    "mode": "obc_distance_threshold",
+    "near_obc_size_m": 8000,
+    "near_obc_distance_m": 10000,
+    "far_obc_distance_m": 70000,
+    "bathymetry_floor_multiplier": 3,
+    "bathymetry_floor_roundup_m": 25
+  },
+  "preparation": [
+    "Revalidate the accepted prevention-only adaptive-v2 manifest and input hashes.",
+    "Keep the full-coverage bathymetry product frozen."
+  ],
+  "readiness": {
+    "status": "ready",
+    "boundary_status": "available",
+    "bathymetry_status": "available",
+    "blockers": []
+  },
+  "notes": [
+    "Archived in-house meshes are context only; do not rerun the in-house mesher."
+  ]
+}

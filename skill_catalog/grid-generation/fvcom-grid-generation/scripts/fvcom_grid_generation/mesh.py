@@ -8,7 +8,8 @@ from typing import Any, Callable
 import numpy as np
 from scipy.spatial import Delaunay, cKDTree
 from shapely import contains_xy
-from shapely.geometry import Point
+from shapely.geometry import MultiLineString, Point
+from shapely.ops import linemerge
 
 from .boundary import BoundaryNodes
 from .metrics import build_edge_topology, constraint_integrity, triangle_geometry
@@ -101,6 +102,7 @@ class MeshResult:
 
 
 ProgressCallback = Callable[[str, float, dict[str, Any] | None], None]
+SizeSamplerXY = Callable[[np.ndarray], np.ndarray]
 
 
 def generate_mesh(
@@ -108,8 +110,46 @@ def generate_mesh(
     size_field: SizeField,
     config: MeshConfig,
     progress_callback: ProgressCallback | None = None,
+    size_sampler_xy: SizeSamplerXY | None = None,
 ) -> MeshResult:
     """Generate a constrained Delaunay mesh with boundary midpoint recovery."""
+    declared_open_boundaries = boundary.open_boundaries or []
+    explicit_named_multi = bool(
+        len(declared_open_boundaries) > 1
+        and any(
+            not str(chain.chain_id).startswith("obc_")
+            for chain in declared_open_boundaries
+        )
+    )
+    merged_open_boundary = (
+        linemerge(boundary.open_boundary_xy)
+        if isinstance(boundary.open_boundary_xy, MultiLineString)
+        else boundary.open_boundary_xy
+    )
+    multi_geometry = bool(
+        isinstance(merged_open_boundary, MultiLineString)
+        and len(merged_open_boundary.geoms) > 1
+    )
+    cyclic_unsupported = bool(
+        any(chain.cyclic for chain in declared_open_boundaries)
+        and (
+            boundary.adaptive_resolution
+            or any(
+                not str(chain.chain_id).startswith("obc_")
+                for chain in declared_open_boundaries
+            )
+        )
+    )
+    if (
+        explicit_named_multi
+        or multi_geometry
+        or cyclic_unsupported
+    ):
+        raise ValueError(
+            "The production clean-room mesher currently supports at most one "
+            "noncyclic open-boundary chain. Use the research Gmsh route for "
+            "multiple or cyclic OBC contracts."
+        )
     if str(config.thin_repair_profile) not in {
         "guarded-v1",
         "systematic-v2",
@@ -124,6 +164,35 @@ def generate_mesh(
         )
     if str(config.systematic_v3_obc_policy) not in {"preserve", "redistribute"}:
         raise ValueError("systematic_v3_obc_policy must be preserve or redistribute")
+    def _sample_size_field_targets(
+        sample_points_xy: np.ndarray,
+    ) -> np.ndarray:
+        sample_points = np.asarray(sample_points_xy, dtype=float)
+        if size_sampler_xy is not None:
+            values = np.asarray(size_sampler_xy(sample_points), dtype=float)
+        else:
+            sampled_lonlat = unproject_points(
+                sample_points,
+                boundary.projection,
+            )
+            values = np.asarray(
+                size_field.sample(
+                    sampled_lonlat[:, 0],
+                    sampled_lonlat[:, 1],
+                ),
+                dtype=float,
+            )
+        values = values.reshape(-1)
+        if (
+            len(values) != len(sample_points)
+            or np.any(~np.isfinite(values))
+            or np.any(values <= 0.0)
+        ):
+            raise ValueError(
+                "size sampler must return one finite positive target per point"
+            )
+        return values
+
     _progress(progress_callback, "seed_boundary_nodes", 0.0, {"boundary_node_count": int(len(boundary.xy))})
     points = [tuple(xy) for xy in boundary.xy]
     kinds = list(boundary.kinds)
@@ -136,7 +205,12 @@ def generate_mesh(
     )
     chains = [list(chain) for chain in boundary.constraint_chains]
 
-    interior = _interior_seed_points(boundary, size_field, config)
+    interior = _interior_seed_points(
+        boundary,
+        size_field,
+        config,
+        _sample_size_field_targets,
+    )
     _progress(progress_callback, "seed_interior_points", 0.08, {"interior_seed_count": int(len(interior))})
     for xy in interior:
         points.append((float(xy[0]), float(xy[1])))
@@ -181,7 +255,14 @@ def generate_mesh(
 
     for refine_iter in range(config.refine_iterations):
         triangles = _triangulate_filtered(points_arr, boundary)
-        additions = _refinement_points(points_arr, triangles, boundary, size_field, config)
+        additions = _refinement_points(
+            points_arr,
+            triangles,
+            boundary,
+            size_field,
+            config,
+            _sample_size_field_targets,
+        )
         _progress(
             progress_callback,
             "refine_triangles",
@@ -258,10 +339,6 @@ def generate_mesh(
         "point_targets": np.asarray(point_targets, dtype=float).copy(),
         "hard_anchors": np.asarray(hard_anchors, dtype=bool).copy(),
     }
-    def _sample_size_field_targets(sample_points_xy: np.ndarray) -> np.ndarray:
-        sampled_lonlat = unproject_points(np.asarray(sample_points_xy, dtype=float), boundary.projection)
-        return size_field.sample(sampled_lonlat[:, 0], sampled_lonlat[:, 1])
-
     sampled_targets = _sample_size_field_targets(points_arr)
     stored_targets = np.asarray(point_targets, dtype=float)
     conditioning_targets = np.where(np.isfinite(stored_targets) & (stored_targets > 0.0), stored_targets, sampled_targets)
@@ -650,6 +727,11 @@ def generate_mesh(
         "constraint_chain_count": int(len(chains)),
         "open_boundary_rebuilt_from_exterior_chain": True,
         "constraint_recovery": constraint_report,
+        "size_sampling_mode": (
+            "projected_callback"
+            if size_sampler_xy is not None
+            else "size_field_raster"
+        ),
         "refine_iterations": int(config.refine_iterations),
         "smooth_iterations": int(config.smooth_iterations),
         "conditioning": conditioning_report,
@@ -748,9 +830,19 @@ def _progress(callback: ProgressCallback | None, message: str, fraction: float, 
         callback(message, float(fraction), extra)
 
 
-def _interior_seed_points(boundary: BoundaryNodes, size_field: SizeField, config: MeshConfig) -> np.ndarray:
+def _interior_seed_points(
+    boundary: BoundaryNodes,
+    size_field: SizeField,
+    config: MeshConfig,
+    size_sampler_xy: SizeSamplerXY | None = None,
+) -> np.ndarray:
     if config.adaptive_seed or boundary.adaptive_resolution:
-        return _adaptive_quadtree_seed_points(boundary, size_field, config)
+        return _adaptive_quadtree_seed_points(
+            boundary,
+            size_field,
+            config,
+            size_sampler_xy,
+        )
     domain = boundary.domain_polygon_xy
     minx, miny, maxx, maxy = domain.bounds
     area = max(float(domain.area), 1.0)
@@ -759,12 +851,29 @@ def _interior_seed_points(boundary: BoundaryNodes, size_field: SizeField, config
     xs = np.arange(minx + 0.5 * spacing, maxx, spacing)
     ys = np.arange(miny + 0.5 * spacing, maxy, spacing * np.sqrt(3.0) / 2.0)
     pts = []
+    boundary_tree = cKDTree(boundary.xy) if len(boundary.xy) else None
     for row, y in enumerate(ys):
         offset = 0.5 * spacing if row % 2 else 0.0
         for x in xs + offset:
             point = Point(float(x), float(y))
-            if domain.contains(point):
-                pts.append((float(x), float(y)))
+            if not domain.contains(point):
+                continue
+            nearest_boundary_target = spacing
+            if boundary_tree is not None:
+                _, nearest_boundary = boundary_tree.query([x, y])
+                nearest_boundary_target = float(
+                    boundary.target_spacing_m[int(nearest_boundary)]
+                )
+            # A regular lattice can land numerically on a straight boundary.
+            # Keeping a physical clearance prevents an interior duplicate from
+            # hiding the protected boundary vertex during Delaunay uniquing.
+            boundary_clearance = float(domain.boundary.distance(point))
+            if boundary_clearance < 0.20 * min(
+                float(spacing),
+                nearest_boundary_target,
+            ):
+                continue
+            pts.append((float(x), float(y)))
             if len(pts) >= config.max_interior_points:
                 break
         if len(pts) >= config.max_interior_points:
@@ -772,7 +881,12 @@ def _interior_seed_points(boundary: BoundaryNodes, size_field: SizeField, config
     return np.asarray(pts, dtype=float)
 
 
-def _adaptive_quadtree_seed_points(boundary: BoundaryNodes, size_field: SizeField, config: MeshConfig) -> np.ndarray:
+def _adaptive_quadtree_seed_points(
+    boundary: BoundaryNodes,
+    size_field: SizeField,
+    config: MeshConfig,
+    size_sampler_xy: SizeSamplerXY | None = None,
+) -> np.ndarray:
     """Create deterministic variable-density seeds from local target size."""
     domain = boundary.domain_polygon_xy
     minx, miny, maxx, maxy = domain.bounds
@@ -814,8 +928,11 @@ def _adaptive_quadtree_seed_points(boundary: BoundaryNodes, size_field: SizeFiel
                 continue
             representative = overlap.representative_point()
             sample_xy = np.asarray([[representative.x, representative.y]], dtype=float)
-        lonlat = unproject_points(sample_xy, boundary.projection)
-        targets = size_field.sample(lonlat[:, 0], lonlat[:, 1])
+        if size_sampler_xy is not None:
+            targets = np.asarray(size_sampler_xy(sample_xy), dtype=float)
+        else:
+            lonlat = unproject_points(sample_xy, boundary.projection)
+            targets = size_field.sample(lonlat[:, 0], lonlat[:, 1])
         target = max(10.0, float(np.nanmin(targets)))
         if width > 1.25 * target and depth < max_depth:
             quarter = 0.25 * width
@@ -1080,15 +1197,28 @@ def _generation_obc_remap_manifest(
     }
 
 
-def _refinement_points(points: np.ndarray, triangles: np.ndarray, boundary: BoundaryNodes, size_field: SizeField, config: MeshConfig) -> np.ndarray:
+def _refinement_points(
+    points: np.ndarray,
+    triangles: np.ndarray,
+    boundary: BoundaryNodes,
+    size_field: SizeField,
+    config: MeshConfig,
+    size_sampler_xy: SizeSamplerXY | None = None,
+) -> np.ndarray:
     additions = []
     if not len(triangles):
         return np.empty((0, 2), dtype=float)
     tree = cKDTree(points)
     triangle_coords = points[triangles]
     centroids = triangle_coords.mean(axis=1)
-    centroid_lonlat = unproject_points(centroids, boundary.projection)
-    targets = size_field.sample(centroid_lonlat[:, 0], centroid_lonlat[:, 1])
+    if size_sampler_xy is not None:
+        targets = np.asarray(size_sampler_xy(centroids), dtype=float)
+    else:
+        centroid_lonlat = unproject_points(centroids, boundary.projection)
+        targets = size_field.sample(
+            centroid_lonlat[:, 0],
+            centroid_lonlat[:, 1],
+        )
     for tri, coords, centroid, sampled_target in zip(triangles, triangle_coords, centroids, targets, strict=True):
         max_edge = _max_edge_length(coords)
         min_angle = _triangle_angles(coords).min()
@@ -1102,7 +1232,16 @@ def _refinement_points(points: np.ndarray, triangles: np.ndarray, boundary: Boun
         if candidate is None or not boundary.domain_polygon_xy.contains(Point(float(candidate[0]), float(candidate[1]))):
             a, b = _longest_edge(coords)
             candidate = 0.5 * (a + b)
-        if not boundary.domain_polygon_xy.contains(Point(float(candidate[0]), float(candidate[1]))):
+        candidate_point = Point(float(candidate[0]), float(candidate[1]))
+        if not boundary.domain_polygon_xy.contains(candidate_point):
+            continue
+        # A fallback midpoint can be numerically just inside a protected
+        # boundary edge.  Reject that pseudo-interior point before it can
+        # split the edge without joining the boundary constraint chain.
+        if float(boundary.domain_polygon_xy.boundary.distance(candidate_point)) < max(
+            0.10 * target,
+            1.0,
+        ):
             continue
         distance, _ = tree.query(candidate)
         if distance < max(0.25 * target, 1.0):
