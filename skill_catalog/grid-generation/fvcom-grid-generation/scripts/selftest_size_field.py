@@ -23,9 +23,11 @@ from fvcom_grid_generation.projection import (
 )
 from fvcom_grid_generation.size_field import (
     SizeFieldConfig,
+    WetMaskAwareSizeInterpolator,
     _wet_graph_distance_and_labels,
     apply_gradation_limit,
     build_size_field,
+    recorded_size_interpolator,
     write_size_field,
 )
 
@@ -207,7 +209,15 @@ def test_wet_obc_target_hold_and_quintic_log_transfer() -> None:
     report = field.report["open_boundary_transition"]
     assert report["method"] == "wet_distance_quintic_log_authority_transfer"
     assert report["hold_distance_m"] == 1000.0
-    assert report["effective_transition_distance_m"] == 6000.0
+    assert report["effective_transition_distance_m"] == max(
+        6000.0,
+        report["required_transition_distance_m"],
+    )
+    assert report[
+        "effective_distance_auto_extended_for_gradation"
+    ] == (
+        report["required_transition_distance_m"] > 6000.0
+    )
     assert report["wet_distance_reachable_cell_count"] == int(
         np.count_nonzero(active)
     )
@@ -267,6 +277,176 @@ def test_gradation_never_coarsens_and_uses_eight_neighbors() -> None:
     assert np.all(limited <= raw + 1.0e-9)
 
 
+def test_interior_floor_is_separate_from_subgrid_boundary_geometry() -> None:
+    bathy, boundary = _rectangular_estuary_case()
+    field = _build(
+        bathy,
+        boundary,
+        interior_min_size_m=1000.0,
+    )
+    active = field.coverage_mask & field.domain_mask
+    assert float(np.min(boundary.target_spacing_m)) == 250.0
+    assert np.all(field.size[active] >= 1000.0 - 1.0e-9)
+    assert field.report["configured_min_size_m"] == 1000.0
+    assert (
+        field.report["configured_boundary_trace_min_size_m"]
+        == 250.0
+    )
+    assert field.report[
+        "interior_minimum_separated_from_boundary_geometry"
+    ] is True
+
+
+def test_wet_mask_sampler_does_not_share_a_dry_barrier_cell() -> None:
+    lon = np.asarray([-122.002, -122.001, -122.000], dtype=float)
+    lat = np.asarray([37.999, 38.000, 38.001], dtype=float)
+    values = np.full((3, 3), 5.0, dtype=float)
+    values[:, 0] = 100.0
+    values[:, 2] = 1000.0
+    active = np.ones((3, 3), dtype=bool)
+    active[:, 1] = False
+    coverage = np.ones((3, 3), dtype=bool)
+    sampler = WetMaskAwareSizeInterpolator(
+        lat,
+        lon,
+        values,
+        active,
+        coverage,
+    )
+    sampled = sampler.sample(
+        np.asarray(
+            [
+                [38.0000, -122.00125],
+                [38.0000, -122.00075],
+                [38.0000, -122.001000000001],
+                [38.0000, -122.001],
+                [38.0000, -122.000999999999],
+            ],
+            dtype=float,
+        )
+    )
+    assert sampled.tolist() == [100.0, 1000.0, 100.0, 1000.0, 1000.0]
+    exact_value, exact_support = sampler.sample_with_active_support(
+        np.asarray([[38.0000, -122.001]], dtype=float)
+    )
+    assert exact_value.tolist() == [1000.0]
+    assert exact_support.tolist() == [False]
+
+
+def test_wet_mask_sampler_tolerates_axis_roundtrip_noise() -> None:
+    lon = np.asarray([-122.001, -122.000], dtype=float)
+    lat = np.asarray([37.999, 38.000], dtype=float)
+    values = np.asarray([[100.0, 200.0], [300.0, 400.0]])
+    mask = np.ones((2, 2), dtype=bool)
+    sampler = WetMaskAwareSizeInterpolator(
+        lat,
+        lon,
+        values,
+        mask,
+        mask,
+    )
+    sampled = sampler.sample(
+        np.asarray(
+            [
+                [lat[0] - 1.0e-13, lon[0] - 1.0e-13],
+                [lat[0] - 1.0e-13, lon[-1] + 1.0e-13],
+                [lat[-1] + 1.0e-13, lon[0] - 1.0e-13],
+                [lat[-1] + 1.0e-13, lon[-1] + 1.0e-13],
+            ],
+            dtype=float,
+        )
+    )
+    assert np.allclose(sampled, [100.0, 200.0, 300.0, 400.0])
+
+
+def test_wet_mask_sampler_retains_bilinear_interior_sampling() -> None:
+    lon = np.asarray([-122.001, -122.000], dtype=float)
+    lat = np.asarray([37.999, 38.000], dtype=float)
+    values = np.asarray([[100.0, 200.0], [300.0, 400.0]])
+    mask = np.ones((2, 2), dtype=bool)
+    sampler = WetMaskAwareSizeInterpolator(
+        lat,
+        lon,
+        values,
+        mask,
+        mask,
+    )
+    sampled = sampler.sample(
+        np.asarray([[37.9995, -122.0005]], dtype=float)
+    )
+    assert np.isclose(sampled[0], 250.0)
+
+
+def test_wet_mask_sampler_exact_dry_center_and_axis_roundtrip() -> None:
+    lon = np.asarray([-122.002, -122.001, -122.000], dtype=float)
+    lat = np.asarray([37.999, 38.000, 38.001], dtype=float)
+    values = np.full((3, 3), 5.0, dtype=float)
+    values[:, 0] = 100.0
+    values[:, 2] = 1000.0
+    active = np.ones((3, 3), dtype=bool)
+    active[:, 1] = False
+    coverage = np.ones((3, 3), dtype=bool)
+    sampler = WetMaskAwareSizeInterpolator(
+        lat,
+        lon,
+        values,
+        active,
+        coverage,
+    )
+    exact_dry = sampler.sample(
+        np.asarray([[38.000, -122.001]], dtype=float)
+    )
+    assert exact_dry[0] == 1000.0
+
+    tolerance_query = np.asarray(
+        [
+            [
+                lat[0] - 32.0 * np.finfo(float).eps * abs(lat[0]),
+                lon[0],
+            ]
+        ],
+        dtype=float,
+    )
+    assert np.isfinite(sampler.sample(tolerance_query)[0])
+    assert np.isnan(
+        sampler.sample(
+            np.asarray([[lat[0] - 1.0e-6, lon[0]]], dtype=float)
+        )[0]
+    )
+
+
+def test_recorded_wet_mask_v1_and_v2_replay_distinct_semantics() -> None:
+    lon = np.asarray([0.0, 1.0], dtype=float)
+    lat = np.asarray([0.0, 1.0], dtype=float)
+    values = np.asarray([[1000.0, 5.0], [6.0, 7.0]], dtype=float)
+    active = np.asarray([[False, True], [True, True]], dtype=bool)
+    coverage = np.ones((2, 2), dtype=bool)
+    query = np.asarray([[0.0, 0.0]], dtype=float)
+
+    replay_v1 = recorded_size_interpolator(
+        lat,
+        lon,
+        values,
+        coverage,
+        active,
+        "fvcom_wet_mask_sampling_v1",
+    )
+    replay_v2 = recorded_size_interpolator(
+        lat,
+        lon,
+        values,
+        coverage,
+        active,
+        "fvcom_wet_mask_sampling_v2",
+    )
+    value_v1, support_v1 = replay_v1.sample_with_active_support(query)
+    value_v2, support_v2 = replay_v2.sample_with_active_support(query)
+    assert value_v1.tolist() == [5.0]
+    assert support_v1.tolist() == [True]
+    assert value_v2.tolist() == [1000.0]
+    assert support_v2.tolist() == [False]
+
+
 def test_strict_coverage_sampling() -> None:
     bathy, boundary = _rectangular_estuary_case()
     field = _build(bathy, boundary)
@@ -295,6 +475,16 @@ def test_netcdf_v4_and_component_maps() -> None:
         with xr.open_dataset(nc_path) as dataset:
             assert dataset.attrs["schema_version"] == "fvcom_size_field_v4"
             assert dataset.attrs["coverage_policy"] == "strict"
+            assert dataset.attrs[
+                "sampling_interface_schema_version"
+            ] == (
+                "fvcom_wet_mask_sampling_v2"
+            )
+            assert not bool(
+                dataset.attrs[
+                    "sampling_interface_shared_inactive_halo_used"
+                ]
+            )
             expected_variables = {
                 "mesh_size_m",
                 "solid_boundary_background_mesh_size_m",
@@ -325,6 +515,12 @@ def main() -> None:
         test_wet_distance_does_not_cross_a_dry_barrier,
         test_unreachable_raster_component_retains_nearshore_target,
         test_gradation_never_coarsens_and_uses_eight_neighbors,
+        test_interior_floor_is_separate_from_subgrid_boundary_geometry,
+        test_wet_mask_sampler_does_not_share_a_dry_barrier_cell,
+        test_wet_mask_sampler_tolerates_axis_roundtrip_noise,
+        test_wet_mask_sampler_retains_bilinear_interior_sampling,
+        test_wet_mask_sampler_exact_dry_center_and_axis_roundtrip,
+        test_recorded_wet_mask_v1_and_v2_replay_distinct_semantics,
         test_strict_coverage_sampling,
         test_netcdf_v4_and_component_maps,
     ]

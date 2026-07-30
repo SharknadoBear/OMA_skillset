@@ -23,7 +23,7 @@ from dataclasses import dataclass
 import heapq
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import matplotlib
 matplotlib.use("Agg")
@@ -59,6 +59,7 @@ class SizeFieldConfig:
     land_spacing_m: float = 50.0
     open_spacing_m: float = 3000.0
     max_size_m: float = 20_000.0
+    interior_min_size_m: float | None = None
     gradation: float = 0.20
     slope_elements: float = 10.0
     min_gradient: float = 1.0e-5
@@ -92,6 +93,529 @@ class BoundaryDistanceFields:
     land_segment_arc_mid_m: np.ndarray
     land_segment_chain_length_m: np.ndarray
     report: dict[str, Any]
+
+
+class WetMaskAwareSizeInterpolator:
+    """Sample a cell-centred size raster without sharing dry-cell halos.
+
+    Ordinary bilinear interpolation can mix a wet target with a value stored
+    at an inactive land/island cell. Giving that inactive cell a single halo
+    value is also unsafe: the cell can be shared by hydraulically separated
+    wet sides. This sampler therefore uses normal bilinear interpolation only
+    when all four stencil cells are active. At a wet/dry interface it selects
+    the positive-weight active stencil corner with the largest bilinear
+    weight. If a callback query has no positive-weight active corner (for
+    example, an exact CAD boundary query at a dry-cell centre), it falls back
+    to the coarsest covered corner. That conservative fallback prevents a fine
+    target from the wrong side of a dry barrier from overriding the separate
+    boundary-trace sampler.
+
+    This is a raster-interface guard, not a barrier-aware wet-distance solver.
+    """
+
+    def __init__(
+        self,
+        lat: np.ndarray,
+        lon: np.ndarray,
+        values: np.ndarray,
+        active_mask: np.ndarray,
+        coverage_mask: np.ndarray,
+    ) -> None:
+        self._lat = np.asarray(lat, dtype=float)
+        self._lon = np.asarray(lon, dtype=float)
+        self._values = np.asarray(values, dtype=float)
+        self._active = np.asarray(active_mask, dtype=bool)
+        self._coverage = np.asarray(coverage_mask, dtype=bool)
+        expected = (len(self._lat), len(self._lon))
+        for name, value in (
+            ("values", self._values),
+            ("active_mask", self._active),
+            ("coverage_mask", self._coverage),
+        ):
+            if value.shape != expected:
+                raise ValueError(
+                    f"{name} must have shape {expected}; got {value.shape}"
+                )
+        if len(self._lat) < 2 or len(self._lon) < 2:
+            raise ValueError(
+                "wet-mask-aware interpolation needs at least two cells per axis"
+            )
+        if (
+            np.any(~np.isfinite(self._lat))
+            or np.any(~np.isfinite(self._lon))
+            or np.any(np.diff(self._lat) <= 0.0)
+            or np.any(np.diff(self._lon) <= 0.0)
+        ):
+            raise ValueError(
+                "wet-mask-aware interpolation axes must be finite and "
+                "strictly increasing"
+            )
+        invalid_covered = self._coverage & (
+            ~np.isfinite(self._values) | (self._values <= 0.0)
+        )
+        if np.any(invalid_covered):
+            raise ValueError(
+                "covered size-field cells must contain finite positive values"
+            )
+
+    def sample(
+        self,
+        query_lat_lon: np.ndarray | Sequence[Sequence[float]],
+    ) -> np.ndarray:
+        """Return sampled values, with NaN for out-of-coverage queries."""
+
+        sampled, _support = self.sample_with_active_support(query_lat_lon)
+        return sampled
+
+    def sample_with_active_support(
+        self,
+        query_lat_lon: np.ndarray | Sequence[Sequence[float]],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return values and positive-weight wet-stencil support flags."""
+
+        query = np.asarray(query_lat_lon, dtype=float)
+        if query.ndim != 2 or query.shape[1] != 2:
+            raise ValueError("size queries must have shape (N, 2) as lat/lon")
+        if not len(query):
+            return np.empty(0, dtype=float), np.empty(0, dtype=bool)
+        finite = np.all(np.isfinite(query), axis=1)
+        latitude_scale = max(
+            1.0,
+            abs(float(self._lat[0])),
+            abs(float(self._lat[-1])),
+        )
+        longitude_scale = max(
+            1.0,
+            abs(float(self._lon[0])),
+            abs(float(self._lon[-1])),
+        )
+        latitude_tolerance = 64.0 * np.finfo(float).eps * latitude_scale
+        longitude_tolerance = 64.0 * np.finfo(float).eps * longitude_scale
+        in_bounds = (
+            finite
+            & (query[:, 0] >= self._lat[0] - latitude_tolerance)
+            & (query[:, 0] <= self._lat[-1] + latitude_tolerance)
+            & (query[:, 1] >= self._lon[0] - longitude_tolerance)
+            & (query[:, 1] <= self._lon[-1] + longitude_tolerance)
+        )
+        result = np.full(len(query), np.nan, dtype=float)
+        active_support = np.zeros(len(query), dtype=bool)
+        if not np.any(in_bounds):
+            return result, active_support
+
+        selected = np.flatnonzero(in_bounds)
+        q_lat = np.clip(
+            query[selected, 0],
+            self._lat[0],
+            self._lat[-1],
+        )
+        q_lon = np.clip(
+            query[selected, 1],
+            self._lon[0],
+            self._lon[-1],
+        )
+        row_hi = np.clip(
+            np.searchsorted(self._lat, q_lat, side="right"),
+            1,
+            len(self._lat) - 1,
+        )
+        col_hi = np.clip(
+            np.searchsorted(self._lon, q_lon, side="right"),
+            1,
+            len(self._lon) - 1,
+        )
+        row_lo = row_hi - 1
+        col_lo = col_hi - 1
+        fy = (q_lat - self._lat[row_lo]) / (
+            self._lat[row_hi] - self._lat[row_lo]
+        )
+        fx = (q_lon - self._lon[col_lo]) / (
+            self._lon[col_hi] - self._lon[col_lo]
+        )
+
+        corner_values = np.column_stack(
+            [
+                self._values[row_lo, col_lo],
+                self._values[row_lo, col_hi],
+                self._values[row_hi, col_lo],
+                self._values[row_hi, col_hi],
+            ]
+        )
+        corner_active = np.column_stack(
+            [
+                self._active[row_lo, col_lo],
+                self._active[row_lo, col_hi],
+                self._active[row_hi, col_lo],
+                self._active[row_hi, col_hi],
+            ]
+        )
+        corner_covered = np.column_stack(
+            [
+                self._coverage[row_lo, col_lo],
+                self._coverage[row_lo, col_hi],
+                self._coverage[row_hi, col_lo],
+                self._coverage[row_hi, col_hi],
+            ]
+        )
+        weights = np.column_stack(
+            [
+                (1.0 - fy) * (1.0 - fx),
+                (1.0 - fy) * fx,
+                fy * (1.0 - fx),
+                fy * fx,
+            ]
+        )
+        local = np.full(len(selected), np.nan, dtype=float)
+        all_active = np.all(corner_active, axis=1)
+        if np.any(all_active):
+            local[all_active] = np.sum(
+                weights[all_active] * corner_values[all_active],
+                axis=1,
+            )
+
+        positive_weight_active = corner_active & (
+            weights > 64.0 * np.finfo(float).eps
+        )
+        interface = ~all_active & np.any(
+            positive_weight_active,
+            axis=1,
+        )
+        if np.any(interface):
+            active_weights = np.where(
+                positive_weight_active[interface],
+                weights[interface],
+                -np.inf,
+            )
+            chosen = np.argmax(active_weights, axis=1)
+            local[interface] = corner_values[interface, chosen]
+        local_active_support = all_active | interface
+
+        no_positive_active = ~np.any(positive_weight_active, axis=1)
+        covered_fallback = no_positive_active & np.any(
+            corner_covered,
+            axis=1,
+        )
+        if np.any(covered_fallback):
+            covered_values = np.where(
+                corner_covered[covered_fallback],
+                corner_values[covered_fallback],
+                np.nan,
+            )
+            local[covered_fallback] = np.nanmax(
+                covered_values,
+                axis=1,
+            )
+        result[selected] = local
+        active_support[selected] = local_active_support
+        return result, active_support
+
+
+class WetMaskAwareSizeInterpolatorV1Replay(WetMaskAwareSizeInterpolator):
+    """Faithfully replay archived ``fvcom_wet_mask_sampling_v1`` rasters.
+
+    Version 1 treated any active stencil corner as support, including a corner
+    with zero bilinear weight at an exact grid coordinate. When no corner was
+    active, it selected the covered corner with greatest bilinear weight.
+    These semantics are retained only for immutable provenance replay; new
+    size fields use :class:`WetMaskAwareSizeInterpolator`.
+    """
+
+    def sample_with_active_support(
+        self,
+        query_lat_lon: np.ndarray | Sequence[Sequence[float]],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        query = np.asarray(query_lat_lon, dtype=float)
+        if query.ndim != 2 or query.shape[1] != 2:
+            raise ValueError("size queries must have shape (N, 2) as lat/lon")
+        if not len(query):
+            return np.empty(0, dtype=float), np.empty(0, dtype=bool)
+        finite = np.all(np.isfinite(query), axis=1)
+        in_bounds = (
+            finite
+            & (query[:, 0] >= self._lat[0])
+            & (query[:, 0] <= self._lat[-1])
+            & (query[:, 1] >= self._lon[0])
+            & (query[:, 1] <= self._lon[-1])
+        )
+        result = np.full(len(query), np.nan, dtype=float)
+        active_support = np.zeros(len(query), dtype=bool)
+        if not np.any(in_bounds):
+            return result, active_support
+
+        selected = np.flatnonzero(in_bounds)
+        q_lat = query[selected, 0]
+        q_lon = query[selected, 1]
+        row_hi = np.clip(
+            np.searchsorted(self._lat, q_lat, side="right"),
+            1,
+            len(self._lat) - 1,
+        )
+        col_hi = np.clip(
+            np.searchsorted(self._lon, q_lon, side="right"),
+            1,
+            len(self._lon) - 1,
+        )
+        row_lo = row_hi - 1
+        col_lo = col_hi - 1
+        fy = (q_lat - self._lat[row_lo]) / (
+            self._lat[row_hi] - self._lat[row_lo]
+        )
+        fx = (q_lon - self._lon[col_lo]) / (
+            self._lon[col_hi] - self._lon[col_lo]
+        )
+        corner_values = np.column_stack(
+            [
+                self._values[row_lo, col_lo],
+                self._values[row_lo, col_hi],
+                self._values[row_hi, col_lo],
+                self._values[row_hi, col_hi],
+            ]
+        )
+        corner_active = np.column_stack(
+            [
+                self._active[row_lo, col_lo],
+                self._active[row_lo, col_hi],
+                self._active[row_hi, col_lo],
+                self._active[row_hi, col_hi],
+            ]
+        )
+        corner_covered = np.column_stack(
+            [
+                self._coverage[row_lo, col_lo],
+                self._coverage[row_lo, col_hi],
+                self._coverage[row_hi, col_lo],
+                self._coverage[row_hi, col_hi],
+            ]
+        )
+        weights = np.column_stack(
+            [
+                (1.0 - fy) * (1.0 - fx),
+                (1.0 - fy) * fx,
+                fy * (1.0 - fx),
+                fy * fx,
+            ]
+        )
+        local = np.full(len(selected), np.nan, dtype=float)
+        all_active = np.all(corner_active, axis=1)
+        if np.any(all_active):
+            local[all_active] = np.sum(
+                weights[all_active] * corner_values[all_active],
+                axis=1,
+            )
+
+        interface = ~all_active & np.any(corner_active, axis=1)
+        if np.any(interface):
+            active_weights = np.where(
+                corner_active[interface],
+                weights[interface],
+                -np.inf,
+            )
+            chosen = np.argmax(active_weights, axis=1)
+            local[interface] = corner_values[interface, chosen]
+
+        no_active = ~np.any(corner_active, axis=1)
+        covered_fallback = no_active & np.any(corner_covered, axis=1)
+        if np.any(covered_fallback):
+            covered_weights = np.where(
+                corner_covered[covered_fallback],
+                weights[covered_fallback],
+                -np.inf,
+            )
+            chosen = np.argmax(covered_weights, axis=1)
+            local[covered_fallback] = corner_values[
+                covered_fallback,
+                chosen,
+            ]
+
+        result[selected] = local
+        active_support[selected] = all_active | interface
+        return result, active_support
+
+
+class LegacyCoveredBilinearSizeInterpolator:
+    """Replay historical canonical rasters that predate wet-mask sampling."""
+
+    def __init__(
+        self,
+        lat: np.ndarray,
+        lon: np.ndarray,
+        values: np.ndarray,
+        coverage_mask: np.ndarray,
+    ) -> None:
+        self._lat = np.asarray(lat, dtype=float)
+        self._lon = np.asarray(lon, dtype=float)
+        self._values_array = np.asarray(values, dtype=float)
+        self._coverage_array = np.asarray(coverage_mask, dtype=bool)
+        expected = (len(self._lat), len(self._lon))
+        if (
+            self._values_array.shape != expected
+            or self._coverage_array.shape != expected
+        ):
+            raise ValueError(
+                "legacy size raster and coverage must match lat/lon axes"
+            )
+        self._values = RegularGridInterpolator(
+            (self._lat, self._lon),
+            self._values_array,
+            bounds_error=False,
+            fill_value=np.nan,
+        )
+        self._coverage = RegularGridInterpolator(
+            (self._lat, self._lon),
+            self._coverage_array.astype(np.uint8),
+            method="nearest",
+            bounds_error=False,
+            fill_value=0,
+        )
+
+    def sample(
+        self,
+        query_lat_lon: np.ndarray | Sequence[Sequence[float]],
+    ) -> np.ndarray:
+        sampled, _support = self.sample_with_active_support(query_lat_lon)
+        return sampled
+
+    def sample_with_active_support(
+        self,
+        query_lat_lon: np.ndarray | Sequence[Sequence[float]],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        query = np.asarray(query_lat_lon, dtype=float)
+        if query.ndim != 2 or query.shape[1] != 2:
+            raise ValueError("size queries must have shape (N, 2) as lat/lon")
+        sampled = np.asarray(self._values(query), dtype=float)
+        covered = np.asarray(self._coverage(query), dtype=float) >= 0.5
+        invalid = ~covered | ~np.isfinite(sampled) | (sampled <= 0.0)
+        sampled[invalid] = np.nan
+        return sampled, covered & ~invalid
+
+
+def recorded_size_interpolator(
+    lat: np.ndarray,
+    lon: np.ndarray,
+    values: np.ndarray,
+    coverage_mask: np.ndarray,
+    domain_mask: np.ndarray,
+    sampling_interface_schema_version: str | None,
+) -> (
+    WetMaskAwareSizeInterpolator
+    | WetMaskAwareSizeInterpolatorV1Replay
+    | LegacyCoveredBilinearSizeInterpolator
+):
+    """Dispatch an exported canonical raster by its recorded sampler schema."""
+
+    schema = str(sampling_interface_schema_version or "").strip()
+    if schema == "fvcom_wet_mask_sampling_v1":
+        return WetMaskAwareSizeInterpolatorV1Replay(
+            lat,
+            lon,
+            values,
+            np.asarray(coverage_mask, dtype=bool)
+            & np.asarray(domain_mask, dtype=bool),
+            coverage_mask,
+        )
+    if schema == "fvcom_wet_mask_sampling_v2":
+        return WetMaskAwareSizeInterpolator(
+            lat,
+            lon,
+            values,
+            np.asarray(coverage_mask, dtype=bool)
+            & np.asarray(domain_mask, dtype=bool),
+            coverage_mask,
+        )
+    if schema in {
+        "",
+        "legacy_unspecified",
+        "fvcom_size_sampling_halo_v1",
+    }:
+        return LegacyCoveredBilinearSizeInterpolator(
+            lat,
+            lon,
+            values,
+            coverage_mask,
+        )
+    raise ValueError(
+        f"unsupported canonical sampling interface schema {schema!r}"
+    )
+
+
+def linear_target_metric_edge_fractions(
+    length_m: float,
+    target_start_m: float,
+    target_end_m: float,
+    *,
+    samples_per_target: float,
+    include_end: bool = False,
+    maximum_sample_count: int | None = None,
+) -> np.ndarray:
+    """Return deterministic trace fractions for a linear endpoint target.
+
+    Fractions are equidistributed in ``ds / h(s)`` and always include the
+    physical midpoint used by the boundary reconciliation audit. Production
+    oriented chains omit the end because the next edge supplies it; unordered
+    diagnostic edge sets may include it without changing the min-plus field.
+    """
+
+    length = float(length_m)
+    ha = float(target_start_m)
+    hb = float(target_end_m)
+    density = float(samples_per_target)
+    if not np.isfinite(length) or length < 0.0:
+        raise ValueError("boundary trace edge length must be finite and nonnegative")
+    if (
+        not np.isfinite(ha)
+        or ha <= 0.0
+        or not np.isfinite(hb)
+        or hb <= 0.0
+    ):
+        raise ValueError("boundary trace endpoint targets must be finite and positive")
+    if not np.isfinite(density) or density < 2.0:
+        raise ValueError("samples_per_target must be at least two")
+    sample_limit = (
+        None
+        if maximum_sample_count is None
+        else int(maximum_sample_count)
+    )
+    if sample_limit is not None and sample_limit < 1:
+        raise ValueError(
+            "boundary trace sampling exceeds the safety limit before allocation"
+        )
+    target_scale = max(abs(ha), abs(hb), 1.0)
+    nearly_constant = abs(hb - ha) <= (
+        64.0 * np.finfo(float).eps * target_scale
+    )
+    metric_length = (
+        length / ha
+        if nearly_constant
+        else length * np.log(hb / ha) / (hb - ha)
+    )
+    intervals = max(2, int(np.ceil(metric_length * density)))
+    if intervals % 2:
+        intervals += 1
+    stop = intervals + 1 if include_end else intervals
+    if sample_limit is not None and stop > sample_limit:
+        raise ValueError(
+            "boundary trace sampling exceeds the safety limit "
+            f"of {sample_limit} points before allocation"
+        )
+    metric_fraction = np.arange(stop, dtype=float) / intervals
+    if nearly_constant:
+        fraction = metric_fraction
+    else:
+        fraction = (
+            ha
+            * np.expm1(metric_fraction * np.log(hb / ha))
+            / (hb - ha)
+        )
+    if not np.any(fraction == 0.5):
+        if sample_limit is not None and len(fraction) >= sample_limit:
+            raise ValueError(
+                "boundary trace sampling exceeds the safety limit "
+                f"of {sample_limit} points before midpoint insertion"
+            )
+        fraction = np.concatenate(
+            [fraction, np.asarray([0.5], dtype=float)]
+        )
+    return np.unique(fraction)
 
 
 @dataclass(frozen=True)
@@ -128,22 +652,15 @@ class SizeField:
         """Sample the field and reject every point outside explicit coverage."""
         lon, lat = np.broadcast_arrays(np.asarray(lon, dtype=float), np.asarray(lat, dtype=float))
         query = np.column_stack([lat.ravel(), lon.ravel()])
-        size_interp = RegularGridInterpolator(
-            (self.lat, self.lon),
+        size_interp = WetMaskAwareSizeInterpolator(
+            self.lat,
+            self.lon,
             self.size,
-            bounds_error=False,
-            fill_value=np.nan,
+            self.coverage_mask & self.domain_mask,
+            self.coverage_mask,
         )
-        coverage_interp = RegularGridInterpolator(
-            (self.lat, self.lon),
-            np.asarray(self.coverage_mask, dtype=np.uint8),
-            method="nearest",
-            bounds_error=False,
-            fill_value=0,
-        )
-        sampled = np.asarray(size_interp(query), dtype=float)
+        sampled = np.asarray(size_interp.sample(query), dtype=float)
         uncovered = ~np.isfinite(sampled)
-        uncovered |= np.asarray(coverage_interp(query), dtype=float) < 0.5
         if np.any(uncovered):
             first = int(np.flatnonzero(uncovered)[0])
             raise ValueError(
@@ -191,7 +708,8 @@ def build_size_field(
     if not np.any(active):
         raise ValueError("The model-domain mask contains no covered cells")
 
-    minimum = _minimum_size(boundary, config)
+    boundary_minimum = _minimum_size(boundary, config)
+    minimum = _interior_minimum_size(boundary, config)
     boundary_fields = boundary_distance_fields(bathy, boundary, config)
     background = np.where(coverage, boundary_fields.solid_background_m, np.nan)
     open_distance = boundary_fields.open_distance_m
@@ -313,7 +831,14 @@ def build_size_field(
             - float(config.obc_hold_distance_m),
             0.0,
         )
-        effective_transition = requested_transition
+        # Treat the configured distance as a minimum.  A shorter log-transfer
+        # cannot satisfy the declared wet-domain gradation, and previously
+        # created an avoidable OBC-to-bulk resolution kink even though ample
+        # wet distance was available.
+        effective_transition = max(
+            requested_transition,
+            float(required_transition),
+        )
         xi = np.clip(
             (
                 wet_obc_distance
@@ -343,7 +868,10 @@ def build_size_field(
                 requested_transition + 1.0e-9 < required_transition
             ),
             "full_transition_fits_available_wet_distance": bool(
-                requested_transition <= available_transition + 1.0e-9
+                effective_transition <= available_transition + 1.0e-9
+            ),
+            "effective_distance_auto_extended_for_gradation": bool(
+                effective_transition > requested_transition + 1.0e-9
             ),
             "wet_distance_reachable_cell_count": int(
                 np.count_nonzero(active & np.isfinite(wet_obc_distance))
@@ -396,6 +924,23 @@ def build_size_field(
     limited[~coverage] = np.nan
     if np.any(limited[active] > raw[active] + 1.0e-9):
         raise RuntimeError("Gradation limiter coarsened at least one wet-domain cell")
+    sampling_interface_report = {
+        "schema_version": "fvcom_wet_mask_sampling_v2",
+        "method": (
+            "bilinear_only_for_all_wet_stencil_else_highest_weight_"
+            "active_corner"
+        ),
+        "shared_inactive_halo_used": False,
+        "dry_or_zero_weight_fallback": "coarsest_covered_corner",
+        "axis_roundtrip_tolerance": "64_machine_eps_times_axis_scale",
+        "covered_fallback_when_no_active_stencil_corner": True,
+        "budget_domain": "active_wet_cells_only",
+        "barrier_aware_wet_distance": False,
+        "interpretation": (
+            "prevents a shared dry-cell halo from transmitting a target "
+            "between wet sides; does not replace a barrier-aware field"
+        ),
+    }
 
     hold_mask = (
         active
@@ -461,11 +1006,19 @@ def build_size_field(
         "source_attribution_stage": "nearshore_pointwise_minimum_before_obc_transfer_and_gradation",
         "nearshore_gradation": nearshore_gradation_report,
         "gradation": gradation_report,
+        "sampling_interface": sampling_interface_report,
         "cfl": cfl_report,
         "node_budget_estimate": budget,
         "min_size_m": float(np.nanmin(limited[coverage])),
+        "min_active_size_m": float(np.nanmin(limited[active])),
         "max_size_m": float(np.nanmax(limited[coverage])),
         "configured_min_size_m": float(minimum),
+        "configured_boundary_trace_min_size_m": float(
+            boundary_minimum
+        ),
+        "interior_minimum_separated_from_boundary_geometry": bool(
+            minimum > boundary_minimum + 1.0e-9
+        ),
         "land_spacing_m": float(config.land_spacing_m),
         "open_spacing_m": float(config.open_spacing_m),
         "slope_active_cell_count": int(np.count_nonzero(coastal & np.isfinite(slope_size))),
@@ -555,7 +1108,7 @@ def boundary_distance_fields(
 
     background = np.clip(
         background,
-        _minimum_size(boundary, config),
+        _interior_minimum_size(boundary, config),
         float(config.max_size_m),
     )
     report = {
@@ -661,7 +1214,7 @@ def hydraulic_skeleton_size(
         config,
         dx_m,
         dy_m,
-        _minimum_size(boundary, config),
+        _interior_minimum_size(boundary, config),
     )
 
     candidate_indices = np.flatnonzero(skeleton.ravel())
@@ -795,7 +1348,7 @@ def hydraulic_skeleton_size(
     )
     skeleton_target = np.clip(
         width_grid.ravel()[skeleton_indices] / elements_across,
-        _minimum_size(boundary, config),
+        _interior_minimum_size(boundary, config),
         float(config.max_size_m),
     )
     skeleton_target_grid = np.full(shape, np.nan, dtype=float)
@@ -935,6 +1488,16 @@ def _validate_config(config: SizeFieldConfig) -> None:
     for name, value in positive.items():
         if not np.isfinite(float(value)) or float(value) <= 0.0:
             raise ValueError(f"{name} must be finite and positive")
+    if config.interior_min_size_m is not None:
+        interior_minimum = float(config.interior_min_size_m)
+        if not np.isfinite(interior_minimum) or interior_minimum <= 0.0:
+            raise ValueError(
+                "interior_min_size_m must be finite and positive"
+            )
+        if interior_minimum > float(config.max_size_m):
+            raise ValueError(
+                "interior_min_size_m cannot exceed max_size_m"
+            )
     if not np.isfinite(float(config.gradation)) or float(config.gradation) < 0.0:
         raise ValueError("gradation must be finite and non-negative")
     if not np.isfinite(float(config.coastal_distance_m)) or float(config.coastal_distance_m) < 0.0:
@@ -961,6 +1524,17 @@ def _minimum_size(boundary: BoundaryNodes, config: SizeFieldConfig) -> float:
     targets = np.asarray(boundary.target_spacing_m, dtype=float)
     values.extend(targets[np.isfinite(targets) & (targets > 0.0)].tolist())
     return float(min(values))
+
+
+def _interior_minimum_size(
+    boundary: BoundaryNodes,
+    config: SizeFieldConfig,
+) -> float:
+    """Return the 2-D raster floor, independent of subgrid source chords."""
+
+    if config.interior_min_size_m is None:
+        return _minimum_size(boundary, config)
+    return float(config.interior_min_size_m)
 
 
 def _grid_mask(value: np.ndarray, shape: tuple[int, int], name: str) -> np.ndarray:
@@ -2027,10 +2601,43 @@ def write_size_field(
     schema_version = str(
         size_field.report.get("schema_version", "fvcom_size_field_v4")
     )
+    sampling_interface = dict(
+        size_field.report.get("sampling_interface") or {}
+    )
     dataset = xr.Dataset(
         variables,
         coords={"lon": size_field.lon, "lat": size_field.lat},
-        attrs={"schema_version": schema_version, "coverage_policy": "strict"},
+        attrs={
+            "schema_version": schema_version,
+            "coverage_policy": "strict",
+            "interior_min_size_m": float(
+                size_field.report.get("configured_min_size_m", np.nan)
+            ),
+            "boundary_trace_min_size_m": float(
+                size_field.report.get(
+                    "configured_boundary_trace_min_size_m",
+                    np.nan,
+                )
+            ),
+            "sampling_interface_schema_version": str(
+                sampling_interface.get(
+                    "schema_version",
+                    "not_configured",
+                )
+            ),
+            "sampling_interface_shared_inactive_halo_used": int(
+                bool(
+                    sampling_interface.get(
+                        "shared_inactive_halo_used",
+                        False,
+                    )
+                )
+            ),
+            "sampling_interface_report_json": json.dumps(
+                sampling_interface,
+                sort_keys=True,
+            ),
+        },
     )
     dataset["nearshore_size_source_attribution"].attrs["codes"] = json.dumps(
         size_field.report.get("source_attribution_codes", {}),

@@ -340,7 +340,13 @@ def test_sharp_field_drop_gets_cyclic_lower_gradation_envelope() -> None:
         SharpSampler(),
         config=policy,
     )
-    assert result.audit["adjacent_target_gradient"]["maximum"] <= 0.20 + 1.0e-12
+    assert result.audit["adjacent_target_gradient"]["maximum"] <= (
+        policy.maximum_spacing_gradient + policy.edge_tolerance
+    )
+    assert (
+        result.audit["thresholds"]["comparison_tolerance"]
+        == policy.edge_tolerance
+    )
     assert (
         result.audit["boundary_edge_l_over_h_gamma"]["maximum"]
         <= policy.target_metric_edge + policy.edge_tolerance

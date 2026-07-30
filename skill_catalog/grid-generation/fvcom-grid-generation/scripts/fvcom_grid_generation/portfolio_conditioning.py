@@ -49,6 +49,7 @@ from .regional_conditioning import (
     AreaTransitionRelaxConfig,
     relax_mesh_area_transitions,
 )
+from .size_field import recorded_size_interpolator
 from .sms_2dm import Mesh2DM, read_2dm, write_2dm
 
 
@@ -138,12 +139,37 @@ class _RegularGrid:
     source_path: Path
     source_sha256: str
     schema_version: str | None
+    domain_mask: np.ndarray | None = None
+    sampling_interface_schema_version: str | None = None
 
     def sample(self, lonlat: np.ndarray) -> np.ndarray:
         locations = np.asarray(lonlat, dtype=float)
         if locations.ndim != 2 or locations.shape[1] != 2:
             raise ValueError("Regular-grid samples require an N x 2 lon/lat array")
         query = np.column_stack((locations[:, 1], locations[:, 0]))
+        if self.sampling_interface_schema_version is not None:
+            sampled = recorded_size_interpolator(
+                self.lat,
+                self.lon,
+                self.values,
+                np.asarray(self.coverage, dtype=bool),
+                (
+                    np.asarray(self.domain_mask, dtype=bool)
+                    if self.domain_mask is not None
+                    else np.asarray(self.coverage, dtype=bool)
+                ),
+                self.sampling_interface_schema_version,
+            ).sample(query)
+            invalid = ~np.isfinite(sampled) | (sampled <= 0.0)
+            if np.any(invalid):
+                first = int(np.flatnonzero(invalid)[0])
+                raise ValueError(
+                    f"{self.value_name} sampling is outside finite positive "
+                    f"coverage for {int(np.count_nonzero(invalid))} point(s); "
+                    f"first lon/lat=({locations[first, 0]:.10f}, "
+                    f"{locations[first, 1]:.10f})"
+                )
+            return np.asarray(sampled, dtype=float)
         interpolation_values = np.where(
             np.asarray(self.coverage, dtype=bool),
             np.asarray(self.values, dtype=float),
@@ -431,6 +457,9 @@ def condition_portfolio_mesh(
         "size_field_nc": str(size_path),
         "size_field_sha256": size_field.source_sha256,
         "size_field_schema_version": size_field.schema_version,
+        "sampling_interface_schema_version": (
+            size_field.sampling_interface_schema_version
+        ),
         "bathymetry_netcdf": str(bathy_path),
         "bathymetry_sha256": bathymetry.source_sha256,
         "depth_sampling": (
@@ -501,6 +530,9 @@ def condition_portfolio_mesh(
                 "path": str(size_path),
                 "sha256": size_field.source_sha256,
                 "schema_version": size_field.schema_version,
+                "sampling_interface_schema_version": (
+                    size_field.sampling_interface_schema_version
+                ),
             },
             "immutable_bathymetry": {
                 "path": str(bathy_path),
@@ -947,6 +979,39 @@ def _load_canonical_size_field(path: Path) -> _RegularGrid:
             .values,
             dtype=bool,
         )
+        domain = (
+            np.asarray(
+                dataset["model_domain_mask"]
+                .transpose("lat", "lon")
+                .values,
+                dtype=bool,
+            )
+            if "model_domain_mask" in dataset
+            else coverage.copy()
+        )
+        sampling_interface_schema = str(
+            dataset.attrs.get(
+                "sampling_interface_schema_version",
+                "legacy_unspecified",
+            )
+        ).strip()
+    supported_sampling_interfaces = {
+        "legacy_unspecified",
+        "fvcom_size_sampling_halo_v1",
+        "fvcom_wet_mask_sampling_v1",
+        "fvcom_wet_mask_sampling_v2",
+    }
+    if sampling_interface_schema not in supported_sampling_interfaces:
+        raise ValueError(
+            "Unsupported canonical sampling interface schema "
+            f"{sampling_interface_schema!r}"
+        )
+    reverse_lon = bool(np.all(np.diff(lon) < 0.0))
+    reverse_lat = bool(np.all(np.diff(lat) < 0.0))
+    if reverse_lon:
+        domain = domain[:, ::-1]
+    if reverse_lat:
+        domain = domain[::-1, :]
     lon, lat, values, coverage = _normalize_regular_grid(
         lon,
         lat,
@@ -967,6 +1032,8 @@ def _load_canonical_size_field(path: Path) -> _RegularGrid:
         source_path=path,
         source_sha256=_sha256(path),
         schema_version=schema,
+        domain_mask=domain,
+        sampling_interface_schema_version=sampling_interface_schema,
     )
 
 

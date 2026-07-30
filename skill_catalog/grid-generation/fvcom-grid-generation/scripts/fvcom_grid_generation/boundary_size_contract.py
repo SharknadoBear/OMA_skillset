@@ -9,7 +9,8 @@ from typing import Any
 
 import numpy as np
 import xarray as xr
-from scipy.interpolate import RegularGridInterpolator
+
+from .size_field import recorded_size_interpolator
 
 
 SCHEMA_VERSION = "fvcom_boundary_interior_size_contract_v1"
@@ -77,7 +78,36 @@ def diagnose_boundary_size_contract(
             raise ValueError("size field has no mesh_size_m variable")
         lon = np.asarray(dataset["lon"].values, dtype=float)
         lat = np.asarray(dataset["lat"].values, dtype=float)
-        field = np.asarray(dataset["mesh_size_m"].values, dtype=float)
+        field = np.asarray(
+            dataset["mesh_size_m"].transpose("lat", "lon").values,
+            dtype=float,
+        )
+        coverage = (
+            np.asarray(
+                dataset["size_field_coverage_mask"]
+                .transpose("lat", "lon")
+                .values,
+                dtype=bool,
+            )
+            if "size_field_coverage_mask" in dataset
+            else np.isfinite(field) & (field > 0.0)
+        )
+        domain = (
+            np.asarray(
+                dataset["model_domain_mask"]
+                .transpose("lat", "lon")
+                .values,
+                dtype=bool,
+            )
+            if "model_domain_mask" in dataset
+            else coverage.copy()
+        )
+        sampling_interface_schema = str(
+            dataset.attrs.get(
+                "sampling_interface_schema_version",
+                "legacy_unspecified",
+            )
+        ).strip()
     if field.shape != (len(lat), len(lon)):
         raise ValueError("mesh_size_m dimensions do not match lat/lon")
     if len(lon) < 2 or len(lat) < 2:
@@ -85,17 +115,25 @@ def diagnose_boundary_size_contract(
     if lon[0] > lon[-1]:
         lon = lon[::-1]
         field = field[:, ::-1]
+        coverage = coverage[:, ::-1]
+        domain = domain[:, ::-1]
     if lat[0] > lat[-1]:
         lat = lat[::-1]
         field = field[::-1, :]
-    sampler = RegularGridInterpolator(
-        (lat, lon),
+        coverage = coverage[::-1, :]
+        domain = domain[::-1, :]
+    sampler = recorded_size_interpolator(
+        lat,
+        lon,
         field,
-        method="linear",
-        bounds_error=True,
+        coverage,
+        domain,
+        sampling_interface_schema,
     )
     interior_target = np.asarray(
-        sampler(np.column_stack([coordinates[:, 1], coordinates[:, 0]])),
+        sampler.sample(
+            np.column_stack([coordinates[:, 1], coordinates[:, 0]])
+        ),
         dtype=float,
     )
     if (

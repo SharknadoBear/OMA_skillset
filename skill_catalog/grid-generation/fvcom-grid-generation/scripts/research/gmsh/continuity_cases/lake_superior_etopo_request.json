@@ -1,0 +1,28 @@
+{
+  "schema_version": "cudem_bathy_request_v1",
+  "name": "lake_superior_etopo_full_lake",
+  "case_id": "lake_superior",
+  "bbox_wsen": [
+    -92.2,
+    46.25,
+    -84.0,
+    49.1
+  ],
+  "source_order": [
+    "etopo"
+  ],
+  "target_spacing_arcsec": 15.0,
+  "estimated_bytes": 134217728,
+  "estimate_basis": "Conservative 128 MiB cap for two request-bounded NOAA ETOPO 2022 OPeNDAP slabs and local NetCDF products; the final 15 arc-second grid is approximately 1.35 million cells.",
+  "source_tiles": [
+    {
+      "name": "ETOPO_2022_v1_15s_N60W105_surface.nc",
+      "url": "https://www.ngdc.noaa.gov/thredds/dodsC/global/ETOPO2022/15s/15s_surface_elev_netcdf/ETOPO_2022_v1_15s_N60W105_surface.nc"
+    },
+    {
+      "name": "ETOPO_2022_v1_15s_N60W090_surface.nc",
+      "url": "https://www.ngdc.noaa.gov/thredds/dodsC/global/ETOPO2022/15s/15s_surface_elev_netcdf/ETOPO_2022_v1_15s_N60W090_surface.nc"
+    }
+  ],
+  "vertical_datum_policy": "ETOPO elevation is EGM2008; convert to positive-down depth using Lake Superior LWD 183.2 m IGLD 1985 without claiming a vertical datum transformation."
+}

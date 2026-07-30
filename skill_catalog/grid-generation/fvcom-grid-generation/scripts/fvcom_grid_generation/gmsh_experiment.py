@@ -27,6 +27,11 @@ from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, P
 from shapely.ops import unary_union
 
 from .bathymetry import BathymetryGrid, load_bathymetry
+from .node_budget import (
+    DEFAULT_HARD_NODE_LIMIT,
+    DEFAULT_PREFLIGHT_NODE_LIMIT,
+    DEFAULT_SPACING_QUANTUM_M,
+)
 from .projection import (
     LocalProjection,
     local_utm_projection,
@@ -40,12 +45,12 @@ from .sms_2dm import read_2dm, write_2dm
 
 SCHEMA_VERSION = "gmsh_fvcom_experiment_v1"
 GMSH_VERSION = "4.15.2"
-DEFAULT_NODE_LIMIT = 150_000
-DEFAULT_PREFLIGHT_LIMIT = 135_000
+DEFAULT_NODE_LIMIT = DEFAULT_HARD_NODE_LIMIT
+DEFAULT_PREFLIGHT_LIMIT = DEFAULT_PREFLIGHT_NODE_LIMIT
 DEFAULT_NEAR_SIZE_M = 8_000.0
 DEFAULT_NEAR_DISTANCE_M = 10_000.0
 DEFAULT_FAR_DISTANCE_M = 70_000.0
-DEFAULT_STEP_M = 25.0
+DEFAULT_STEP_M = DEFAULT_SPACING_QUANTUM_M
 
 
 @dataclass(frozen=True)
@@ -102,6 +107,61 @@ def load_case_manifest(path: str | Path) -> dict[str, Any]:
     if input_kind not in {"adaptive_v2", "model_loops_v1"}:
         raise ValueError(f"Unsupported boundary.input_kind={input_kind!r}")
     return payload
+
+
+def reject_protected_case_input_overrides(
+    manifest: dict[str, Any],
+    *,
+    bathymetry_override: str | Path | None = None,
+    boundary_loop_override: str | Path | None = None,
+    adaptive_resolution_override: str | Path | None = None,
+) -> None:
+    """Keep fail-closed preparation cases bound to validated inputs.
+
+    Lake Superior is authorized by an immutable readiness artifact whose
+    hashes bind the exact boundary package and bathymetry selected in the case
+    manifest. An explicit path override would otherwise replace one of those
+    inputs after validation. Require a newly validated bound manifest instead.
+    """
+
+    overrides = [
+        name
+        for name, value in (
+            ("bathymetry_override", bathymetry_override),
+            ("boundary_loop_override", boundary_loop_override),
+            ("adaptive_resolution_override", adaptive_resolution_override),
+        )
+        if value is not None
+    ]
+    if manifest.get("case_id") == "lake_superior" and overrides:
+        raise ValueError(
+            "Lake Superior explicit input overrides are prohibited because "
+            "its readiness artifact binds the active inputs; create and "
+            "validate a fresh bound case manifest instead. Overrides: "
+            + ", ".join(overrides)
+        )
+
+
+def assert_readiness_manifest_binding(
+    readiness: dict[str, Any],
+    prepared_manifest_sha256: str,
+) -> None:
+    """Reject a case manifest changed between readiness and preparation."""
+
+    readiness_hash = (
+        (readiness.get("input_hashes") or {})
+        .get("case_manifest", {})
+        .get("sha256")
+    )
+    if not isinstance(readiness_hash, str) or not readiness_hash.strip():
+        raise RuntimeError(
+            "readiness report does not bind the case manifest hash"
+        )
+    if readiness_hash.lower() != str(prepared_manifest_sha256).lower():
+        raise RuntimeError(
+            "case manifest changed between readiness validation and "
+            "input preparation"
+        )
 
 
 def resolve_input_path(value: str | None, workspace_root: str | Path) -> Path | None:
@@ -214,6 +274,212 @@ def file_sha256(path: str | Path, chunk_bytes: int = 1 << 20) -> str:
     return digest.hexdigest()
 
 
+def validate_readiness_artifact(
+    manifest: dict[str, Any],
+    workspace_root: str | Path,
+    active_paths: dict[str, Path],
+) -> tuple[dict[str, Any] | None, Path | None]:
+    """Validate an immutable case-preparation readiness artifact contract.
+
+    The artifact digest binds the case manifest to one exact validation
+    result. Selected hashes inside that result are also compared with the
+    active boundary and bathymetry inputs so a valid but stale report cannot
+    authorize a different preparation package. The contract is optional for
+    legacy cases but mandatory and fail-closed for Lake Superior.
+    """
+    contract = (manifest.get("readiness") or {}).get("validation_artifact")
+    if contract is None:
+        if manifest.get("case_id") == "lake_superior":
+            return (
+                {
+                    "configured": False,
+                    "path": None,
+                    "blockers": [
+                        "readiness_validation_artifact_contract_required"
+                    ],
+                    "warnings": [],
+                    "passed": False,
+                },
+                None,
+            )
+        return None, None
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+    if not isinstance(contract, dict):
+        return (
+            {
+                "configured": True,
+                "path": None,
+                "blockers": [
+                    "readiness_validation_artifact_contract_not_an_object"
+                ],
+                "warnings": [],
+                "passed": False,
+            },
+            None,
+        )
+
+    path_value = contract.get("path")
+    expected_sha256 = str(contract.get("sha256", "")).lower()
+    schema_version = contract.get("schema_version")
+    required_status = contract.get("required_status")
+    required_checks = contract.get("required_checks")
+    required_input_hashes = contract.get("required_input_hashes")
+    if not isinstance(path_value, str) or not path_value.strip():
+        blockers.append("readiness_validation_contract_path_invalid")
+    try:
+        sha_is_valid = (
+            len(expected_sha256) == 64
+            and int(expected_sha256, 16) >= 0
+        )
+    except ValueError:
+        sha_is_valid = False
+    if not sha_is_valid:
+        blockers.append("readiness_validation_contract_sha256_invalid")
+    if not isinstance(schema_version, str) or not schema_version.strip():
+        blockers.append("readiness_validation_contract_schema_invalid")
+    if required_status != "ready":
+        blockers.append("readiness_validation_contract_status_invalid")
+
+    def valid_required_names(value: Any) -> bool:
+        return bool(
+            isinstance(value, list)
+            and value
+            and all(isinstance(name, str) and name.strip() for name in value)
+            and len(set(value)) == len(value)
+        )
+
+    if not valid_required_names(required_checks):
+        blockers.append("readiness_validation_contract_checks_invalid")
+        required_checks = []
+    if not valid_required_names(required_input_hashes):
+        blockers.append("readiness_validation_contract_input_hashes_invalid")
+        required_input_hashes = []
+
+    artifact_path = resolve_input_path(
+        path_value if isinstance(path_value, str) else None,
+        workspace_root,
+    )
+    report: dict[str, Any] = {
+        "configured": True,
+        "path": str(artifact_path) if artifact_path is not None else None,
+        "expected_sha256": expected_sha256,
+        "actual_sha256": None,
+        "hash_matches": False,
+        "expected_schema_version": schema_version,
+        "actual_schema_version": None,
+        "expected_status": required_status,
+        "actual_status": None,
+        "required_checks": list(required_checks),
+        "required_input_hashes": list(required_input_hashes),
+        "blockers": blockers,
+        "warnings": warnings,
+        "passed": False,
+    }
+    if artifact_path is None or not artifact_path.is_file():
+        blockers.append("readiness_validation_artifact_missing")
+        return report, artifact_path
+
+    actual_sha256 = file_sha256(artifact_path)
+    report["actual_sha256"] = actual_sha256
+    report["hash_matches"] = bool(
+        actual_sha256 == report["expected_sha256"]
+    )
+    if not report["hash_matches"]:
+        blockers.append("readiness_validation_artifact_hash_mismatch")
+
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        blockers.append(
+            "readiness_validation_artifact_unreadable: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return report, artifact_path
+    if not isinstance(payload, dict):
+        blockers.append("readiness_validation_artifact_not_an_object")
+        return report, artifact_path
+
+    report["actual_schema_version"] = payload.get("schema_version")
+    report["actual_status"] = payload.get("status")
+    report["artifact_case_id"] = payload.get("case_id")
+    if payload.get("schema_version") != contract.get("schema_version"):
+        blockers.append("readiness_validation_artifact_schema_mismatch")
+    if payload.get("case_id") != manifest.get("case_id"):
+        blockers.append("readiness_validation_artifact_case_id_mismatch")
+    if payload.get("status") != contract.get("required_status"):
+        blockers.append("readiness_validation_artifact_status_not_ready")
+    if payload.get("failed_checks") != []:
+        blockers.append("readiness_validation_artifact_has_failed_checks")
+
+    checks = payload.get("checks")
+    if not isinstance(checks, dict):
+        blockers.append("readiness_validation_artifact_checks_missing")
+        checks = {}
+    required_check_results: dict[str, bool] = {}
+    for name in report["required_checks"]:
+        passed = checks.get(name) is True
+        required_check_results[str(name)] = passed
+        if not passed:
+            blockers.append(
+                f"readiness_validation_required_check_failed:{name}"
+            )
+    false_check_names = sorted(
+        str(name) for name, passed in checks.items() if passed is not True
+    )
+    if false_check_names:
+        blockers.append(
+            "readiness_validation_artifact_contains_nonpassing_checks:"
+            + ",".join(false_check_names)
+        )
+    report["required_check_results"] = required_check_results
+
+    evidence_hashes = payload.get("artifact_hashes")
+    if not isinstance(evidence_hashes, dict):
+        evidence_hashes = {}
+    input_hash_results: dict[str, dict[str, Any]] = {}
+    for name in report["required_input_hashes"]:
+        active_path = active_paths.get(str(name))
+        evidence_record = evidence_hashes.get(str(name))
+        evidence_sha256 = (
+            str(evidence_record.get("sha256", "")).lower()
+            if isinstance(evidence_record, dict)
+            else ""
+        )
+        active_sha256 = (
+            file_sha256(active_path)
+            if active_path is not None and active_path.is_file()
+            else None
+        )
+        matches = bool(
+            active_sha256
+            and evidence_sha256
+            and active_sha256 == evidence_sha256
+        )
+        input_hash_results[str(name)] = {
+            "active_path": str(active_path) if active_path is not None else None,
+            "active_sha256": active_sha256,
+            "evidence_sha256": evidence_sha256 or None,
+            "matches": matches,
+        }
+        if active_path is None or not active_path.is_file():
+            blockers.append(
+                f"readiness_validation_active_input_missing:{name}"
+            )
+        elif not evidence_sha256:
+            blockers.append(
+                f"readiness_validation_evidence_input_hash_missing:{name}"
+            )
+        elif not matches:
+            blockers.append(
+                f"readiness_validation_evidence_input_hash_mismatch:{name}"
+            )
+    report["input_hash_results"] = input_hash_results
+    report["passed"] = not blockers
+    return report, artifact_path
+
+
 def target_size_m(
     distance_to_obc_m: np.ndarray | float,
     h_uniform_m: float,
@@ -308,7 +574,7 @@ def select_uniform_target_m(
     has_open_boundary: bool,
     config: BudgetConfig | None = None,
 ) -> tuple[float, float]:
-    """Select the smallest 25 m multiple satisfying the preflight threshold."""
+    """Select the smallest spacing-quantum multiple within the planning budget."""
     config = config or BudgetConfig()
     step = float(config.step_m)
     lower_index = max(1, int(math.ceil(float(bathymetry_floor_m) / step)))
@@ -1048,7 +1314,11 @@ def bathymetry_resolution_floor_m(
     multiplier: float = 3.0,
     roundup_m: float = DEFAULT_STEP_M,
 ) -> tuple[float, dict[str, float]]:
-    """Return 3*sqrt(projected p95 dx*p95 dy), rounded upward to 25 m."""
+    """Return the raster-supported floor rounded up to ``roundup_m``.
+
+    The projected p95 cell dimensions determine bathymetry capability.
+    ``roundup_m`` is only a deterministic numerical quantum.
+    """
     lon = np.asarray(bathymetry.lon, dtype=float)
     lat = np.asarray(bathymetry.lat, dtype=float)
     if lon.ndim != 1 or lat.ndim != 1 or len(lon) < 2 or len(lat) < 2:
@@ -1283,6 +1553,20 @@ def check_case_readiness(
         except Exception as exc:
             blockers.append(f"bathymetry_unreadable: {exc}")
 
+    readiness_validation, readiness_artifact_path = validate_readiness_artifact(
+        manifest,
+        workspace,
+        paths,
+    )
+    if readiness_validation is not None:
+        blockers.extend(readiness_validation["blockers"])
+        warnings.extend(readiness_validation["warnings"])
+        if (
+            readiness_artifact_path is not None
+            and readiness_artifact_path.is_file()
+        ):
+            paths["readiness_validation_artifact"] = readiness_artifact_path
+
     input_hashes = {
         key: {"path": str(path), "sha256": file_sha256(path)}
         for key, path in paths.items()
@@ -1297,6 +1581,7 @@ def check_case_readiness(
         "warnings": warnings,
         "geometry": geometry_report,
         "bathymetry": bathy_report,
+        "readiness_validation": readiness_validation,
         "input_hashes": input_hashes,
     }
 
@@ -2047,6 +2332,13 @@ def run_gmsh_experiment(
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Run directory must be fresh and empty: {output}")
 
+    override_policy_manifest = load_case_manifest(case_manifest_path)
+    reject_protected_case_input_overrides(
+        override_policy_manifest,
+        bathymetry_override=bathymetry_override,
+        boundary_loop_override=boundary_loop_override,
+        adaptive_resolution_override=adaptive_resolution_override,
+    )
     readiness = None
     if (
         bathymetry_override is None
@@ -2066,6 +2358,20 @@ def run_gmsh_experiment(
         boundary_loop_override=boundary_loop_override,
         adaptive_resolution_override=adaptive_resolution_override,
     )
+    # Repeat the check on the manifest loaded by ``prepare_case`` so a
+    # concurrent case-file replacement cannot turn a legacy override run into
+    # a protected Lake Superior run after the initial policy check.
+    reject_protected_case_input_overrides(
+        prepared.manifest,
+        bathymetry_override=bathymetry_override,
+        boundary_loop_override=boundary_loop_override,
+        adaptive_resolution_override=adaptive_resolution_override,
+    )
+    if readiness is not None:
+        assert_readiness_manifest_binding(
+            readiness,
+            prepared.manifest_sha256,
+        )
     coverage = bathymetry_coverage_report(
         prepared.bathymetry,
         prepared.source_domain_lonlat,
@@ -2426,6 +2732,7 @@ __all__ = [
     "run_gmsh_experiment",
     "select_uniform_target_m",
     "target_size_m",
+    "validate_readiness_artifact",
     "validate_reversed_threshold_direction",
     "write_contextual_quality_deltas",
 ]

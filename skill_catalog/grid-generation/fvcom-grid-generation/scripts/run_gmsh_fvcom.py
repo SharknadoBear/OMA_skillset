@@ -10,6 +10,8 @@ import sys
 
 from fvcom_grid_generation.gmsh_experiment import (
     BudgetConfig,
+    DEFAULT_NODE_LIMIT,
+    DEFAULT_PREFLIGHT_LIMIT,
     check_case_readiness,
     run_gmsh_experiment,
 )
@@ -36,8 +38,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--boundary-loop-package", type=Path)
     parser.add_argument("--adaptive-resolution-manifest", type=Path)
     parser.add_argument("--bathymetry-netcdf", type=Path)
-    parser.add_argument("--preflight-node-threshold", type=int, default=135_000)
-    parser.add_argument("--hard-node-cap", type=int, default=150_000)
+    parser.add_argument(
+        "--preflight-node-threshold",
+        type=int,
+        default=DEFAULT_PREFLIGHT_LIMIT,
+        help=(
+            "Planning threshold used to select h_u "
+            f"(default: {DEFAULT_PREFLIGHT_LIMIT:,}; reserves headroom)."
+        ),
+    )
+    parser.add_argument(
+        "--hard-node-cap",
+        type=int,
+        default=DEFAULT_NODE_LIMIT,
+        help=(
+            "Maximum delivered mesh node count "
+            f"(default: {DEFAULT_NODE_LIMIT:,})."
+        ),
+    )
     parser.add_argument("--integration-max-cells", type=int, default=250_000)
     parser.add_argument(
         "--check-only",

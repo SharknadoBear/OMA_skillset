@@ -40,6 +40,8 @@ def audit_edge_target_sizes(
     thresholds: Sequence[float] = DEFAULT_THRESHOLDS,
     boundary_gradation_limit: float = 0.20,
     boundary_field_ratio_limit: float = 2.0,
+    boundary_first_ring_p95_limit: float = 1.5,
+    boundary_first_ring_maximum_limit: float = 2.0,
 ) -> dict[str, Any]:
     """Audit unique-edge ``L/h`` and boundary-to-interior transition strata.
 
@@ -69,14 +71,21 @@ def audit_edge_target_sizes(
         Number of triangle graph rings after ``first_ring`` assigned to the
         transition stratum.
     thresholds
-        Strict ``L/h`` exceedance thresholds reported for every stratum.
+        Strict ``L/h`` exceedance thresholds reported for every stratum. The
+        smallest value is the hard all-triangle p95 limit and the largest is
+        the hard all-triangle maximum limit.
     boundary_gradation_limit
         Maximum advisory adjacent-edge target and realized-size slope,
         ``abs(delta h) / distance_between_edge_midpoints``.
     boundary_field_ratio_limit
         Hard symmetric-ratio limit between the conservative explicit boundary
         target and conservative two-dimensional field target sampled on the
-        same constraint edge.  The production contract uses exactly ``2.0``.
+        same constraint edge. The generic default is ``2.0``; the raw mesher
+        portfolio currently overrides it with its stricter common policy.
+    boundary_first_ring_p95_limit, boundary_first_ring_maximum_limit
+        Hard limits on the realized symmetric ratio between each constraint
+        edge length and the equilateral-side characteristic length of every
+        incident boundary-row triangle.
     """
 
     points = np.asarray(points_xy, dtype=float)
@@ -108,6 +117,25 @@ def audit_edge_target_sizes(
     ):
         raise ValueError(
             "boundary_field_ratio_limit must be finite and greater than one"
+        )
+    if (
+        not np.isfinite(boundary_first_ring_p95_limit)
+        or boundary_first_ring_p95_limit < 1.0
+    ):
+        raise ValueError(
+            "boundary_first_ring_p95_limit must be finite and at least one"
+        )
+    if (
+        not np.isfinite(boundary_first_ring_maximum_limit)
+        or boundary_first_ring_maximum_limit < 1.0
+    ):
+        raise ValueError(
+            "boundary_first_ring_maximum_limit must be finite and at least one"
+        )
+    if boundary_first_ring_p95_limit > boundary_first_ring_maximum_limit:
+        raise ValueError(
+            "boundary_first_ring_p95_limit cannot exceed "
+            "boundary_first_ring_maximum_limit"
         )
 
     chains = _normalize_chains(constraint_chains, len(points))
@@ -239,20 +267,45 @@ def audit_edge_target_sizes(
         for stratum in STRATA
     }
     triangle_reports["all"] = _ratio_summary(triangle_ratios, threshold_values)
+    target_size_gate = _target_size_hard_gate(
+        triangle_reports["all"],
+        edge_summary=edge_reports["all"],
+        p95_limit=float(threshold_values[0]),
+        maximum_limit=float(threshold_values[-1]),
+    )
     boundary_field_interface = _boundary_field_interface_diagnostic(
         is_constraint,
         boundary_samples,
         field_samples,
         float(boundary_field_ratio_limit),
     )
+    boundary_first_ring = _boundary_first_ring_continuity(
+        chains,
+        edge_lookup,
+        edge_triangles,
+        lengths,
+        points,
+        tris,
+        p95_limit=float(boundary_first_ring_p95_limit),
+        maximum_limit=float(boundary_first_ring_maximum_limit),
+    )
+    failures = sorted(
+        set(
+            list(boundary_field_interface["failure_taxonomy"])
+            + list(boundary_first_ring["failure_taxonomy"])
+            + list(target_size_gate["failure_taxonomy"])
+        )
+    )
 
     return {
         "schema": SCHEMA,
         "schema_version": 1,
-        "passed": bool(boundary_field_interface["passed"]),
-        "failure_taxonomy": list(
-            boundary_field_interface["failure_taxonomy"]
+        "passed": bool(
+            boundary_field_interface["passed"]
+            and boundary_first_ring["passed"]
+            and target_size_gate["passed"]
         ),
+        "failure_taxonomy": failures,
         "method": {
             "edge_target_sampling": "minimum_of_endpoints_and_midpoint",
             "triangle_l_over_h": "maximum_of_three_incident_edge_ratios",
@@ -267,6 +320,16 @@ def audit_edge_target_sizes(
             "strict_threshold_comparison": True,
             "boundary_gradation_limit": float(boundary_gradation_limit),
             "boundary_field_ratio_limit": float(boundary_field_ratio_limit),
+            "boundary_first_ring_characteristic_length": (
+                "equilateral_side_with_incident_triangle_area_"
+                "sqrt_4A_over_sqrt3"
+            ),
+            "boundary_first_ring_p95_limit": float(
+                boundary_first_ring_p95_limit
+            ),
+            "boundary_first_ring_maximum_limit": float(
+                boundary_first_ring_maximum_limit
+            ),
         },
         "counts": {
             "nodes": int(len(points)),
@@ -283,7 +346,9 @@ def audit_edge_target_sizes(
         },
         "edge_l_over_h": edge_reports,
         "triangle_l_over_h": triangle_reports,
+        "target_size_hard_gate": target_size_gate,
         "boundary_field_interface": boundary_field_interface,
+        "boundary_first_ring_realized_continuity": boundary_first_ring,
         "stratum_counts": {
             "edges": {
                 stratum: int(np.count_nonzero(edge_strata == stratum))
@@ -542,6 +607,61 @@ def _ratio_summary(
     return summary
 
 
+def _target_size_hard_gate(
+    triangle_summary: Mapping[str, Any],
+    *,
+    edge_summary: Mapping[str, Any],
+    p95_limit: float,
+    maximum_limit: float,
+) -> dict[str, Any]:
+    """Evaluate all-triangle limits while requiring every edge to be valid."""
+
+    p95 = triangle_summary.get("quantiles", {}).get("p95")
+    maximum = triangle_summary.get("maximum")
+    invalid_edge_count = int(edge_summary.get("invalid_count", 0))
+    invalid_triangle_count = int(
+        triangle_summary.get("invalid_count", 0)
+    )
+    invalid = bool(
+        invalid_edge_count > 0
+        or invalid_triangle_count > 0
+        or p95 is None
+        or maximum is None
+    )
+    p95_exceeded = bool(
+        p95 is not None and float(p95) > float(p95_limit)
+    )
+    maximum_exceeded = bool(
+        maximum is not None and float(maximum) > float(maximum_limit)
+    )
+    failures: list[str] = []
+    if invalid:
+        failures.append("edge_aware_target_size_invalid")
+    if p95_exceeded:
+        failures.append("edge_aware_target_size_p95_exceeded")
+    if maximum_exceeded:
+        failures.append("edge_aware_target_size_maximum_exceeded")
+    return {
+        "definition": (
+            "all_edges_valid_and_all_triangle_maximum_incident_edge_l_over_h"
+        ),
+        "p95": p95,
+        "maximum": maximum,
+        "limits": {
+            "p95": float(p95_limit),
+            "maximum": float(maximum_limit),
+            "comparison": "inclusive_limit_passes",
+        },
+        "invalid_count": invalid_edge_count + invalid_triangle_count,
+        "invalid_edge_count": invalid_edge_count,
+        "invalid_triangle_count": invalid_triangle_count,
+        "p95_exceeded": p95_exceeded,
+        "maximum_exceeded": maximum_exceeded,
+        "passed": not failures,
+        "failure_taxonomy": failures,
+    }
+
+
 def _boundary_field_interface_diagnostic(
     is_constraint: np.ndarray,
     boundary_samples: np.ndarray,
@@ -609,15 +729,22 @@ def _boundary_field_interface_diagnostic(
     if np.any(invalid_field):
         failures.append("boundary_field_interface_2d_target_incomplete")
     if np.any(exceeds):
-        failures.append("boundary_field_interface_factor_two_jump")
+        failures.append("boundary_field_interface_ratio_limit_exceeded")
 
     ratio_summary = _value_summary(edge_ratio[evaluated])
     ratio_summary["limit"] = float(ratio_limit)
-    ratio_summary["above_limit_count"] = int(np.count_nonzero(exceeds))
+    edge_exceedance_count = int(np.count_nonzero(exceeds))
+    ratio_summary["above_limit_count"] = edge_exceedance_count
     pointwise_summary = _value_summary(pointwise_ratio[evaluated].reshape(-1))
     pointwise_summary["limit"] = float(ratio_limit)
-    pointwise_summary["above_limit_count"] = int(
+    sample_exceedance_count = int(
         np.count_nonzero(pointwise_ratio[evaluated] > float(ratio_limit))
+    )
+    pointwise_summary["above_limit_count"] = sample_exceedance_count
+    limit_passed = bool(
+        not np.any(missing_boundary)
+        and not np.any(invalid_field)
+        and not np.any(exceeds)
     )
     return {
         "definition": (
@@ -627,6 +754,7 @@ def _boundary_field_interface_diagnostic(
         "sample_locations": ["endpoint_a", "endpoint_b", "midpoint"],
         "reduction": "maximum_pointwise_symmetric_ratio",
         "strict_limit_comparison": True,
+        "ratio_limit": float(ratio_limit),
         "factor_two_limit": float(ratio_limit),
         "constraint_edge_count": int(np.count_nonzero(constraint)),
         "evaluated_edge_count": int(np.count_nonzero(evaluated)),
@@ -644,19 +772,211 @@ def _boundary_field_interface_diagnostic(
         ),
         "symmetric_ratio": ratio_summary,
         "pointwise_symmetric_ratio": pointwise_summary,
-        "factor_two_exceedance_count": int(np.count_nonzero(exceeds)),
-        "factor_two_sample_exceedance_count": int(
-            np.count_nonzero(
-                pointwise_ratio[evaluated] > float(ratio_limit)
-            )
-        ),
-        "factor_two_passed": bool(
-            not np.any(missing_boundary)
-            and not np.any(invalid_field)
-            and not np.any(exceeds)
-        ),
+        "ratio_limit_exceedance_count": edge_exceedance_count,
+        "ratio_limit_sample_exceedance_count": sample_exceedance_count,
+        "ratio_limit_passed": limit_passed,
+        # Retain these top-level fields because archived comparison consumers
+        # read them directly. They are aliases only: their values always
+        # follow the configured ratio limit, which need not equal two.
+        "factor_two_exceedance_count": edge_exceedance_count,
+        "factor_two_sample_exceedance_count": sample_exceedance_count,
+        "factor_two_passed": limit_passed,
+        "legacy_compatibility_aliases": {
+            "deprecated": True,
+            "semantic_note": (
+                "factor_two names are historical aliases; values follow "
+                "the configured ratio_limit and do not imply a limit of 2"
+            ),
+            "aliases": {
+                "factor_two_limit": "ratio_limit",
+                "factor_two_exceedance_count": (
+                    "ratio_limit_exceedance_count"
+                ),
+                "factor_two_sample_exceedance_count": (
+                    "ratio_limit_sample_exceedance_count"
+                ),
+                "factor_two_passed": "ratio_limit_passed",
+            },
+        },
         "failure_taxonomy": failures,
         "passed": not failures,
+    }
+
+
+def _boundary_first_ring_continuity(
+    chains: Sequence[Mapping[str, Any]],
+    edge_lookup: Mapping[tuple[int, int], int],
+    edge_triangles: Sequence[Sequence[int]],
+    edge_lengths: np.ndarray,
+    points: np.ndarray,
+    triangles: np.ndarray,
+    *,
+    p95_limit: float,
+    maximum_limit: float,
+) -> dict[str, Any]:
+    """Compare realized boundary edges with their incident triangle scale."""
+
+    triangle_xy = np.asarray(points, dtype=float)[
+        np.asarray(triangles, dtype=np.int64)
+    ]
+    twice_area = np.abs(
+        (triangle_xy[:, 1, 0] - triangle_xy[:, 0, 0])
+        * (triangle_xy[:, 2, 1] - triangle_xy[:, 0, 1])
+        - (triangle_xy[:, 1, 1] - triangle_xy[:, 0, 1])
+        * (triangle_xy[:, 2, 0] - triangle_xy[:, 0, 0])
+    )
+    triangle_area = 0.5 * twice_area
+    characteristic = np.sqrt(
+        4.0 * triangle_area / np.sqrt(3.0)
+    )
+
+    global_values: list[float] = []
+    global_pairs: set[tuple[int, int]] = set()
+    global_invalid_pairs: set[tuple[int, int]] = set()
+    chain_reports: list[dict[str, Any]] = []
+    chain_p95_exceedance_count = 0
+    chain_maximum_exceedance_count = 0
+
+    for chain in chains:
+        values: list[float] = []
+        invalid_count = 0
+        incident_count = 0
+        for edge in chain["edges"]:
+            edge_index = int(edge_lookup[edge])
+            owners = edge_triangles[edge_index]
+            if not owners:
+                invalid_count += 1
+                continue
+            for raw_triangle_index in owners:
+                triangle_index = int(raw_triangle_index)
+                incident_count += 1
+                pair = (edge_index, triangle_index)
+                edge_length = float(edge_lengths[edge_index])
+                triangle_length = float(characteristic[triangle_index])
+                if (
+                    not np.isfinite(edge_length)
+                    or edge_length <= 0.0
+                    or not np.isfinite(triangle_length)
+                    or triangle_length <= 0.0
+                ):
+                    invalid_count += 1
+                    global_invalid_pairs.add(pair)
+                    continue
+                ratio = _symmetric_ratio(edge_length, triangle_length)
+                values.append(ratio)
+                if pair not in global_pairs:
+                    global_pairs.add(pair)
+                    global_values.append(ratio)
+
+        summary = _value_summary(values)
+        p95 = summary["quantiles"]["p95"]
+        maximum = summary["maximum"]
+        p95_exceeded = bool(
+            p95 is not None and float(p95) > float(p95_limit)
+        )
+        maximum_exceeded = bool(
+            maximum is not None and float(maximum) > float(maximum_limit)
+        )
+        if p95_exceeded:
+            chain_p95_exceedance_count += 1
+        if maximum_exceeded:
+            chain_maximum_exceedance_count += 1
+        chain_failures: list[str] = []
+        if invalid_count:
+            chain_failures.append(
+                "boundary_first_ring_characteristic_length_invalid"
+            )
+        if p95_exceeded:
+            chain_failures.append(
+                "boundary_first_ring_realized_ratio_p95_exceeded"
+            )
+        if maximum_exceeded:
+            chain_failures.append(
+                "boundary_first_ring_realized_ratio_maximum_exceeded"
+            )
+        chain_reports.append(
+            {
+                "chain_id": str(chain["chain_id"]),
+                "cyclic": bool(chain["cyclic"]),
+                "constraint_edge_count": int(len(chain["edges"])),
+                "incident_triangle_count": int(incident_count),
+                "invalid_incident_count": int(invalid_count),
+                "symmetric_ratio": summary,
+                "p95_exceeded": p95_exceeded,
+                "maximum_exceeded": maximum_exceeded,
+                "passed": not chain_failures,
+                "failure_taxonomy": chain_failures,
+            }
+        )
+
+    global_summary = _value_summary(global_values)
+    global_p95 = global_summary["quantiles"]["p95"]
+    global_maximum = global_summary["maximum"]
+    global_p95_exceeded = bool(
+        global_p95 is not None and float(global_p95) > float(p95_limit)
+    )
+    global_maximum_exceeded = bool(
+        global_maximum is not None
+        and float(global_maximum) > float(maximum_limit)
+    )
+    invalid_count = int(len(global_invalid_pairs))
+    failures: list[str] = []
+    if invalid_count or any(
+        int(record["invalid_incident_count"]) > 0
+        for record in chain_reports
+    ):
+        failures.append("boundary_first_ring_characteristic_length_invalid")
+    if global_p95_exceeded or chain_p95_exceedance_count:
+        failures.append("boundary_first_ring_realized_ratio_p95_exceeded")
+    if global_maximum_exceeded or chain_maximum_exceedance_count:
+        failures.append(
+            "boundary_first_ring_realized_ratio_maximum_exceeded"
+        )
+
+    return {
+        "definition": (
+            "symmetric ratio max(L_boundary/h_incident, "
+            "h_incident/L_boundary) for each constraint edge and each "
+            "incident boundary-row triangle"
+        ),
+        "first_ring_interpretation": (
+            "triangle directly incident to a constraint edge"
+        ),
+        "triangle_characteristic_length": (
+            "equilateral side with equal area: sqrt(4*A/sqrt(3))"
+        ),
+        "limits": {
+            "p95": float(p95_limit),
+            "maximum": float(maximum_limit),
+            "comparison": "inclusive_limit_passes",
+        },
+        "global": {
+            "constraint_edge_count": int(
+                len(
+                    {
+                        int(edge_lookup[edge])
+                        for chain in chains
+                        for edge in chain["edges"]
+                    }
+                )
+            ),
+            "incident_triangle_count": int(
+                len(global_pairs | global_invalid_pairs)
+            ),
+            "invalid_incident_count": invalid_count,
+            "symmetric_ratio": global_summary,
+            "p95_exceeded": global_p95_exceeded,
+            "maximum_exceeded": global_maximum_exceeded,
+            "chain_p95_exceedance_count": int(
+                chain_p95_exceedance_count
+            ),
+            "chain_maximum_exceedance_count": int(
+                chain_maximum_exceedance_count
+            ),
+        },
+        "chains": chain_reports,
+        "passed": not failures,
+        "failure_taxonomy": failures,
     }
 
 

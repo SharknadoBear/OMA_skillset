@@ -62,8 +62,8 @@
     "status": "available"
   },
   "budget": {
-    "preflight_node_threshold": 135000,
-    "hard_node_cap": 150000,
+    "preflight_node_threshold": 900000,
+    "hard_node_cap": 1000000,
     "hu_increment_m": 25,
     "overflow_reruns": 1
   },

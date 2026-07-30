@@ -1,0 +1,115 @@
+{
+  "$schema": "../case-manifest.schema.json",
+  "schema_version": "gmsh_fvcom_case_v1",
+  "case_id": "lake_superior",
+  "display_name": "Lake Superior",
+  "execution_order": 3,
+  "experiment_status": "proposed",
+  "domain_type": "closed_lake",
+  "projected_crs": "EPSG:32616",
+  "boundary": {
+    "input_kind": "adaptive_v2",
+    "resolution_manifest": "Workspace/Preprocessing/fvcom-grid-generation/runs/cont2_lsup_prep_20260730/03_lake_superior/prep_boundary_v5/boundary_resolution_manifest.json",
+    "model_boundary_loops_gpkg": null,
+    "model_boundary_loop_manifest": null,
+    "expected_open_boundary_count": 0,
+    "open_boundaries": [],
+    "expected_island_holes": 45,
+    "preserve_source_vertices": true,
+    "allow_gmsh_boundary_insertion": true,
+    "negative_rejection_fixtures": [],
+    "build_policy": [
+      "retain the Lake Superior portion of the joined upper-Great-Lakes GSHHG L2 feature",
+      "select the shortest accepted St. Marys water cross-section in the frozen search window",
+      "require shoreline-snapped endpoints, zero GSHHG L3 land crossing, and separation of Superior and Huron references",
+      "close the accepted 2.21 km St. Marys gate as land, never as an OBC",
+      "preserve the independently inventoried 45 GSHHG L3 islands as hole loops",
+      "preserve every retained source shoreline vertex and both artificial closure anchors",
+      "emit zero SMS nodestrings"
+    ]
+  },
+  "bathymetry": {
+    "netcdf": "Workspace/Preprocessing/fvcom-grid-generation/runs/cont2_lsup_prep_20260730/03_lake_superior/prep_bathymetry/lake_superior_fvcom_depth_v2.nc",
+    "source_policy": [
+      "NOAA NCEI ETOPO 2022 15 arc-second full-lake surface elevation"
+    ],
+    "coverage_requirement": "finite positive depth at every accepted wet-domain cell center, with a GSHHG-derived wet mask and complete interpolation support around the boundary",
+    "status": "available"
+  },
+  "budget": {
+    "preflight_node_threshold": 900000,
+    "hard_node_cap": 1000000,
+    "hu_increment_m": 25,
+    "overflow_reruns": 1
+  },
+  "sizing": {
+    "mode": "uniform",
+    "near_obc_size_m": null,
+    "near_obc_distance_m": null,
+    "far_obc_distance_m": null,
+    "bathymetry_floor_multiplier": 3,
+    "bathymetry_floor_roundup_m": 25
+  },
+  "preparation": [
+    "Select the cached GSHHG 2.3.7 high-resolution L2 upper-Great-Lakes feature.",
+    "Retain Lake Superior with one deterministic water-only St. Marys numerical land gate.",
+    "Preserve all contained GSHHG L3 islands.",
+    "Fetch a request-bounded ETOPO 2022 15 arc-second full-lake subset.",
+    "Convert ETOPO elevation to positive-down depth using 183.2 m IGLD 1985 LWD."
+  ],
+  "readiness": {
+    "status": "ready",
+    "boundary_status": "available",
+    "bathymetry_status": "available",
+    "blockers": [],
+    "validation_artifact": {
+      "path": "Workspace/Preprocessing/fvcom-grid-generation/runs/cont2_lsup_prep_20260730/03_lake_superior/lake_superior_preparation_readiness_v2.json",
+      "sha256": "678cb4b77b06dbc4905e4345c52b04134bec41eb74a9e3f41640db7170fdc05a",
+      "schema_version": "lake_superior_preparation_readiness_v1",
+      "required_status": "ready",
+      "required_checks": [
+        "case_id_is_lake_superior",
+        "domain_is_valid",
+        "wet_component_count_is_one",
+        "gate_is_inside_joined_l2_water",
+        "gate_endpoints_are_shoreline_snapped",
+        "gate_has_zero_l3_land_intersection",
+        "gate_separates_superior_and_downstream_references",
+        "retained_l2_shell_matches_frozen_source_split",
+        "domain_matches_frozen_l2_l3_reconstruction",
+        "domain_hole_count_matches_frozen_l3",
+        "island_layer_count_matches_frozen_l3",
+        "manifest_island_count_matches_frozen_l3",
+        "case_expected_island_count_matches_frozen_l3",
+        "manifest_l3_inventory_count_matches_frozen_source",
+        "manifest_l3_inventory_ids_match_frozen_source",
+        "open_boundary_layer_is_empty",
+        "manifest_open_boundary_count_is_zero",
+        "manifest_open_boundaries_is_empty",
+        "case_open_boundaries_is_empty",
+        "closure_has_two_hard_anchors",
+        "closure_has_two_artificial_vertices",
+        "closure_artificial_vertices_match_gate_endpoints",
+        "bathymetry_wet_mask_matches_domain",
+        "bathymetry_all_wet_cells_finite",
+        "bathymetry_all_wet_cells_positive",
+        "bathymetry_covers_domain_bounds",
+        "chart_datum_is_183_2_m",
+        "depth_conversion_matches_declared_policy",
+        "vertical_datum_caveat_is_explicit"
+      ],
+      "required_input_hashes": [
+        "boundary_manifest",
+        "boundary_gpkg",
+        "bathymetry_netcdf"
+      ]
+    }
+  },
+  "notes": [
+    "This manifest belongs to the three-case boundary-continuity experiment, not the archived six-case matrix.",
+    "This is a zero-OBC closed-lake contract case and must write no NS records.",
+    "The selected St. Marys gate is a 2.21 km numerical land boundary near 46.478 degrees north with two shoreline-snapped hard anchors and zero L3-land crossing.",
+    "ETOPO elevation uses EGM2008 and the 183.2 m lake LWD uses IGLD 1985; no vertical datum transformation is claimed.",
+    "Preparation readiness is bound to the exact versioned validation artifact and its active boundary/bathymetry hashes before meshing."
+  ]
+}

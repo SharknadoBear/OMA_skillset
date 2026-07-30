@@ -271,13 +271,18 @@
       ],
       "properties": {
         "preflight_node_threshold": {
-          "const": 135000
+          "type": "integer",
+          "minimum": 1,
+          "description": "Planning threshold; current default 900000 and historical overrides remain valid."
         },
         "hard_node_cap": {
-          "const": 150000
+          "type": "integer",
+          "minimum": 1,
+          "description": "Delivered-node ceiling; current default 1000000 and historical overrides remain valid."
         },
         "hu_increment_m": {
-          "const": 25
+          "const": 25,
+          "description": "Numerical h_u search quantum in metres, not bathymetry raster resolution."
         },
         "overflow_reruns": {
           "const": 1
@@ -324,7 +329,8 @@
           "const": 3
         },
         "bathymetry_floor_roundup_m": {
-          "const": 25
+          "const": 25,
+          "description": "Numerical upward-rounding quantum in metres, not bathymetry raster resolution."
         }
       }
     },
@@ -363,6 +369,53 @@
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "validation_artifact": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "path",
+            "sha256",
+            "schema_version",
+            "required_status",
+            "required_checks",
+            "required_input_hashes"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{64}$"
+            },
+            "schema_version": {
+              "type": "string",
+              "minLength": 1
+            },
+            "required_status": {
+              "const": "ready"
+            },
+            "required_checks": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required_input_hashes": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
           }
         }
       }

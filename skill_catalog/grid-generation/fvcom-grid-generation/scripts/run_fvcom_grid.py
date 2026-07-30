@@ -11,6 +11,11 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fvcom_grid_generation import GridConfig, run_fvcom_grid  # noqa: E402
+from fvcom_grid_generation.node_budget import (  # noqa: E402
+    DEFAULT_HARD_NODE_LIMIT,
+    DEFAULT_MAX_INTERIOR_POINTS,
+    DEFAULT_NODE_BUDGET_STOP_FRACTION,
+)
 from fvcom_grid_generation.systematic_v6_policy import (  # noqa: E402
     FIXED_GATE_POLICIES,
 )
@@ -42,9 +47,33 @@ def main() -> int:
     parser.add_argument("--obc-hold-distance-m", type=float, default=10_000.0)
     parser.add_argument("--obc-transition-distance-m", type=float, default=60_000.0)
     parser.add_argument("--target-timestep-s", default="auto")
-    parser.add_argument("--max-interior-points", type=int, default=80_000)
-    parser.add_argument("--max-total-nodes", type=int, default=120_000)
-    parser.add_argument("--node-budget-stop-fraction", type=float, default=0.90)
+    parser.add_argument(
+        "--max-interior-points",
+        type=int,
+        default=DEFAULT_MAX_INTERIOR_POINTS,
+        help=(
+            "Clean-room interior seed ceiling "
+            f"(default: {DEFAULT_MAX_INTERIOR_POINTS:,})."
+        ),
+    )
+    parser.add_argument(
+        "--max-total-nodes",
+        type=int,
+        default=DEFAULT_HARD_NODE_LIMIT,
+        help=(
+            "Maximum delivered mesh node count "
+            f"(default: {DEFAULT_HARD_NODE_LIMIT:,})."
+        ),
+    )
+    parser.add_argument(
+        "--node-budget-stop-fraction",
+        type=float,
+        default=DEFAULT_NODE_BUDGET_STOP_FRACTION,
+        help=(
+            "Pre-triangulation planning fraction of the hard cap "
+            f"(default: {DEFAULT_NODE_BUDGET_STOP_FRACTION:.2f})."
+        ),
+    )
     parser.add_argument("--refine-iterations", type=int, default=3)
     parser.add_argument("--smooth-iterations", type=int, default=8)
     parser.add_argument(

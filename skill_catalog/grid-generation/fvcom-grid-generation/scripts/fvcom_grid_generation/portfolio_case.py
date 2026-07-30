@@ -23,6 +23,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
+from scipy.ndimage import minimum_filter
 from scipy.spatial import cKDTree
 from shapely.geometry import LineString, MultiLineString, Polygon
 from shapely.ops import unary_union
@@ -47,6 +48,7 @@ from .gmsh_experiment import (
     _backend_geometry,
     _delivered_lineage_manifest,
     _native_quality_report,
+    assert_readiness_manifest_binding,
     bathymetry_coverage_report,
     check_case_readiness,
     file_sha256,
@@ -55,6 +57,12 @@ from .gmsh_experiment import (
     select_uniform_target_m,
 )
 from .mesh import MeshConfig, generate_mesh
+from .node_budget import (
+    DEFAULT_HARD_NODE_LIMIT,
+    DEFAULT_PREFLIGHT_NODE_LIMIT,
+    DEFAULT_SPACING_QUANTUM_M,
+    delivered_node_budget_report,
+)
 from .projection import (
     project_geometry,
     project_points,
@@ -65,8 +73,11 @@ from .quality import evaluate_mesh_quality
 from .size_field import (
     SizeField,
     SizeFieldConfig,
+    WetMaskAwareSizeInterpolator,
     boundary_front_seed_points,
     build_size_field,
+    estimate_node_budget,
+    linear_target_metric_edge_fractions,
     write_size_field,
 )
 from .sms_2dm import read_2dm, write_2dm
@@ -74,8 +85,6 @@ from .sms_2dm import read_2dm, write_2dm
 
 SCHEMA_VERSION = "fvcom_mesher_portfolio_case_v2"
 INPUT_BUNDLE_SCHEMA = "fvcom_mesher_input_bundle_v2"
-DEFAULT_PREFLIGHT_NODE_LIMIT = 135_000
-DEFAULT_HARD_NODE_LIMIT = 150_000
 
 CANDIDATE_ALIASES: Mapping[str, str] = {
     "clean-room": "clean_room_raw",
@@ -118,7 +127,7 @@ class PortfolioCaseConfig:
     land_spacing_m: float = 50.0
     open_spacing_m: float = 3_000.0
     maximum_size_m: float = 8_000.0
-    gradation: float = 0.20
+    gradation: float = 0.10
     slope_elements: float = 10.0
     coastal_distance_m: float = 25_000.0
     hydraulic_elements_across_min: float = 3.0
@@ -129,10 +138,12 @@ class PortfolioCaseConfig:
     obc_hold_distance_m: float = 10_000.0
     obc_transition_distance_m: float = 60_000.0
     target_timestep_s: str = "auto"
-    boundary_reconciliation_max_iterations: int = 5
+    boundary_reconciliation_max_iterations: int = 8
     boundary_metric_edge: float = 1.0
-    boundary_field_compatibility_factor: float = 2.0
+    boundary_field_compatibility_factor: float = 1.5
     boundary_target_combination: str = "sampled_field"
+    boundary_geometry_continuity: bool = True
+    boundary_geometry_metric_ratio: float = 1.0
     boundary_trace_samples_per_target: float = 4.0
     boundary_trace_nearest_sample_count: int = 16
     use_case_budget_spacing_policy: bool = True
@@ -183,6 +194,14 @@ class PortfolioCaseConfig:
         ):
             raise ValueError(
                 "boundary_field_compatibility_factor must be finite and > 1"
+            )
+        if (
+            not np.isfinite(float(self.boundary_geometry_metric_ratio))
+            or float(self.boundary_geometry_metric_ratio) <= 0.0
+            or float(self.boundary_geometry_metric_ratio) > 1.0
+        ):
+            raise ValueError(
+                "boundary_geometry_metric_ratio must be finite and in (0, 1]"
             )
         if self.boundary_target_combination not in {
             "minimum",
@@ -247,7 +266,9 @@ def _case_budget_spacing_policy(
             + config.obc_transition_distance_m
         )
     )
-    step_m = float(budget.get("hu_increment_m") or 25.0)
+    step_m = float(
+        budget.get("hu_increment_m") or DEFAULT_SPACING_QUANTUM_M
+    )
     quadrature_cells = min(int(config.size_field_max_cells), 250_000)
     quadrature = integration_samples(
         prepared,
@@ -288,7 +309,7 @@ def _case_budget_spacing_policy(
         "status": "resolved",
         "applied": True,
         "method": (
-            "bathymetry_floor_plus_25m_uniform_target_bisection_under_"
+            "bathymetry_floor_plus_quantized_uniform_target_bisection_under_"
             "common_preflight_budget"
         ),
         "bathymetry_floor_m": floor_m,
@@ -324,29 +345,112 @@ def _case_budget_spacing_policy(
 def _apply_case_budget_targets(
     boundary: BoundaryNodes,
     spacing_policy: Mapping[str, Any],
+    *,
+    geometry_continuity: bool = True,
+    geometry_metric_ratio: float = 1.0,
 ) -> tuple[BoundaryNodes, dict[str, Any]]:
-    """Assign one solid/island target and the case-defined OBC target."""
+    """Assign budget targets and reconcile them with realized source chords.
 
-    if not bool(spacing_policy.get("applied")):
-        return boundary, {
-            "applied": False,
-            "geometry_forced_subgrid_edge_count": 0,
-        }
-    solid_target = float(spacing_policy["solid_and_island_target_m"])
-    open_target_value = spacing_policy.get("open_boundary_target_m")
-    open_target = (
-        float(open_target_value)
-        if open_target_value is not None
-        else solid_target
-    )
+    The source geometry is immutable: every original vertex must remain in the
+    delivered CAD loops.  A short chord can therefore be much finer than a
+    bathymetry- or budget-selected target.  When geometry continuity is
+    enabled, each boundary vertex receives the conservative minimum of its
+    policy target and the two incident chord scales
+
+    ``h_geo = L_edge / geometry_metric_ratio``.
+
+    The resulting targets seed both the canonical wet-domain field and the
+    continuous boundary trace.  This makes the first interior ring respond to
+    the actual one-dimensional discretization instead of merely reporting a
+    geometry-forced jump after meshing.
+    """
+
+    budget_applied = bool(spacing_policy.get("applied"))
     open_nodes = {
         int(node)
         for chain in (boundary.open_boundaries or [])
         for node in chain.node_indices
     }
-    targets = np.full(len(boundary.xy), solid_target, dtype=float)
-    if open_nodes:
-        targets[np.asarray(sorted(open_nodes), dtype=int)] = open_target
+    if budget_applied:
+        solid_target: float | None = float(
+            spacing_policy["solid_and_island_target_m"]
+        )
+        open_target_value = spacing_policy.get("open_boundary_target_m")
+        open_target: float | None = (
+            float(open_target_value)
+            if open_target_value is not None
+            else solid_target
+        )
+        policy_targets = np.full(
+            len(boundary.xy),
+            solid_target,
+            dtype=float,
+        )
+        if open_nodes:
+            policy_targets[
+                np.asarray(sorted(open_nodes), dtype=int)
+            ] = open_target
+    else:
+        solid_target = None
+        open_target = None
+        policy_targets = np.asarray(
+            boundary.target_spacing_m,
+            dtype=float,
+        ).copy()
+        if policy_targets.shape != (len(boundary.xy),):
+            raise ValueError(
+                "boundary target spacing must have one value per vertex "
+                "when case-budget spacing is disabled"
+            )
+        if np.any(~np.isfinite(policy_targets)) or np.any(
+            policy_targets <= 0.0
+        ):
+            raise ValueError(
+                "boundary target spacing must be finite and positive "
+                "when case-budget spacing is disabled"
+            )
+
+    if (
+        not np.isfinite(float(geometry_metric_ratio))
+        or float(geometry_metric_ratio) <= 0.0
+        or float(geometry_metric_ratio) > 1.0
+    ):
+        raise ValueError(
+            "geometry_metric_ratio must be finite and in (0, 1]"
+        )
+    geometry_targets = np.full(len(boundary.xy), np.inf, dtype=float)
+    edge_lengths: list[float] = []
+    for raw_chain in boundary.constraint_chains:
+        chain = [int(value) for value in raw_chain]
+        for start, end in zip(chain, chain[1:] + chain[:1]):
+            length = float(
+                np.linalg.norm(boundary.xy[end] - boundary.xy[start])
+            )
+            if not np.isfinite(length) or length <= 0.0:
+                raise ValueError(
+                    f"constraint edge {start}->{end} has invalid length"
+                )
+            edge_lengths.append(length)
+            edge_target = length / float(geometry_metric_ratio)
+            geometry_targets[start] = min(
+                float(geometry_targets[start]),
+                edge_target,
+            )
+            geometry_targets[end] = min(
+                float(geometry_targets[end]),
+                edge_target,
+            )
+    if np.any(~np.isfinite(geometry_targets)):
+        missing = np.flatnonzero(~np.isfinite(geometry_targets))
+        raise ValueError(
+            "every boundary node must be incident to a constraint edge; "
+            f"missing {missing[:10].tolist()}"
+        )
+    targets = (
+        np.minimum(policy_targets, geometry_targets)
+        if bool(geometry_continuity)
+        else policy_targets.copy()
+    )
 
     forced_edges = 0
     forced_lengths: list[float] = []
@@ -356,27 +460,77 @@ def _apply_case_budget_targets(
             length = float(
                 np.linalg.norm(boundary.xy[end] - boundary.xy[start])
             )
-            target = min(float(targets[start]), float(targets[end]))
+            target = min(
+                float(policy_targets[start]),
+                float(policy_targets[end]),
+            )
             if length + 1.0e-9 < target:
                 forced_edges += 1
                 forced_lengths.append(length / target)
     metadata = dict(boundary.metadata or {})
-    metadata["case_budget_target_spacing_m"] = targets.copy()
-    updated = replace(
-        boundary,
-        target_spacing_m=targets,
-        metadata=metadata,
-        resolution_profile=(
-            f"{boundary.resolution_profile}+case_budget_hu"
-        ),
+    metadata["pre_geometry_target_spacing_m"] = policy_targets.copy()
+    if budget_applied:
+        metadata["case_budget_target_spacing_m"] = (
+            policy_targets.copy()
+        )
+    metadata["geometry_continuity_target_spacing_m"] = (
+        geometry_targets.copy()
+    )
+    metadata["effective_boundary_target_spacing_m"] = targets.copy()
+    profile_suffixes: list[str] = []
+    if budget_applied:
+        profile_suffixes.append("case_budget_hu")
+    if geometry_continuity:
+        profile_suffixes.append("geometry_continuity")
+    updated = (
+        replace(
+            boundary,
+            target_spacing_m=targets,
+            metadata=metadata,
+            resolution_profile=(
+                boundary.resolution_profile
+                + "".join(f"+{value}" for value in profile_suffixes)
+            ),
+        )
+        if profile_suffixes
+        else boundary
     )
     return updated, {
-        "applied": True,
+        "applied": bool(budget_applied),
         "solid_and_island_target_m": solid_target,
         "open_boundary_target_m": (
             open_target if open_nodes else None
         ),
         "open_boundary_node_count": int(len(open_nodes)),
+        "geometry_continuity_applied": bool(geometry_continuity),
+        "geometry_metric_ratio": float(geometry_metric_ratio),
+        "geometry_target_minimum_m": float(np.min(geometry_targets)),
+        "geometry_target_p50_m": float(np.median(geometry_targets)),
+        "geometry_target_p95_m": float(
+            np.percentile(geometry_targets, 95.0)
+        ),
+        "geometry_target_maximum_m": float(np.max(geometry_targets)),
+        "geometry_limited_node_count": int(
+            np.count_nonzero(
+                geometry_targets < policy_targets - 1.0e-9
+            )
+            if geometry_continuity
+            else 0
+        ),
+        "geometry_limited_node_fraction": float(
+            np.count_nonzero(
+                geometry_targets < policy_targets - 1.0e-9
+            )
+            / max(len(targets), 1)
+            if geometry_continuity
+            else 0.0
+        ),
+        "source_edge_length_minimum_m": float(min(edge_lengths)),
+        "source_edge_length_p50_m": float(np.median(edge_lengths)),
+        "source_edge_length_p95_m": float(
+            np.percentile(edge_lengths, 95.0)
+        ),
+        "source_edge_length_maximum_m": float(max(edge_lengths)),
         "geometry_forced_subgrid_edge_count": int(forced_edges),
         "geometry_forced_subgrid_edge_fraction": float(
             forced_edges
@@ -420,27 +574,48 @@ class ProjectedSizeSampler:
 
     def __init__(self, size_field: SizeField, projection: Any) -> None:
         self._projection = projection
-        self._size = RegularGridInterpolator(
-            (
-                np.asarray(size_field.lat, dtype=float),
-                np.asarray(size_field.lon, dtype=float),
-            ),
+        coverage = np.asarray(size_field.coverage_mask, dtype=bool)
+        domain = np.asarray(
+            getattr(size_field, "domain_mask", coverage),
+            dtype=bool,
+        )
+        self._size = WetMaskAwareSizeInterpolator(
+            np.asarray(size_field.lat, dtype=float),
+            np.asarray(size_field.lon, dtype=float),
             np.asarray(size_field.size, dtype=float),
-            bounds_error=False,
-            fill_value=np.nan,
+            coverage & domain,
+            coverage,
         )
-        self._coverage = RegularGridInterpolator(
-            (
-                np.asarray(size_field.lat, dtype=float),
-                np.asarray(size_field.lon, dtype=float),
+        sampling_interface = dict(
+            (getattr(size_field, "report", {}) or {}).get(
+                "sampling_interface"
+            )
+            or {}
+        )
+        self.report = {
+            "schema_version": "fvcom_projected_size_sampler_v2",
+            "sampling_interface": sampling_interface,
+            "sampling_interface_schema_version": str(
+                sampling_interface.get(
+                    "schema_version",
+                    "legacy_unspecified",
+                )
             ),
-            np.asarray(size_field.coverage_mask, dtype=np.uint8),
-            method="nearest",
-            bounds_error=False,
-            fill_value=0,
-        )
+            "strict_coverage": True,
+        }
 
     def sample_xy(self, values_xy: np.ndarray | Sequence[Sequence[float]]) -> np.ndarray:
+        sampled, _active_support = self.sample_xy_with_active_support(
+            values_xy
+        )
+        return sampled
+
+    def sample_xy_with_active_support(
+        self,
+        values_xy: np.ndarray | Sequence[Sequence[float]],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return strict raster values and wet-stencil support flags."""
+
         values = np.asarray(values_xy, dtype=float)
         if values.ndim != 2 or values.shape[1] != 2:
             raise ValueError("projected size queries must have shape (n, 2)")
@@ -448,9 +623,9 @@ class ProjectedSizeSampler:
             raise ValueError("projected size queries contain non-finite coordinates")
         lon, lat = self._projection.to_lonlat.transform(values[:, 0], values[:, 1])
         query = np.column_stack([lat, lon])
-        sampled = np.asarray(self._size(query), dtype=float)
-        covered = np.asarray(self._coverage(query), dtype=float) >= 0.5
-        invalid = ~covered | ~np.isfinite(sampled) | (sampled <= 0.0)
+        sampled, active_support = self._size.sample_with_active_support(query)
+        sampled = np.asarray(sampled, dtype=float)
+        invalid = ~np.isfinite(sampled) | (sampled <= 0.0)
         if np.any(invalid):
             first = int(np.flatnonzero(invalid)[0])
             raise ValueError(
@@ -458,14 +633,14 @@ class ProjectedSizeSampler:
                 f"{int(np.count_nonzero(invalid))} point(s); first projected "
                 f"coordinate=({values[first, 0]:.6f}, {values[first, 1]:.6f})"
             )
-        return sampled
+        return sampled, np.asarray(active_support, dtype=bool)
 
     def __call__(self, x: float, y: float) -> float:
         return float(self.sample_xy(np.asarray([[x, y]], dtype=float))[0])
 
 
 class BoundaryTraceSizeSampler:
-    """Add a continuous gradated boundary trace to a raster size sampler.
+    """Add a sampled gradated boundary trace to a raster size sampler.
 
     ``fvcom_size_field_v4`` is stored at wet-cell centers. Directly
     interpolating that raster back to the exact shoreline can therefore
@@ -475,8 +650,11 @@ class BoundaryTraceSizeSampler:
     ``min(H_raster(x), min_i(h_gamma_i + g * |x - x_i|))``
 
     using deterministic samples that include every delivered boundary vertex
-    and every edge midpoint. It guarantees exact endpoint/midpoint trace
-    recovery while retaining the raster field away from the boundary.
+    and every edge midpoint. The nearest-neighbour search expands until a
+    global lower bound proves that no unvisited sample can reduce the result.
+    It therefore returns the exact minimum over the deterministic trace sample
+    set, rather than a fixed-``k`` approximation, while retaining the raster
+    field away from the boundary.
     """
 
     def __init__(
@@ -487,6 +665,8 @@ class BoundaryTraceSizeSampler:
         gradation: float,
         samples_per_target: float = 4.0,
         nearest_sample_count: int = 16,
+        maximum_total_sample_count: int = 5_000_000,
+        query_chunk_size: int = 4_096,
     ) -> None:
         if not np.isfinite(float(gradation)) or float(gradation) <= 0.0:
             raise ValueError("boundary trace gradation must be positive")
@@ -497,8 +677,16 @@ class BoundaryTraceSizeSampler:
             raise ValueError("samples_per_target must be at least two")
         if int(nearest_sample_count) < 1:
             raise ValueError("nearest_sample_count must be positive")
+        if int(maximum_total_sample_count) < 1:
+            raise ValueError(
+                "maximum_total_sample_count must be positive"
+            )
+        if int(query_chunk_size) < 1:
+            raise ValueError("query_chunk_size must be positive")
         points: list[np.ndarray] = []
         targets: list[np.ndarray] = []
+        sample_spacings: list[float] = []
+        total_sample_count = 0
         for raw_chain in boundary.constraint_chains:
             chain = [int(value) for value in raw_chain]
             for position, start in enumerate(chain):
@@ -508,20 +696,30 @@ class BoundaryTraceSizeSampler:
                 ha = float(boundary.target_spacing_m[start])
                 hb = float(boundary.target_spacing_m[end])
                 length = float(np.linalg.norm(b - a))
-                minimum_target = min(ha, hb)
-                intervals = max(
-                    2,
-                    int(
-                        np.ceil(
-                            length
-                            * float(samples_per_target)
-                            / minimum_target
-                        )
-                    ),
+                remaining_sample_count = (
+                    int(maximum_total_sample_count) - total_sample_count
                 )
-                if intervals % 2:
-                    intervals += 1
-                fraction = np.arange(intervals, dtype=float) / intervals
+                fraction = linear_target_metric_edge_fractions(
+                    length,
+                    ha,
+                    hb,
+                    samples_per_target=float(samples_per_target),
+                    include_end=False,
+                    maximum_sample_count=remaining_sample_count,
+                )
+                total_sample_count += len(fraction)
+                sample_spacings.append(
+                    length
+                    * float(
+                        np.max(
+                            np.diff(
+                                np.concatenate(
+                                    [fraction, np.asarray([1.0])]
+                                )
+                            )
+                        )
+                    )
+                )
                 points.append(
                     a[None, :] + fraction[:, None] * (b - a)[None, :]
                 )
@@ -533,45 +731,266 @@ class BoundaryTraceSizeSampler:
         self._points = np.vstack(points)
         self._targets = np.concatenate(targets)
         self._tree = cKDTree(self._points)
-        self._nearest_sample_count = min(
+        self._initial_nearest_sample_count = min(
             int(nearest_sample_count),
             len(self._points),
         )
+        self._query_chunk_size = int(query_chunk_size)
+        self._minimum_target = float(np.min(self._targets))
+        maximum_sample_spacing = max(sample_spacings, default=0.0)
         self.report = {
-            "schema_version": "fvcom_boundary_trace_sampler_v1",
+            "schema_version": "fvcom_boundary_trace_sampler_v2",
             "method": (
                 "raster_min_deterministic_boundary_point_"
-                "euclidean_gradation_extension"
+                "euclidean_gradation_extension_adaptive_exact_sample_minimum"
             ),
             "boundary_sample_count": int(len(self._points)),
             "samples_per_target": float(samples_per_target),
-            "nearest_sample_count": int(self._nearest_sample_count),
+            "sample_distribution": (
+                "linear_endpoint_target_metric_equidistribution"
+            ),
+            "maximum_total_sample_count": int(
+                maximum_total_sample_count
+            ),
+            "query_chunk_size": int(self._query_chunk_size),
+            "memory_bounded_query_chunks": True,
+            # Retain the v1 key as a backward-compatible alias. In v2 this is
+            # the initial search size, not a hard truncation.
+            "nearest_sample_count": int(
+                self._initial_nearest_sample_count
+            ),
+            "initial_nearest_sample_count": int(
+                self._initial_nearest_sample_count
+            ),
             "gradation": float(self._gradation),
             "endpoint_midpoint_exact_by_construction": True,
+            "adaptive_neighbor_expansion": True,
+            "exact_discrete_trace_sample_minimum": True,
+            "global_unvisited_lower_bound": (
+                "minimum_boundary_target_plus_gradation_times_"
+                "current_kth_nearest_distance"
+            ),
+            "maximum_trace_sample_spacing_m": float(
+                maximum_sample_spacing
+            ),
+            "maximum_continuous_trace_overestimate_bound_m": float(
+                self._gradation * maximum_sample_spacing
+            ),
+            "sample_query_count": 0,
+            "expanded_sample_query_count": 0,
+            "maximum_neighbors_examined": 0,
+            "base_query_without_positive_active_support_count": 0,
+            "no_active_support_policy": "boundary_trace_authoritative",
+            "operational_counter_scope": "since_most_recent_reset",
             "distance_metric": "straight_euclidean",
             "barrier_aware": False,
+            "base_raster_sampler": dict(
+                getattr(base_sampler, "report", {})
+            ),
         }
+
+    def reset_operational_counters(self) -> None:
+        """Start a fresh, candidate-local sampler measurement interval."""
+
+        self.report["sample_query_count"] = 0
+        self.report["expanded_sample_query_count"] = 0
+        self.report["maximum_neighbors_examined"] = 0
+        self.report["base_query_without_positive_active_support_count"] = 0
 
     def sample_xy(
         self,
         values_xy: np.ndarray | Sequence[Sequence[float]],
     ) -> np.ndarray:
         values = np.asarray(values_xy, dtype=float)
-        base = self._base.sample_xy(values)
-        distance, indices = self._tree.query(
+        if values.ndim != 2 or values.shape[1] != 2:
+            raise ValueError("boundary trace query must have shape (N, 2)")
+        if not len(values):
+            return np.empty(0, dtype=float)
+        base, active_support = self._sample_base_with_support(values)
+        effective_base = np.where(active_support, base, np.inf)
+        self.report[
+            "base_query_without_positive_active_support_count"
+        ] = int(
+            self.report[
+                "base_query_without_positive_active_support_count"
+            ]
+        ) + int(np.count_nonzero(~active_support))
+        return self._sample_trace_reduction(
             values,
-            k=self._nearest_sample_count,
+            upper_bound=np.asarray(effective_base, dtype=float),
+            update_counters=True,
         )
-        distance_array = np.asarray(distance, dtype=float)
-        index_array = np.asarray(indices, dtype=int)
-        if distance_array.ndim == 1:
-            distance_array = distance_array[:, None]
-            index_array = index_array[:, None]
-        extension = np.min(
-            self._targets[index_array] + self._gradation * distance_array,
-            axis=1,
+
+    def sample_trace_xy(
+        self,
+        values_xy: np.ndarray | Sequence[Sequence[float]],
+    ) -> np.ndarray:
+        """Return the exact discrete trace extension without the raster min."""
+
+        values = np.asarray(values_xy, dtype=float)
+        if values.ndim != 2 or values.shape[1] != 2:
+            raise ValueError("boundary trace query must have shape (N, 2)")
+        if not len(values):
+            return np.empty(0, dtype=float)
+        return self._sample_trace_reduction(
+            values,
+            upper_bound=None,
+            update_counters=False,
         )
-        return np.minimum(base, extension)
+
+    def sample_components_xy(
+        self,
+        values_xy: np.ndarray | Sequence[Sequence[float]],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return strict raster and exact trace components independently."""
+
+        values = np.asarray(values_xy, dtype=float)
+        if values.ndim != 2 or values.shape[1] != 2:
+            raise ValueError("boundary trace query must have shape (N, 2)")
+        if not len(values):
+            empty = np.empty(0, dtype=float)
+            return empty, empty
+        base, active_support = self._sample_base_with_support(values)
+        base = np.where(active_support, base, np.inf)
+        trace = self._sample_trace_reduction(
+            values,
+            upper_bound=None,
+            update_counters=False,
+        )
+        return base, trace
+
+    def _sample_base_with_support(
+        self,
+        values: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        method = getattr(
+            self._base,
+            "sample_xy_with_active_support",
+            None,
+        )
+        if callable(method):
+            base, support = method(values)
+            return (
+                np.asarray(base, dtype=float),
+                np.asarray(support, dtype=bool),
+            )
+        base = np.asarray(self._base.sample_xy(values), dtype=float)
+        return base, np.ones(len(values), dtype=bool)
+
+    @property
+    def gradation(self) -> float:
+        return float(self._gradation)
+
+    @property
+    def minimum_trace_target_m(self) -> float:
+        return float(self._minimum_target)
+
+    def _sample_trace_reduction(
+        self,
+        values: np.ndarray,
+        *,
+        upper_bound: np.ndarray | None,
+        update_counters: bool,
+    ) -> np.ndarray:
+        if len(values) > self._query_chunk_size:
+            chunks: list[np.ndarray] = []
+            for begin in range(0, len(values), self._query_chunk_size):
+                end = min(len(values), begin + self._query_chunk_size)
+                chunks.append(
+                    self._sample_trace_reduction(
+                        values[begin:end],
+                        upper_bound=(
+                            None
+                            if upper_bound is None
+                            else np.asarray(upper_bound)[begin:end]
+                        ),
+                        update_counters=update_counters,
+                    )
+                )
+            return np.concatenate(chunks)
+        result = (
+            np.full(len(values), np.inf, dtype=float)
+            if upper_bound is None
+            else np.asarray(upper_bound, dtype=float).copy()
+        )
+        best_extension = np.full(len(values), np.inf, dtype=float)
+        unresolved = np.arange(len(values), dtype=int)
+        neighbor_count = int(self._initial_nearest_sample_count)
+        expanded_queries = 0
+        maximum_examined = 0
+        tolerance = 32.0 * np.finfo(float).eps
+
+        while len(unresolved):
+            distance, indices = self._tree.query(
+                values[unresolved],
+                k=neighbor_count,
+            )
+            distance_array = np.asarray(distance, dtype=float)
+            index_array = np.asarray(indices, dtype=int)
+            if distance_array.ndim == 1:
+                distance_array = distance_array[:, None]
+                index_array = index_array[:, None]
+            local_extension = np.min(
+                self._targets[index_array]
+                + self._gradation * distance_array,
+                axis=1,
+            )
+            best_extension[unresolved] = np.minimum(
+                best_extension[unresolved],
+                local_extension,
+            )
+            if upper_bound is None:
+                result[unresolved] = best_extension[unresolved]
+            else:
+                result[unresolved] = np.minimum(
+                    upper_bound[unresolved],
+                    best_extension[unresolved],
+                )
+            maximum_examined = max(maximum_examined, neighbor_count)
+            if neighbor_count >= len(self._points):
+                break
+
+            # Every unvisited sample is at least as distant as the current
+            # kth neighbour and has target >= the global minimum target.
+            # Once the incumbent is no larger than that bound, the exact
+            # discrete min-plus value is proven without visiting the rest.
+            unseen_lower_bound = (
+                self._minimum_target
+                + self._gradation * distance_array[:, -1]
+            )
+            scale = np.maximum(
+                1.0,
+                np.maximum(
+                    np.abs(result[unresolved]),
+                    np.abs(unseen_lower_bound),
+                ),
+            )
+            resolved_here = (
+                result[unresolved]
+                <= unseen_lower_bound + tolerance * scale
+            )
+            remaining = unresolved[~resolved_here]
+            if not len(remaining):
+                break
+            expanded_queries += int(len(remaining))
+            unresolved = remaining
+            neighbor_count = min(
+                len(self._points),
+                max(neighbor_count + 1, 2 * neighbor_count),
+            )
+
+        if update_counters:
+            self.report["sample_query_count"] = int(
+                self.report["sample_query_count"]
+            ) + int(len(values))
+            self.report["expanded_sample_query_count"] = int(
+                self.report["expanded_sample_query_count"]
+            ) + int(expanded_queries)
+            self.report["maximum_neighbors_examined"] = max(
+                int(self.report["maximum_neighbors_examined"]),
+                int(maximum_examined),
+            )
+        return result
 
     def __call__(self, x: float, y: float) -> float:
         return float(self.sample_xy(np.asarray([[x, y]], dtype=float))[0])
@@ -1203,10 +1622,17 @@ def _reconciliation_changed_obc_sequence(
 def _size_field_config(
     config: PortfolioCaseConfig,
 ) -> SizeFieldConfig:
+    if float(config.land_spacing_m) > float(config.maximum_size_m):
+        raise ValueError(
+            "budget-selected land/interior spacing exceeds maximum_size_m; "
+            "increase --maximum-size-m so the two-dimensional raster can "
+            "honor h_u without silently lowering its budget-compatible floor"
+        )
     return SizeFieldConfig(
         land_spacing_m=float(config.land_spacing_m),
         open_spacing_m=float(config.open_spacing_m),
         max_size_m=float(config.maximum_size_m),
+        interior_min_size_m=float(config.land_spacing_m),
         gradation=float(config.gradation),
         slope_elements=float(config.slope_elements),
         coastal_distance_m=float(config.coastal_distance_m),
@@ -1256,9 +1682,27 @@ def _reconcile_boundary_and_size_field(
         source_boundary,
         field_config,
     )
-    current_sampler = ProjectedSizeSampler(
+    current_raster_sampler = ProjectedSizeSampler(
         current_field,
         source_boundary.projection,
+    )
+    # The first pass must already see the immutable source-chord scale.  If it
+    # starts from raster-cell-center interpolation alone, the reconciliation
+    # can erase a fine realized boundary target before the trace exists.
+    current_sampler = (
+        BoundaryTraceSizeSampler(
+            current_raster_sampler,
+            source_boundary,
+            gradation=float(config.gradation),
+            samples_per_target=float(
+                config.boundary_trace_samples_per_target
+            ),
+            nearest_sample_count=int(
+                config.boundary_trace_nearest_sample_count
+            ),
+        )
+        if bool(config.boundary_geometry_continuity)
+        else current_raster_sampler
     )
     final_boundary = source_boundary
     final_field = current_field
@@ -1294,16 +1738,20 @@ def _reconcile_boundary_and_size_field(
             candidate_field,
             candidate_boundary.projection,
         )
-        candidate_sampler = BoundaryTraceSizeSampler(
-            candidate_raster_sampler,
-            candidate_boundary,
-            gradation=float(config.gradation),
-            samples_per_target=float(
-                config.boundary_trace_samples_per_target
-            ),
-            nearest_sample_count=int(
-                config.boundary_trace_nearest_sample_count
-            ),
+        candidate_sampler = (
+            BoundaryTraceSizeSampler(
+                candidate_raster_sampler,
+                candidate_boundary,
+                gradation=float(config.gradation),
+                samples_per_target=float(
+                    config.boundary_trace_samples_per_target
+                ),
+                nearest_sample_count=int(
+                    config.boundary_trace_nearest_sample_count
+                ),
+            )
+            if bool(config.boundary_geometry_continuity)
+            else candidate_raster_sampler
         )
         post_rebuild = audit_reconciled_boundary_size_field(
             candidate_boundary,
@@ -1345,7 +1793,15 @@ def _reconcile_boundary_and_size_field(
         "status": "pass" if passed else "needs_review",
         "passed": bool(passed),
         "method": (
-            "authoritative_source_resampling_plus_rebuilt_field_fixed_point"
+            (
+                "authoritative_source_geometry_trace_resampling_plus_"
+                "rebuilt_field_fixed_point"
+            )
+            if bool(config.boundary_geometry_continuity)
+            else (
+                "authoritative_source_resampling_plus_rebuilt_field_"
+                "fixed_point"
+            )
         ),
         "source_boundary_node_count": int(len(source_boundary.xy)),
         "reconciled_boundary_node_count": int(len(final_boundary.xy)),
@@ -1394,13 +1850,291 @@ def _reconcile_boundary_and_size_field(
                 else "boundary targets are the pointwise minimum of the "
                 "source target and sampled fvcom_size_field_v4"
             )
-            + "; final sampling adds a deterministic Euclidean boundary-trace "
-            "gradation extension; not a barrier-aware wet-distance min-plus "
-            "solve"
+            + (
+                "; every pass includes the deterministic realized-geometry "
+                "boundary trace before resampling; the trace uses straight "
+                "Euclidean distance and is not a barrier-aware wet-distance "
+                "min-plus solve"
+                if bool(config.boundary_geometry_continuity)
+                else (
+                    "; realized-geometry boundary trace is explicitly "
+                    "disabled for this reproducibility run"
+                )
+            )
         ),
-        "boundary_trace_sampler": getattr(final_sampler, "report", None),
+        # Freeze this evidence before preflight and candidate-local resets
+        # mutate the live sampler's operational counters.
+        "boundary_trace_sampler": (
+            dict(final_sampler.report)
+            if isinstance(final_sampler, BoundaryTraceSizeSampler)
+            else None
+        ),
     }
     return final_boundary, final_field, final_sampler, report
+
+
+def _sampler_adjusted_node_budget(
+    size_field: SizeField,
+    boundary: BoundaryNodes,
+    sampler: ProjectedSizeSampler | BoundaryTraceSizeSampler,
+    *,
+    chunk_size: int = 50_000,
+) -> dict[str, Any]:
+    """Conservatively integrate the final callback over active raster cells.
+
+    A center-only sample can miss the trace minimum at a shoreline inside the
+    cell. The raster component is bounded below by the minimum of neighboring
+    *active* centers. The min-plus trace is ``gradation``-Lipschitz, so its
+    per-subcell lower bound is the exact subcell-center value minus a
+    conservative subcell radius, never below the global trace target minimum.
+    Cells refine adaptively only when that release is material relative to the
+    local target. Their pointwise minimum is therefore no coarser than the
+    callback anywhere in each charged subcell without spreading an isolated
+    fine trace point over a complete coarse raster cell.
+    """
+
+    if int(chunk_size) < 1:
+        raise ValueError("chunk_size must be positive")
+    raster = np.asarray(size_field.size, dtype=float)
+    active = (
+        np.asarray(size_field.coverage_mask, dtype=bool)
+        & np.asarray(size_field.domain_mask, dtype=bool)
+        & np.isfinite(raster)
+        & (raster > 0.0)
+    )
+    flat_active = np.flatnonzero(active.ravel())
+    adjusted = raster.copy()
+    finite_raster = np.where(
+        active,
+        raster,
+        np.inf,
+    )
+    raster_stencil_lower_bound = minimum_filter(
+        finite_raster,
+        size=3,
+        mode="constant",
+        cval=np.inf,
+    )
+    lon_axis = np.asarray(size_field.lon, dtype=float)
+    lat_axis = np.asarray(size_field.lat, dtype=float)
+    maximum_lon_step = float(np.max(np.diff(lon_axis)))
+    maximum_lat_step = float(np.max(np.diff(lat_axis)))
+    # 111.32 km/degree overestimates longitude distance away from the equator;
+    # the 5% factor also covers the regional projected-coordinate scale.
+    cell_radius_upper_bound_m = float(
+        0.5
+        * 111_320.0
+        * np.hypot(maximum_lon_step, maximum_lat_step)
+        * 1.05
+    )
+    lon_grid, lat_grid = np.meshgrid(
+        lon_axis,
+        lat_axis,
+    )
+    callback_center = np.full(raster.shape, np.inf, dtype=float)
+    trace_center = np.full(raster.shape, np.inf, dtype=float)
+    reduced_count = 0
+    maximum_reduction = 0.0
+    for begin in range(0, len(flat_active), int(chunk_size)):
+        indices = flat_active[begin : begin + int(chunk_size)]
+        lonlat = np.column_stack(
+            [
+                lon_grid.ravel()[indices],
+                lat_grid.ravel()[indices],
+            ]
+        )
+        xy = project_points(lonlat, boundary.projection)
+        if isinstance(sampler, BoundaryTraceSizeSampler):
+            base_values, trace_values = sampler.sample_components_xy(xy)
+            values = np.minimum(base_values, trace_values)
+            trace_center.ravel()[indices] = trace_values
+        else:
+            values = np.asarray(sampler.sample_xy(xy), dtype=float)
+        original = raster.ravel()[indices]
+        values = np.minimum(values, original)
+        callback_center.ravel()[indices] = values
+        trace_reduction = original - values
+        reduced_count += int(
+            np.count_nonzero(trace_reduction > 1.0e-9)
+        )
+        maximum_reduction = max(
+            maximum_reduction,
+            float(np.max(trace_reduction, initial=0.0)),
+        )
+    subdivision_count_by_axis: dict[int, int] = {1: int(len(flat_active))}
+    subcell_trace_query_count = 0
+    final_values = raster_stencil_lower_bound.ravel()[flat_active].copy()
+    if isinstance(sampler, BoundaryTraceSizeSampler):
+        raster_lower = raster_stencil_lower_bound.ravel()[flat_active]
+        center_trace = trace_center.ravel()[flat_active]
+        release = float(
+            sampler.gradation * cell_radius_upper_bound_m
+        )
+        candidate = (
+            np.maximum(
+                center_trace - release,
+                sampler.minimum_trace_target_m,
+            )
+            < raster_lower
+        )
+        local_scale = np.minimum(center_trace, raster_lower)
+        target_release = np.maximum(0.25 * local_scale, 0.5)
+        needed = np.maximum(
+            1,
+            np.ceil(release / target_release).astype(int),
+        )
+        powers = np.asarray([1, 2, 4, 8, 16, 32], dtype=int)
+        selected_power = powers[
+            np.minimum(
+                np.searchsorted(powers, needed, side="left"),
+                len(powers) - 1,
+            )
+        ]
+        selected_power[~candidate] = 1
+        subdivision_count_by_axis = {
+            int(value): int(np.count_nonzero(selected_power == value))
+            for value in powers
+            if np.any(selected_power == value)
+        }
+        lon_width = np.abs(np.gradient(lon_axis))
+        lat_width = np.abs(np.gradient(lat_axis))
+        for subdivisions in powers:
+            group_positions = np.flatnonzero(
+                selected_power == int(subdivisions)
+            )
+            if not len(group_positions):
+                continue
+            group_indices = flat_active[group_positions]
+            if int(subdivisions) == 1:
+                lower = np.maximum(
+                    center_trace[group_positions] - release,
+                    sampler.minimum_trace_target_m,
+                )
+                final_values[group_positions] = np.minimum(
+                    raster_lower[group_positions],
+                    lower,
+                )
+                continue
+            fractions = (
+                (np.arange(int(subdivisions), dtype=float) + 0.5)
+                / float(subdivisions)
+                - 0.5
+            )
+            offset_x, offset_y = np.meshgrid(fractions, fractions)
+            offset_x = offset_x.ravel()
+            offset_y = offset_y.ravel()
+            samples_per_cell = int(subdivisions) ** 2
+            cells_per_chunk = max(
+                1,
+                int(chunk_size) // samples_per_cell,
+            )
+            subcell_radius = (
+                cell_radius_upper_bound_m / float(subdivisions)
+            )
+            for begin in range(0, len(group_indices), cells_per_chunk):
+                indices = group_indices[
+                    begin : begin + cells_per_chunk
+                ]
+                positions = group_positions[
+                    begin : begin + cells_per_chunk
+                ]
+                rows, columns = np.unravel_index(indices, raster.shape)
+                query_lon = (
+                    lon_axis[columns, None]
+                    + lon_width[columns, None] * offset_x[None, :]
+                )
+                query_lat = (
+                    lat_axis[rows, None]
+                    + lat_width[rows, None] * offset_y[None, :]
+                )
+                lonlat = np.column_stack(
+                    [query_lon.ravel(), query_lat.ravel()]
+                )
+                xy = project_points(lonlat, boundary.projection)
+                trace_values = sampler.sample_trace_xy(xy).reshape(
+                    len(indices),
+                    samples_per_cell,
+                )
+                trace_lower = np.maximum(
+                    trace_values
+                    - sampler.gradation * subcell_radius,
+                    sampler.minimum_trace_target_m,
+                )
+                cell_lower = np.minimum(
+                    raster_stencil_lower_bound.ravel()[indices, None],
+                    trace_lower,
+                )
+                mean_inverse_square = np.mean(
+                    1.0 / np.square(cell_lower),
+                    axis=1,
+                )
+                final_values[positions] = 1.0 / np.sqrt(
+                    mean_inverse_square
+                )
+                subcell_trace_query_count += int(trace_values.size)
+    adjusted.ravel()[flat_active] = final_values
+    stencil_reduction = (
+        callback_center.ravel()[flat_active] - final_values
+    )
+    stencil_reduced_count = int(
+        np.count_nonzero(stencil_reduction > 1.0e-9)
+    )
+    maximum_stencil_reduction = float(
+        np.max(stencil_reduction, initial=0.0)
+    )
+    budget = estimate_node_budget(
+        np.asarray(size_field.lon, dtype=float),
+        np.asarray(size_field.lat, dtype=float),
+        adjusted,
+        coverage_mask=np.asarray(size_field.coverage_mask, dtype=bool),
+        domain_mask=np.asarray(size_field.domain_mask, dtype=bool),
+    )
+    budget.update(
+        {
+            "schema_version": "fvcom_sampler_adjusted_node_budget_v3",
+            "callback_schema": (
+                sampler.report.get("schema_version")
+                if isinstance(sampler, BoundaryTraceSizeSampler)
+                else "fvcom_raster_size_sampler_v1"
+            ),
+            "active_cell_center_sample_count": int(len(flat_active)),
+            "trace_reduced_cell_count": int(reduced_count),
+            "trace_reduced_cell_fraction": float(
+                reduced_count / max(len(flat_active), 1)
+            ),
+            "maximum_trace_reduction_m": float(maximum_reduction),
+            "stencil_support": (
+                "active_three_by_three_raster_minimum_plus_adaptive_"
+                "trace_lipschitz_subcell_lower_bounds"
+            ),
+            "inactive_cells_excluded_from_raster_stencil": True,
+            "trace_lipschitz_lower_bound_applied": bool(
+                isinstance(sampler, BoundaryTraceSizeSampler)
+            ),
+            "trace_cell_radius_upper_bound_m": float(
+                cell_radius_upper_bound_m
+            ),
+            "trace_cell_radius_projection_safety_factor": 1.05,
+            "trace_subdivision_count_by_axis": {
+                str(key): int(value)
+                for key, value in subdivision_count_by_axis.items()
+            },
+            "trace_maximum_subdivision_count_by_axis": 32,
+            "trace_subcell_query_count": int(
+                subcell_trace_query_count
+            ),
+            "trace_subdivision_release_fraction": 0.25,
+            "stencil_reduced_cell_count": int(stencil_reduced_count),
+            "stencil_reduced_cell_fraction": float(
+                stencil_reduced_count / max(len(flat_active), 1)
+            ),
+            "maximum_stencil_reduction_m": float(
+                maximum_stencil_reduction
+            ),
+            "chunk_size": int(chunk_size),
+        }
+    )
+    return budget
 
 
 def _preflight_report(
@@ -1408,14 +2142,32 @@ def _preflight_report(
     boundary: BoundaryNodes,
     config: PortfolioCaseConfig,
     *,
+    sampler: ProjectedSizeSampler | BoundaryTraceSizeSampler | None = None,
     upstream_source_boundary_node_count: int | None = None,
     gmsh_boundary_node_count: int | None = None,
 ) -> dict[str, Any]:
-    interior = int(
+    raster_interior = int(
         size_field.report.get("node_budget_estimate", {}).get(
             "estimated_interior_node_count",
             0,
         )
+    )
+    sampler_budget = (
+        _sampler_adjusted_node_budget(
+            size_field,
+            boundary,
+            sampler,
+        )
+        if sampler is not None
+        else None
+    )
+    interior = int(
+        sampler_budget.get(
+            "estimated_interior_node_count",
+            raster_interior,
+        )
+        if sampler_budget is not None
+        else raster_interior
     )
     _seeds, front = boundary_front_seed_points(boundary)
     explicit_boundary = int(len(boundary.xy))
@@ -1427,9 +2179,12 @@ def _preflight_report(
         interior + common_boundary + int(front.get("accepted_count", 0))
     )
     return {
-        "schema_version": "fvcom_portfolio_node_budget_preflight_v2",
+        "schema_version": "fvcom_portfolio_node_budget_preflight_v3",
         "canonical_size_field_schema": size_field.report.get("schema_version"),
         "estimated_interior_node_count": interior,
+        "raster_only_estimated_interior_node_count": raster_interior,
+        "final_callback_estimated_interior_node_count": interior,
+        "final_callback_budget": sampler_budget,
         "upstream_source_boundary_node_count": int(
             upstream_source_boundary_node_count
             if upstream_source_boundary_node_count is not None
@@ -2017,21 +2772,18 @@ def _quality_report(
     quality["common_conditioning_applied"] = False
     quality["input_bundle_sha256"] = str(input_bundle_sha256)
     quality["canonical_size_field_schema"] = "fvcom_size_field_v4"
-    quality["canonical_size_sampling"] = (
-        dict(sampler.report)
-        if isinstance(sampler, BoundaryTraceSizeSampler)
-        else {
-            "schema_version": "fvcom_raster_size_sampler_v1",
-            "method": "strict_cell_center_raster_interpolation",
-        }
-    )
+    quality["canonical_size_sampling"] = dict(sampler.report)
     quality["edge_aware_size_error"] = edge_size
     quality["sms_2dm_roundtrip"] = roundtrip
-    quality["node_budget"] = {
-        "actual_node_count": int(len(mesh.nodes_xy)),
-        "hard_node_limit": int(config.hard_node_limit),
-        "passed": bool(len(mesh.nodes_xy) <= config.hard_node_limit),
-    }
+    delivered_budget = delivered_node_budget_report(
+        len(mesh.nodes_xy),
+        config.hard_node_limit,
+    )
+    # Preserve the archived portfolio aliases while making the shared
+    # delivered-budget schema authoritative.
+    delivered_budget["actual_node_count"] = int(len(mesh.nodes_xy))
+    delivered_budget["hard_node_limit"] = int(config.hard_node_limit)
+    quality["node_budget"] = delivered_budget
     quality.update(mesh.extra_quality)
     return quality
 
@@ -2152,6 +2904,10 @@ def _execute_candidate(
         config,
         input_bundle_sha256,
     )
+    delivered_budget_path = _write_json(
+        candidate_dir / "node_budget_delivered.json",
+        quality["node_budget"],
+    )
     quality_path = _write_json(candidate_dir / "quality.json", quality)
     execution_wall_seconds = float(time.perf_counter() - execution_clock)
     artifact_paths: dict[str, Path] = {
@@ -2159,6 +2915,7 @@ def _execute_candidate(
         "boundary_metadata": boundary_path,
         "generator_report": generator_path,
         "roundtrip": roundtrip_path,
+        "node_budget_delivered": delivered_budget_path,
         "quality_json": quality_path,
     }
     if mesh.raw_msh_path is not None:
@@ -2368,6 +3125,19 @@ def _nested_value(payload: Mapping[str, Any], *keys: str) -> Any:
     return value
 
 
+def _first_nested_value(
+    payload: Mapping[str, Any],
+    *paths: Sequence[str],
+) -> Any:
+    """Return the first present nested value, preserving falsey values."""
+
+    for path in paths:
+        value = _nested_value(payload, *path)
+        if value is not None:
+            return value
+    return None
+
+
 def _write_raw_metric_comparison(
     output: Path,
     candidate_manifests: Sequence[Mapping[str, Any]],
@@ -2575,12 +3345,76 @@ def _write_raw_metric_comparison(
                     "symmetric_ratio",
                     "maximum",
                 ),
+                "boundary_field_interface_ratio_limit_exceedance_count": (
+                    _first_nested_value(
+                        quality,
+                        (
+                            "edge_aware_size_error",
+                            "boundary_field_interface",
+                            "ratio_limit_exceedance_count",
+                        ),
+                        (
+                            "edge_aware_size_error",
+                            "boundary_field_interface",
+                            "factor_two_exceedance_count",
+                        ),
+                    )
+                ),
+                # Backward-compatible comparison alias for archived readers.
                 "boundary_field_interface_factor_two_exceedance_count": (
+                    _first_nested_value(
+                        quality,
+                        (
+                            "edge_aware_size_error",
+                            "boundary_field_interface",
+                            "ratio_limit_exceedance_count",
+                        ),
+                        (
+                            "edge_aware_size_error",
+                            "boundary_field_interface",
+                            "factor_two_exceedance_count",
+                        ),
+                    )
+                ),
+                "boundary_first_ring_continuity_passed": _nested_value(
+                    quality,
+                    "edge_aware_size_error",
+                    "boundary_first_ring_realized_continuity",
+                    "passed",
+                ),
+                "boundary_first_ring_continuity_p95": _nested_value(
+                    quality,
+                    "edge_aware_size_error",
+                    "boundary_first_ring_realized_continuity",
+                    "global",
+                    "symmetric_ratio",
+                    "quantiles",
+                    "p95",
+                ),
+                "boundary_first_ring_continuity_maximum": _nested_value(
+                    quality,
+                    "edge_aware_size_error",
+                    "boundary_first_ring_realized_continuity",
+                    "global",
+                    "symmetric_ratio",
+                    "maximum",
+                ),
+                "boundary_first_ring_chain_p95_exceedance_count": (
                     _nested_value(
                         quality,
                         "edge_aware_size_error",
-                        "boundary_field_interface",
-                        "factor_two_exceedance_count",
+                        "boundary_first_ring_realized_continuity",
+                        "global",
+                        "chain_p95_exceedance_count",
+                    )
+                ),
+                "boundary_first_ring_chain_maximum_exceedance_count": (
+                    _nested_value(
+                        quality,
+                        "edge_aware_size_error",
+                        "boundary_first_ring_realized_continuity",
+                        "global",
+                        "chain_maximum_exceedance_count",
                     )
                 ),
                 "roundtrip_passed": _nested_value(
@@ -2660,6 +3494,10 @@ def run_portfolio_case(
             "case readiness failed: " + ", ".join(readiness["blockers"])
         )
     prepared = prepare_case(case_manifest_path, workspace_root)
+    assert_readiness_manifest_binding(
+        readiness,
+        prepared.manifest_sha256,
+    )
     config, case_spacing_policy = _case_budget_spacing_policy(
         prepared,
         readiness,
@@ -2678,6 +3516,12 @@ def run_portfolio_case(
     source_boundary, target_assignment = _apply_case_budget_targets(
         source_boundary,
         case_spacing_policy,
+        geometry_continuity=bool(
+            config.boundary_geometry_continuity
+        ),
+        geometry_metric_ratio=float(
+            config.boundary_geometry_metric_ratio
+        ),
     )
     case_spacing_policy["boundary_target_assignment"] = target_assignment
     size_bathy = coarsen_for_size_field(
@@ -2734,6 +3578,7 @@ def run_portfolio_case(
         size_field,
         boundary,
         config,
+        sampler=sampler,
         upstream_source_boundary_node_count=len(source_boundary.xy),
         gmsh_boundary_node_count=gmsh_boundary_count,
     )
@@ -2823,6 +3668,10 @@ def run_portfolio_case(
                 )
             )
             continue
+        if isinstance(sampler, BoundaryTraceSizeSampler):
+            # Preflight and earlier candidates must not leak operational
+            # sampler counters into this candidate's immutable quality report.
+            sampler.reset_operational_counters()
         try:
             manifest = _execute_candidate(
                 candidate_id,

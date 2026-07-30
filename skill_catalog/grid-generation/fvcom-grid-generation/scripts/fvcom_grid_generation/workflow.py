@@ -25,6 +25,12 @@ from .boundary import (
 )
 from .mesh import MeshConfig, generate_mesh
 from .metrics import triangle_geometry
+from .node_budget import (
+    DEFAULT_HARD_NODE_LIMIT,
+    DEFAULT_MAX_INTERIOR_POINTS,
+    DEFAULT_NODE_BUDGET_STOP_FRACTION,
+    delivered_node_budget_report,
+)
 from .plotting import write_mesh_gpkg, write_mesh_quality_gpkg, write_mesh_review_map
 from .progress import ProgressTracker
 from .projection import project_points, unproject_points
@@ -58,9 +64,9 @@ class GridConfig:
     obc_hold_distance_m: float = 10_000.0
     obc_transition_distance_m: float = 60_000.0
     target_timestep_s: str = "auto"
-    max_interior_points: int = 80_000
-    max_total_nodes: int = 120_000
-    node_budget_stop_fraction: float = 0.90
+    max_interior_points: int = DEFAULT_MAX_INTERIOR_POINTS
+    max_total_nodes: int = DEFAULT_HARD_NODE_LIMIT
+    node_budget_stop_fraction: float = DEFAULT_NODE_BUDGET_STOP_FRACTION
     refine_iterations: int = 3
     smooth_iterations: int = 8
     fetch_bathymetry: bool = True
@@ -419,6 +425,15 @@ def run_fvcom_grid(
         )
 
     mesh = generate_mesh(boundary_nodes, size_field, mesh_config, progress_callback=_mesh_progress)
+    delivered_node_budget = delivered_node_budget_report(
+        len(mesh.nodes_xy),
+        int(config.max_total_nodes),
+    )
+    delivered_node_budget_path = run_dir / "node_budget_delivered.json"
+    delivered_node_budget_path.write_text(
+        json.dumps(_json_safe(delivered_node_budget), indent=2),
+        encoding="utf-8",
+    )
     conditioning_json = run_dir / "mesh_conditioning.json"
     conditioning_json.write_text(json.dumps(_json_safe(mesh.report.get("conditioning", {})), indent=2), encoding="utf-8")
     edit_ledger_json = run_dir / "mesh_edit_ledger.json"
@@ -464,6 +479,7 @@ def run_fvcom_grid(
         constraint_chains=mesh.constraint_chains,
         target_size_by_triangle=target_sizes,
     )
+    _apply_delivered_node_budget_gate(quality, delivered_node_budget)
     quality["open_boundary_size_error"] = _open_boundary_size_error(mesh.nodes_xy, mesh.open_boundary_nodes, mesh.target_spacing_m)
     if quality["open_boundary_size_error"]["p95_l_over_h"] > 1.55 or quality["open_boundary_size_error"]["maximum_l_over_h"] > 2.0:
         if "open_boundary_size_mismatch" not in quality["failure_taxonomy"]:
@@ -607,6 +623,10 @@ def run_fvcom_grid(
             ),
             "target_timestep_s": str(config.target_timestep_s),
             "max_interior_points": int(config.max_interior_points),
+            "max_total_nodes": int(config.max_total_nodes),
+            "node_budget_stop_fraction": float(
+                config.node_budget_stop_fraction
+            ),
             "bathy_fallback_policy": config.bathy_fallback_policy,
             "bathy_resolution_policy": config.bathy_resolution_policy,
             "bathy_target_spacing_arcsec": float(config.bathy_target_spacing_arcsec),
@@ -719,6 +739,9 @@ def run_fvcom_grid(
             "boundary_nodes_geojson": str(boundary_nodes_path),
             "boundary_contract_v2_json": str(boundary_contract_path) if boundary_contract_path else None,
             "node_budget_preflight_json": str(node_budget_path),
+            "node_budget_delivered_json": str(
+                delivered_node_budget_path
+            ),
             "delivered_boundary_nodes_geojson": str(delivered_boundary_nodes_path),
             "mesh_nodes_elements_gpkg": str(mesh_gpkg),
             "mesh_quality_elements_gpkg": str(mesh_quality_gpkg),
@@ -1086,6 +1109,21 @@ def _element_target_sizes(
     centroids_xy = np.mean(np.asarray(nodes_xy, dtype=float)[triangles], axis=1)
     centroids_lonlat = unproject_points(centroids_xy, boundary_nodes.projection)
     return size_field.sample(centroids_lonlat[:, 0], centroids_lonlat[:, 1])
+
+
+def _apply_delivered_node_budget_gate(
+    quality: dict[str, Any],
+    delivered_report: dict[str, object],
+) -> None:
+    """Attach and enforce the hard post-triangulation node-count audit."""
+
+    quality["node_budget"] = dict(delivered_report)
+    if bool(delivered_report.get("passed")):
+        return
+    failures = quality.setdefault("failure_taxonomy", [])
+    if "hard_node_cap_exceeded" not in failures:
+        failures.append("hard_node_cap_exceeded")
+    quality["accepted"] = False
 
 
 def _open_boundary_size_error(nodes_xy: np.ndarray, open_nodes_one_based: np.ndarray, node_targets: np.ndarray) -> dict[str, Any]:

@@ -81,7 +81,11 @@ than guessing.
 - Stratify results by boundary-discretization policy; do not rank unmatched
   policies as an algorithm-only bakeoff.
 - Use fresh, non-overwriting candidate directories.
-- Enforce the same 135,000-node preflight threshold and 150,000-node hard cap.
+- By default, enforce the same 900,000-node preflight threshold and
+  1,000,000-node hard cap. Explicit smaller budgets remain valid reproducibility
+  overrides.
+- Re-audit the delivered mesh after generation. A delivered count above the
+  hard cap is a hard failure even when the metric preflight passed.
 - Evaluate every delivered 2DM with `fvcom_mesh_quality_v2`, including the
   canonical target-size `L/h` gates.
 - Keep structural failures, generator failures, node-budget failures,
@@ -102,10 +106,9 @@ after these controls are reproducible.
 
 ## Boundary/field reconciliation before a ranked run
 
-The first Lake portfolio audit found that the adaptive one-dimensional target
-can be much coarser than the final slope/hydraulic two-dimensional field at the
-same shoreline. Treat that as an input-contract failure, not a triangle
-algorithm failure.
+A one-dimensional boundary target can be much coarser or finer than the final
+slope/hydraulic two-dimensional field at the same shoreline. Treat that as an
+input-contract failure, not a triangle-algorithm failure.
 
 First resolve the scientific scale shared by the boundary and field. Compute
 the bathymetry-supported floor
@@ -118,15 +121,56 @@ h_b=
 \]
 
 then select the smallest 25 m multiple \(h_u\ge h_b\) that satisfies the common
-135,000-node metric preflight. Assign \(h_u\) to every solid and island target
-and use the case manifest's near-OBC target for every open chain. Preserve all
-source vertices even when their chords are shorter than \(h_u\); count and
-label those unavoidable constraints `geometry_forced_subgrid` instead of
-inventing finer boundary nodes or pretending that the physical resolution is
-uniform.
+900,000-node metric preflight. Here \(\Delta x_{95}\) and \(\Delta y_{95}\)
+describe bathymetry raster support; 25 m is only the deterministic rounding and
+search quantum. The 1,000,000-node cap is a ceiling, not a requested node count:
+selection stops at \(h_b\) when that floor already fits. Assign \(h_u\) to every
+solid and island target and use the case manifest's near-OBC target for every
+open chain. Reject a configuration whose maximum size is below selected
+\(h_u\); do not silently clamp the raster floor and invalidate the node-budget
+solution. Preserve all source vertices even when their chords are shorter
+than \(h_u\); count and label those unavoidable constraints
+`geometry_forced_subgrid` instead of inventing finer boundary nodes or
+pretending that the physical resolution is uniform.
+
+Make realized source geometry authoritative before the first field build. For
+each immutable source chord of length \(L\), derive
+
+\[
+h_{\rm geo}=L,
+\]
+
+assign each endpoint the minimum of its incident chord targets, and then take
+the conservative minimum of \(h_{\rm geo}\) and the case-policy target. This
+does not remove, move, or merge a source vertex. It makes the field and first
+interior ring respond to a short delivered chord instead of merely diagnosing
+the jump after triangulation.
+
+Sub-bathymetry-floor chord targets remain on the one-dimensional boundary
+trace; they do not lower the entire two-dimensional raster below its
+bathymetry-supported floor. Use bilinear sampling only when all four stencil
+cells are active. At a wet/dry interface, choose the highest-weight active
+corner with positive interpolation weight instead of assigning one shared
+inactive-halo value that could connect two wet banks across land. At a dry-cell
+centre, choose the coarsest covered corner so a fine wrong-bank value cannot
+override the boundary trace. This raster-interface guard does not claim global
+barrier awareness. In the boundary-trace wrapper, use the raster value only
+when the query has positive-weight active support. Otherwise make the trace
+authoritative and record
+`no_active_support_policy=boundary_trace_authoritative`; the coarsest-covered
+fallback remains available to raster-only controls and provenance diagnostics,
+but it cannot override the trace. The node-budget integral remains restricted
+to active wet cells. It combines an active-only neighboring-raster minimum
+with adaptive gradation-Lipschitz lower bounds over as many as \(32\times32\)
+subcells. The refinement level is chosen from the within-cell release relative
+to the local target. This covers off-centre callback refinement without
+importing dry-cell targets or charging one fine trace point to a whole coarse
+raster cell.
 
 The current research implementation uses a deterministic direct fixed point,
-not the wet-distance min-plus equations that appeared in the original design:
+not the wet-distance min-plus equations that appeared in the original design.
+Use gradation \(g=0.10\), boundary/field compatibility factor \(1.5\), and at
+most eight fixed-point passes:
 
 1. build provisional `fvcom_size_field_v4` \(H_k\) from the case targets;
 2. sample \(H_k\) along every immutable source segment;
@@ -135,42 +179,70 @@ not the wet-distance min-plus equations that appeared in the original design:
    envelope with gradation \(g\), and equidistribute boundary metric length
    while retaining every source vertex and lineage record;
 4. rebuild \(H_{k+1}\) from that reconciled boundary;
-5. restore the exact continuous boundary trace that a cell-centred raster
-   cannot represent,
+5. restore a sampled approximation to the continuous boundary trace that a
+   cell-centred raster cannot represent,
    \[
-   \widehat H(x)=\min\left[
-   H_{k+1}^{\rm raster}(x),
-   \min_i\{h_{\Gamma,i}+g\|x-x_i\|_2\}
-   \right],
+   T(x)=\min_i\{h_{\Gamma,i}+g\|x-x_i\|_2\},\qquad
+   \widehat H(x)=
+   \begin{cases}
+   \min\!\left(H_{k+1}^{\rm raster}(x),T(x)\right),
+      & \text{positive-weight active raster support},\\
+   T(x), & \text{otherwise},
+   \end{cases}
    \]
    using deterministic trace samples that include every delivered vertex and
    every edge midpoint;
 6. repeat from the immutable source boundary until endpoint-and-midpoint
-   \(L/\min(h_\Gamma,\widehat H)\), gradation, and factor-two interface gates
-   all pass.
+   \(L/\min(h_\Gamma,\widehat H)\), gradation, and factor-1.5 interface gates
+   all pass, or reject the common input bundle after the eighth pass.
 
 This method is recorded as
-`authoritative_source_resampling_plus_rebuilt_field_fixed_point` and explicitly
-reports `not_wet_distance_min_plus`. It is sufficient for the present raw
-bakeoff only when the independent edge audit passes. A tested one-cell
-nearest-wet raster halo made the Lake interface worse and is not part of the
-contract. The trace extension uses four deterministic samples per local target
-spacing and the 16 nearest samples by default; both controls are recorded in
-the scientific bundle hash. It is exact at the audited endpoints and
-midpoints and releases normally at the same gradation \(g\).
+`authoritative_source_geometry_trace_resampling_plus_rebuilt_field_fixed_point`
+and explicitly reports `not_wet_distance_min_plus`. It is sufficient for the
+present raw bakeoff only when the independent edge audit passes. The
+`fvcom_boundary_trace_sampler_v2` extension uses four deterministic samples per
+local target spacing, equidistributed by the metric of the linearly
+interpolated endpoint targets. It also includes every audited endpoint and
+physical midpoint, and fails safely if the deterministic set would exceed five
+million points. Its nearest-neighbour search starts with 16 samples and expands
+until a global lower bound proves that no unseen sample can lower the answer.
+Query locations are processed in deterministic batches of at most 4,096;
+this preserves exact values and aggregate counters while bounding the memory
+used by the expanding neighbour arrays.
+It is therefore exact over the deterministic sample set—not over the
+continuous segment—and releases normally at the same gradation \(g\). The
+report records expansion counts and the remaining continuous-sampling
+overestimate bound. It also records the no-active-support policy so immutable
+older v2 artifacts without that key replay their historical `raster_min`
+behavior instead of being silently reinterpreted. A fixed 16-neighbour
+truncation is not the v2 contract.
+
+After reconciliation, integrate the final size callback at every active wet
+raster-cell centre and use that callback-adjusted interior estimate in the
+900,000-node preflight. The stored raster estimate is retained for comparison,
+but it cannot authorize triangulation when the sampled trace makes the
+callback finer.
+
+For open domains, treat the configured OBC transition distance as a minimum.
+Compute the distance required by the declared gradation and use the greater of
+the requested and required values. Record requested, required, effective, and
+available wet distances, including whether the transfer was auto-extended and
+whether the full transfer fits within the connected wet domain.
 
 The standalone reconciler keeps a backward-compatible `minimum` mode,
 \(h_\Gamma=\min(h_{\rm source},H)\), for workflows whose explicit source target
 must never be coarsened. The research portfolio selects `sampled_field` by
-default because retaining a finer source target where \(H\) is coarser creates
-the boundary/first-ring jump this preflight is designed to reject. Record and
-hash the selected mode; changing the case-budget policy does not silently
-change it.
+default. Under default geometry continuity, \(H\) already includes the
+chord-derived trace, so its subfloor source-geometry targets remain
+authoritative; disabling geometry continuity is the explicit route that can
+allow a coarser sampled field to replace them. Record and hash both controls.
 
 The current trace distance is straight Euclidean distance, not wet-domain
-geodesic distance. Report possible refinement leakage through barrier land and
-islands as an advisory diagnostic; do not describe this trace extension as the
-future barrier-aware wet-distance min-plus solver.
+geodesic distance. Record `barrier_aware=false` and possible refinement leakage
+through barrier land and islands as an advisory risk. Do not report leakage as
+observed or quantified unless a separate barrier audit was run, and do not
+describe this trace extension as the future barrier-aware wet-distance
+min-plus solver.
 
 The topology-aware target for a later production revision remains the
 wet-distance min-plus construction below. Let \(h_0(x)\) be the provisional
@@ -193,8 +265,9 @@ Do not claim these min-plus equations are implemented until a barrier-aware
 wet-domain solver and its fixtures replace the direct fixed point.
 Deterministically resample every curve from the accepted \(h_\Gamma\), retain
 every source vertex, hard anchor, kind transition, orientation, and lineage
-record, and recompute the node budget. Make the boundary/interior factor-two
-diagnostic a hard bundle preflight; do not rank algorithms while it fails.
+record, and recompute the node budget. Make the boundary/field factor-1.5
+compatibility diagnostic a hard bundle preflight; do not rank algorithms while
+it fails.
 
 Use two explicit candidate strata:
 
@@ -212,19 +285,13 @@ boundary-policy delta.
 ## Current raw-mesher routing default
 
 Use Gmsh Frontal-Delaunay algorithm 6 as the research raw primary. It supports
-zero, single, plural, and cyclic OBC contracts and gave the strongest closed-
-lake result after the continuous boundary-trace correction: lower node count,
-higher \(q_{L3\sigma}\), lower first-ring \(L/h\), maximum valence 8, and fewer
-area-change hotspots than Gmsh Delaunay algorithm 5.
-
-This is a routing default, not a declaration that algorithm 6 wins every
-metric or has passed production gates. Run algorithm 5 as the first challenger
-whenever algorithm 6 fails a hard gate; it retained somewhat better shape-tail
-and singly-connected counts in the cyclic Hawaii control. Keep the clean-room
-route as the production reference for supported zero/single noncyclic OBC
-topologies, and use MeshAdapt algorithm 1 as an explicit diagnostic rather
-than the default. Compare failed candidates metric by metric without a
-composite winner.
+zero, single, plural, and cyclic OBC contracts. Run Gmsh Delaunay algorithm 5
+as the first hard-gate challenger. This is a routing policy, not a regional
+result, a composite ranking, or a production-promotion claim. Keep the
+clean-room route as the production reference for supported zero/single
+noncyclic OBC topologies, and use MeshAdapt algorithm 1 as an explicit
+diagnostic rather than the default. Compare failed candidates metric by metric
+without a composite winner.
 
 The executable default policy order is:
 
@@ -234,9 +301,10 @@ The executable default policy order is:
 4. `gmsh_meshadapt_1` — robustness diagnostic.
 
 Production promotion remains withheld until one routed workflow passes every
-hard gate across the complete six-case topology matrix. The current three-case
-no-conditioning control still requires conditioning for thin-angle,
-area-change, valence, and/or singly-connected debt.
+hard gate across the complete six-case topology matrix. The current continuity
+experiment stops at `RAW`: disable all OMA conditioning and postprocessing.
+Native algorithm and smoothing settings remain generator provenance and do not
+make the candidate `COMMON_CONDITIONED`.
 
 Audit target size per edge, not only from the longest triangle edge divided by
 one centroid sample:
@@ -251,9 +319,18 @@ the midpoint, then take the maximum symmetric ratio
 \(\max(h_\Gamma/H,H/h_\Gamma)\). Comparing the minimum of one triplet with the
 minimum of the other can false-pass anticorrelated targets and is forbidden.
 
+Audit realized boundary-to-bulk continuity independently. For every constraint
+edge of length \(L_e\) and every incident first-ring triangle of area \(A_t\),
+define \(h_t=\sqrt{4A_t/\sqrt{3}}\) and report
+\(\max(L_e/h_t,h_t/L_e)\). Require both the global and per-chain p95 to be at
+most `1.5`, and every global and per-chain maximum to be at most `2.0`. This is
+a hard gate, not an advisory plot statistic.
+
 Report the existing p95 and maximum gates separately for boundary edges,
 first-ring triangles, the transition band, and the true interior. Do not hide
-boundary defects by excluding them.
+boundary defects by excluding them. Retain the canonical target-size
+triangle-edge gates of p95 at most `1.55` and maximum at most `2.0`; they are
+separate from the realized boundary/first-ring scale-ratio gate above.
 
 ## Parallel execution
 

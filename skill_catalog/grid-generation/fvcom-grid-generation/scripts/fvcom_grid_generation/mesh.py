@@ -13,6 +13,7 @@ from shapely.ops import linemerge
 
 from .boundary import BoundaryNodes
 from .metrics import build_edge_topology, constraint_integrity, triangle_geometry
+from .node_budget import DEFAULT_MAX_INTERIOR_POINTS
 from .local_topology import AggressiveConditioningConfig, condition_mesh_aggressive
 from .systematic_v5 import SystematicV5LoopConfig, run_systematic_v5_loop
 from .systematic_v6 import SystematicV6LoopConfig, run_systematic_v6_loop
@@ -37,7 +38,7 @@ class MeshConfig:
     max_constraint_iterations: int = 8
     refine_iterations: int = 3
     smooth_iterations: int = 8
-    max_interior_points: int = 80_000
+    max_interior_points: int = DEFAULT_MAX_INTERIOR_POINTS
     max_refine_insertions_per_iter: int = 1500
     size_overrun_factor: float = 1.55
     min_angle_refine_deg: float = 24.0

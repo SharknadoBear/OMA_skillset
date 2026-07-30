@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -30,17 +31,21 @@ from fvcom_grid_generation.portfolio_case import (
     ProjectedSizeSampler,
     _CandidateMesh,
     _apply_case_budget_targets,
+    _execute_candidate,
     _load_canonical_boundary,
+    _preflight_report,
     _prepared_case_on_boundary,
     _reconciliation_changed_obc_sequence,
     _reconcile_boundary_and_size_field,
     _roundtrip_report,
     _run_clean_room_candidate,
     _run_gmsh_candidate,
+    _sampler_adjusted_node_budget,
     _scientific_bundle_sha256,
     _size_field_config,
     _validate_output_path_budget,
     _source_obc_node_indices,
+    _write_raw_metric_comparison,
     capability_routing,
     normalize_candidate_ids,
     run_portfolio_case,
@@ -49,7 +54,11 @@ from fvcom_grid_generation.projection import (
     local_utm_projection,
     project_points,
 )
-from fvcom_grid_generation.size_field import build_size_field
+from fvcom_grid_generation.size_field import (
+    build_size_field,
+    estimate_node_budget,
+)
+from run_mesher_portfolio_case import build_parser
 
 
 def _expect_raises(
@@ -123,6 +132,17 @@ def _uniform_size_field(prepared: PreparedCase, size_m: float = 1_000.0):
         lat=prepared.bathymetry.lat,
         size=np.full(shape, size_m, dtype=float),
         coverage_mask=np.ones(shape, dtype=bool),
+        domain_mask=np.ones(shape, dtype=bool),
+        report={
+            "schema_version": "fvcom_size_field_v4",
+            "sampling_interface": {
+                "schema_version": "fvcom_wet_mask_sampling_v2",
+                "method": (
+                    "bilinear_all_positive_weight_active_else_"
+                    "highest_weight_positive_active_else_coarsest_covered"
+                ),
+            },
+        },
     )
 
 
@@ -349,6 +369,7 @@ def test_case_budget_targets_and_geometry_forced_edge_count() -> None:
             "solid_and_island_target_m": solid_target,
             "open_boundary_target_m": open_target,
         },
+        geometry_continuity=False,
     )
     assert np.allclose(
         updated.target_spacing_m,
@@ -363,6 +384,86 @@ def test_case_budget_targets_and_geometry_forced_edge_count() -> None:
         updated.target_spacing_m,
     )
 
+    geometry_updated, geometry_report = _apply_case_budget_targets(
+        boundary,
+        {
+            "applied": True,
+            "solid_and_island_target_m": solid_target,
+            "open_boundary_target_m": open_target,
+        },
+        geometry_continuity=True,
+        geometry_metric_ratio=0.80,
+    )
+    expected_geometry = np.full(len(boundary.xy), np.inf, dtype=float)
+    for start, end in zip(
+        exterior,
+        exterior[1:] + exterior[:1],
+    ):
+        value = (
+            np.linalg.norm(boundary.xy[end] - boundary.xy[start])
+            / 0.80
+        )
+        expected_geometry[start] = min(
+            expected_geometry[start],
+            value,
+        )
+        expected_geometry[end] = min(
+            expected_geometry[end],
+            value,
+        )
+    assert np.allclose(
+        geometry_updated.target_spacing_m,
+        np.minimum(updated.target_spacing_m, expected_geometry),
+        rtol=0.0,
+        atol=1.0e-12,
+    )
+    assert geometry_report["geometry_continuity_applied"]
+    assert geometry_report["geometry_limited_node_count"] > 0
+    assert np.array_equal(
+        geometry_updated.metadata[
+            "geometry_continuity_target_spacing_m"
+        ],
+        expected_geometry,
+    )
+
+    independent_updated, independent_report = (
+        _apply_case_budget_targets(
+            boundary,
+            {"applied": False},
+            geometry_continuity=True,
+            geometry_metric_ratio=1.0,
+        )
+    )
+    expected_independent_geometry = np.full(
+        len(boundary.xy),
+        np.inf,
+        dtype=float,
+    )
+    for start, end in zip(
+        exterior,
+        exterior[1:] + exterior[:1],
+    ):
+        length = np.linalg.norm(
+            boundary.xy[end] - boundary.xy[start]
+        )
+        expected_independent_geometry[start] = min(
+            expected_independent_geometry[start],
+            length,
+        )
+        expected_independent_geometry[end] = min(
+            expected_independent_geometry[end],
+            length,
+        )
+    assert independent_report["applied"] is False
+    assert independent_report["geometry_continuity_applied"] is True
+    assert np.allclose(
+        independent_updated.target_spacing_m,
+        np.minimum(
+            boundary.target_spacing_m,
+            expected_independent_geometry,
+        ),
+    )
+
 
 def test_portfolio_config_reconciliation_validation() -> None:
     valid = PortfolioCaseConfig(
@@ -374,6 +475,9 @@ def test_portfolio_config_reconciliation_validation() -> None:
     assert valid.boundary_metric_edge > 0.0
     assert valid.boundary_field_compatibility_factor > 1.0
     assert valid.boundary_target_combination == "sampled_field"
+    assert valid.boundary_geometry_continuity
+    assert valid.boundary_geometry_metric_ratio == 1.0
+    assert valid.gradation == 0.10
     assert valid.boundary_trace_samples_per_target == 4.0
     assert valid.boundary_trace_nearest_sample_count == 16
     for value in (1.0, 0.0, -1.0, np.nan):
@@ -421,6 +525,42 @@ def test_portfolio_config_reconciliation_validation() -> None:
         ),
         "must be positive",
     )
+    for value in (0.0, -1.0, 1.00001, np.nan):
+        _expect_raises(
+            ValueError,
+            lambda value=value: PortfolioCaseConfig(
+                boundary_geometry_metric_ratio=value
+            ),
+            "in (0, 1]",
+        )
+    _expect_raises(
+        ValueError,
+        lambda: _size_field_config(
+            PortfolioCaseConfig(
+                land_spacing_m=2_000.0,
+                maximum_size_m=1_000.0,
+            )
+        ),
+        "exceeds maximum_size_m",
+    )
+
+
+def test_portfolio_cli_continuity_defaults() -> None:
+    args = build_parser().parse_args(
+        [
+            "--case-manifest",
+            "case.json",
+            "--output-dir",
+            "fresh-output",
+        ]
+    )
+    assert args.gradation == 0.10
+    assert args.boundary_geometry_metric_ratio == 1.0
+    assert args.boundary_reconciliation_max_iterations == 8
+    assert args.boundary_field_compatibility_factor == 1.5
+    assert args.boundary_target_combination == "sampled_field"
+    assert not args.disable_boundary_geometry_continuity
+    assert not args.disable_case_budget_spacing_policy
 
 
 def test_cached_projected_size_sampler() -> None:
@@ -437,6 +577,7 @@ def test_cached_projected_size_sampler() -> None:
         lat=prepared.bathymetry.lat,
         size=values,
         coverage_mask=np.ones(values.shape, dtype=bool),
+        domain_mask=np.ones(values.shape, dtype=bool),
     )
     sampler = ProjectedSizeSampler(field, prepared.projection)
     lonlat = np.asarray([[-76.08, 43.22], [-76.06, 43.225]])
@@ -511,6 +652,599 @@ def test_boundary_trace_sampler_exact_trace_and_normal_release() -> None:
     assert sampler.report["distance_metric"] == "straight_euclidean"
     assert sampler.report["barrier_aware"] is False
 
+    # Operational counters are candidate-local: preflight and candidate order
+    # cannot change another candidate's immutable sampling evidence.
+    sampler.reset_operational_counters()
+    sampler.sample_xy(outward_normal_points[:2])
+    first_order_a = {
+        key: sampler.report[key]
+        for key in (
+            "sample_query_count",
+            "expanded_sample_query_count",
+            "maximum_neighbors_examined",
+        )
+    }
+    sampler.reset_operational_counters()
+    sampler.sample_xy(outward_normal_points[2:])
+    first_order_b = {
+        key: sampler.report[key]
+        for key in (
+            "sample_query_count",
+            "expanded_sample_query_count",
+            "maximum_neighbors_examined",
+        )
+    }
+    sampler.reset_operational_counters()
+    sampler.sample_xy(outward_normal_points[2:])
+    single_candidate_b = {
+        key: sampler.report[key]
+        for key in (
+            "sample_query_count",
+            "expanded_sample_query_count",
+            "maximum_neighbors_examined",
+        )
+    }
+    sampler.reset_operational_counters()
+    sampler.sample_xy(outward_normal_points[:2])
+    reversed_order_a = {
+        key: sampler.report[key]
+        for key in (
+            "sample_query_count",
+            "expanded_sample_query_count",
+            "maximum_neighbors_examined",
+        )
+    }
+    assert first_order_a == reversed_order_a
+    assert first_order_b == single_candidate_b
+
+
+def test_boundary_trace_adaptive_search_finds_distant_fine_source() -> None:
+    prepared = _synthetic_case()
+    boundary, _ = _load_canonical_boundary(prepared, PortfolioCaseConfig())
+    square_xy = np.asarray(
+        [
+            [0.0, 0.0],
+            [100.0, 0.0],
+            [100.0, 100.0],
+            [0.0, 100.0],
+        ],
+        dtype=float,
+    )
+    mixed = replace(
+        boundary,
+        xy=square_xy,
+        target_spacing_m=np.asarray(
+            [1.0, 100.0, 100.0, 100.0],
+            dtype=float,
+        ),
+    )
+
+    class ConstantBaseSampler:
+        def sample_xy(self, values_xy):
+            return np.full(len(np.asarray(values_xy)), 1_000.0)
+
+    sampler = BoundaryTraceSizeSampler(
+        ConstantBaseSampler(),
+        mixed,
+        gradation=0.01,
+        samples_per_target=4.0,
+        nearest_sample_count=1,
+    )
+    query = np.asarray([[100.0, 50.0]], dtype=float)
+    actual = float(sampler.sample_xy(query)[0])
+    brute_force = float(
+        np.min(
+            sampler._targets
+            + 0.01
+            * np.linalg.norm(
+                sampler._points - query[0],
+                axis=1,
+            )
+        )
+    )
+    assert np.isclose(actual, brute_force, rtol=0.0, atol=1.0e-12)
+    assert sampler.report["expanded_sample_query_count"] > 0
+    assert sampler.report["maximum_neighbors_examined"] > 1
+    assert sampler.report["exact_discrete_trace_sample_minimum"]
+
+
+def test_boundary_trace_query_chunking_preserves_values_and_counters() -> None:
+    prepared = _synthetic_case()
+    boundary, _ = _load_canonical_boundary(prepared, PortfolioCaseConfig())
+    mixed = replace(
+        boundary,
+        xy=np.asarray(
+            [
+                [0.0, 0.0],
+                [100.0, 0.0],
+                [100.0, 100.0],
+                [0.0, 100.0],
+            ],
+            dtype=float,
+        ),
+        target_spacing_m=np.asarray(
+            [1.0, 100.0, 100.0, 100.0],
+            dtype=float,
+        ),
+    )
+
+    class ConstantBaseSampler:
+        def sample_xy(self, values_xy):
+            return np.full(len(np.asarray(values_xy)), 1_000.0)
+
+    common = {
+        "gradation": 0.01,
+        "samples_per_target": 4.0,
+        "nearest_sample_count": 1,
+    }
+    chunked = BoundaryTraceSizeSampler(
+        ConstantBaseSampler(),
+        mixed,
+        query_chunk_size=2,
+        **common,
+    )
+    unchunked = BoundaryTraceSizeSampler(
+        ConstantBaseSampler(),
+        mixed,
+        query_chunk_size=1_000,
+        **common,
+    )
+    query = np.column_stack(
+        [
+            np.linspace(5.0, 95.0, 11),
+            np.linspace(95.0, 5.0, 11),
+        ]
+    )
+    chunked_values = chunked.sample_xy(query)
+    unchunked_values = unchunked.sample_xy(query)
+    assert np.allclose(
+        chunked_values,
+        unchunked_values,
+        rtol=0.0,
+        atol=1.0e-12,
+    )
+    for key in (
+        "sample_query_count",
+        "expanded_sample_query_count",
+        "maximum_neighbors_examined",
+    ):
+        assert chunked.report[key] == unchunked.report[key]
+    assert chunked.report["query_chunk_size"] == 2
+    assert chunked.report["memory_bounded_query_chunks"]
+
+
+def test_boundary_trace_metric_sampling_bounds_extreme_endpoint_ratio() -> None:
+    prepared = _synthetic_case()
+    boundary, _ = _load_canonical_boundary(
+        prepared,
+        PortfolioCaseConfig(),
+    )
+    extreme = replace(
+        boundary,
+        xy=np.asarray(
+            [
+                [0.0, 0.0],
+                [1_000_000.0, 0.0],
+                [1_000_000.0, 1_000_000.0],
+                [0.0, 1_000_000.0],
+            ],
+            dtype=float,
+        ),
+        target_spacing_m=np.asarray(
+            [1.0, 1_000_000.0, 1_000_000.0, 1_000_000.0],
+            dtype=float,
+        ),
+    )
+
+    class ConstantBaseSampler:
+        def sample_xy(self, values_xy):
+            return np.full(len(np.asarray(values_xy)), 2_000_000.0)
+
+    sampler = BoundaryTraceSizeSampler(
+        ConstantBaseSampler(),
+        extreme,
+        gradation=0.10,
+        samples_per_target=4.0,
+        nearest_sample_count=16,
+        maximum_total_sample_count=1_000,
+    )
+    assert sampler.report["boundary_sample_count"] < 1_000
+    assert sampler.report["sample_distribution"] == (
+        "linear_endpoint_target_metric_equidistribution"
+    )
+    _expect_raises(
+        ValueError,
+        lambda: BoundaryTraceSizeSampler(
+            ConstantBaseSampler(),
+            extreme,
+            gradation=0.10,
+            samples_per_target=4.0,
+            nearest_sample_count=16,
+            maximum_total_sample_count=10,
+        ),
+        "safety limit",
+    )
+
+
+def test_boundary_trace_single_edge_cap_fails_before_large_allocation() -> None:
+    prepared = _synthetic_case()
+    boundary, _ = _load_canonical_boundary(
+        prepared,
+        PortfolioCaseConfig(),
+    )
+    pathological = replace(
+        boundary,
+        xy=np.asarray(
+            [
+                [0.0, 0.0],
+                [1.0e12, 0.0],
+                [1.0e12, 1.0],
+                [0.0, 1.0],
+            ],
+            dtype=float,
+        ),
+        target_spacing_m=np.ones(4, dtype=float),
+    )
+
+    class ConstantBaseSampler:
+        def sample_xy(self, values_xy):
+            return np.full(len(np.asarray(values_xy)), 2.0e12)
+
+    _expect_raises(
+        ValueError,
+        lambda: BoundaryTraceSizeSampler(
+            ConstantBaseSampler(),
+            pathological,
+            gradation=0.10,
+            samples_per_target=4.0,
+            nearest_sample_count=16,
+            maximum_total_sample_count=1_000,
+        ),
+        "before allocation",
+    )
+
+
+def test_sampler_adjusted_preflight_counts_trace_refinement() -> None:
+    prepared = _synthetic_case()
+    boundary, _ = _load_canonical_boundary(prepared, PortfolioCaseConfig())
+    traced_boundary = replace(
+        boundary,
+        target_spacing_m=np.full(len(boundary.xy), 100.0, dtype=float),
+    )
+    shape = prepared.bathymetry.depth.shape
+    raster = np.full(shape, 1_000.0, dtype=float)
+
+    class ConstantBaseSampler:
+        def sample_xy(self, values_xy):
+            return np.full(len(np.asarray(values_xy)), 1_000.0)
+
+    sampler = BoundaryTraceSizeSampler(
+        ConstantBaseSampler(),
+        traced_boundary,
+        gradation=0.15,
+        samples_per_target=4.0,
+        nearest_sample_count=2,
+    )
+    field = SimpleNamespace(
+        lon=prepared.bathymetry.lon,
+        lat=prepared.bathymetry.lat,
+        size=raster,
+        coverage_mask=np.ones(shape, dtype=bool),
+        domain_mask=np.ones(shape, dtype=bool),
+    )
+    base = estimate_node_budget(
+        field.lon,
+        field.lat,
+        field.size,
+        coverage_mask=field.coverage_mask,
+        domain_mask=field.domain_mask,
+    )
+    field.report = {
+        "schema_version": "fvcom_size_field_v4",
+        "node_budget_estimate": base,
+    }
+    adjusted = _sampler_adjusted_node_budget(
+        field,
+        traced_boundary,
+        sampler,
+        chunk_size=100,
+    )
+    assert adjusted["trace_reduced_cell_count"] > 0
+    assert adjusted["estimated_interior_node_count"] > (
+        base["estimated_interior_node_count"]
+    )
+    assert adjusted["callback_schema"] == (
+        "fvcom_boundary_trace_sampler_v2"
+    )
+    assert adjusted["schema_version"] == (
+        "fvcom_sampler_adjusted_node_budget_v3"
+    )
+    assert adjusted["trace_lipschitz_lower_bound_applied"]
+    assert adjusted["inactive_cells_excluded_from_raster_stencil"]
+    assert adjusted["trace_cell_radius_upper_bound_m"] > 0.0
+    pilot = _preflight_report(
+        field,
+        traced_boundary,
+        PortfolioCaseConfig(
+            preflight_node_limit=1_000_000,
+            hard_node_limit=1_000_001,
+        ),
+        sampler=sampler,
+    )
+    callback_total = int(pilot["estimated_total_node_count"])
+    raster_total = callback_total - (
+        int(pilot["final_callback_estimated_interior_node_count"])
+        - int(pilot["raster_only_estimated_interior_node_count"])
+    )
+    assert callback_total > raster_total
+    separating_limit = (callback_total + raster_total) // 2
+    gated = _preflight_report(
+        field,
+        traced_boundary,
+        PortfolioCaseConfig(
+            preflight_node_limit=separating_limit,
+            hard_node_limit=max(separating_limit + 1, 1_000_000),
+        ),
+        sampler=sampler,
+    )
+    assert raster_total <= separating_limit
+    assert gated["estimated_total_node_count"] > separating_limit
+    assert gated["passed"] is False
+
+
+def test_boundary_trace_is_authoritative_without_wet_support() -> None:
+    prepared = _synthetic_case()
+    boundary, _ = _load_canonical_boundary(
+        prepared,
+        PortfolioCaseConfig(),
+    )
+    traced = replace(
+        boundary,
+        target_spacing_m=np.full(len(boundary.xy), 8_000.0),
+    )
+
+    class UnsupportedFineBase:
+        report = {
+            "schema_version": "fvcom_projected_size_sampler_v2"
+        }
+
+        def sample_xy_with_active_support(self, values_xy):
+            count = len(np.asarray(values_xy))
+            return np.full(count, 1_375.0), np.zeros(count, dtype=bool)
+
+        def sample_xy(self, values_xy):
+            return self.sample_xy_with_active_support(values_xy)[0]
+
+    sampler = BoundaryTraceSizeSampler(
+        UnsupportedFineBase(),
+        traced,
+        gradation=0.10,
+        samples_per_target=4.0,
+        nearest_sample_count=2,
+    )
+    delivered = sampler.sample_xy(traced.xy[[0]])
+    assert np.isclose(delivered[0], 8_000.0)
+    assert sampler.report[
+        "base_query_without_positive_active_support_count"
+    ] == 1
+
+
+def test_preflight_stencil_excludes_inactive_dry_values() -> None:
+    prepared = _synthetic_case()
+    boundary, _ = _load_canonical_boundary(
+        prepared,
+        PortfolioCaseConfig(),
+    )
+    shape = prepared.bathymetry.depth.shape
+    raster = np.full(shape, 100.0, dtype=float)
+    active = np.zeros(shape, dtype=bool)
+    active[9:12, 11:14] = True
+    raster[active] = 1_000.0
+    field = SimpleNamespace(
+        lon=prepared.bathymetry.lon,
+        lat=prepared.bathymetry.lat,
+        size=raster,
+        coverage_mask=np.ones(shape, dtype=bool),
+        domain_mask=active,
+        report={},
+    )
+
+    class ConstantActiveSampler:
+        def sample_xy(self, values_xy):
+            return np.full(len(np.asarray(values_xy)), 1_000.0)
+
+    base = estimate_node_budget(
+        field.lon,
+        field.lat,
+        field.size,
+        coverage_mask=field.coverage_mask,
+        domain_mask=field.domain_mask,
+    )
+    adjusted = _sampler_adjusted_node_budget(
+        field,
+        boundary,
+        ConstantActiveSampler(),
+    )
+    assert adjusted["estimated_interior_node_count"] == (
+        base["estimated_interior_node_count"]
+    )
+    assert adjusted["stencil_reduced_cell_count"] == 0
+
+
+def test_trace_lipschitz_preflight_bounds_dense_subcell_quadrature() -> None:
+    prepared = _synthetic_case()
+    boundary, _ = _load_canonical_boundary(
+        prepared,
+        PortfolioCaseConfig(),
+    )
+    traced = replace(
+        boundary,
+        # Keep the trace fine enough relative to this fixture's raster-cell
+        # radius to force the adaptive subcell integration branch.
+        target_spacing_m=np.full(len(boundary.xy), 10.0),
+    )
+    shape = prepared.bathymetry.depth.shape
+    raster = np.full(shape, 1_000.0, dtype=float)
+    active = np.zeros(shape, dtype=bool)
+    active[1:-1, 1:-1] = True
+    field = SimpleNamespace(
+        lon=prepared.bathymetry.lon,
+        lat=prepared.bathymetry.lat,
+        size=raster,
+        coverage_mask=np.ones(shape, dtype=bool),
+        domain_mask=active,
+        report={},
+    )
+
+    class ConstantBaseSampler:
+        def sample_xy(self, values_xy):
+            return np.full(len(np.asarray(values_xy)), 1_000.0)
+
+    sampler = BoundaryTraceSizeSampler(
+        ConstantBaseSampler(),
+        traced,
+        gradation=0.10,
+        samples_per_target=4.0,
+        nearest_sample_count=2,
+    )
+    conservative = _sampler_adjusted_node_budget(
+        field,
+        traced,
+        sampler,
+    )
+    assert conservative["trace_subcell_query_count"] > 0
+    assert any(
+        int(subdivisions) > 1 and int(cell_count) > 0
+        for subdivisions, cell_count in conservative[
+            "trace_subdivision_count_by_axis"
+        ].items()
+    )
+
+    fractions = np.linspace(-0.5, 0.5, 9)
+    queries: list[list[float]] = []
+    cell_ids: list[int] = []
+    lon_width = np.gradient(np.asarray(field.lon, dtype=float))
+    lat_width = np.gradient(np.asarray(field.lat, dtype=float))
+    for row, column in np.argwhere(active):
+        cell_id = int(row * shape[1] + column)
+        for fy in fractions:
+            for fx in fractions:
+                queries.append(
+                    [
+                        float(field.lon[column] + fx * lon_width[column]),
+                        float(field.lat[row] + fy * lat_width[row]),
+                    ]
+                )
+                cell_ids.append(cell_id)
+    query_xy = project_points(
+        np.asarray(queries, dtype=float),
+        traced.projection,
+    )
+    dense_h = sampler.sample_xy(query_xy)
+    inverse_square_sum = np.bincount(
+        np.asarray(cell_ids, dtype=int),
+        weights=1.0 / np.square(dense_h),
+        minlength=int(np.prod(shape)),
+    ).reshape(shape)
+    counts = np.bincount(
+        np.asarray(cell_ids, dtype=int),
+        minlength=int(np.prod(shape)),
+    ).reshape(shape)
+    equivalent_size = raster.copy()
+    equivalent_size[active] = 1.0 / np.sqrt(
+        inverse_square_sum[active] / counts[active]
+    )
+    dense = estimate_node_budget(
+        field.lon,
+        field.lat,
+        equivalent_size,
+        coverage_mask=field.coverage_mask,
+        domain_mask=field.domain_mask,
+    )
+    assert conservative["estimated_interior_node_count_float"] >= (
+        dense["estimated_interior_node_count_float"] * (1.0 - 1.0e-12)
+    )
+
+
+def test_raw_comparison_exports_realized_boundary_continuity() -> None:
+    with tempfile.TemporaryDirectory(
+        prefix="portfolio_comparison_continuity_"
+    ) as temporary:
+        output = Path(temporary)
+        quality_path = output / "quality.json"
+        quality_path.write_text(
+            json.dumps(
+                {
+                    "accepted": False,
+                    "edge_aware_size_error": {
+                        "boundary_field_interface": {
+                            "factor_two_exceedance_count": 2,
+                        },
+                        "boundary_first_ring_realized_continuity": {
+                            "passed": False,
+                            "global": {
+                                "symmetric_ratio": {
+                                    "quantiles": {"p95": 1.61},
+                                    "maximum": 2.25,
+                                },
+                                "chain_p95_exceedance_count": 3,
+                                "chain_maximum_exceedance_count": 1,
+                            },
+                        },
+                    },
+                    "failure_taxonomy": [
+                        "boundary_first_ring_continuity_p95_exceeded"
+                    ],
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        manifest = {
+            "candidate_id": "gmsh_frontal_delaunay_6",
+            "status": "needs_review",
+            "artifacts": {
+                "quality_json": {
+                    "path": str(quality_path),
+                }
+            },
+        }
+        routing = {
+            "candidates": {
+                "gmsh_frontal_delaunay_6": {
+                    "supported": True,
+                    "reasons": [],
+                }
+            }
+        }
+        _write_raw_metric_comparison(
+            output,
+            [manifest],
+            routing,
+            "fixture_bundle_sha256",
+        )
+        payload = json.loads(
+            (output / "raw_metric_comparison.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        row = payload["supported_candidate_metrics"][0]
+        assert row[
+            "boundary_field_interface_ratio_limit_exceedance_count"
+        ] == 2
+        assert row["boundary_first_ring_continuity_passed"] is False
+        assert row["boundary_first_ring_continuity_p95"] == 1.61
+        assert row["boundary_first_ring_continuity_maximum"] == 2.25
+        assert row["boundary_first_ring_chain_p95_exceedance_count"] == 3
+        assert row[
+            "boundary_first_ring_chain_maximum_exceedance_count"
+        ] == 1
+        csv_header = (output / "raw_metric_comparison.csv").read_text(
+            encoding="utf-8"
+        ).splitlines()[0]
+        assert "boundary_first_ring_continuity_p95" in csv_header
+
 
 def test_scientific_bundle_hash_excludes_paths_and_measurement_detail() -> None:
     config = PortfolioCaseConfig(size_field_max_cells=40_000)
@@ -523,8 +1257,8 @@ def test_scientific_bundle_hash_excludes_paths_and_measurement_detail() -> None:
         "common_boundary_node_count": 20,
         "boundary_front_seed_count": 5,
         "estimated_total_node_count": 125,
-        "preflight_node_limit": 135_000,
-        "hard_node_limit": 150_000,
+        "preflight_node_limit": 900_000,
+        "hard_node_limit": 1_000_000,
         "passed": True,
     }
     first, _ = _scientific_bundle_sha256(
@@ -666,9 +1400,14 @@ def test_real_small_gmsh_candidate_samples_immutable_bathymetry() -> None:
         print(f"SKIP real Gmsh candidate: found gmsh {gmsh.__version__}")
         return
     prepared = _synthetic_case()
+    field = _uniform_size_field(prepared)
     sampler = ProjectedSizeSampler(
-        _uniform_size_field(prepared),
+        field,
         prepared.projection,
+    )
+    boundary, _ = _load_canonical_boundary(
+        prepared,
+        PortfolioCaseConfig(),
     )
     with tempfile.TemporaryDirectory(prefix="portfolio_real_gmsh_") as temporary:
         root = Path(temporary)
@@ -700,6 +1439,46 @@ def test_real_small_gmsh_candidate_samples_immutable_bathymetry() -> None:
         )
         assert report["passed"]
         assert report["open_boundary_chain_count"] == 0
+
+        import fvcom_grid_generation.portfolio_case as portfolio_case_module
+
+        original_runner = portfolio_case_module._run_gmsh_candidate
+        portfolio_case_module._run_gmsh_candidate = (
+            lambda *_args, **_kwargs: mesh
+        )
+        try:
+            manifest = _execute_candidate(
+                "gmsh_frontal_delaunay_6",
+                root,
+                prepared,
+                boundary,
+                field,
+                sampler,
+                PortfolioCaseConfig(),
+                "fixture_bundle_sha256",
+            )
+        finally:
+            portfolio_case_module._run_gmsh_candidate = original_runner
+        delivered_artifact = manifest["artifacts"]["node_budget_delivered"]
+        delivered_path = Path(delivered_artifact["path"])
+        assert delivered_path.name == "node_budget_delivered.json"
+        assert delivered_path.is_file()
+        assert delivered_artifact["sha256"] == hashlib.sha256(
+            delivered_path.read_bytes()
+        ).hexdigest()
+        delivered = json.loads(delivered_path.read_text(encoding="utf-8"))
+        assert delivered["passed"]
+        quality = json.loads(
+            Path(manifest["artifacts"]["quality_json"]["path"]).read_text(
+                encoding="utf-8"
+            )
+        )
+        assert quality["canonical_size_sampling"]["schema_version"] == (
+            "fvcom_projected_size_sampler_v2"
+        )
+        assert quality["canonical_size_sampling"][
+            "sampling_interface_schema_version"
+        ] == "fvcom_wet_mask_sampling_v2"
 
 
 def test_gmsh_common_locked_boundary_mismatch_is_rejected() -> None:
@@ -831,8 +1610,8 @@ def test_common_boundary_field_fixed_point_and_gmsh_rebase() -> None:
     prepared = _synthetic_case()
     config = PortfolioCaseConfig(
         size_field_max_cells=10_000,
-        land_spacing_m=5_000.0,
-        open_spacing_m=5_000.0,
+        land_spacing_m=1_000.0,
+        open_spacing_m=1_000.0,
         maximum_size_m=1_000.0,
         boundary_reconciliation_max_iterations=5,
         clean_room_refine_iterations=0,
@@ -850,7 +1629,13 @@ def test_common_boundary_field_fixed_point_and_gmsh_rebase() -> None:
     assert len(delivered.xy) > len(source.xy)
     assert report["final_boundary_field_audit"]["passed"]
     assert field.report["schema_version"] == "fvcom_size_field_v4"
+    frozen_reconciliation_sampler = json.loads(
+        json.dumps(report["boundary_trace_sampler"])
+    )
     assert np.all(np.isfinite(sampler.sample_xy(delivered.xy)))
+    sampler.reset_operational_counters()
+    sampler.sample_xy(delivered.xy[:2])
+    assert report["boundary_trace_sampler"] == frozen_reconciliation_sampler
     rebased = _prepared_case_on_boundary(prepared, delivered)
     assert len(rebased.exterior_xy) == len(delivered.constraint_chains[0])
     assert len(rebased.holes_xy) == len(delivered.constraint_chains) - 1
@@ -867,6 +1652,7 @@ def test_case_budget_reconciliation_follows_spatial_field_without_jump() -> None
         open_spacing_m=100.0,
         maximum_size_m=2_000.0,
         boundary_reconciliation_max_iterations=3,
+        boundary_geometry_continuity=False,
         use_case_budget_spacing_policy=True,
     )
     source, _ = _load_canonical_boundary(prepared, config)
@@ -893,6 +1679,13 @@ def test_case_budget_reconciliation_follows_spatial_field_without_jump() -> None
             report={
                 "schema_version": "fvcom_size_field_v4",
                 "node_budget_estimate": {},
+                "sampling_interface": {
+                    "schema_version": "fvcom_wet_mask_sampling_v2",
+                    "method": (
+                        "bilinear_all_positive_weight_active_else_"
+                        "highest_weight_positive_active_else_coarsest_covered"
+                    ),
+                },
             },
         )
 
@@ -911,6 +1704,12 @@ def test_case_budget_reconciliation_follows_spatial_field_without_jump() -> None
         portfolio_case_module.build_size_field = original_builder
 
     source_field_values = sampler.sample_xy(source.xy)
+    assert isinstance(sampler, ProjectedSizeSampler)
+    assert sampler.report["sampling_interface_schema_version"] == (
+        "fvcom_wet_mask_sampling_v2"
+    )
+    assert report["boundary_trace_sampler"] is None
+    assert "explicitly disabled" in report["method_scope"]
     assert np.all(source.target_spacing_m < source_field_values)
     assert report["passed"], report
     assert report["policy"]["target_combination"] == "sampled_field"
@@ -1046,8 +1845,18 @@ TESTS: tuple[Callable[[], None], ...] = (
     test_reconciliation_lineage_controls_forcing_compatibility,
     test_case_budget_targets_and_geometry_forced_edge_count,
     test_portfolio_config_reconciliation_validation,
+    test_portfolio_cli_continuity_defaults,
     test_cached_projected_size_sampler,
     test_boundary_trace_sampler_exact_trace_and_normal_release,
+    test_boundary_trace_adaptive_search_finds_distant_fine_source,
+    test_boundary_trace_query_chunking_preserves_values_and_counters,
+    test_boundary_trace_metric_sampling_bounds_extreme_endpoint_ratio,
+    test_boundary_trace_single_edge_cap_fails_before_large_allocation,
+    test_sampler_adjusted_preflight_counts_trace_refinement,
+    test_boundary_trace_is_authoritative_without_wet_support,
+    test_preflight_stencil_excludes_inactive_dry_values,
+    test_trace_lipschitz_preflight_bounds_dense_subcell_quadrature,
+    test_raw_comparison_exports_realized_boundary_continuity,
     test_scientific_bundle_hash_excludes_paths_and_measurement_detail,
     test_zero_and_plural_nodestring_roundtrip,
     test_real_small_gmsh_candidate_samples_immutable_bathymetry,

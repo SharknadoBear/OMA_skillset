@@ -119,6 +119,15 @@ def test_closed_lake_common_conditioning() -> None:
             ),
         )
         assert report["status"] == "pass", json.dumps(report, indent=2)
+        assert report["inputs"]["canonical_size_field"][
+            "sampling_interface_schema_version"
+        ] == "legacy_unspecified"
+        quality = json.loads(
+            (output / "mesh_quality.json").read_text(encoding="utf-8")
+        )
+        assert quality["canonical_inputs"][
+            "sampling_interface_schema_version"
+        ] == "legacy_unspecified"
         delivered = read_2dm(output / "conditioned.2dm")
         assert len(delivered.open_boundary_chains) == 0
         assert delivered.open_boundary_ids == ()

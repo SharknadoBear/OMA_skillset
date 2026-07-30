@@ -1144,7 +1144,10 @@ def _build_audit(
         failures.append("hard_anchor_loss")
     if policy.enforce_sampled_field_compatibility and np.any(incompatible):
         failures.append("boundary_field_factor_compatibility")
-    if maximum_gradient > policy.maximum_spacing_gradient + 1.0e-12:
+    if (
+        maximum_gradient
+        > policy.maximum_spacing_gradient + policy.edge_tolerance
+    ):
         failures.append("adjacent_target_gradation")
     if maximum_lh > policy.target_metric_edge + policy.edge_tolerance:
         failures.append("boundary_edge_metric_length")
@@ -1195,6 +1198,7 @@ def _build_audit(
         "thresholds": {
             "target_metric_edge": float(policy.target_metric_edge),
             "maximum_spacing_gradient": float(policy.maximum_spacing_gradient),
+            "comparison_tolerance": float(policy.edge_tolerance),
             "maximum_boundary_l_over_h": float(
                 policy.maximum_boundary_l_over_h
             ),

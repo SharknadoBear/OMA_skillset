@@ -18,7 +18,7 @@ fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> fvcom-grid-generation
 - Keep full bathymetry for final node sampling and bound only the in-memory size-field grid.
 - Build nearshore sizing from the solid-boundary background, bathymetric gradient, and a geometry-derived paired-bank hydraulic skeleton. Detect the skeleton from land and island segments only; never use an open-boundary segment as a bank.
 - Do not consume or generate an external drainage/flow-network package. Infer hydraulic corridors directly from the wet model polygon, solid boundary geometry, and the supplied bathymetry.
-- For open domains, propagate the delivered OBC target and distance through connected wet cells, hold offshore authority near the OBC, then transfer smoothly in log space to the nearshore target. For closed domains, omit this transfer.
+- For open domains, propagate the delivered OBC target and distance through connected wet cells, hold offshore authority near the OBC, then transfer smoothly in log space to the nearshore target. Treat the configured transfer distance as a minimum and extend it automatically when the declared gradation requires more wet distance. For closed domains, omit this transfer.
 - Apply all distance propagation and final gradation over the wet model domain so land and island holes cannot create shortcuts.
 - Treat boundary, bathymetry, `fvcom_size_field_v4`, node budget, and QA policy as generator-neutral mesh intent. Lock their hashes before a multi-mesher test, choose adapters by topology capability, and never flatten OBC chains to make an unsupported generator run.
 - End normal adaptive generation after guarded shape relaxation, first-pass thin repair, aggressive local topology conditioning, target-aware area-transition relaxation, and a terminal constraint audit. Do not run the broad legacy postprocessor implicitly.
@@ -43,21 +43,61 @@ Feed every candidate the same immutable boundary, bathymetry,
 `fvcom_size_field_v4`, node budget, and QA policy. Separate the `RAW` generator
 result from `COMMON_CONDITIONED`; do not credit generator-specific cleanup as
 common conditioning.
-By default, resolve the bathymetry floor and the smallest 25 m
-budget-compatible uniform target `h_u` from the case manifest before building
-the bundle. Assign `h_u` to solid/island targets and the manifest's near-OBC
-target to open chains. Preserve shorter source chords but report them as
-`geometry_forced_subgrid`. Reconcile the immutable source boundary and rebuilt
-field to a fixed point. The portfolio default uses `sampled_field`, so delivered
-boundary targets follow the same pointwise `fvcom_size_field_v4` even when that
-coarsens a finer source target; the standalone reconciler retains an explicit
-`minimum` mode for source-target-lock workflows. Preserve every source vertex
-and its lineage in either mode. Restore a continuous gradated boundary trace
-over the cell-centred raster so every delivered endpoint and midpoint samples
-the same target used to discretize the arc. This trace uses straight Euclidean
-distance and must report possible through-land/island refinement leakage.
-Then require pointwise endpoint/midpoint factor-two compatibility and
-edge-aware boundary/first-ring/transition/interior `L/h` before triangulation.
+By default, derive the bathymetry floor from three times the geometric mean of
+the projected p95 raster-cell dimensions, round it upward on a 25 m numerical
+grid, and select the smallest budget-compatible uniform target `h_u` on that
+same grid. The 25 m value is a deterministic rounding/search quantum, not the
+bathymetry resolution. Use a 900,000-node planning threshold and a 1,000,000-node
+hard cap by default; this permits finer meshes but does not require one million
+nodes. Assign `h_u` to solid/island targets and the manifest's near-OBC target
+to open chains. If budget-selected `h_u` exceeds the configured maximum size,
+fail with an explicit request to raise that maximum; never silently lower the
+bathymetry-supported floor. Preserve every source vertex and its lineage. For each source
+chord of length \(L\), also derive the geometry-aware endpoint target
+\(h_{\rm geo}=L\) and take the conservative minimum with the case target;
+continue to report unavoidable short chords as `geometry_forced_subgrid`.
+Keep sub-bathymetry-floor chord targets on the one-dimensional boundary trace;
+the two-dimensional raster retains the bathymetry-supported interior floor.
+Use wet-mask-aware raster sampling: retain bilinear interpolation only when
+all four stencil cells are active; at a wet/dry interface select the
+highest-weight positive-weight active corner instead of sharing an inactive
+halo between wet banks. At a dry-cell centre use the coarsest covered fallback
+so the wrong bank cannot inject a finer target. This interface guard is not a
+global barrier-aware solver. When the boundary-trace wrapper reports no
+positive-weight active raster support, make the trace authoritative and ignore
+the covered-corner fallback for that query; record
+`no_active_support_policy=boundary_trace_authoritative`. The fallback remains
+the finite strict-coverage value for raster-only control runs and diagnostics.
+Keep the node-budget integral on active wet cells only. Bound the raster
+component with the active neighboring-stencil minimum and the trace component
+with adaptive gradation-Lipschitz subcell lower bounds. Increase subcell
+resolution only where the within-cell release is material relative to the
+local target, up to \(32\times32\), so an isolated fine trace point is charged
+to its influence area rather than a complete coarse raster cell.
+Reconcile the immutable source boundary and rebuilt field for at most eight
+fixed-point passes. The portfolio default uses `sampled_field`, so delivered
+boundary targets follow the same pointwise callback. With default geometry
+continuity enabled, the sampled chord-derived trace remains part of that
+callback and preserves its subfloor targets. The standalone reconciler retains
+an explicit `minimum` mode for source-target-lock workflows.
+
+Use gradation `0.10` and boundary/field compatibility factor `1.5` for this
+portfolio policy. Restore the `fvcom_boundary_trace_sampler_v2` sampled
+approximation to the continuous trace over the cell-centred raster. Distribute
+samples by linear endpoint-target metric length, include every delivered
+endpoint and midpoint, and fail safely above five million samples. Each query
+starts from 16 nearest samples and expands until a global lower bound proves
+the exact minimum over that deterministic sample set. Process requested
+locations in deterministic batches of at most 4,096 so QA memory does not grow
+as `query_count × expanded_neighbor_count`; batching must not change values or
+operational counters. The trace uses straight Euclidean distance: record
+`barrier_aware=false` and the possible through-land/island refinement risk,
+but do not claim observed leakage without a separate barrier audit. Recompute
+node-budget preflight from the final callback sampled at every active wet
+raster-cell centre, not from the stored raster alone. Then require the
+realized boundary-edge/incident-first-ring symmetric scale ratio to have p95
+at most `1.5` and maximum at most `2.0`, in addition to the edge-aware
+boundary/first-ring/transition/interior `L/h` gates.
 Record source and delivered boundary-node counts plus the adapter's boundary
 discretization mode. Treat unmatched discretization policies as a
 generator-plus-boundary-policy comparison, not an algorithm-only ranking, and
@@ -71,6 +111,9 @@ Delaunay algorithm 5 as the first hard-gate challenger, the clean-room route as
 the production reference where supported, and MeshAdapt algorithm 1 as a
 diagnostic. Treat this as routing policy rather than a composite quality
 winner; production promotion remains withheld until the six-case matrix passes.
+The current continuity experiment is a no-conditioning `RAW` comparison:
+disable OMA conditioning and postprocessing, while recording native generator
+settings as raw provenance.
 Record unsupported pairings as capability evidence rather than quality
 failures. Compare metrics without a composite winner, and do not promote a
 Gmsh candidate into the production path until the complete topology matrix
@@ -81,12 +124,12 @@ Important controls:
 
 - `--boundary-resolution-profile legacy|adaptive-coastal-v1|adaptive-coastal-v2`, default `legacy`. V2 is opt-in and requires an upstream `pass` manifest before gridding.
 - `--boundary-resolution-manifest`, optional; explicit nodes and chains take precedence over legacy densification.
-- `--gradation`, default `0.20`; limits adjacent size growth after all candidates are combined.
+- `--gradation`, default `0.20` in the production generator and `0.10` in `run_mesher_portfolio_case.py`; limits adjacent size growth after all candidates are combined.
 - `--slope-elements 10` and `--coastal-distance-m 25000` control the nearshore bathymetric-slope candidate.
 - `--hydraulic-elements-across-min 3` and `--hydraulic-elements-across-max 8` set the paired-bank cross-corridor element range. Importance increases the requested count continuously between those limits.
 - `--hydraulic-max-width-m 20000` and `--hydraulic-bank-angle-deg 110` screen candidate bank pairs by span and opposition angle.
 - `--hydraulic-longitudinal-gradation 0.10` limits size change along the accepted skeleton.
-- `--obc-hold-distance-m 10000` holds the propagated OBC target over the first wet-domain reach. `--obc-transition-distance-m 60000` sets the following quintic log-space transfer length; the workflow reports an infeasible or derivative-limited transition instead of silently extending it.
+- `--obc-hold-distance-m 10000` holds the propagated OBC target over the first wet-domain reach. `--obc-transition-distance-m 60000` sets the minimum following quintic log-space transfer length; the workflow extends it to the gradation-required distance when necessary and records the requested, required, effective, and available distances.
 - `--refine-iterations` controls adaptive insertion and `--smooth-iterations` controls the initial, fixed-boundary geometric smoothing that is part of mesh construction. These are distinct from the post-generation conditioning stages below.
 - `--regional-spring-relaxation|--no-regional-spring-relaxation`; normal generation applies one guarded, defect-selected spring-equilibrium stage by default.
 - `--thin-triangle-repair|--no-thin-triangle-repair`; normal generation applies local protected-edge-safe flips/splits and patch relaxation by default.
@@ -103,8 +146,8 @@ Important controls:
 - `--area-transition-relaxation|--no-area-transition-relaxation`; normal generation applies sequential target-aware spring patches after thin repair.
 - `--area-transition-max-patches`, default 12; bounds accepted local transition patches. The raw adjacent-area trigger defaults to `0.50`, equivalent to an area ratio of two.
 - `--postprocess-profile`, compatibility default `none`; non-`none` integrated requests are rejected with standalone-tool guidance.
-- `--max-total-nodes` and `--node-budget-stop-fraction` audit the pre-triangulation estimate, including explicit boundary and boundary-front seeds. The audit is recorded for every boundary package and remains a hard gate for adaptive-coastal-v2.
-- `--land-spacing-m`, `--open-spacing-m`, `--max-interior-points`, and `--size-field-max-cells` set the boundary targets and execution limits.
+- `--max-total-nodes` and `--node-budget-stop-fraction` default to 1,000,000 and `0.90`, producing a 900,000-node planning gate. They audit the pre-triangulation estimate, including explicit boundary and boundary-front seeds. The audit is recorded for every boundary package and remains a hard gate for adaptive-coastal-v2. Independently audit the delivered node count after every generator; exceeding 1,000,000 is a hard failure even when preflight passed.
+- `--land-spacing-m`, `--open-spacing-m`, `--max-interior-points`, and `--size-field-max-cells` set the boundary targets and execution limits. The default interior-seed ceiling is 900,000 so it does not retain the former 80,000-point bottleneck.
 
 To stop after the initial constrained mesh, explicitly use
 `--no-regional-spring-relaxation --no-thin-triangle-repair
@@ -157,7 +200,10 @@ Hard anchors and all boundary nodes not explicitly handled by the kind-aware edi
 ## Standalone Tools
 
 - `scripts/run_mesher_portfolio_case.py`: build one immutable regional `fvcom_size_field_v4` bundle and generate the clean-room plus Gmsh 1/5/6 `RAW` candidates under one node budget. It writes a metric-by-metric comparison and never claims common conditioning.
-- `scripts/plot_raw_mesh_transition.py`: read one raw portfolio 2DM and its locked boundary/field/quality artifacts, then write immutable whole-mesh and boundary/first-ring `L/h`, factor-two-interface, and adjacent-area-change maps without editing the mesh.
+- `scripts/research/gmsh/prepare_lake_superior_boundary.py`: estimate first, then build a fresh zero-OBC GSHHG L2/L3 Lake Superior boundary package with the deterministic St. Marys numerical land gate.
+- `scripts/research/gmsh/prepare_lake_superior_bathymetry.py`: convert a request-bounded ETOPO elevation mosaic to positive-down Lake Superior depth using the accepted wet-domain mask and the explicit 183.2 m IGLD 1985/EGM2008 caveat. Start estimate-first fetches from the committed `scripts/research/gmsh/continuity_cases/lake_superior_etopo_request.json`, and build a fresh ETOPO-only source index with the `cudem-bathy` connector instead of depending on a dated workspace index.
+- `scripts/research/gmsh/validate_lake_superior_preparation.py`: independently hash and validate the boundary, island inventory, numerical gate, wet mask, depth conversion, and readiness selected by `scripts/research/gmsh/continuity_cases/lake_superior.json`. The current selector is boundary preparation v5 plus bathymetry v2; earlier preparation versions are superseded evidence, not fallback inputs. See the research Gmsh README for the immutable end-to-end command sequence.
+- `scripts/plot_raw_mesh_transition.py`: read one raw portfolio 2DM and its locked boundary/field/quality artifacts, then write immutable whole-mesh and boundary/first-ring `L/h`, configured boundary/field-interface, and adjacent-area-change maps without editing the mesh.
 - `scripts/run_portfolio_conditioning.py`: apply the generator-neutral fixed-boundary topology/area conditioner to an arbitrary raw 2DM, preserve zero/single/plural noncyclic NS chains through lineage, and resample final depths from the locked bathymetry. Treat cyclicity as unsupported because SMS 2DM does not encode it.
 - `scripts/diagnose_boundary_size_contract.py`: compare adaptive source-boundary targets with `fvcom_size_field_v4` at the same vertices and withhold triangle-algorithm attribution when the 1-D and 2-D targets conflict.
 - `scripts/research/mesher_bakeoff/run_mesher_bakeoff.py`: lock a generator-neutral input bundle, plan non-overwriting candidate stages, execute `RAW` or `COMMON_CONDITIONED`, and compare only identical bundle/QA hashes. Unsupported topology/adapter pairs remain explicit and unranked.
@@ -195,7 +241,7 @@ Hard anchors and all boundary nodes not explicitly handled by the kind-aware edi
 - `boundary_nodes.geojson` (input boundary-node package)
 - `delivered_boundary_nodes.geojson` (terminal constraint chains, including any recovery nodes)
 - `size_field.nc`, `size_field.png`, and `size_field_components.png`
-- `node_budget_preflight.json` for every run and `boundary_contract_v2.json` for adaptive v2
+- `node_budget_preflight.json` and `node_budget_delivered.json` for every run, plus `boundary_contract_v2.json` for adaptive v2
 - `mesh_nodes_elements.gpkg`
 - `mesh_quality_elements.gpkg`
 - `mesh_review_map.png`
@@ -221,6 +267,7 @@ For a human-approved whole-passage deletion, replace the ordinary one-wet-compon
 
 ```powershell
 python scripts/selftest_fvcom_grid.py
+python scripts/selftest_node_budget_policy.py
 python scripts/selftest_boundary_contract_v2.py
 python scripts/selftest_size_field.py
 python scripts/selftest_gmsh_mesher_portfolio.py

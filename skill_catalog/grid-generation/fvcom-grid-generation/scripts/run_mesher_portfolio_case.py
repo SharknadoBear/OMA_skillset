@@ -11,6 +11,8 @@ import sys
 from fvcom_grid_generation.portfolio_case import (
     CANDIDATE_ALIASES,
     DEFAULT_CANDIDATES,
+    DEFAULT_HARD_NODE_LIMIT,
+    DEFAULT_PREFLIGHT_NODE_LIMIT,
     PortfolioCaseConfig,
     run_portfolio_case,
 )
@@ -55,12 +57,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--preflight-node-limit",
         type=int,
-        default=135_000,
+        default=DEFAULT_PREFLIGHT_NODE_LIMIT,
+        help=(
+            "Planning threshold for common h_u selection "
+            f"(default: {DEFAULT_PREFLIGHT_NODE_LIMIT:,})."
+        ),
     )
     parser.add_argument(
         "--hard-node-limit",
         type=int,
-        default=150_000,
+        default=DEFAULT_HARD_NODE_LIMIT,
+        help=(
+            "Maximum delivered nodes for every candidate "
+            f"(default: {DEFAULT_HARD_NODE_LIMIT:,})."
+        ),
     )
     parser.add_argument(
         "--size-field-max-cells",
@@ -70,11 +80,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--land-spacing-m", type=float, default=50.0)
     parser.add_argument("--open-spacing-m", type=float, default=3_000.0)
     parser.add_argument("--maximum-size-m", type=float, default=8_000.0)
-    parser.add_argument("--gradation", type=float, default=0.20)
+    parser.add_argument("--gradation", type=float, default=0.10)
     parser.add_argument(
         "--boundary-reconciliation-max-iterations",
         type=int,
-        default=5,
+        default=8,
         help=(
             "Maximum boundary/2-D-field fixed-point passes before the common "
             "input bundle is rejected."
@@ -89,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--boundary-field-compatibility-factor",
         type=float,
-        default=2.0,
+        default=1.5,
         help="Hard boundary-target versus rebuilt-field compatibility factor.",
     )
     parser.add_argument(
@@ -98,8 +108,26 @@ def build_parser() -> argparse.ArgumentParser:
         default="sampled_field",
         help=(
             "How delivered boundary targets combine with the sampled 2-D "
-            "field. Default sampled_field follows H exactly; minimum retains "
-            "any finer source target."
+            "callback. Default sampled_field follows H exactly; with default "
+            "geometry continuity H includes the chord-derived boundary trace. "
+            "minimum additionally locks any finer source target."
+        ),
+    )
+    parser.add_argument(
+        "--disable-boundary-geometry-continuity",
+        action="store_true",
+        help=(
+            "Disable the default chord-derived boundary target that makes the "
+            "first interior ring respond to the realized source geometry."
+        ),
+    )
+    parser.add_argument(
+        "--boundary-geometry-metric-ratio",
+        type=float,
+        default=1.0,
+        help=(
+            "Desired realized boundary-edge L/h used to derive geometry-aware "
+            "targets (default: 1.0)."
         ),
     )
     parser.add_argument(
@@ -116,8 +144,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=16,
         help=(
-            "Nearest trace samples considered by the Euclidean gradation "
-            "extension."
+            "Initial nearest trace samples; the exact search expands "
+            "adaptively until no unseen sample can improve the result."
         ),
     )
     parser.add_argument(
@@ -125,7 +153,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Use literal land/open spacing arguments instead of resolving the "
-            "case bathymetry floor and 135k budget-selected h_u policy."
+            "case bathymetry floor and common budget-selected h_u policy. "
+            "The 25 m h_u increment is a numerical search quantum, not "
+            "bathymetry raster resolution."
         ),
     )
     parser.add_argument("--slope-elements", type=float, default=10.0)
@@ -162,6 +192,12 @@ def main() -> int:
                 args.boundary_field_compatibility_factor
             ),
             boundary_target_combination=args.boundary_target_combination,
+            boundary_geometry_continuity=(
+                not args.disable_boundary_geometry_continuity
+            ),
+            boundary_geometry_metric_ratio=(
+                args.boundary_geometry_metric_ratio
+            ),
             boundary_trace_samples_per_target=(
                 args.boundary_trace_samples_per_target
             ),

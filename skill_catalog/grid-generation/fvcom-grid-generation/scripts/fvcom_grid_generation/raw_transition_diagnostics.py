@@ -31,13 +31,16 @@ from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
 import matplotlib.tri as mtri
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
 from scipy.spatial import cKDTree
 import xarray as xr
 
 from .edge_size_audit import audit_edge_target_sizes
 from .metrics import build_edge_topology, triangle_geometry
 from .projection import local_utm_projection, project_points
+from .size_field import (
+    linear_target_metric_edge_fractions,
+    recorded_size_interpolator,
+)
 from .sms_2dm import read_2dm
 
 
@@ -46,6 +49,14 @@ DEFAULT_MAX_PLOT_TRIANGLES = 100_000
 DEFAULT_INTERFACE_RATIO_LIMIT = 2.0
 DEFAULT_AREA_CHANGE_LIMIT = 0.5
 DEFAULT_BOUNDARY_MATCH_TOLERANCE_M = 0.05
+BOUNDARY_TRACE_SAMPLER_V1 = "fvcom_boundary_trace_sampler_v1"
+BOUNDARY_TRACE_SAMPLER_V2 = "fvcom_boundary_trace_sampler_v2"
+BOUNDARY_TRACE_SAMPLER_SCHEMAS = frozenset(
+    {
+        BOUNDARY_TRACE_SAMPLER_V1,
+        BOUNDARY_TRACE_SAMPLER_V2,
+    }
+)
 
 
 class _CanonicalSizeSampler:
@@ -79,6 +90,21 @@ class _CanonicalSizeSampler:
                 )
             else:
                 coverage = np.isfinite(values) & (values > 0.0)
+            if "model_domain_mask" in dataset:
+                domain = np.asarray(
+                    dataset["model_domain_mask"]
+                    .transpose("lat", "lon")
+                    .values,
+                    dtype=bool,
+                )
+            else:
+                domain = coverage.copy()
+            sampling_interface_schema = str(
+                dataset.attrs.get(
+                    "sampling_interface_schema_version",
+                    "legacy_unspecified",
+                )
+            ).strip()
         if lon.ndim != 1 or lat.ndim != 1:
             raise ValueError("size-field lon and lat must be one dimensional")
         if len(lon) < 2 or len(lat) < 2:
@@ -89,14 +115,20 @@ class _CanonicalSizeSampler:
             raise ValueError(
                 "size_field_coverage_mask dimensions do not match mesh_size_m"
             )
+        if domain.shape != values.shape:
+            raise ValueError(
+                "model_domain_mask dimensions do not match mesh_size_m"
+            )
         if np.all(np.diff(lon) < 0.0):
             lon = lon[::-1]
             values = values[:, ::-1]
             coverage = coverage[:, ::-1]
+            domain = domain[:, ::-1]
         if np.all(np.diff(lat) < 0.0):
             lat = lat[::-1]
             values = values[::-1, :]
             coverage = coverage[::-1, :]
+            domain = domain[::-1, :]
         if (
             np.any(~np.isfinite(lon))
             or np.any(~np.isfinite(lat))
@@ -115,26 +147,30 @@ class _CanonicalSizeSampler:
         self.lat = lat
         self.values = values
         self.coverage = coverage
-        self._values = RegularGridInterpolator(
-            (lat, lon),
+        self.domain = domain
+        self.sampling_interface_schema_version = sampling_interface_schema
+        self._raster = recorded_size_interpolator(
+            lat,
+            lon,
             values,
-            bounds_error=False,
-            fill_value=np.nan,
-        )
-        self._coverage = RegularGridInterpolator(
-            (lat, lon),
-            coverage.astype(np.uint8),
-            method="nearest",
-            bounds_error=False,
-            fill_value=0,
+            coverage,
+            domain,
+            sampling_interface_schema,
         )
         self._trace_tree: cKDTree | None = None
         self._trace_targets: np.ndarray | None = None
         self._trace_gradation: float | None = None
         self._trace_nearest_count = 0
+        self._trace_minimum_target: float | None = None
+        self._trace_adaptive_neighbor_expansion = False
+        self._trace_no_active_support_policy = "raster_min"
+        self._trace_query_chunk_size = 4_096
         self.trace_report: dict[str, Any] = {
             "enabled": False,
             "method": "raster_only",
+            "base_raster_sampling_interface_schema_version": (
+                self.sampling_interface_schema_version
+            ),
         }
 
     def enable_boundary_trace(
@@ -146,15 +182,44 @@ class _CanonicalSizeSampler:
         gradation: float,
         samples_per_target: float = 4.0,
         nearest_sample_count: int = 16,
+        maximum_total_sample_count: int = 5_000_000,
+        schema_version: str = BOUNDARY_TRACE_SAMPLER_V1,
+        no_active_support_policy: str | None = None,
+        query_chunk_size: int = 4_096,
     ) -> None:
-        """Reconstruct the portfolio's continuous boundary-trace extension."""
+        """Reconstruct the portfolio's sampled boundary-trace extension."""
 
         nodes = np.asarray(nodes_xy, dtype=float)
         targets_by_node = np.asarray(target_by_node, dtype=float)
+        schema = str(schema_version).strip()
+        if schema not in BOUNDARY_TRACE_SAMPLER_SCHEMAS:
+            raise ValueError(
+                "unsupported boundary trace sampler schema "
+                f"{schema_version!r}"
+            )
         if not np.isfinite(gradation) or gradation <= 0.0:
             raise ValueError("boundary trace gradation must be positive")
+        if int(nearest_sample_count) < 1:
+            raise ValueError("nearest_sample_count must be positive")
+        if int(maximum_total_sample_count) < 1:
+            raise ValueError("maximum_total_sample_count must be positive")
+        if int(query_chunk_size) < 1:
+            raise ValueError("query_chunk_size must be positive")
+        support_policy = str(
+            no_active_support_policy or "raster_min"
+        ).strip()
+        if support_policy not in {
+            "raster_min",
+            "boundary_trace_authoritative",
+        }:
+            raise ValueError(
+                "unsupported boundary trace no-active-support policy "
+                f"{support_policy!r}"
+            )
         points: list[np.ndarray] = []
         targets: list[np.ndarray] = []
+        sample_spacings: list[float] = []
+        total_sample_count = 0
         for raw_start, raw_end in sorted(boundary_edges):
             start = int(raw_start)
             end = int(raw_end)
@@ -165,19 +230,53 @@ class _CanonicalSizeSampler:
             a = nodes[start]
             b = nodes[end]
             length = float(np.linalg.norm(b - a))
-            intervals = max(
-                2,
-                int(
-                    np.ceil(
-                        length
-                        * float(samples_per_target)
-                        / min(ha, hb)
-                    )
-                ),
+            remaining_sample_count = (
+                int(maximum_total_sample_count) - total_sample_count
             )
-            if intervals % 2:
-                intervals += 1
-            fraction = np.arange(intervals, dtype=float) / intervals
+            if schema == BOUNDARY_TRACE_SAMPLER_V1:
+                intervals = max(
+                    2,
+                    int(
+                        np.ceil(
+                            length
+                            * float(samples_per_target)
+                            / min(ha, hb)
+                        )
+                    ),
+                )
+                if intervals % 2:
+                    intervals += 1
+                required = intervals + 1
+                if required > remaining_sample_count:
+                    raise ValueError(
+                        "boundary trace sampling exceeds the safety limit "
+                        "before allocation"
+                    )
+                fraction = np.linspace(
+                    0.0,
+                    1.0,
+                    required,
+                    endpoint=True,
+                    dtype=float,
+                )
+            else:
+                fraction = linear_target_metric_edge_fractions(
+                    length,
+                    ha,
+                    hb,
+                    samples_per_target=float(samples_per_target),
+                    include_end=True,
+                    maximum_sample_count=remaining_sample_count,
+                )
+            total_sample_count += len(fraction)
+            if total_sample_count > int(maximum_total_sample_count):
+                raise ValueError(
+                    "boundary trace sampling exceeds the safety limit "
+                    f"of {int(maximum_total_sample_count)} points"
+                )
+            sample_spacings.append(
+                length * float(np.max(np.diff(fraction), initial=0.0))
+            )
             points.append(
                 a[None, :] + fraction[:, None] * (b - a)[None, :]
             )
@@ -185,56 +284,244 @@ class _CanonicalSizeSampler:
         if not points:
             raise ValueError("no finite boundary edges are available for trace sampling")
         trace_points = np.vstack(points)
+        trace_targets = np.concatenate(targets)
+        if schema == BOUNDARY_TRACE_SAMPLER_V1:
+            _unique, first = np.unique(
+                np.column_stack([trace_points, trace_targets]),
+                axis=0,
+                return_index=True,
+            )
+            keep = np.sort(first)
+            trace_points = trace_points[keep]
+            trace_targets = trace_targets[keep]
         self._trace_tree = cKDTree(trace_points)
-        self._trace_targets = np.concatenate(targets)
+        self._trace_targets = trace_targets
         self._trace_gradation = float(gradation)
         self._trace_nearest_count = min(
             int(nearest_sample_count),
             len(trace_points),
         )
-        self.trace_report = {
+        self._trace_minimum_target = float(np.min(self._trace_targets))
+        self._trace_adaptive_neighbor_expansion = (
+            schema == BOUNDARY_TRACE_SAMPLER_V2
+        )
+        self._trace_no_active_support_policy = support_policy
+        self._trace_query_chunk_size = int(query_chunk_size)
+        report = {
             "enabled": True,
-            "schema_version": "fvcom_boundary_trace_sampler_v1",
-            "method": (
-                "raster_min_deterministic_boundary_point_"
-                "euclidean_gradation_extension"
-            ),
+            "schema_version": schema,
             "boundary_sample_count": int(len(trace_points)),
             "samples_per_target": float(samples_per_target),
+            "sample_distribution": (
+                "linear_endpoint_target_metric_equidistribution"
+                if schema == BOUNDARY_TRACE_SAMPLER_V2
+                else "uniform_physical_arclength"
+            ),
+            "maximum_total_sample_count": int(
+                maximum_total_sample_count
+            ),
+            "query_chunk_size": int(self._trace_query_chunk_size),
+            "memory_bounded_query_chunks": True,
             "nearest_sample_count": int(self._trace_nearest_count),
             "gradation": float(gradation),
             "endpoint_midpoint_exact_by_construction": True,
             "distance_metric": "straight_euclidean",
             "barrier_aware": False,
+            "base_raster_sampling_interface_schema_version": (
+                self.sampling_interface_schema_version
+            ),
+            "base_query_without_positive_active_support_count": 0,
+            "no_active_support_policy": support_policy,
         }
+        if schema == BOUNDARY_TRACE_SAMPLER_V2:
+            maximum_sample_spacing = max(sample_spacings, default=0.0)
+            report.update(
+                {
+                    "method": (
+                        "raster_min_deterministic_boundary_point_"
+                        "euclidean_gradation_extension_"
+                        "adaptive_exact_sample_minimum"
+                    ),
+                    "initial_nearest_sample_count": int(
+                        self._trace_nearest_count
+                    ),
+                    "adaptive_neighbor_expansion": True,
+                    "exact_discrete_trace_sample_minimum": True,
+                    "global_unvisited_lower_bound": (
+                        "minimum_boundary_target_plus_gradation_times_"
+                        "current_kth_nearest_distance"
+                    ),
+                    "maximum_trace_sample_spacing_m": float(
+                        maximum_sample_spacing
+                    ),
+                    "maximum_continuous_trace_overestimate_bound_m": float(
+                        float(gradation) * maximum_sample_spacing
+                    ),
+                    "sample_query_count": 0,
+                    "expanded_sample_query_count": 0,
+                    "maximum_neighbors_examined": 0,
+                }
+            )
+        else:
+            report["method"] = (
+                "raster_min_deterministic_boundary_point_"
+                "euclidean_gradation_extension"
+            )
+        self.trace_report = report
 
     def sample_lonlat(self, lonlat: np.ndarray) -> np.ndarray:
+        sampled, _active_support = (
+            self.sample_lonlat_with_active_support(lonlat)
+        )
+        return sampled
+
+    def sample_lonlat_with_active_support(
+        self,
+        lonlat: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
         points = np.asarray(lonlat, dtype=float)
         if points.ndim != 2 or points.shape[1] != 2:
             raise ValueError("size queries must have shape (n, 2)")
         query = np.column_stack((points[:, 1], points[:, 0]))
-        sampled = np.asarray(self._values(query), dtype=float)
-        covered = np.asarray(self._coverage(query), dtype=float) >= 0.5
-        sampled[
-            ~covered | ~np.isfinite(sampled) | (sampled <= 0.0)
-        ] = np.nan
-        return sampled
+        sampled, support = self._raster.sample_with_active_support(query)
+        return (
+            np.asarray(sampled, dtype=float),
+            np.asarray(support, dtype=bool),
+        )
 
     def sample_xy(self, xy: np.ndarray) -> np.ndarray:
         points = np.asarray(xy, dtype=float)
         if points.ndim != 2 or points.shape[1] != 2:
             raise ValueError("projected size queries must have shape (n, 2)")
+        if len(points) > self._trace_query_chunk_size:
+            return np.concatenate(
+                [
+                    self.sample_xy(
+                        points[
+                            begin : min(
+                                len(points),
+                                begin + self._trace_query_chunk_size,
+                            )
+                        ]
+                    )
+                    for begin in range(
+                        0,
+                        len(points),
+                        self._trace_query_chunk_size,
+                    )
+                ]
+            )
         lon, lat = self.projection.to_lonlat.transform(
             points[:, 0],
             points[:, 1],
         )
-        sampled = self.sample_lonlat(np.column_stack((lon, lat)))
+        sampled, active_support = self.sample_lonlat_with_active_support(
+            np.column_stack((lon, lat))
+        )
+        invalid = ~np.isfinite(sampled) | (sampled <= 0.0)
+        if np.any(invalid):
+            first = int(np.flatnonzero(invalid)[0])
+            raise ValueError(
+                "canonical size query is outside strict coverage or invalid: "
+                f"{int(np.count_nonzero(invalid))} point(s); first projected "
+                f"coordinate=({points[first, 0]:.6f}, "
+                f"{points[first, 1]:.6f})"
+            )
         if (
             self._trace_tree is None
             or self._trace_targets is None
             or self._trace_gradation is None
         ):
             return sampled
+        effective_sampled = (
+            np.where(active_support, sampled, np.inf)
+            if self._trace_no_active_support_policy
+            == "boundary_trace_authoritative"
+            else np.asarray(sampled, dtype=float)
+        )
+        self.trace_report[
+            "base_query_without_positive_active_support_count"
+        ] = int(
+            self.trace_report[
+                "base_query_without_positive_active_support_count"
+            ]
+        ) + int(np.count_nonzero(~active_support))
+        if self._trace_adaptive_neighbor_expansion:
+            if self._trace_minimum_target is None:
+                raise RuntimeError(
+                    "adaptive boundary trace is missing its minimum target"
+                )
+            result = np.asarray(effective_sampled, dtype=float).copy()
+            best_extension = np.full(len(points), np.inf, dtype=float)
+            unresolved = np.arange(len(points), dtype=int)
+            neighbor_count = int(self._trace_nearest_count)
+            expanded_queries = 0
+            maximum_examined = 0
+            tolerance = 32.0 * np.finfo(float).eps
+
+            while len(unresolved):
+                distance, indices = self._trace_tree.query(
+                    points[unresolved],
+                    k=neighbor_count,
+                )
+                distance_array = np.asarray(distance, dtype=float)
+                index_array = np.asarray(indices, dtype=int)
+                if distance_array.ndim == 1:
+                    distance_array = distance_array[:, None]
+                    index_array = index_array[:, None]
+                local_extension = np.min(
+                    self._trace_targets[index_array]
+                    + self._trace_gradation * distance_array,
+                    axis=1,
+                )
+                best_extension[unresolved] = np.minimum(
+                    best_extension[unresolved],
+                    local_extension,
+                )
+                result[unresolved] = np.minimum(
+                    effective_sampled[unresolved],
+                    best_extension[unresolved],
+                )
+                maximum_examined = max(maximum_examined, neighbor_count)
+                if neighbor_count >= len(self._trace_targets):
+                    break
+
+                unseen_lower_bound = (
+                    self._trace_minimum_target
+                    + self._trace_gradation * distance_array[:, -1]
+                )
+                scale = np.maximum(
+                    1.0,
+                    np.maximum(
+                        np.abs(result[unresolved]),
+                        np.abs(unseen_lower_bound),
+                    ),
+                )
+                resolved_here = (
+                    result[unresolved]
+                    <= unseen_lower_bound + tolerance * scale
+                )
+                remaining = unresolved[~resolved_here]
+                if not len(remaining):
+                    break
+                expanded_queries += int(len(remaining))
+                unresolved = remaining
+                neighbor_count = min(
+                    len(self._trace_targets),
+                    max(neighbor_count + 1, 2 * neighbor_count),
+                )
+
+            self.trace_report["sample_query_count"] = int(
+                self.trace_report["sample_query_count"]
+            ) + int(len(points))
+            self.trace_report["expanded_sample_query_count"] = int(
+                self.trace_report["expanded_sample_query_count"]
+            ) + int(expanded_queries)
+            self.trace_report["maximum_neighbors_examined"] = max(
+                int(self.trace_report["maximum_neighbors_examined"]),
+                int(maximum_examined),
+            )
+            return result
         distance, indices = self._trace_tree.query(
             points,
             k=self._trace_nearest_count,
@@ -249,7 +536,7 @@ class _CanonicalSizeSampler:
             + self._trace_gradation * distance_array,
             axis=1,
         )
-        return np.fmin(sampled, extension)
+        return np.minimum(effective_sampled, extension)
 
 
 def write_raw_transition_diagnostics(
@@ -342,7 +629,7 @@ def write_raw_transition_diagnostics(
     if not (
         isinstance(sampling_contract, Mapping)
         and sampling_contract.get("schema_version")
-        == "fvcom_boundary_trace_sampler_v1"
+        in BOUNDARY_TRACE_SAMPLER_SCHEMAS
     ):
         reconciliation_path = (
             paths["canonical_boundary_geojson"].parent
@@ -360,15 +647,16 @@ def write_raw_transition_diagnostics(
             if (
                 isinstance(fallback_contract, Mapping)
                 and fallback_contract.get("schema_version")
-                == "fvcom_boundary_trace_sampler_v1"
+                in BOUNDARY_TRACE_SAMPLER_SCHEMAS
             ):
                 sampling_contract = fallback_contract
                 paths["boundary_size_reconciliation"] = reconciliation_path
     if (
         isinstance(sampling_contract, Mapping)
         and sampling_contract.get("schema_version")
-        == "fvcom_boundary_trace_sampler_v1"
+        in BOUNDARY_TRACE_SAMPLER_SCHEMAS
     ):
+        sampling_schema = str(sampling_contract["schema_version"])
         sampler.enable_boundary_trace(
             nodes_xy,
             topology.boundary_edges,
@@ -383,7 +671,20 @@ def write_raw_transition_diagnostics(
                 sampling_contract.get("samples_per_target", 4.0)
             ),
             nearest_sample_count=int(
-                sampling_contract.get("nearest_sample_count", 16)
+                sampling_contract.get(
+                    "initial_nearest_sample_count",
+                    sampling_contract.get("nearest_sample_count", 16),
+                )
+            ),
+            schema_version=sampling_schema,
+            no_active_support_policy=str(
+                sampling_contract.get(
+                    "no_active_support_policy",
+                    "raster_min",
+                )
+            ),
+            query_chunk_size=int(
+                sampling_contract.get("query_chunk_size", 4_096)
             ),
         )
 
@@ -459,18 +760,23 @@ def write_raw_transition_diagnostics(
 
     interface_hotspots = arrays["interface_hotspot_edge_indices"]
     area_hotspots = arrays["area_hotspot_edge_indices"]
+    diagnostic_failures = _diagnostic_failure_taxonomy(
+        edge_audit=edge_audit,
+        interface_hotspot_count=int(len(interface_hotspots)),
+        area_hotspot_count=int(len(area_hotspots)),
+        unmatched_boundary_node_count=int(
+            target_mapping["unmatched_mesh_boundary_node_count"]
+        ),
+        invalid_triangle_l_over_h_count=int(
+            arrays["invalid_triangle_l_over_h_count"]
+        ),
+    )
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "diagnostic_status": (
-            "pass"
-            if (
-                len(interface_hotspots) == 0
-                and len(area_hotspots) == 0
-                and target_mapping["unmatched_mesh_boundary_node_count"] == 0
-                and arrays["invalid_triangle_l_over_h_count"] == 0
-            )
-            else "needs_review"
+            "pass" if not diagnostic_failures else "needs_review"
         ),
+        "failure_taxonomy": diagnostic_failures,
         "read_only_inputs": True,
         "method": {
             "length_coordinates": (
@@ -639,10 +945,13 @@ def _quality_thresholds(quality: Mapping[str, Any]) -> dict[str, float]:
         ),
         "interface_ratio_limit": float(
             interface_source.get(
-                "factor_two_limit",
-                edge_method.get(
-                    "boundary_field_ratio_limit",
-                    DEFAULT_INTERFACE_RATIO_LIMIT,
+                "ratio_limit",
+                interface_source.get(
+                    "factor_two_limit",
+                    edge_method.get(
+                        "boundary_field_ratio_limit",
+                        DEFAULT_INTERFACE_RATIO_LIMIT,
+                    ),
                 ),
             )
         ),
@@ -1157,7 +1466,7 @@ def _write_transition_map(
         (
             "Edges touching triangles at graph distance 0-1 from a "
             "topological boundary are colored.\n"
-            "Red: factor-two 1-D/2-D target jump. "
+            "Red: configured ratio-limit 1-D/2-D target jump. "
             "Orange: adjacent-area-change hotspot touching this strip."
         ),
         transform=ax.transAxes,
@@ -1386,7 +1695,7 @@ def _hotspot_legend(ax: Any) -> None:
                 [0],
                 color="#d62728",
                 linewidth=2.0,
-                label="boundary/field factor-two hotspot",
+                label="boundary/field ratio-limit hotspot",
             ),
             Line2D(
                 [0],
@@ -1449,6 +1758,33 @@ def _quality_summary(quality: Mapping[str, Any]) -> dict[str, Any]:
             else []
         ),
     }
+
+
+def _diagnostic_failure_taxonomy(
+    *,
+    edge_audit: Mapping[str, Any],
+    interface_hotspot_count: int,
+    area_hotspot_count: int,
+    unmatched_boundary_node_count: int,
+    invalid_triangle_l_over_h_count: int,
+) -> list[str]:
+    """Combine every hard transition diagnostic into one status contract."""
+
+    failures = {
+        str(value)
+        for value in edge_audit.get("failure_taxonomy", [])
+    }
+    if not bool(edge_audit.get("passed", False)) and not failures:
+        failures.add("authoritative_edge_size_audit_failed")
+    if int(interface_hotspot_count) > 0:
+        failures.add("boundary_field_interface_ratio_limit_exceeded")
+    if int(area_hotspot_count) > 0:
+        failures.add("adjacent_area_change_above_threshold")
+    if int(unmatched_boundary_node_count) > 0:
+        failures.add("boundary_target_mapping_incomplete")
+    if int(invalid_triangle_l_over_h_count) > 0:
+        failures.add("edge_aware_target_size_invalid")
+    return sorted(failures)
 
 
 def _hotspot_records(
