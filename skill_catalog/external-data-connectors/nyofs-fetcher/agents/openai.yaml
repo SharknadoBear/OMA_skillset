@@ -1,0 +1,4 @@
+interface:
+  display_name: "NYOFS Fetcher"
+  short_description: "Plan, fetch, and QA NOAA NYOFS POM data."
+  default_prompt: "Use $nyofs-fetcher to plan, download, concatenate, extract, and health-check bounded NOAA NYOFS POM data from public AWS."

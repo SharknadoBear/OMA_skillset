@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oma.local/schemas/nyofs_request_v1.json",
+  "title": "NYOFS Fetcher Request v1",
+  "description": "A bounded request for NOAA NYOFS inventory, planning, anonymous download, and optional POM field extraction. Runtime defaults are shown as annotations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "start_utc", "end_utc_exclusive", "product", "guidance"],
+  "properties": {
+    "schema_version": {"const": "nyofs_request_v1"},
+    "start_utc": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Inclusive timestamp with an explicit UTC offset."
+    },
+    "end_utc_exclusive": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Exclusive timestamp later than start_utc, with an explicit UTC offset."
+    },
+    "grid": {
+      "type": "string",
+      "enum": ["coarse", "fine", "both"],
+      "default": "coarse"
+    },
+    "product": {"type": "string", "enum": ["fields", "stations"]},
+    "guidance": {"type": "string", "enum": ["nowcast", "forecast"]},
+    "run_cycle_utc": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Required only for forecast requests; accepted cycle hours are 05, 11, 17, and 23 UTC."
+    },
+    "variables": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1},
+      "default": ["zeta", "u", "v", "air_u", "air_v"]
+    },
+    "vertical_views": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "oneOf": [
+          {"type": "string", "enum": ["surface", "near_surface", "bottom", "depth_average"]},
+          {"type": "integer", "minimum": 0}
+        ]
+      },
+      "default": ["surface", "bottom", "depth_average"]
+    },
+    "missing_policy": {"type": "string", "enum": ["error", "skip"], "default": "error"},
+    "cache_policy": {"type": "string", "enum": ["keep", "delete_after_extract"], "default": "keep"},
+    "max_workers": {"type": "integer", "minimum": 1, "default": 4}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"guidance": {"const": "forecast"}}, "required": ["guidance"]},
+      "then": {"required": ["run_cycle_utc"]}
+    },
+    {
+      "if": {"properties": {"guidance": {"const": "nowcast"}}, "required": ["guidance"]},
+      "then": {"not": {"required": ["run_cycle_utc"]}}
+    },
+    {
+      "if": {"properties": {"product": {"const": "stations"}}, "required": ["product"]},
+      "then": {
+        "not": {
+          "anyOf": [
+            {"required": ["variables"]},
+            {"required": ["vertical_views"]}
+          ]
+        }
+      }
+    }
+  ]
+}
