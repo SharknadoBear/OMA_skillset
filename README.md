@@ -8,8 +8,8 @@ by capability family rather than by the older broad project-stage folders.
 
 - `common-core/`: shared FVCOM support utilities, currently `fvcom-common`.
 - `external-data-connectors/`: source-specific data acquisition and conversion
-  capabilities, such as HYCOM, NOAA CO-OPS, USGS, CBOFS, DBOFS, CFSv2,
-  GloFAS, GSHHS, CUDEM, CUSP, NHD/NHM river products, and usSEABED.
+  capabilities, such as HYCOM, NOAA CO-OPS, USGS, CBOFS, DBOFS, SSCOFS,
+  CFSv2, GloFAS, GSHHS, CUDEM, CUSP, NHD/NHM river products, and usSEABED.
 - `forcing-builders/`: tools that assemble FVCOM-ready forcing products from
   source data or local inputs.
 - `grid-generation/`: regional-domain, boundary-arc, coastline-topology, and
@@ -141,9 +141,9 @@ usable skill families at different maturity levels:
 - `external-data-connectors/` entries are maintained as installable skills with
   `SKILL.md` metadata, agent UI metadata, estimate-first routing hooks where
   appropriate, and downloaded-data health checks. The connector set now includes
-  HYCOM, NOAA CO-OPS, CBOFS/DBOFS, CFSv2, CUDEM, CUSP, GSHHS, NHD/NHM river
-  tools, USGS rivers, usSEABED, and the newly cataloged
-  `glofas-data-fetcher`.
+  HYCOM, NOAA CO-OPS, CBOFS/DBOFS, SSCOFS, CFSv2, CUDEM, CUSP, GSHHS,
+  NHD/NHM river tools, USGS rivers, usSEABED, `glofas-data-fetcher`, and the
+  new `sscofs-fetcher` public-AWS connector.
 - `model-execution-hpc/kestrel-hpc` is a robust operational bridge skill, not
   merely a copied placeholder. It records Bear's Kestrel account context,
   required SSH MAC option, Password+OTP handling rules, Slurm job inspection and

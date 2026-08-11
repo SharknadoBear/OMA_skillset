@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oma.local/schemas/sscofs_request_v1.json",
+  "title": "SSCOFS Fetcher Request v1",
+  "description": "A bounded request for NOAA SSCOFS inventory, planning, download, and optional native-field extraction. Defaults are applied by the runtime; JSON Schema default values are annotations.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "start_utc",
+    "end_utc_exclusive",
+    "product",
+    "guidance"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "sscofs_request_v1"
+    },
+    "start_utc": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Inclusive UTC start. The runtime requires an explicit UTC offset and normalizes to Z."
+    },
+    "end_utc_exclusive": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Exclusive UTC end. The runtime requires this value to be later than start_utc."
+    },
+    "product": {
+      "type": "string",
+      "enum": [
+        "fields",
+        "stations",
+        "regulargrid"
+      ]
+    },
+    "guidance": {
+      "type": "string",
+      "enum": [
+        "nowcast",
+        "forecast"
+      ]
+    },
+    "run_cycle_utc": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Selected SSCOFS cycle in UTC. Required for forecast requests; accepted cycle hours are 03, 09, 15, and 21."
+    },
+    "variables": {
+      "type": "array",
+      "description": "Native field variable names to retain or derive. Valid names are discovered from the downloaded NetCDF files.",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "vertical_views": {
+      "type": "array",
+      "description": "Named vertical views or zero-based explicit sigma-layer indices. Applies only to native fields.",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "surface",
+              "near_surface",
+              "bottom",
+              "depth_average"
+            ]
+          },
+          {
+            "type": "integer",
+            "minimum": 0
+          }
+        ]
+      }
+    },
+    "missing_policy": {
+      "type": "string",
+      "enum": [
+        "error",
+        "skip"
+      ],
+      "default": "error"
+    },
+    "cache_policy": {
+      "type": "string",
+      "enum": [
+        "keep",
+        "delete_after_extract"
+      ],
+      "default": "keep"
+    },
+    "max_workers": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 4
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "guidance": {
+            "const": "forecast"
+          }
+        },
+        "required": [
+          "guidance"
+        ]
+      },
+      "then": {
+        "required": [
+          "run_cycle_utc"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "product": {
+            "enum": [
+              "stations",
+              "regulargrid"
+            ]
+          }
+        },
+        "required": [
+          "product"
+        ]
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "variables"
+              ]
+            },
+            {
+              "required": [
+                "vertical_views"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

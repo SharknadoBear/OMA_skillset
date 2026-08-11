@@ -1,0 +1,4 @@
+interface:
+  display_name: "SSCOFS Fetcher"
+  short_description: "Plan, fetch, and QA NOAA SSCOFS fields."
+  default_prompt: "Use $sscofs-fetcher to plan, download, extract, and health-check a bounded NOAA SSCOFS request from public AWS."
