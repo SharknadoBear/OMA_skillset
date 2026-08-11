@@ -1,0 +1,4 @@
+interface:
+  display_name: "POM Movie Postprocessing"
+  short_description: "Animate NOAA POM curvilinear-grid fields."
+  default_prompt: "Use $pom-movie-postprocessing to create a fixed-scale GIF from time-varying POM curvilinear NetCDF fields."
