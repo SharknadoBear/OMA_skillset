@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oma.local/schemas/pom_map_manifest_v1.json",
+  "title": "POM static map manifest v1",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "status",
+    "created_utc",
+    "input",
+    "request",
+    "selection",
+    "rendering",
+    "quiver",
+    "output"
+  ],
+  "properties": {
+    "schema_version": {"const": "pom_map_manifest_v1"},
+    "status": {"const": "pass"},
+    "created_utc": {"type": "string"},
+    "input": {
+      "type": "object",
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": {"type": "string"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "request": {"type": "object"},
+    "selection": {
+      "type": "object",
+      "required": ["grid", "grid_shape", "geometry_sha256", "normalized_time_utc", "variable_requested", "resolution"],
+      "properties": {
+        "grid": {"enum": ["coarse", "fine"]},
+        "grid_shape": {
+          "type": "array",
+          "prefixItems": [{"type": "integer"}, {"type": "integer"}],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "geometry_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "normalized_time_utc": {"type": "string"},
+        "variable_requested": {"type": "string"},
+        "resolution": {"type": "object"}
+      }
+    },
+    "rendering": {
+      "type": "object",
+      "required": ["style", "vmin", "vmax", "finite_wet_coverage"],
+      "properties": {
+        "style": {"enum": ["pcolormesh", "contourf"]},
+        "vmin": {"type": "number"},
+        "vmax": {"type": "number"},
+        "finite_wet_coverage": {"type": "number", "minimum": 0, "maximum": 1},
+        "quiver_count": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "quiver": {"type": "object"},
+    "output": {
+      "type": "object",
+      "required": ["path", "bytes", "sha256", "format"],
+      "properties": {
+        "path": {"type": "string"},
+        "bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "format": {"const": "png"}
+      }
+    }
+  },
+  "additionalProperties": true
+}
