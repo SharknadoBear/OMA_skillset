@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oma.local/schemas/efdc_movie_manifest_v1.json",
+  "title": "EFDC fixed-scale GIF manifest v1",
+  "type": "object",
+  "required": ["schema_version", "status", "inputs", "request", "resolved", "grid", "selection", "fixed_color_limits", "coverage", "rendering", "frames", "output"],
+  "properties": {
+    "schema_version": {"const": "efdc_movie_manifest_v1"},
+    "status": {"enum": ["pass", "pass_with_warnings"]},
+    "inputs": {"type": "array", "minItems": 1},
+    "resolved": {"type": "object", "required": ["vertical_method", "vector_method"]},
+    "grid": {"type": "object", "required": ["shape", "wet_cell_count", "geometry_sha256"]},
+    "selection": {"type": "object", "required": ["frame_count", "first_time_utc", "last_time_utc", "unique_monotonic"]},
+    "fixed_color_limits": {"type": "object", "required": ["method", "vmin", "vmax"], "properties": {"vmin": {"type": "number"}, "vmax": {"type": "number"}}},
+    "coverage": {"type": "object", "required": ["minimum_finite_wet_fraction", "all_nan_frame_count"]},
+    "rendering": {"type": "object", "required": ["format", "style", "fps_requested", "temporary_frames_cleaned", "wet_footprint_method", "wet_footprint_count", "wet_footprint_fallback_cell_count", "wet_footprint_maximum_span_km"]},
+    "frames": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["index", "time_utc", "original_time_utc", "normalization_offset_seconds", "finite_wet_fraction", "source_record_index"]}},
+    "output": {"type": "object", "required": ["path", "size_bytes", "sha256", "frame_count"], "properties": {"size_bytes": {"type": "integer", "minimum": 1}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "frame_count": {"type": "integer", "minimum": 1}}}
+  },
+  "additionalProperties": true
+}

@@ -21,7 +21,7 @@ by capability family rather than by the older broad project-stage folders.
   Constance, and the PNNL cloud VM, including Codex and Copilot-facing variants
   where staged.
 - `model-analysis/`: active structured-grid POM, staggered-grid ROMS, and
-  sparse curvilinear EFDC map post-processing, plus staged future
+  sparse curvilinear EFDC map and movie post-processing, plus staged future
   scientific-analysis work.
 
 ## Installing Skills
@@ -174,9 +174,9 @@ usable skill families at different maturity levels:
 - `model-analysis/` now includes the active `pom-map-postprocessing`,
   `pom-movie-postprocessing`, `roms-map-postprocessing`, and
   `roms-movie-postprocessing` skills, together with
-  `efdc-map-postprocessing` for sparse curvilinear EFDC grids. Script-only
-  FVCOM folders without `SKILL.md` remain reference material rather than
-  installable skills.
+  `efdc-map-postprocessing` and `efdc-movie-postprocessing` for sparse
+  curvilinear EFDC grids. Script-only FVCOM folders without `SKILL.md` remain
+  reference material rather than installable skills.
 - `common-core/` and `forcing-builders/` remain less mature catalog families and
   should be expanded only through explicit skill development work.
 

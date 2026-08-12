@@ -1,0 +1,4 @@
+interface:
+  display_name: "EFDC Movie Postprocessing"
+  short_description: "Animate NOAA EFDC curvilinear-grid fields."
+  default_prompt: "Use $efdc-movie-postprocessing to create a fixed-scale GIF from time-varying EFDC curvilinear NetCDF fields."
