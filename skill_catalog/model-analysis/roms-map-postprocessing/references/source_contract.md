@@ -51,3 +51,16 @@ Precomputed earth/north fields are accepted only from an exact `roms_compact_fie
 ## Map manifest
 
 `roms_map_manifest_v1` records input hashes, requested and source variables, the selected source record, normalized/source time, grid hash, vertical-transform and vector-resolution methods, strictly positive wet coverage, fixed or robust limits, quiver settings, and PNG hash. See `map_manifest.schema.json` for the machine-checkable shape.
+
+## Wet-cell rendering convention
+
+The default renderer does not pass rho-center coordinates to `pcolormesh`. ROMS grids
+may pack unrelated dry-coordinate blocks next to narrow wet reaches in index space;
+center-based corner inference can therefore stretch a nominally wet face across a dry
+seam. Instead, render each finite `mask_rho == 1` cell as an independent footprint.
+Measure XI and ETA size only between immediate wet-neighbor centers, orient the footprint
+with the verified ROMS `angle`, and use the median wet-grid aspect ratio only where a
+one-cell-wide boundary lacks a neighbor along one axis. Never consult a dry center when
+constructing a wet footprint. Reports record the rule, fallback count, and maximum
+footprint span. `contourf` is an intentional interpolation option; legacy center-coordinate
+`pcolormesh` is allowed only when every coordinate cell is wet.

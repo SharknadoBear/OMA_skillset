@@ -48,7 +48,13 @@ Repeat `--input` or pass several paths after one `--input` for native hourly fil
 
 ## Rendering choices
 
-- Keep `--style pcolormesh` for native-grid evidence; use `contourf` only intentionally.
+- Keep the default `--style wet_cells` for native-grid evidence. It draws only finite
+  `mask_rho == 1` cells as independent, angle-oriented footprints whose dimensions
+  come only from immediate wet-neighbor spacing. This prevents packed dry coordinates
+  from creating false strips across river channels.
+- Use `contourf` only for an intentional smoothed view. Legacy `pcolormesh` is rejected
+  on any grid containing dry cells because center-coordinate corner inference can cross
+  dry or packed seams.
 - Use the default 2nd/98th percentiles or pass both `--vmin` and `--vmax` for fixed comparisons.
 - Use `--limits-scope series` so a midpoint PNG can share a movie's full-series scale.
 - Use quivers only for static earth-relative currents and increase the stride until arrows are readable.

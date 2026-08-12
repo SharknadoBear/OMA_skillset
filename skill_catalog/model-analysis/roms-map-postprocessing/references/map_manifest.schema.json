@@ -86,10 +86,12 @@
       "type": "object",
       "required": [
         "style", "cmap", "vmin", "vmax", "color_limit_method", "finite_wet_coverage",
-        "wet_cells", "finite_wet_cells", "quiver_count", "quiver_stride", "title", "dpi"
+        "wet_cells", "finite_wet_cells", "rendered_cells", "wet_mask_rule",
+        "footprint_method", "footprint_fallback_cells", "footprint_maximum_span_km",
+        "quiver_count", "quiver_stride", "title", "dpi"
       ],
       "properties": {
-        "style": {"enum": ["pcolormesh", "contourf"]},
+        "style": {"enum": ["wet_cells", "pcolormesh", "contourf"]},
         "cmap": {"type": "string", "minLength": 1},
         "vmin": {"type": "number"},
         "vmax": {"type": "number"},
@@ -97,6 +99,14 @@
         "finite_wet_coverage": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
         "wet_cells": {"type": "integer", "minimum": 1},
         "finite_wet_cells": {"type": "integer", "minimum": 1},
+        "rendered_cells": {"type": "integer", "minimum": 1},
+        "wet_mask_rule": {"const": "mask_rho==1_and_finite_scalar"},
+        "footprint_method": {
+          "type": ["string", "null"],
+          "enum": ["wet_neighbor_centers_with_angle_orientation", null]
+        },
+        "footprint_fallback_cells": {"type": ["integer", "null"], "minimum": 0},
+        "footprint_maximum_span_km": {"type": ["number", "null"], "exclusiveMinimum": 0},
         "quiver_count": {"type": ["integer", "null"], "minimum": 0},
         "quiver_stride": {"type": ["integer", "null"], "minimum": 1},
         "title": {"type": "string"},

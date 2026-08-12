@@ -180,6 +180,7 @@ def map_command(args) -> dict[str, Any]:
             str(temporary), lon=series.grid.lon, lat=series.grid.lat, mask=series.grid.mask,
             values=frame, vmin=vmin, vmax=vmax, cmap=cmap, title=title,
             colorbar_label=f"{long_name}{f' [{units}]' if units else ''}", method=args.style,
+            angle=series.grid.angle,
             quiver_u=quiver_u, quiver_v=quiver_v, quiver_stride=args.quiver_stride,
             quiver_scale=args.quiver_scale, figure_size=tuple(args.figsize), dpi=args.dpi)
         os.replace(temporary, output)
@@ -208,7 +209,14 @@ def map_command(args) -> dict[str, Any]:
             "style": args.style, "cmap": cmap, "vmin": float(vmin), "vmax": float(vmax),
             "color_limit_method": limit_method, "quantiles_percent": list(args.quantiles) if args.vmin is None else None,
             "finite_wet_coverage": result.finite_wet_fraction, "wet_cells": result.wet_cell_count,
-            "finite_wet_cells": result.finite_wet_count, "quiver_count": quiver_count if result.quiver else None,
+            "finite_wet_cells": result.finite_wet_count,
+            "rendered_cells": result.rendered_cell_count,
+            "wet_mask_rule": "mask_rho==1_and_finite_scalar",
+            "footprint_method": (
+                "wet_neighbor_centers_with_angle_orientation" if args.style == "wet_cells" else None),
+            "footprint_fallback_cells": result.footprint_fallback_cell_count,
+            "footprint_maximum_span_km": result.footprint_maximum_span_km,
+            "quiver_count": quiver_count if result.quiver else None,
             "quiver_stride": args.quiver_stride if result.quiver else None,
             "quiver_scale": args.quiver_scale, "title": title, "dpi": args.dpi,
         },
@@ -240,7 +248,10 @@ def build_parser() -> argparse.ArgumentParser:
     map_parser.add_argument("--quantiles", nargs=2, type=float, default=(2.0, 98.0), metavar=("LOW", "HIGH"))
     map_parser.add_argument("--vmin", type=float)
     map_parser.add_argument("--vmax", type=float)
-    map_parser.add_argument("--style", choices=("pcolormesh", "contourf"), default="pcolormesh")
+    map_parser.add_argument(
+        "--style", choices=("wet_cells", "pcolormesh", "contourf"), default="wet_cells",
+        help=("wet_cells draws independent mask_rho==1 footprints (default); pcolormesh is "
+              "accepted only for grids with no dry cells."))
     map_parser.add_argument("--cmap", default="auto")
     map_parser.add_argument("--quiver", choices=("none", "current"), default="none")
     map_parser.add_argument("--quiver-stride", type=int, default=8)

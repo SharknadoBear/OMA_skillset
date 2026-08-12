@@ -25,6 +25,11 @@ Decode CF time metadata, normalize only adjustments within 60 seconds of an hour
 ## GIF behavior
 
 - Render every selected scalar frame on the native rho grid.
+- Draw only finite `mask_rho == 1` cells as independent angle-oriented footprints.
+  Derive their XI/ETA dimensions only from immediate wet-neighbor center spacing;
+  never use a dry center to infer a wet-cell corner. Reuse one precomputed footprint
+  geometry for every frame and report total/minimum/maximum rendered counts, fallback
+  counts, and maximum span.
 - Use one explicit or full-series percentile color range for all frames.
 - Reject all-NaN wet frames and report finite wet coverage for every frame.
 - Write a looping Pillow GIF with the requested FPS.

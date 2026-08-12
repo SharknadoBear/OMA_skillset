@@ -12,6 +12,7 @@ import numpy as np
 from netCDF4 import Dataset
 from PIL import Image
 
+from roms_map_tools import build_wet_cell_footprints
 from roms_map_postprocessing import main as map_main
 from roms_output import (
     destagger_u_to_rho,
@@ -208,6 +209,37 @@ def _expect_error(callable_, text):
         raise AssertionError(f"Expected an error containing {text!r}.")
 
 
+def _packed_seam_footprint_regression():
+    """Prove dry packed coordinates cannot stretch an independent wet footprint."""
+
+    x = np.arange(5, dtype=float)
+    lon = np.vstack((
+        -76.0 + 0.01 * x,
+        -76.0 + 0.01 * x,
+        -74.0 + 0.01 * x,  # unrelated packed coordinates: this row is dry
+        -74.0 + 0.01 * x,
+    ))
+    lat = np.vstack((
+        np.full(5, 38.00),
+        np.full(5, 38.01),
+        np.full(5, 39.00),
+        np.full(5, 39.01),
+    ))
+    mask = np.ones((4, 5), dtype=np.int8)
+    mask[2, :] = 0
+    footprints = build_wet_cell_footprints(lon, lat, mask, angle=np.zeros_like(lon))
+    wet = mask == 1
+    centers = footprints.polygons.mean(axis=1)
+    expected_centers = np.column_stack((lon[wet], lat[wet]))
+    assert len(footprints.polygons) == int(np.count_nonzero(wet)) == 15
+    assert np.allclose(centers, expected_centers, atol=1.0e-12)
+    assert np.max(np.ptp(footprints.polygons[:, :, 0], axis=1)) < 0.02
+    assert np.max(np.ptp(footprints.polygons[:, :, 1], axis=1)) < 0.02
+    assert footprints.maximum_span_km < 2.0
+    assert int(np.count_nonzero(footprints.fallback_cells)) == 5
+    return footprints
+
+
 def main() -> int:
     regression_checks = []
     with tempfile.TemporaryDirectory(prefix="roms_map_selftest_") as temporary:
@@ -228,6 +260,9 @@ def main() -> int:
         assert np.isfinite(noaa_series.grid.cs_w).all()
         assert noaa_series.grid.cs_w[-1] > 0.0
         regression_checks.append("coordinate_valid_range_roundoff_preserved")
+
+        packed_footprints = _packed_seam_footprint_regression()
+        regression_checks.append("packed_dry_seam_independent_wet_cell_footprints")
 
         inspection = inspect_inputs(raw)
         assert inspection["geometry"]["angle_units"] == "radians"
@@ -407,6 +442,11 @@ def main() -> int:
         salinity_manifest = json.loads(salinity_json.read_text())
         current_manifest = json.loads(current_json.read_text())
         assert salinity_manifest["rendering"]["finite_wet_coverage"] >= 0.95
+        assert salinity_manifest["rendering"]["style"] == "wet_cells"
+        assert salinity_manifest["rendering"]["wet_mask_rule"] == "mask_rho==1_and_finite_scalar"
+        assert salinity_manifest["rendering"]["rendered_cells"] == salinity_manifest["rendering"]["finite_wet_cells"]
+        assert salinity_manifest["rendering"]["footprint_method"] == packed_footprints.spacing_method
+        assert salinity_manifest["rendering"]["footprint_maximum_span_km"] > 0
         assert current_manifest["rendering"]["quiver_count"] > 0
         assert current_manifest["selection"]["resolution"]["earth_relative_on_rho_grid"] is True
         assert current_manifest["selection"]["angle_units"] == "radians"
@@ -416,6 +456,15 @@ def main() -> int:
         assert salinity_manifest["selection"]["long_name"] == "selected-source salinity"
         assert current_manifest["selection"]["long_name"] == "Earth-relative current speed"
         regression_checks.append("selected_record_metadata_and_current_label")
+
+        unsafe_png, unsafe_json = root / "unsafe.png", root / "unsafe.json"
+        assert map_main([
+            "map", "--input", str(raw[0]), "--variable", "salinity", "--time-index", "0",
+            "--layer", "surface", "--style", "pcolormesh", "--vmin", "0", "--vmax", "40",
+            "--output", str(unsafe_png), "--report", str(unsafe_json),
+        ]) == 2
+        assert not unsafe_png.exists() and not unsafe_json.exists()
+        regression_checks.append("masked_center_pcolormesh_rejected")
 
         all_nan = root / "all_nan.nc"
         write_raw(all_nan, [0])
@@ -449,7 +498,7 @@ def main() -> int:
                 right = hashlib.sha256((sibling / name).read_bytes()).hexdigest()
                 assert left == right, f"Shared core drift: {name}"
                 parity[name] = left
-        print(json.dumps({"status": "pass", "tests": 40, "unique_frames": 24,
+        print(json.dumps({"status": "pass", "tests": 44, "unique_frames": 24,
                           "regression_checks": regression_checks,
                           "raw_compact_parity": True, "shared_module_sha256": parity}, indent=2))
     return 0

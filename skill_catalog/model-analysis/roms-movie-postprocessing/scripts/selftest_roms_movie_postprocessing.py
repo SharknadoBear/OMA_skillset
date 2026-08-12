@@ -185,6 +185,15 @@ def main() -> int:
         assert salinity["selection"]["distinct_rendered_frame_count"] == 24
         assert salinity["coverage"]["minimum_finite_wet_fraction"] >= 0.95
         assert salinity["rendering"]["temporary_frames_cleaned"] is True
+        assert salinity["rendering"]["style"] == "wet_cells"
+        assert salinity["rendering"]["wet_mask_rule"] == "mask_rho==1_and_finite_scalar"
+        assert salinity["rendering"]["footprint_method"] == "wet_neighbor_centers_with_angle_orientation"
+        assert salinity["rendering"]["wet_footprint_count"] == 19
+        assert salinity["rendering"]["minimum_rendered_footprint_count"] == 19
+        assert salinity["rendering"]["maximum_rendered_footprint_count"] == 19
+        assert salinity["rendering"]["footprint_fallback_cells"] >= 0
+        assert salinity["rendering"]["footprint_maximum_span_km"] > 0
+        regression_checks.append("wet_cell_only_movie_rendering")
 
         current_gif, current_report = root / "current.gif", root / "current.json"
         current = create_gif([compact], variable="current_speed", layer="surface", fps=5,
@@ -256,6 +265,7 @@ def main() -> int:
         assert set(movie_schema["required"]) <= set(current)
         assert movie_schema["properties"]["coverage"]["properties"]["minimum_finite_wet_fraction"]["exclusiveMinimum"] == 0
         assert movie_schema["properties"]["rendering"]["properties"]["temporary_frames_cleaned"]["const"] is True
+        assert movie_schema["properties"]["rendering"]["properties"]["style"]["const"] == "wet_cells"
         assert len(current["frames"]) == current["output"]["frame_count"] == current["selection"]["frame_count"]
         regression_checks.append("movie_manifest_schema")
 

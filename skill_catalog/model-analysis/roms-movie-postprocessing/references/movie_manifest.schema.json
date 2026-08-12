@@ -96,7 +96,11 @@
       "type": "object",
       "required": [
         "format", "fps_requested", "frame_duration_ms", "cmap", "dpi",
-        "figure_size_inches", "movie_quivers", "temporary_frames_cleaned"
+        "figure_size_inches", "style", "wet_mask_rule", "footprint_method",
+        "wet_footprint_count", "minimum_rendered_footprint_count",
+        "maximum_rendered_footprint_count",
+        "footprint_fallback_cells", "footprint_maximum_span_km",
+        "movie_quivers", "temporary_frames_cleaned"
       ],
       "properties": {
         "format": {"const": "GIF"},
@@ -105,6 +109,14 @@
         "cmap": {"type": "string", "minLength": 1},
         "dpi": {"type": "integer", "minimum": 40},
         "figure_size_inches": {"$ref": "#/$defs/pair"},
+        "style": {"const": "wet_cells"},
+        "wet_mask_rule": {"const": "mask_rho==1_and_finite_scalar"},
+        "footprint_method": {"const": "wet_neighbor_centers_with_angle_orientation"},
+        "wet_footprint_count": {"type": "integer", "minimum": 1},
+        "minimum_rendered_footprint_count": {"type": "integer", "minimum": 1},
+        "maximum_rendered_footprint_count": {"type": "integer", "minimum": 1},
+        "footprint_fallback_cells": {"type": "integer", "minimum": 0},
+        "footprint_maximum_span_km": {"type": "number", "exclusiveMinimum": 0},
         "movie_quivers": {"const": false},
         "temporary_frames_cleaned": {"const": true}
       }

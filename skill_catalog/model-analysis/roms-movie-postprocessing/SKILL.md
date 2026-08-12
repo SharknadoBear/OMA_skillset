@@ -39,6 +39,9 @@ Repeat `--input` or pass several paths after one `--input` for native hourly fil
 - Resolve `surface`, `near_surface`, and `bottom` from `s_rho`; use `index:N` only for an intentional native index.
 - For `depth_average`, use actual W-level thicknesses from `h`, `zeta`, `s_w`, `Cs_w`, `hc`, and `Vtransform`.
 - Derive current speed only after separately reducing native U/V, applying U/V masks, destaggering to rho points, and rotating with `angle`.
+- Render every frame with independent finite `mask_rho == 1` footprints sized only
+  from immediate wet-neighbor centers and oriented with ROMS `angle`. Never infer
+  pcolormesh corners through dry or packed coordinates.
 - Reject geometry or vertical-schema drift, missing rotation metadata, unpaired vectors, invalid thickness closure, and all-NaN frames.
 - Keep one explicit or full-series quantile scale for every frame. Do not create MP4 output or animated quivers in v1.
 - Store GIFs and reports outside this skill package.

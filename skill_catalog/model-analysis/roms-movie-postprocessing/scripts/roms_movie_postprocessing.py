@@ -21,11 +21,13 @@ import numpy as np
 from PIL import Image
 
 try:
-    from .roms_map_tools import colormap_for_variable, plot_roms_scalar, quantile_limits
+    from .roms_map_tools import (
+        build_wet_cell_footprints, colormap_for_variable, plot_roms_scalar, quantile_limits)
     from .roms_output import inspect_inputs as inspect_roms_inputs
     from .roms_output import load_scalar_series
 except ImportError:
-    from roms_map_tools import colormap_for_variable, plot_roms_scalar, quantile_limits
+    from roms_map_tools import (
+        build_wet_cell_footprints, colormap_for_variable, plot_roms_scalar, quantile_limits)
     from roms_output import inspect_inputs as inspect_roms_inputs
     from roms_output import load_scalar_series
 
@@ -154,8 +156,12 @@ def create_gif(
     if wet_count == 0:
         raise ValueError("ROMS grid has zero finite wet coordinate cells.")
     coverage = np.asarray([np.count_nonzero(np.isfinite(frame) & wet) / wet_count for frame in values])
+    rendered_counts = np.asarray([
+        np.count_nonzero(np.isfinite(frame) & wet) for frame in values], dtype=int)
     if np.any(coverage == 0):
         raise ValueError(f"All-NaN wet frames are not renderable: {np.flatnonzero(coverage == 0).tolist()}.")
+    footprints = build_wet_cell_footprints(
+        series.grid.lon, series.grid.lat, series.grid.mask, angle=series.grid.angle)
     finite = values[:, wet]
     finite = finite[np.isfinite(finite)]
     if vmin is None:
@@ -188,7 +194,8 @@ def create_gif(
                     plot_roms_scalar(
                         ax, lon=series.grid.lon, lat=series.grid.lat, mask=series.grid.mask,
                         values=frame, vmin=vmin, vmax=vmax, cmap=selected_cmap, title=title,
-                        colorbar_label=_display_label(variable))
+                        colorbar_label=_display_label(variable), method="wet_cells",
+                        angle=series.grid.angle, footprints=footprints)
                     fig.savefig(png, dpi=dpi)
                 finally:
                     plt.close(fig)
@@ -247,6 +254,14 @@ def create_gif(
                      "mean_finite_wet_fraction": float(np.mean(coverage)), "all_nan_frame_count": 0},
         "rendering": {"format": "GIF", "fps_requested": float(fps), "frame_duration_ms": duration_ms,
                       "cmap": selected_cmap, "dpi": int(dpi), "figure_size_inches": list(figure_size),
+                      "style": "wet_cells",
+                      "wet_mask_rule": "mask_rho==1_and_finite_scalar",
+                      "footprint_method": footprints.spacing_method,
+                      "wet_footprint_count": len(footprints.polygons),
+                      "minimum_rendered_footprint_count": int(np.min(rendered_counts)),
+                      "maximum_rendered_footprint_count": int(np.max(rendered_counts)),
+                      "footprint_fallback_cells": int(np.count_nonzero(footprints.fallback_cells)),
+                      "footprint_maximum_span_km": footprints.maximum_span_km,
                       "movie_quivers": False, "temporary_frames_cleaned": temporary_cleaned},
         "frames": frames,
         "output": {"path": str(output_path), "size_bytes": output_path.stat().st_size,
