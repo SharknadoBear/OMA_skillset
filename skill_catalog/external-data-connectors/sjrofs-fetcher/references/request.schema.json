@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oma.local/schemas/sjrofs_request_v2.json",
+  "title": "SJROFS Fetcher Request v2",
+  "description": "Bounded NOAA SJROFS AWS/NCEI discovery, reviewed transfer, and EFDC extraction request.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "start_utc", "end_utc_exclusive", "product", "guidance"],
+  "properties": {
+    "schema_version": {"enum": ["sjrofs_request_v1", "sjrofs_request_v2"]},
+    "start_utc": {"type": "string", "format": "date-time", "description": "Inclusive UTC timestamp."},
+    "end_utc_exclusive": {"type": "string", "format": "date-time", "description": "Exclusive UTC timestamp."},
+    "product": {"type": "string", "enum": ["fields", "stations"]},
+    "guidance": {"type": "string", "enum": ["nowcast", "forecast"]},
+    "run_cycle_utc": {"type": "string", "format": "date-time", "description": "Forecast-only 05/11/17/23 UTC cycle."},
+    "variables": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}, "default": ["zeta", "salt", "u", "v"]},
+    "vertical_views": {
+      "type": "array", "minItems": 1, "uniqueItems": true,
+      "items": {"oneOf": [{"type": "string", "enum": ["surface", "near_surface", "bottom", "depth_average"]}, {"type": "integer", "minimum": 0}]},
+      "default": ["surface", "bottom", "depth_average"]
+    },
+    "missing_policy": {"type": "string", "enum": ["error", "skip"], "default": "error"},
+    "cache_policy": {"type": "string", "enum": ["keep", "delete_after_extract"], "default": "keep"},
+    "max_workers": {"type": "integer", "minimum": 1, "default": 4},
+    "source_policy": {"type": "string", "enum": ["aws_then_ncei", "aws_only", "ncei_only"], "default": "aws_then_ncei"}
+  },
+  "allOf": [
+    {"if": {"properties": {"schema_version": {"const": "sjrofs_request_v1"}}, "required": ["schema_version"]}, "then": {"not": {"required": ["source_policy"]}}},
+    {"if": {"properties": {"guidance": {"const": "forecast"}}, "required": ["guidance"]}, "then": {"required": ["run_cycle_utc"]}},
+    {"if": {"properties": {"guidance": {"const": "nowcast"}}, "required": ["guidance"]}, "then": {"not": {"required": ["run_cycle_utc"]}}},
+    {"if": {"properties": {"product": {"const": "stations"}}, "required": ["product"]}, "then": {"not": {"anyOf": [{"required": ["variables"]}, {"required": ["vertical_views"]}]}}}
+  ]
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "SJROFS Fetcher"
+  short_description: "Plan, fetch, and QA NOAA SJROFS EFDC data."
+  default_prompt: "Use $sjrofs-fetcher to plan, anonymously download, concatenate, extract, and health-check bounded NOAA SJROFS EFDC data from operational AWS with NCEI fallback."
