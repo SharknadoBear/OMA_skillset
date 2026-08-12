@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -11,12 +12,14 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 try:  # Package import.
+    from . import ofs_archive_sources as archive_sources
     from .roms_aws_core import (
         BUCKET, S3_ENDPOINT, ModelConfig, canonical_json_sha256, expected_times,
         iso_utc, json_clean, manifest_paths, normalize_request_input, parse_utc,
         read_json, sha256_file, verify_transfers, write_json_atomic,
     )
 except ImportError:  # Direct script execution.
+    import ofs_archive_sources as archive_sources
     from roms_aws_core import (
         BUCKET, S3_ENDPOINT, ModelConfig, canonical_json_sha256, expected_times,
         iso_utc, json_clean, manifest_paths, normalize_request_input, parse_utc,
@@ -68,17 +71,39 @@ def _datetime(value: Any) -> datetime:
     )
 
 
-def decode_ocean_times(ds: Any) -> list[datetime]:
-    netCDF4, np = _modules()
+CALENDAR_ALIASES = {
+    # Historical NOAA/NCEI ROMS files use this non-CF spelling.
+    "gregorian_proleptic": "proleptic_gregorian",
+}
+
+
+def ocean_time_metadata(ds: Any) -> dict[str, Any]:
+    """Return lossless ocean_time metadata plus the decoder-safe calendar."""
     if "ocean_time" not in ds.variables:
         raise ValueError("NetCDF has no ocean_time variable")
     variable = ds.variables["ocean_time"]
     units = getattr(variable, "units", None)
     if not units:
         raise ValueError("ocean_time has no units")
-    calendar = getattr(variable, "calendar", "standard")
+    source_calendar = str(getattr(variable, "calendar", "standard"))
+    decoder_calendar = CALENDAR_ALIASES.get(source_calendar.strip().casefold(),
+                                            source_calendar)
+    return {
+        "source_time_units": str(units),
+        "source_calendar": source_calendar,
+        "decoder_calendar": decoder_calendar,
+        "calendar_alias_applied": decoder_calendar != source_calendar,
+    }
+
+
+def decode_ocean_times(ds: Any) -> list[datetime]:
+    netCDF4, np = _modules()
+    metadata = ocean_time_metadata(ds)
+    variable = ds.variables["ocean_time"]
     raw = np.atleast_1d(variable[:])
-    decoded = netCDF4.num2date(raw, units=units, calendar=calendar, only_use_cftime_datetimes=False)
+    decoded = netCDF4.num2date(raw, units=metadata["source_time_units"],
+                              calendar=metadata["decoder_calendar"],
+                              only_use_cftime_datetimes=False)
     return [_datetime(value) for value in np.atleast_1d(decoded)]
 
 
@@ -544,6 +569,16 @@ class SourceRecord:
     normalized_time: datetime
     offset_seconds: float
     source_key: str
+    source_archive: str
+    source_url: str
+    archive_role: str
+    container: str
+    endpoint: str
+    listing_endpoint: str
+    source_time_units: str
+    source_calendar: str
+    decoder_calendar: str
+    calendar_alias_applied: bool
 
 
 def _source_key_for_path(path: Path, ds: Any, model: str | None) -> str:
@@ -563,6 +598,79 @@ def _source_key_for_path(path: Path, ds: Any, model: str | None) -> str:
     return path.name
 
 
+def _source_metadata_for_path(path: Path, ds: Any, model: str | None,
+                              bound: Mapping[str, Any] | None = None) -> dict[str, str]:
+    """Resolve source metadata, preferring an integrity-verified manifest object."""
+    if bound is not None:
+        source_archive = str(bound.get("source_archive") or bound.get("source_id") or "")
+        values = {
+            "source_key": str(bound.get("key") or ""),
+            "source_archive": source_archive,
+            "source_url": str(bound.get("url") or ""),
+            "archive_role": str(bound.get("archive_role") or ""),
+            "container": str(bound.get("container") or ""),
+            "endpoint": str(bound.get("endpoint") or ""),
+            "listing_endpoint": str(bound.get("listing_endpoint") or ""),
+        }
+        if any(not values[name] for name in ("source_key", "source_archive", "source_url", "endpoint")):
+            raise ValueError("verified transfer binding has incomplete source archive provenance")
+        return values
+    sidecar = path.with_name(path.name + ".download.json")
+    metadata: Mapping[str, Any] = {}
+    if sidecar.is_file():
+        try:
+            candidate = read_json(sidecar)
+            if isinstance(candidate, Mapping):
+                metadata = candidate
+        except Exception:
+            pass
+    source_archive = str(metadata.get("source_id") or "unbound")
+    key = str(metadata.get("key") or _source_key_for_path(path, ds, model))
+    url = str(metadata.get("url") or "")
+    if source_archive in {"aws_operational", "ncei_long_term"} and model:
+        descriptor = archive_sources.get_source_descriptor(source_archive, model)
+    else:
+        descriptor = {"archive_role": "unbound", "container": "", "endpoint": "",
+                      "listing_endpoint": ""}
+    return {
+        "source_key": key, "source_archive": source_archive, "source_url": url,
+        "archive_role": descriptor["archive_role"], "container": descriptor["container"],
+        "endpoint": descriptor["endpoint"],
+        "listing_endpoint": descriptor["listing_endpoint"],
+    }
+
+
+def _source_summary(records: Sequence[SourceRecord]) -> dict[str, Any]:
+    archives: dict[tuple[str, str], dict[str, str]] = {}
+    for record in records:
+        identity = (record.source_archive, record.endpoint)
+        archives[identity] = {
+            "source_archive": record.source_archive,
+            "archive_role": record.archive_role,
+            "container": record.container,
+            "endpoint": record.endpoint,
+            "listing_endpoint": record.listing_endpoint,
+        }
+    values = sorted(archives.values(), key=lambda item: (item["source_archive"], item["endpoint"]))
+    return {
+        "record_count": len(records), "archive_count": len(values), "archives": values,
+        "endpoints": {item["source_archive"]: item["endpoint"] for item in values},
+    }
+
+
+def _source_time_metadata(records: Sequence[SourceRecord]) -> list[dict[str, Any]]:
+    """Summarize lossless source calendar metadata used during decoding."""
+    unique = {
+        (record.source_time_units, record.source_calendar, record.decoder_calendar,
+         record.calendar_alias_applied)
+        for record in records
+    }
+    fields = ("source_time_units", "source_calendar", "decoder_calendar",
+              "calendar_alias_applied")
+    return [dict(zip(fields, values))
+            for values in sorted(unique, key=lambda row: tuple(map(str, row)))]
+
+
 def collect_records(
     paths: Sequence[str | Path],
     start: datetime,
@@ -570,13 +678,15 @@ def collect_records(
     product: str = "fields",
     model: str | None = None,
     requested_variables: Sequence[str] | None = None,
+    bound_objects: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[list[SourceRecord], dict[str, Any]]:
     netCDF4, _ = _modules()
     records: list[SourceRecord] = []
     reference: dict[str, Any] | None = None
     schema_reference: dict[str, Any] | None = None
     for raw_path in paths:
-        path = Path(raw_path)
+        path = Path(raw_path).resolve()
+        bound = None if bound_objects is None else bound_objects.get(str(path))
         with netCDF4.Dataset(path) as ds:
             candidate = geometry_snapshot(ds) if product == "fields" else None
             if candidate is not None:
@@ -600,12 +710,20 @@ def collect_records(
                         f"ROMS requested-variable schema/dimension drift in {path}: "
                         f"{', '.join(differing)}"
                     )
+            time_metadata = ocean_time_metadata(ds)
             times = decode_ocean_times(ds)
-            source_key = _source_key_for_path(path, ds, model)
+            source = _source_metadata_for_path(path, ds, model, bound)
             for index, raw_time in enumerate(times):
                 normalized, offset = normalize_time(raw_time, 360 if product == "stations" else 3600)
                 if start <= normalized < end:
-                    records.append(SourceRecord(path, index, raw_time, normalized, offset, str(source_key)))
+                    records.append(SourceRecord(
+                        path, index, raw_time, normalized, offset,
+                        source["source_key"], source["source_archive"], source["source_url"],
+                        source["archive_role"], source["container"], source["endpoint"],
+                        source["listing_endpoint"], time_metadata["source_time_units"],
+                        time_metadata["source_calendar"], time_metadata["decoder_calendar"],
+                        time_metadata["calendar_alias_applied"],
+                    ))
     records.sort(key=lambda record: (record.normalized_time, record.raw_time, str(record.path)))
     deduplicated: dict[datetime, SourceRecord] = {}
     duplicates: list[dict[str, Any]] = []
@@ -680,8 +798,28 @@ def extract_fields(
     if normalized["product"] != "fields":
         raise ValueError("field extraction is unavailable for passthrough products")
     start, end = parse_utc(normalized["start_utc"]), parse_utc(normalized["end_utc_exclusive"])
+    bound_by_path: dict[str, Mapping[str, Any]] | None = None
+    if transfer_provenance is not None:
+        if (transfer_provenance.get("status") != "pass"
+                or canonical_json_sha256(transfer_provenance.get("request"))
+                != canonical_json_sha256(normalized)):
+            raise ValueError("extraction provenance is not a verified fetch-manifest binding")
+        bound_objects = transfer_provenance.get("objects")
+        if not isinstance(bound_objects, list) or not bound_objects:
+            raise ValueError("verified fetch-manifest binding has no source objects")
+        bound_by_path = {}
+        for item in bound_objects:
+            if not isinstance(item, Mapping) or item.get("status") != "pass":
+                raise ValueError("verified fetch-manifest binding contains an invalid object")
+            path = str(Path(str(item.get("local_path", ""))).resolve())
+            if path in bound_by_path:
+                raise ValueError("verified fetch-manifest binding contains duplicate local paths")
+            bound_by_path[path] = item
+        supplied = {str(Path(path).resolve()) for path in paths}
+        if supplied != set(bound_by_path):
+            raise ValueError("extraction inputs do not exactly match the verified fetch-manifest binding")
     records, record_meta = collect_records(
-        paths, start, end, "fields", config.model, normalized["variables"],
+        paths, start, end, "fields", config.model, normalized["variables"], bound_by_path,
     )
     if not records:
         raise RuntimeError("no downloaded field records overlap the request")
@@ -717,13 +855,17 @@ def extract_fields(
     output_variables: dict[str, Any] = {}
     closure_values: list[float] = []
     finite_coverage: dict[str, list[float]] = {}
+    source_summary = _source_summary(records)
+    source_time_metadata = _source_time_metadata(records)
     with netCDF4.Dataset(temporary, "w", format="NETCDF4") as output:
         output.createDimension("time", len(records))
         output.createDimension("eta_rho", rho_shape[0]); output.createDimension("xi_rho", rho_shape[1])
         output.createDimension("eta_u", u_shape[0]); output.createDimension("xi_u", u_shape[1])
         output.createDimension("eta_v", v_shape[0]); output.createDimension("xi_v", v_shape[1])
         output.createDimension("s_rho", len(static["s_rho"])); output.createDimension("s_w", len(static["s_w"]))
-        output.createDimension("source_key_strlen", max(64, max(len(record.source_key) for record in records)))
+        output.createDimension("source_key_strlen", max(1, max(len(record.source_key) for record in records)))
+        output.createDimension("source_archive_strlen", max(1, max(len(record.source_archive) for record in records)))
+        output.createDimension("source_url_strlen", max(1, max(len(record.source_url) for record in records)))
         output.schema_version = COMPACT_SCHEMA_VERSION
         output.model = config.model
         output.vector_reference = "earth_relative_on_rho_grid"
@@ -733,8 +875,16 @@ def extract_fields(
         output.request_schema_version = normalized["schema_version"]
         output.request_sha256 = canonical_json_sha256(normalized)
         output.request_json = __import__("json").dumps(json_clean(normalized), sort_keys=True, separators=(",", ":"))
-        output.source_bucket = BUCKET
-        output.source_endpoint = S3_ENDPOINT
+        output.source_provenance_json = json.dumps(source_summary, sort_keys=True, separators=(",", ":"))
+        output.source_archives_json = json.dumps(source_summary["archives"], sort_keys=True, separators=(",", ":"))
+        output.source_endpoints_json = json.dumps(source_summary["endpoints"], sort_keys=True, separators=(",", ":"))
+        output.source_time_metadata_json = json.dumps(source_time_metadata, sort_keys=True, separators=(",", ":"))
+        if len(source_summary["archives"]) == 1:
+            output.source_bucket = source_summary["archives"][0]["container"]
+            output.source_endpoint = source_summary["archives"][0]["endpoint"]
+        else:
+            output.source_bucket = "mixed"
+            output.source_endpoint = "mixed"
         if transfer_provenance:
             output.fetch_manifest_path = str(transfer_provenance.get("manifest_path", ""))
             output.fetch_manifest_sha256 = str(transfer_provenance.get("manifest_sha256", ""))
@@ -742,16 +892,29 @@ def extract_fields(
         time_var = output.createVariable("time", "f8", ("time",))
         time_var.units = "seconds since 1970-01-01 00:00:00 UTC"
         time_var.standard_name = "time"
+        time_var.calendar = "proleptic_gregorian"
         raw_time_var = output.createVariable("source_ocean_time", "f8", ("time",))
         raw_time_var.units = time_var.units
+        raw_time_var.calendar = time_var.calendar
         offset_var = output.createVariable("time_normalization_offset_seconds", "f8", ("time",))
         key_var = output.createVariable("source_key", "S1", ("time", "source_key_strlen"))
+        key_var.long_name = "NOAA source object key"
+        archive_var = output.createVariable("source_archive", "S1", ("time", "source_archive_strlen"))
+        archive_var.long_name = "NOAA archive source identifier"
+        url_var = output.createVariable("source_url", "S1", ("time", "source_url_strlen"))
+        url_var.long_name = "canonical NOAA source object URL"
         time_var[:] = [record.normalized_time.timestamp() for record in records]
         raw_time_var[:] = [record.raw_time.timestamp() for record in records]
         offset_var[:] = [record.offset_seconds for record in records]
         for index, record in enumerate(records):
-            encoded = np.frombuffer(record.source_key.encode("utf-8")[: len(output.dimensions["source_key_strlen"])], dtype="S1")
-            key_var[index, : encoded.size] = encoded
+            for variable, dimension, value in (
+                (key_var, "source_key_strlen", record.source_key),
+                (archive_var, "source_archive_strlen", record.source_archive),
+                (url_var, "source_url_strlen", record.source_url),
+            ):
+                width = len(output.dimensions[dimension])
+                encoded = np.frombuffer(value.encode("utf-8")[:width], dtype="S1")
+                variable[index, : encoded.size] = encoded
 
         def ensure(name: str, dims: tuple[str, ...], source: Any | None = None):
             if name not in output_variables:
@@ -839,13 +1002,18 @@ def extract_fields(
                             finite_coverage[name].append(float(np.isfinite(field[static["mask_rho"]]).mean()))
     os.replace(temporary, destination)
     manifest = {
-        "schema_version": f"{config.model}_extraction_manifest_v1",
+        "schema_version": f"{config.model}_extraction_manifest_v2",
         "created_utc": iso_utc(datetime.now(UTC)), "request": normalized,
         "output": {"path": str(destination.resolve()), "size": destination.stat().st_size, "sha256": sha256_file(destination)},
         "records": [
             {"path": str(record.path.resolve()), "source_key": record.source_key,
+             "source_archive": record.source_archive, "source_url": record.source_url,
              "raw_time_utc": iso_utc(record.raw_time), "normalized_time_utc": iso_utc(record.normalized_time),
-             "normalization_offset_seconds": record.offset_seconds}
+             "normalization_offset_seconds": record.offset_seconds,
+             "source_time_units": record.source_time_units,
+             "source_calendar": record.source_calendar,
+             "decoder_calendar": record.decoder_calendar,
+             "calendar_alias_applied": record.calendar_alias_applied}
             for record in records
         ],
         "duplicate_records": record_meta["duplicates"], "grid_hash": record_meta["geometry"]["grid_hash"],
@@ -857,7 +1025,8 @@ def extract_fields(
         "missing_requested_times": [iso_utc(stamp) for stamp in missing_times],
         "finite_wet_coverage": finite_coverage,
         "vector_processing": "native-grid vertical average; finite-aware C-grid destagger; angle rotation; speed after rotation",
-        "source_provenance": {"bucket": BUCKET, "endpoint": S3_ENDPOINT},
+        "source_provenance": source_summary,
+        "source_time_metadata": source_time_metadata,
         "request_sha256": canonical_json_sha256(normalized),
         "fetch_manifest": None if not transfer_provenance else {
             "path": transfer_provenance.get("manifest_path"),
@@ -875,6 +1044,8 @@ def compact_health(path: str | Path, request: Mapping[str, Any], *, coverage_thr
     netCDF4, np = _modules()
     critical: list[str] = []
     warnings: list[str] = []
+    source_records: list[dict[str, str]] = []
+    source_provenance: Mapping[str, Any] | None = None
     source = Path(path)
     with netCDF4.Dataset(source) as ds:
         if getattr(ds, "schema_version", None) != COMPACT_SCHEMA_VERSION:
@@ -888,6 +1059,58 @@ def compact_health(path: str | Path, request: Mapping[str, Any], *, coverage_thr
             }
         if getattr(ds, "request_sha256", None) != canonical_json_sha256(request):
             critical.append("compact request provenance does not match the requested contract")
+        try:
+            values: dict[str, list[str]] = {}
+            for name in ("source_key", "source_archive", "source_url"):
+                variable = ds.variables.get(name)
+                if variable is None or not variable.dimensions or variable.dimensions[0] != "time":
+                    raise ValueError(f"compact output has no time-indexed {name}")
+                values[name] = [
+                    str(value).rstrip("\x00")
+                    for value in netCDF4.chartostring(variable[:]).tolist()
+                ]
+            if len({len(item) for item in values.values()}) != 1:
+                raise ValueError("compact record source provenance lengths are inconsistent")
+            model = str(request.get("schema_version", "")).removesuffix("_request_v2")
+            for key, source_archive, url in zip(
+                    values["source_key"], values["source_archive"], values["source_url"]):
+                if source_archive not in {"aws_operational", "ncei_long_term", "unbound"}:
+                    raise ValueError(f"unsupported compact source archive: {source_archive!r}")
+                if source_archive == "unbound":
+                    if url:
+                        raise ValueError("unbound compact record unexpectedly claims a source URL")
+                else:
+                    expected_url = archive_sources.canonical_object_url(source_archive, model, key)
+                    if url != expected_url:
+                        raise ValueError("compact record source URL is not canonical for its archive/key")
+                source_records.append({"source_key": key, "source_archive": source_archive,
+                                       "source_url": url})
+            source_provenance = json.loads(str(getattr(ds, "source_provenance_json", "")))
+            archives = json.loads(str(getattr(ds, "source_archives_json", "")))
+            endpoints = json.loads(str(getattr(ds, "source_endpoints_json", "")))
+            if (not isinstance(source_provenance, Mapping)
+                    or source_provenance.get("archives") != archives
+                    or source_provenance.get("endpoints") != endpoints
+                    or source_provenance.get("record_count") != len(source_records)):
+                raise ValueError("compact global archive/endpoint JSON is inconsistent")
+            expected_archive_ids = {item["source_archive"] for item in source_records}
+            if (set(endpoints) != expected_archive_ids
+                    or {item.get("source_archive") for item in archives} != expected_archive_ids):
+                raise ValueError("compact global archives do not cover its record sources exactly")
+            for item in archives:
+                if item["source_archive"] == "unbound":
+                    if any(item.get(field) for field in ("container", "endpoint", "listing_endpoint")):
+                        raise ValueError("unbound compact source claims a remote archive endpoint")
+                    warnings.append("compact source provenance is unbound to a verified fetch manifest")
+                else:
+                    descriptor = archive_sources.get_source_descriptor(item["source_archive"], model)
+                    for field in ("archive_role", "container", "endpoint", "listing_endpoint"):
+                        if item.get(field) != descriptor[field]:
+                            raise ValueError(f"compact global source {field} is not canonical")
+                    if endpoints.get(item["source_archive"]) != descriptor["endpoint"]:
+                        raise ValueError("compact global source endpoint mapping is not canonical")
+        except Exception as exc:
+            critical.append(f"compact source provenance is invalid: {exc}")
         time = np.asarray(ds.variables["time"][:], dtype=float)
         if time.size == 0 or np.any(np.diff(time) <= 0):
             critical.append("time is empty or not strictly increasing")
@@ -995,6 +1218,7 @@ def compact_health(path: str | Path, request: Mapping[str, Any], *, coverage_thr
         "path": str(source.resolve()), "size": source.stat().st_size, "sha256": sha256_file(source),
         "status": "pass" if not critical else "fail", "critical_findings": critical,
         "warnings": warnings, "variables": checks,
+        "source_records": source_records, "source_provenance": source_provenance,
     }
 
 
@@ -1142,6 +1366,7 @@ def evaluate_health(
     normalized = normalize_request_input(request, config)
     run_path = Path(run_dir)
     transfer = verify_transfers(run_path, expected_request=normalized)
+    legacy_v1 = bool(transfer.get("legacy_read_only"))
     paths = [Path(item["local_path"]) for item in transfer.get("objects", []) if item.get("status") == "pass"]
     selection_path = run_path / f"{normalized['product']}_cropped_selection.json"
     raw = raw_consistency(
@@ -1156,12 +1381,17 @@ def evaluate_health(
     compact_path: Path | None = None
     manifest_findings: list[str] = []
     if normalized["product"] == "fields":
-        if not extraction_manifest_path.is_file():
-            manifest_findings.append("extraction_manifest.json is missing")
+        if legacy_v1:
+            manifest_findings.append(
+                "legacy v1 extraction evidence is read-only; create a new v2 plan before transfer or re-extraction")
         else:
+            pass
+        if not legacy_v1 and not extraction_manifest_path.is_file():
+            manifest_findings.append("extraction_manifest.json is missing")
+        elif not legacy_v1:
             try:
                 extraction_manifest = read_json(extraction_manifest_path)
-                if extraction_manifest.get("schema_version") != f"{config.model}_extraction_manifest_v1":
+                if extraction_manifest.get("schema_version") != f"{config.model}_extraction_manifest_v2":
                     manifest_findings.append("extraction manifest schema_version is invalid")
                 if canonical_json_sha256(extraction_manifest.get("request")) != canonical_json_sha256(normalized):
                     manifest_findings.append("extraction manifest request does not match health request")
@@ -1183,6 +1413,47 @@ def evaluate_health(
                 provenance = extraction_manifest.get("fetch_manifest")
                 if not isinstance(provenance, Mapping) or provenance.get("sha256") != transfer.get("manifest_sha256"):
                     manifest_findings.append("extraction manifest is not bound to the verified fetch manifest")
+                extraction_records = extraction_manifest.get("records")
+                transfer_objects = transfer.get("objects")
+                if (not isinstance(extraction_records, list) or not extraction_records
+                        or not isinstance(transfer_objects, list) or not transfer_objects):
+                    manifest_findings.append("extraction/transfer record provenance is missing")
+                else:
+                    source_by_key = {
+                        item.get("key"): item for item in transfer_objects
+                        if isinstance(item, Mapping) and item.get("status") == "pass"
+                    }
+                    for record in extraction_records:
+                        source = source_by_key.get(record.get("source_key")) if isinstance(record, Mapping) else None
+                        if (source is None
+                                or record.get("source_archive") != source.get("source_archive")
+                                or record.get("source_url") != source.get("url")
+                                or str(Path(str(record.get("path", ""))).resolve())
+                                != str(Path(str(source.get("local_path", ""))).resolve())):
+                            manifest_findings.append(
+                                "extraction record archive/URL/path is outside the verified fetch binding")
+                            break
+                    archives = {}
+                    for source in source_by_key.values():
+                        identity = (str(source["source_archive"]), str(source["endpoint"]))
+                        archives[identity] = {
+                            "source_archive": identity[0],
+                            "archive_role": str(source.get("archive_role") or ""),
+                            "container": str(source.get("container") or ""),
+                            "endpoint": identity[1],
+                            "listing_endpoint": str(source.get("listing_endpoint") or ""),
+                        }
+                    archive_values = sorted(
+                        archives.values(), key=lambda item: (item["source_archive"], item["endpoint"]))
+                    expected_source_summary = {
+                        "record_count": len(extraction_records),
+                        "archive_count": len(archive_values),
+                        "archives": archive_values,
+                        "endpoints": {item["source_archive"]: item["endpoint"] for item in archive_values},
+                    }
+                    if extraction_manifest.get("source_provenance") != expected_source_summary:
+                        manifest_findings.append(
+                            "extraction global archive/endpoint provenance is inconsistent")
             except Exception as exc:
                 manifest_findings.append(f"extraction manifest is unreadable: {type(exc).__name__}: {exc}")
     compact = (
@@ -1194,6 +1465,17 @@ def evaluate_health(
     critical.extend(manifest_findings)
     warnings = list(raw.get("warnings", []))
     if compact is not None:
+        if extraction_manifest is not None:
+            expected_records = [
+                {name: str(item.get(name) or "")
+                 for name in ("source_key", "source_archive", "source_url")}
+                for item in extraction_manifest.get("records", [])
+                if isinstance(item, Mapping)
+            ]
+            if compact.get("source_records") != expected_records:
+                critical.append("compact record-level source provenance does not match extraction manifest")
+            if compact.get("source_provenance") != extraction_manifest.get("source_provenance"):
+                critical.append("compact global archive/endpoint provenance does not match extraction manifest")
         critical.extend(compact["critical_findings"])
         warnings.extend(compact["warnings"])
     elif normalized["product"] == "fields":
@@ -1217,7 +1499,7 @@ def evaluate_health(
         except Exception as exc:
             warnings.append(f"health diagnostic plot failed: {type(exc).__name__}: {exc}")
     report = {
-        "schema_version": f"{config.model}_health_v1", "created_utc": iso_utc(datetime.now(UTC)),
+        "schema_version": f"{config.model}_health_v2", "created_utc": iso_utc(datetime.now(UTC)),
         "request": normalized, "status": "pass" if not critical else "fail",
         "critical_findings": critical, "warnings": warnings, "transfer_integrity": transfer,
         "raw_source_consistency": raw, "compact_output": compact, "diagnostic_plots": plot_paths,

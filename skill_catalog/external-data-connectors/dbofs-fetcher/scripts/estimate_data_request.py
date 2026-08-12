@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write an exact-byte public-AWS plan for a bounded DBOFS request."""
+"""Write an exact-byte NOAA-archive plan for a bounded DBOFS request."""
 
 from __future__ import annotations
 

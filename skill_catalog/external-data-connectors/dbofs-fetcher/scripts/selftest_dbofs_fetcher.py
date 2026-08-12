@@ -28,7 +28,7 @@ import dbofs_fetcher as dbofs
 import roms_aws_core as core
 from roms_aws_core import download_object, list_s3_objects, verify_transfers, write_json_atomic
 from roms_processing import (
-    compact_health,
+    compact_health, decode_ocean_times,
     destagger_to_rho,
     extract_fields,
     geometry_snapshot,
@@ -36,7 +36,7 @@ from roms_processing import (
     raw_consistency,
     roms_depths,
     rotate_to_earth,
-    weighted_vertical_average,
+    weighted_vertical_average, ocean_time_metadata,
 )
 
 UTC = timezone.utc
@@ -71,6 +71,13 @@ def object_item(key: str, size: int = 10, etag: str = "abc-4"):
     }
 
 
+def authorize_aws_fixture_plan(path: Path) -> dict:
+    plan = core.read_json(path)
+    plan["source_attempts"] = [{"source_id": "aws_operational", "status": "success"}]
+    core.write_json_atomic(path, plan)
+    return plan
+
+
 def write_fixture(
     path: Path,
     hour: int,
@@ -79,6 +86,7 @@ def write_fixture(
     reversed_sigma: bool = False,
     angle: float = 0.0,
     omit_mask: str | None = None,
+    source_calendar: str | None = None,
 ):
     eta, xi, layers = 3, 4, 3
     with netCDF4.Dataset(path, "w", format="NETCDF4") as ds:
@@ -131,6 +139,8 @@ def write_fixture(
         ds.createVariable("Vstretching", "i4").assignValue(1)
         time_var = ds.createVariable("ocean_time", "f8", ("ocean_time",))
         time_var.units = "seconds since 1970-01-01 00:00:00 UTC"
+        if source_calendar is not None:
+            time_var.calendar = source_calendar
         time_var[:] = datetime(2026, 7, 20, hour, tzinfo=UTC).timestamp() + 30
         zeta = ds.createVariable("zeta", "f4", ("ocean_time", "eta_rho", "xi_rho"), fill_value=1e37)
         zeta.standard_name = "sea_surface_height_above_geoid"; zeta.units = "m"
@@ -217,14 +227,44 @@ class DownloadSession:
     def __init__(self, payload: bytes, etag: str):
         self.payload, self.etag, self.headers_seen = payload, etag, []
 
-    def get(self, url, headers=None, stream=True, timeout=None):
+    def get(self, url, headers=None, stream=True, timeout=None, params=None):
+        if isinstance(params, dict) and params.get("list-type") == "2":
+            key = str(params["prefix"])
+            xml = (
+                "<ListBucketResult>"
+                f"<Contents><Key>{key}</Key><LastModified>2026-07-20T00:00:00Z</LastModified>"
+                f"<ETag>{self.etag}</ETag><Size>{len(self.payload)}</Size></Contents>"
+                "<IsTruncated>false</IsTruncated></ListBucketResult>"
+            ).encode()
+            return FakeResponse(xml)
         headers = headers or {}; self.headers_seen.append(headers)
         start = int(headers.get("Range", "bytes=0-").split("=")[1].split("-")[0])
         data = self.payload[start:]
-        return FakeResponse(data, status=206 if start else 200, headers={"Content-Length": str(len(data)), "ETag": self.etag})
+        response_headers = {"Content-Length": str(len(data)), "ETag": self.etag}
+        if start:
+            response_headers["Content-Range"] = f"bytes {start}-{len(self.payload)-1}/{len(self.payload)}"
+        return FakeResponse(data, status=206 if start else 200, headers=response_headers)
 
 
 class ContractTests(unittest.TestCase):
+    def test_v1_migrates_to_v2_and_ncei_capability_gate(self):
+        normalized = dbofs.validate_request(request())
+        self.assertEqual(normalized["schema_version"], "dbofs_request_v2")
+        self.assertEqual(normalized["source_policy"], "aws_then_ncei")
+        with self.assertRaisesRegex(ValueError, "source_policy"):
+            dbofs.validate_request(request(source_policy="silent_fallback"))
+        with self.assertRaisesRegex(ValueError, "v1 always migrates"):
+            dbofs.validate_request(request(source_policy="ncei_only"))
+        explicit_v2 = dbofs.validate_request(request(
+            schema_version="dbofs_request_v2", source_policy="ncei_only"))
+        self.assertEqual(explicit_v2["source_policy"], "ncei_only")
+        regular = dbofs.validate_request({
+            "schema_version": "dbofs_request_v2", "start_utc": "2026-07-20T00:00:00Z",
+            "end_utc_exclusive": "2026-07-20T01:00:00Z", "product": "regulargrid",
+            "guidance": "nowcast", "source_policy": "ncei_only"})
+        with self.assertRaisesRegex(ValueError, "regulargrid"):
+            core.discover_objects_with_evidence(regular, dbofs.CONFIG)
+
     def test_package_import_surface(self):
         environment = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         result = subprocess.run(
@@ -290,6 +330,50 @@ class ContractTests(unittest.TestCase):
         self.assertEqual([item["key"] for item in selected["selected"]], [before["key"]])
         self.assertEqual(selected["duplicate_times"], [])
 
+    def test_station_boundary_triggers_ncei_discovery_for_preceding_terminal(self):
+        req = request(
+            schema_version="dbofs_request_v2", product="stations",
+            variables=None, vertical_views=None,
+            end_utc_exclusive="2026-07-20T00:06:00Z",
+            source_policy="aws_then_ncei",
+        )
+        req.pop("variables"); req.pop("vertical_views")
+        req = dbofs.validate_request(req)
+        aws = core._decorate_source(
+            dbofs.CONFIG,
+            object_item("dbofs/netcdf/2026/07/20/dbofs.t06z.20260720.stations.nowcast.nc"),
+            "aws_operational",
+        )
+        descriptor = core.archive_sources.get_source_descriptor("ncei_long_term", "dbofs")
+        ncei_key = (
+            descriptor["root_prefix"]
+            + "2026/07/nos.dbofs.stations.nowcast.20260720.t00z.nc"
+        )
+        parsed = dbofs.parse_object_key(ncei_key)
+        self.assertIsNotNone(parsed)
+        ncei = core._decorate_source(
+            dbofs.CONFIG,
+            {**parsed, "size": 11, "etag": "ncei-station",
+             "last_modified": "2026-07-22T00:00:00Z"},
+            "ncei_long_term",
+        )
+
+        def discover(_request, _config, source_id, **_kwargs):
+            values = [aws] if source_id == "aws_operational" else [ncei]
+            return values, {"source_id": source_id, "status": "success",
+                            "prefixes": [], "object_count": 1, "error": None}
+
+        with mock.patch.object(core, "_discover_one_source", side_effect=discover) as mocked:
+            combined, evidence = core.discover_objects_with_evidence(req, dbofs.CONFIG)
+        self.assertEqual(mocked.call_count, 2)
+        self.assertTrue(evidence["fallback_triggered"])
+        self.assertEqual(evidence["fallback_reason"],
+                         "aws_scientific_precedence_unresolved")
+        self.assertEqual(evidence["scientific_precedence_before_fallback"],
+                         ["2026-07-20T00:00:00Z"])
+        selected = dbofs.select_objects(req, combined)
+        self.assertEqual([item["key"] for item in selected["selected"]], [ncei_key])
+
     def test_missing_policy_and_regulargrid_passthrough(self):
         with self.assertRaisesRegex(RuntimeError, "missing 1"):
             dbofs.select_objects(request(), [object_item("dbofs/netcdf/2026/07/20/dbofs.t00z.20260720.fields.n006.nc")])
@@ -308,6 +392,10 @@ class ContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             report = dbofs.plan_request(request(), td, objects=[object_item(key, size=31 + i) for i, key in enumerate(keys)])
             self.assertEqual(report["total_bytes"], 63)
+            self.assertEqual(report["source_totals"], {
+                "aws_operational": {"object_count": 2, "bytes": 63},
+                "ncei_long_term": {"object_count": 0, "bytes": 0},
+            })
             self.assertEqual(report["required_free_bytes"], 252)
             self.assertEqual(report["routing_decision"], "local")
             unknown = dbofs.plan_request(
@@ -325,6 +413,23 @@ class ContractTests(unittest.TestCase):
             self.assertEqual(missing_etag["routing_reason"], "source_metadata_incomplete")
             self.assertEqual(missing_etag["incomplete_source_metadata"][0]["field"], "etag")
 
+    def test_mixed_source_plan_totals_are_exact(self):
+        aws = object_item(
+            "dbofs/netcdf/2026/07/20/dbofs.t00z.20260720.fields.n006.nc", size=11)
+        descriptor = core.archive_sources.get_source_descriptor("ncei_long_term", "dbofs")
+        key = descriptor["root_prefix"] + "2026/07/nos.dbofs.fields.n001.20260720.t06z.nc"
+        ncei = {**dbofs.parse_object_key(key), "source_id": "ncei_long_term",
+                "size": 13, "etag": "ncei", "last_modified": "2026-07-20T00:00:00Z"}
+        with tempfile.TemporaryDirectory() as temporary:
+            report = dbofs.plan_request(request(
+                schema_version="dbofs_request_v2", source_policy="aws_then_ncei"),
+                temporary, objects=[aws, ncei])
+        self.assertEqual(report["source_totals"], {
+            "aws_operational": {"object_count": 1, "bytes": 11},
+            "ncei_long_term": {"object_count": 1, "bytes": 13},
+        })
+        self.assertEqual(report["total_bytes"], 24)
+
     def test_direct_fetch_disabled_and_legacy_conflict(self):
         with self.assertRaisesRegex(RuntimeError, "review a plan"):
             dbofs.fetch_request(request(), "unused")
@@ -338,8 +443,153 @@ class ContractTests(unittest.TestCase):
         finally:
             dbofs.list_s3_objects = original
 
+    def test_injected_object_plan_cannot_authorize_transfer(self):
+        item = object_item(
+            "dbofs/netcdf/2026/07/20/dbofs.t00z.20260720.fields.n006.nc")
+        req = request(end_utc_exclusive="2026-07-20T01:00:00Z")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "approved.json"
+            dbofs.plan_request(req, temporary, objects=[item], output=path)
+            with self.assertRaisesRegex(RuntimeError, "discovery evidence"):
+                dbofs.fetch_plan(path, temporary)
+
+    def test_legacy_fetch_hands_off_written_plan_path_and_warns(self):
+        item = object_item(
+            "dbofs/netcdf/2026/07/20/dbofs.t00z.20260720.fields.n006.nc")
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(dbofs, "_legacy_object", return_value=item), \
+                mock.patch.object(dbofs, "plan_request") as planner, \
+                mock.patch.object(dbofs, "fetch_plan", return_value={
+                    "outcomes": [{"status": "cache_hit",
+                                  "local_path": str(Path(temporary) / "field.nc")}]
+                }) as fetcher, warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = dbofs.fetch_dbofs_field(
+                "2026-07-20", work_dir=temporary)
+        plan_path = Path(temporary) / "download_estimate.json"
+        self.assertEqual(result, Path(temporary) / "field.nc")
+        self.assertEqual(planner.call_args.kwargs["output"], plan_path)
+        self.assertEqual(fetcher.call_args.args[0], plan_path)
+        self.assertTrue(any(item.category is DeprecationWarning for item in caught))
+
 
 class TransferTests(unittest.TestCase):
+    def test_partial_sidecar_source_identity_drift_restarts_from_zero(self):
+        payload = netcdf_payload()
+        raw = object_item(
+            "dbofs/netcdf/2026/07/20/dbofs.t00z.20260720.fields.n006.nc",
+            size=len(payload), etag="opaque-etag",
+        )
+        item = core._decorate_source(dbofs.CONFIG, raw, "aws_operational")
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "field.nc"
+            destination.with_name("field.nc.part").write_bytes(payload[:7])
+            core.write_json_atomic(destination.with_name("field.nc.part.json"), {
+                "schema_version": "dbofs_partial_object_v1",
+                "source_id": item["source_id"], "source_identity": "stale-identity",
+                "key": item["key"], "url": item["url"], "size": item["size"],
+                "etag": item["etag"], "last_modified": "stale-modified",
+            })
+            session = DownloadSession(payload, item["etag"])
+            result = download_object(item, destination, session=session, schema_prefix="dbofs")
+            self.assertFalse(result["resumed"])
+            self.assertNotIn("Range", session.headers_seen[0])
+
+    def test_fetch_relists_exact_key_and_rejects_changed_remote_metadata(self):
+        payload = netcdf_payload()
+        item = object_item(
+            "dbofs/netcdf/2026/07/20/dbofs.t00z.20260720.fields.n006.nc",
+            size=len(payload), etag="approved-etag",
+        )
+        req = request(end_utc_exclusive="2026-07-20T01:00:00Z")
+        with tempfile.TemporaryDirectory() as temporary:
+            plan_path = Path(temporary) / "approved.json"
+            plan = dbofs.plan_request(req, temporary, objects=[item], output=plan_path)
+            plan = authorize_aws_fixture_plan(plan_path)
+            changed = dict(plan["objects"][0], etag="changed-etag")
+            changed["source_identity"] = core.archive_sources.source_identity_digest(changed)
+            with mock.patch.object(
+                core.archive_sources, "list_objects_v2", return_value=[changed],
+            ) as relist:
+                with self.assertRaisesRegex(RuntimeError, "remote ETag differs"):
+                    dbofs.fetch_plan(plan_path, temporary,
+                                     session=DownloadSession(payload, item["etag"]))
+            relist.assert_called_once_with(
+                "aws_operational", "dbofs", item["key"],
+                session=mock.ANY, max_keys=2,
+            )
+
+    def test_fetch_rejects_in_memory_plan_mapping(self):
+        with self.assertRaisesRegex(RuntimeError, "reviewed plan file path"):
+            dbofs.fetch_plan({}, ".")
+
+    def test_fallback_evidence_is_required_at_fetch_and_health(self):
+        payload = netcdf_payload()
+        descriptor = core.archive_sources.get_source_descriptor("ncei_long_term", "dbofs")
+        key = descriptor["root_prefix"] + "2020/01/nos.dbofs.fields.n006.20200101.t00z.nc"
+        parsed = dbofs.parse_object_key(key)
+        ncei = {**parsed, "source_id": "ncei_long_term",
+                "size": len(payload), "etag": "ncei-etag",
+                "last_modified": "2026-07-20T00:00:00Z"}
+        req = request(
+            schema_version="dbofs_request_v2", source_policy="aws_then_ncei",
+            start_utc="2020-01-01T00:00:00Z",
+            end_utc_exclusive="2020-01-01T01:00:00Z", max_workers=1,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); plan_path = root / "approved.json"
+            plan = dbofs.plan_request(req, root, objects=[ncei], output=plan_path)
+            with self.assertRaisesRegex(RuntimeError, "fallback decision"):
+                dbofs.fetch_plan(plan_path, root, session=DownloadSession(payload, ncei["etag"]))
+            plan.update({
+                "source_attempts": [
+                    {"source_id": "aws_operational", "status": "success"},
+                    {"source_id": "ncei_long_term", "status": "success"},
+                ],
+                "fallback_triggered": True,
+                "coverage_before_fallback": ["2020-01-01T00:00:00Z"],
+            })
+            core.write_json_atomic(plan_path, plan)
+            manifest = dbofs.fetch_plan(
+                plan_path, root, session=DownloadSession(payload, ncei["etag"]))
+            self.assertEqual(verify_transfers(root, dbofs.validate_request(req))["status"], "pass")
+            plan["fallback_triggered"] = False
+            core.write_json_atomic(plan_path, plan)
+            manifest["approved_plan"]["sha256"] = core.sha256_file(plan_path)
+            core.write_json_atomic(root / "fetch_manifest.json", manifest)
+            report = verify_transfers(root, dbofs.validate_request(req))
+            self.assertEqual(report["status"], "fail")
+            self.assertTrue(any("fallback" in finding for finding in report["failures"]), report)
+
+    def test_verified_legacy_aws_cache_is_reused_in_place(self):
+        payload = netcdf_payload()
+        raw = object_item(
+            "dbofs/netcdf/2026/07/20/dbofs.t00z.20260720.fields.n006.nc",
+            size=len(payload), etag="opaque-etag",
+        )
+        req = request(end_utc_exclusive="2026-07-20T01:00:00Z")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan_path = root / "approved.json"
+            plan = dbofs.plan_request(req, root, objects=[raw], output=plan_path)
+            plan = authorize_aws_fixture_plan(plan_path)
+            item = plan["objects"][0]
+            legacy = root / "cache" / "raw" / "2026" / "07" / "20" / Path(item["key"]).name
+            legacy.parent.mkdir(parents=True)
+            legacy.write_bytes(payload)
+            core.write_json_atomic(legacy.with_name(legacy.name + ".download.json"), {
+                "schema_version": "dbofs_cached_object_v1", "key": item["key"],
+                "url": item["url"], "size": len(payload), "etag": item["etag"],
+                "last_modified": item["last_modified"], "sha256": core.sha256_file(legacy),
+            })
+            manifest = dbofs.fetch_plan(
+                plan_path, root, session=DownloadSession(payload, item["etag"]))
+            outcome = manifest["outcomes"][0]
+            self.assertEqual(outcome["cache_location"], "legacy_aws_v1")
+            self.assertEqual(Path(outcome["local_path"]), legacy.resolve())
+            report = verify_transfers(root, dbofs.validate_request(req))
+            self.assertEqual(report["status"], "pass", report)
+
     def test_resume_multipart_and_cache_hit(self):
         payload = netcdf_payload()
         item = {"key": "dbofs/netcdf/test.nc", "url": "https://example.test/test.nc", "size": len(payload), "etag": "opaque-4", "last_modified": "now"}
@@ -347,8 +597,10 @@ class TransferTests(unittest.TestCase):
             destination = Path(td) / "test.nc"
             destination.with_name("test.nc.part").write_bytes(payload[:5])
             write_json_atomic(destination.with_name("test.nc.part.json"), {
-                "schema_version": "dbofs_partial_object_v1", "key": item["key"],
+                "schema_version": "dbofs_partial_object_v1", "source_id": None,
+                "source_identity": None, "key": item["key"],
                 "url": item["url"], "size": item["size"], "etag": item["etag"],
+                "last_modified": item["last_modified"],
             })
             session = DownloadSession(payload, item["etag"])
             first = download_object(item, destination, session=session, chunk_size=3, schema_prefix="dbofs")
@@ -374,9 +626,11 @@ class TransferTests(unittest.TestCase):
             part = destination.with_name("test.nc.part")
             part.write_bytes(corrupt)
             write_json_atomic(destination.with_name("test.nc.part.json"), {
-                "schema_version": "dbofs_partial_object_v1",
+                "schema_version": "dbofs_partial_object_v1", "source_id": None,
+                "source_identity": None,
                 "key": item["key"], "url": item["url"], "size": len(payload),
                 "etag": item["etag"],
+                "last_modified": item["last_modified"],
             })
             session = DownloadSession(payload, item["etag"])
             result = download_object(
@@ -405,6 +659,7 @@ class TransferTests(unittest.TestCase):
             root = Path(td)
             plan_path = root / "approved.json"
             dbofs.plan_request(req, root, objects=[item], output=plan_path)
+            authorize_aws_fixture_plan(plan_path)
             manifest = dbofs.fetch_plan(plan_path, root, session=DownloadSession(payload, item["etag"]))
             self.assertEqual(manifest["approved_plan"]["path"], str(plan_path.resolve()))
             self.assertEqual(verify_transfers(root, dbofs.validate_request(req))["status"], "pass")
@@ -413,6 +668,46 @@ class TransferTests(unittest.TestCase):
             self.assertEqual(failed["status"], "fail")
             self.assertTrue(any("approved plan" in finding for finding in failed["failures"]))
 
+    def test_health_rejects_every_cache_sidecar_identity_mutation(self):
+        payload = netcdf_payload()
+        item = object_item(
+            "dbofs/netcdf/2026/07/20/dbofs.t00z.20260720.fields.n006.nc",
+            size=len(payload), etag="opaque-etag",
+        )
+        req = request(end_utc_exclusive="2026-07-20T01:00:00Z")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan_path = root / "approved.json"
+            dbofs.plan_request(req, root, objects=[item], output=plan_path)
+            authorize_aws_fixture_plan(plan_path)
+            manifest = dbofs.fetch_plan(
+                plan_path, root, session=DownloadSession(payload, item["etag"]),
+            )
+            sidecar_path = Path(manifest["outcomes"][0]["local_path"]).with_name(
+                Path(manifest["outcomes"][0]["local_path"]).name + ".download.json"
+            )
+            original = core.read_json(sidecar_path)
+            required = (
+                "schema_version", "model", "source_id", "provider", "archive_role",
+                "container", "endpoint", "listing_endpoint", "source_identity", "key",
+                "url", "size", "etag", "last_modified", "etag_semantics", "sha256",
+            )
+            for name in required:
+                mutated = dict(original)
+                mutated[name] = (mutated[name] + 1 if isinstance(mutated[name], int)
+                                 else f"tampered-{name}")
+                core.write_json_atomic(sidecar_path, mutated)
+                with self.subTest(field=name):
+                    report = verify_transfers(root, dbofs.validate_request(req))
+                    self.assertEqual(report["status"], "fail", report)
+                    self.assertTrue(any(
+                        check.get("reason") == "cache sidecar provenance mismatch"
+                        for check in report["objects"]
+                    ), report)
+                core.write_json_atomic(sidecar_path, original)
+            self.assertEqual(
+                verify_transfers(root, dbofs.validate_request(req))["status"], "pass")
+
     def test_fetch_recomputes_storage_gate_and_source_scope(self):
         payload = netcdf_payload()
         key = "dbofs/netcdf/2026/07/20/dbofs.t00z.20260720.fields.n006.nc"
@@ -420,17 +715,21 @@ class TransferTests(unittest.TestCase):
         req = request(end_utc_exclusive="2026-07-20T01:00:00Z")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            plan = dbofs.plan_request(req, root, objects=[item])
+            plan_path = root / "approved.json"
+            plan = dbofs.plan_request(req, root, objects=[item], output=plan_path)
+            plan = authorize_aws_fixture_plan(plan_path)
             bad_required = json.loads(json.dumps(plan))
             bad_required["required_free_bytes"] += 1
+            core.write_json_atomic(plan_path, bad_required)
             with self.assertRaisesRegex(RuntimeError, "exactly four times"):
-                dbofs.fetch_plan(bad_required, root, session=DownloadSession(payload, item["etag"]))
+                dbofs.fetch_plan(plan_path, root, session=DownloadSession(payload, item["etag"]))
+            core.write_json_atomic(plan_path, plan)
             with mock.patch.object(
                 core.shutil, "disk_usage",
                 return_value=type("Usage", (), {"free": plan["required_free_bytes"]})(),
             ):
                 with self.assertRaisesRegex(RuntimeError, "immediately before transfer"):
-                    dbofs.fetch_plan(plan, root, session=DownloadSession(payload, item["etag"]))
+                    dbofs.fetch_plan(plan_path, root, session=DownloadSession(payload, item["etag"]))
 
             mutations = {
                 "wrong prefix": {"key": key.replace("dbofs/netcdf/", "other/netcdf/")},
@@ -445,12 +744,14 @@ class TransferTests(unittest.TestCase):
             for label, changes in mutations.items():
                 tampered = json.loads(json.dumps(plan))
                 tampered["objects"][0].update(changes)
+                core.write_json_atomic(plan_path, tampered)
                 with self.subTest(label=label):
                     with self.assertRaisesRegex(RuntimeError, "approved plan"):
                         dbofs.fetch_plan(
-                            tampered, root,
+                            plan_path, root,
                             session=DownloadSession(payload, item["etag"]),
                         )
+            core.write_json_atomic(plan_path, plan)
 
     def test_transfer_response_etag_is_mandatory_and_exact(self):
         payload = netcdf_payload()
@@ -481,6 +782,7 @@ class TransferTests(unittest.TestCase):
             plan_path = root / "approved.json"
             manifest_path = root / "fetch_manifest.json"
             original_plan = dbofs.plan_request(req, root, objects=[item], output=plan_path)
+            original_plan = authorize_aws_fixture_plan(plan_path)
             original_manifest = dbofs.fetch_plan(
                 plan_path, root, session=DownloadSession(payload, item["etag"]),
             )
@@ -744,6 +1046,77 @@ class RomsMathTests(unittest.TestCase):
 
 
 class ExtractionTests(unittest.TestCase):
+    def test_historical_calendar_alias_decodes_and_preserves_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "historical.nc"
+            write_fixture(source, 0, source_calendar="gregorian_proleptic")
+            with netCDF4.Dataset(source) as dataset:
+                decoded = decode_ocean_times(dataset)
+                metadata = ocean_time_metadata(dataset)
+            self.assertEqual(core.iso_utc(decoded[0]), "2026-07-20T00:00:30Z")
+            self.assertEqual(metadata["source_calendar"], "gregorian_proleptic")
+            self.assertEqual(metadata["decoder_calendar"], "proleptic_gregorian")
+            self.assertTrue(metadata["calendar_alias_applied"])
+            manifest = extract_fields(
+                request(end_utc_exclusive="2026-07-20T01:00:00Z"), [source],
+                root / "compact.nc", dbofs.CONFIG)
+            self.assertEqual(manifest["records"][0]["source_calendar"],
+                             "gregorian_proleptic")
+            self.assertEqual(manifest["source_time_metadata"][0]["decoder_calendar"],
+                             "proleptic_gregorian")
+            with netCDF4.Dataset(root / "compact.nc") as dataset:
+                compact_metadata = json.loads(dataset.source_time_metadata_json)
+                self.assertEqual(compact_metadata[0]["source_calendar"],
+                                 "gregorian_proleptic")
+            unsupported = root / "unsupported-calendar.nc"
+            write_fixture(unsupported, 0, source_calendar="not_a_cf_calendar")
+            with netCDF4.Dataset(unsupported) as dataset:
+                with self.assertRaises(ValueError):
+                    decode_ocean_times(dataset)
+
+    def test_matching_mixed_archive_extraction_provenance_and_drift_rejection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); aws_path = root / "aws.nc"; ncei_path = root / "ncei.nc"
+            write_fixture(aws_path, 0); write_fixture(ncei_path, 1)
+            aws_desc = core.archive_sources.get_source_descriptor("aws_operational", "dbofs")
+            ncei_desc = core.archive_sources.get_source_descriptor("ncei_long_term", "dbofs")
+            verified = {
+                "status": "pass", "request": dbofs.validate_request(request()),
+                "manifest_path": str(root / "fetch_manifest.json"),
+                "manifest_sha256": "a" * 64,
+                "objects": [
+                    {**aws_desc, "status": "pass", "source_archive": "aws_operational",
+                     "key": "dbofs/netcdf/2026/07/20/dbofs.t00z.20260720.fields.n006.nc",
+                     "url": core.archive_sources.canonical_object_url("aws_operational", "dbofs", "dbofs/netcdf/2026/07/20/dbofs.t00z.20260720.fields.n006.nc"),
+                     "local_path": str(aws_path.resolve())},
+                    {**ncei_desc, "status": "pass", "source_archive": "ncei_long_term",
+                     "key": ncei_desc["root_prefix"] + "2026/07/nos.dbofs.fields.n001.20260720.t06z.nc",
+                     "url": core.archive_sources.canonical_object_url("ncei_long_term", "dbofs", ncei_desc["root_prefix"] + "2026/07/nos.dbofs.fields.n001.20260720.t06z.nc"),
+                     "local_path": str(ncei_path.resolve())},
+                ],
+            }
+            output = root / "mixed.nc"
+            report = extract_fields(request(), [aws_path, ncei_path], output, dbofs.CONFIG,
+                                    transfer_provenance=verified)
+            self.assertEqual(report["source_provenance"]["archive_count"], 2)
+            self.assertEqual({item["source_archive"] for item in report["records"]},
+                             {"aws_operational", "ncei_long_term"})
+            with netCDF4.Dataset(ncei_path, "a") as ds:
+                ds.variables["lon_rho"][:] += 0.25
+            with self.assertRaisesRegex(ValueError, "geometry.*drift"):
+                extract_fields(request(), [aws_path, ncei_path], root / "bad.nc", dbofs.CONFIG,
+                               transfer_provenance=verified)
+
+    def test_existing_v1_station_evidence_remains_readable(self):
+        run = HERE.parents[2] / "runs" / "station_smoke"
+        if not (run / "fetch_manifest.json").is_file():
+            self.skipTest("retained v1 station evidence is unavailable")
+        req = core.read_json(run / "request.json")
+        report = core.verify_transfers(run, dbofs.validate_request(req))
+        self.assertEqual(report["status"], "pass", report)
+        self.assertTrue(report["legacy_read_only"])
+
     def test_synthetic_extract_reversed_sigma_health_and_legacy_depth(self):
         with tempfile.TemporaryDirectory() as td:
             directory = Path(td)
@@ -840,6 +1213,7 @@ class ExtractionTests(unittest.TestCase):
             )
             plan_path = root / "download_estimate.json"
             dbofs.plan_request(req, root, objects=[item], output=plan_path)
+            authorize_aws_fixture_plan(plan_path)
             dbofs.fetch_plan(plan_path, root, session=DownloadSession(payload, item["etag"]))
             custom = root / "custom-name.nc"
             dbofs.extract_request(req, root, output=custom)

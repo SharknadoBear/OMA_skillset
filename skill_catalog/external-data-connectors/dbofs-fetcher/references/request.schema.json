@@ -1,17 +1,23 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://oma.local/schemas/dbofs_request_v1.json",
-  "title": "DBOFS Fetch Request v1",
-  "description": "A bounded request for NOAA DBOFS public-AWS inventory, planning, anonymous transfer, and optional native ROMS field extraction.",
+  "$id": "https://oma.local/schemas/dbofs_request_v2.json",
+  "title": "DBOFS Fetch Request v2",
+  "description": "A bounded request for NOAA DBOFS archive inventory, planning, anonymous transfer, and optional native ROMS field extraction. Version 1 remains accepted for migration and normalizes to version 2 with source_policy=aws_then_ncei.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "start_utc", "end_utc_exclusive", "product", "guidance"],
   "properties": {
-    "schema_version": {"const": "dbofs_request_v1"},
+    "schema_version": {"enum": ["dbofs_request_v1", "dbofs_request_v2"]},
     "start_utc": {"type": "string", "format": "date-time", "description": "Inclusive timestamp with an explicit UTC offset."},
     "end_utc_exclusive": {"type": "string", "format": "date-time", "description": "Exclusive timestamp later than start_utc, with an explicit UTC offset."},
     "product": {"type": "string", "enum": ["fields", "stations", "regulargrid"]},
     "guidance": {"type": "string", "enum": ["nowcast", "forecast"]},
+    "source_policy": {
+      "type": "string",
+      "enum": ["aws_then_ncei", "aws_only", "ncei_only"],
+      "default": "aws_then_ncei",
+      "description": "Ordered NOAA archive policy. Version 1 input is migrated to aws_then_ncei."
+    },
     "run_cycle_utc": {"type": "string", "format": "date-time", "description": "Required only for forecasts; cycle hour must be 00, 06, 12, or 18 UTC."},
     "variables": {
       "type": "array", "minItems": 1, "uniqueItems": true,
@@ -31,6 +37,13 @@
     "max_workers": {"type": "integer", "minimum": 1, "default": 4}
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "dbofs_request_v1"}},
+        "required": ["schema_version"]
+      },
+      "then": {"not": {"required": ["source_policy"]}}
+    },
     {
       "if": {"properties": {"guidance": {"const": "forecast"}}, "required": ["guidance"]},
       "then": {"required": ["run_cycle_utc"]}

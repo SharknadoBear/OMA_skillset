@@ -1,16 +1,43 @@
-# DBOFS public-AWS source contract
+# DBOFS operational AWS and NCEI source contract
+
+## Archive policy v2
+
+Requests normalize to `dbofs_request_v2` and carry one explicit policy:
+`aws_then_ncei`, `aws_only`, or `ncei_only`. A v1 request is accepted only as a
+lossless migration to v2 with `aws_then_ncei`. The operational source is
+`aws_operational`. The fallback source is `ncei_long_term`, rooted at
+`operational-nowcast-and-forecast-hydrodynamic-model-systems-co-ops/access/delaware-bay-operational-forecast-system-dbofs/`
+under `https://www.ncei.noaa.gov/oa/prod-model`.
+
+NCEI discovery is month-bounded and supports native nowcast fields (including
+historical `n000`) and station nowcast/forecast aggregates. It does not support
+field forecasts or regular-grid products. Filename time is only a planning
+hint; decoded NetCDF time is authoritative and cross-archive duplicates are
+removed after normalization. Scientific duplicate rules run before provider
+preference: an equivalent `n006` outranks historical `n000`, and a preceding
+station cycle's terminal record outranks the following cycle's initial record.
+AWS wins only otherwise-equivalent candidates under `aws_then_ncei`; NCEI
+fills uncovered or scientifically lower-ranked AWS coverage. Every selected object,
+cache sidecar, plan, fetch manifest, extraction manifest, and health report
+binds its source identity. No object may silently change archive at fetch time.
 
 ## Archive
 
-- Bucket: `noaa-nos-ofs-pds`
-- HTTPS endpoint: `https://noaa-nos-ofs-pds.s3.amazonaws.com`
-- Current layout: `dbofs/netcdf/YYYY/MM/DD/`
-- Legacy layout: `dbofs/netcdf/YYYYMM/`
+- AWS operational source: bucket `noaa-nos-ofs-pds`, anonymous ListObjectsV2
+  endpoint `https://noaa-nos-ofs-pds.s3.amazonaws.com/`, canonical object
+  endpoint `https://noaa-nos-ofs-pds.s3.amazonaws.com`, current layout
+  `dbofs/netcdf/YYYY/MM/DD/`, and legacy layout `dbofs/netcdf/YYYYMM/`.
+- NCEI long-term source: container `prod-model`, anonymous ListObjectsV2 and
+  canonical object endpoint `https://www.ncei.noaa.gov/oa/prod-model`, and
+  month-bounded root
+  `operational-nowcast-and-forecast-hydrodynamic-model-systems-co-ops/access/delaware-bay-operational-forecast-system-dbofs/YYYY/MM/`.
+- A canonical URL is the approved provider endpoint plus its exact, safely
+  encoded key; keys are never translated between providers.
 - Cycles: 00, 06, 12, and 18 UTC
 - Products: native `fields`, aggregate `stations`, and `regulargrid`
 
-Discover prefixes with anonymous S3 ListObjectsV2. Do not encode a retention
-window. The listing and downloaded NetCDF metadata are authoritative.
+Discover provider-specific prefixes with anonymous ListObjectsV2. Do not encode
+a retention window. The listing and downloaded NetCDF metadata are authoritative.
 
 Current fields use names such as
 `dbofs.t06z.20260720.fields.n001.nc`; legacy monthly archives can use
@@ -25,6 +52,11 @@ where `n001=cycle-5h` and `n006=cycle`. Forecasts are `f001` through `f048`.
 Reject cycle hours other than 00, 06, 12, and 18 UTC and reject other leads.
 Always verify `ocean_time` after transfer. Normalize jitter only within 60
 seconds and preserve the original value and adjustment.
+
+Historical NCEI files may label the CF proleptic Gregorian calendar as
+`gregorian_proleptic`. Decode that exact legacy alias as
+`proleptic_gregorian`, while retaining the original calendar string, units,
+and alias decision in extraction provenance.
 
 Station files aggregate a cycle at nominal six-minute cadence. At a cycle
 boundary, prefer the preceding cycle's terminal record. Crop all products to
@@ -70,13 +102,21 @@ Calculate W-level depths and `abs(diff(z_w))`. A valid column closes to
 columns, destagger finite wet values to rho points, rotate to earth-relative
 east/north, then calculate speed.
 
+Reject geometry, dimensions, masks, sigma metadata, vector convention, or
+variable-schema drift. Do not coerce incompatible eras; split a long request
+at the verified model/grid-era boundary and process each compatible segment.
+
 ## Transfer integrity
 
-Only accept exact `dbofs/netcdf/` daily or monthly keys whose archive path
-agrees with the filename run date and whose URL is the exact NOAA S3 object
-URL. An approved object requires positive size, nonempty ETag, and
-Last-Modified provenance. Immediately before transfer, recompute the exact
-total and require current free space to exceed four times that total.
+Only accept keys inside the exact AWS `dbofs/netcdf/` daily/monthly root or the
+exact NCEI DBOFS `YYYY/MM/` root, with directory date agreeing with the filename
+run date and URL equal to that provider's canonical object URL. An approved
+object requires positive size, nonempty opaque ETag, and Last-Modified
+provenance. Immediately before transfer, recompute the exact total and require
+current free space to exceed four times that total. After any cache miss and
+immediately before GET, re-list the exact key from its approved provider and
+require current size, ETag, and Last-Modified to match the reviewed plan;
+listing failure or drift requires replanning and never changes provider.
 
 Use resumable `.part` files and atomic completion. Validate object byte count
 and require each HTTP response to repeat the exact planned ETag; a missing or

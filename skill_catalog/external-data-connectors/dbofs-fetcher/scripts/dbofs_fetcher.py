@@ -48,7 +48,7 @@ except ImportError:  # Direct script execution.
 
 CONFIG = ModelConfig(
     model="dbofs",
-    request_schema="dbofs_request_v1",
+    request_schema="dbofs_request_v2",
     connector_name="dbofs-fetcher",
 )
 UTC = timezone.utc
@@ -277,7 +277,8 @@ def fetch_dbofs_field(
     _deprecated("fetch_dbofs_field")
     item = _legacy_object(date_str, cycle, fhour)
     directory = Path(work_dir) if work_dir is not None else Path(tempfile.gettempdir()) / "dbofs_cache"
-    plan = plan_request(
+    plan_path = directory / "download_estimate.json"
+    plan_request(
         {
             "schema_version": "dbofs_request_v1",
             "start_utc": item["expected_start_utc"],
@@ -293,8 +294,9 @@ def fetch_dbofs_field(
         },
         directory,
         objects=[item],
+        output=plan_path,
     )
-    result = fetch_plan(plan, directory)["outcomes"][0]
+    result = fetch_plan(plan_path, directory)["outcomes"][0]
     if result["status"] == "failed":
         raise RuntimeError("DBOFS transfer failed: " + "; ".join(result.get("errors", [])))
     return Path(result["local_path"])

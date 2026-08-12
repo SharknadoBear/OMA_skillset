@@ -1,17 +1,20 @@
 ---
 name: dbofs-fetcher
-description: Plan, inventory, anonymously download, concatenate, extract, and health-check NOAA Delaware Bay Operational Forecast System (DBOFS) ROMS NetCDF data from the public AWS archive. Use when Codex needs bounded DBOFS native staggered-grid fields, station or regular-grid passthrough files, exact byte and storage estimates, resumable cached transfers, practical salinity, earth-relative current components, sigma-layer views, depth averages, or provenance-preserving QA artifacts.
+description: Plan, inventory, anonymously download, concatenate, extract, and health-check NOAA Delaware Bay Operational Forecast System (DBOFS) ROMS NetCDF data from operational AWS with bounded NCEI long-term fallback. Use when Codex needs bounded DBOFS native staggered-grid fields, station or regular-grid passthrough files, exact byte and storage estimates, resumable source-isolated caches, practical salinity, earth-relative current components, sigma-layer views, depth averages, or provenance-preserving QA artifacts.
 ---
 
 # DBOFS Fetcher
 
-Use the packaged scripts as a bounded, estimate-first connector for the public
-`noaa-nos-ofs-pds` bucket. Native `fields` are fully processed. Treat
+Use the packaged scripts as a bounded, estimate-first connector for NOAA's
+operational AWS and NCEI long-term archives. Native `fields` are fully
+processed. Treat
 `stations` and `regulargrid` as inspected raw passthrough products.
 
 ## Required workflow
 
-1. Write a `dbofs_request_v1` request. Read
+1. Write a `dbofs_request_v2` request. Choose `source_policy=aws_then_ncei`
+   (default), `aws_only`, or `ncei_only`. Version 1 requests remain accepted
+   and are explicitly migrated to v2. Read
    [references/request.schema.json](references/request.schema.json) for the exact
    contract and [references/source_contract.md](references/source_contract.md)
    when archive layout or ROMS conventions matter.
@@ -56,6 +59,9 @@ python scripts/check_download_health.py --request request.json --run-dir runs/ca
   strict finite monotone vertical coordinates, and stable requested-variable
   dimension/grid signatures across every source file.
 - Keep raw files by default. A rerun must use validated cache hits.
+- NCEI supports native nowcast fields and station nowcast/forecast only. Field
+  forecasts and regular-grid requests remain AWS-only and fail closed under
+  `ncei_only`.
 - Do not pass field extraction options for station or regular-grid requests.
 
 ## Outputs

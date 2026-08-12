@@ -21,10 +21,16 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote
 
+try:
+    from . import ofs_archive_sources as archive_sources
+except ImportError:
+    import ofs_archive_sources as archive_sources
+
 BUCKET = "noaa-nos-ofs-pds"
 S3_ENDPOINT = f"https://{BUCKET}.s3.amazonaws.com"
 UTC = timezone.utc
 _NETCDF_METADATA_LOCK = threading.Lock()
+SOURCE_POLICIES = {"aws_then_ncei", "aws_only", "ncei_only"}
 
 
 @dataclass(frozen=True)
@@ -37,6 +43,43 @@ class ModelConfig:
     cycle_hours: tuple[int, ...] = (0, 6, 12, 18)
     default_variables: tuple[str, ...] = ("zeta", "salt", "u", "v")
     default_views: tuple[str | int, ...] = ("surface",)
+
+
+def _source_ids(request: Mapping[str, Any]) -> list[str]:
+    return ({"aws_only": ["aws_operational"],
+             "ncei_only": ["ncei_long_term"]}
+            .get(request["source_policy"], ["aws_operational", "ncei_long_term"]))
+
+
+def _ncei_capability(request: Mapping[str, Any]) -> tuple[bool, str | None]:
+    if request["product"] == "regulargrid":
+        return False, "ncei_long_term does not support regulargrid"
+    if request["product"] == "fields" and request["guidance"] == "forecast":
+        return False, "ncei_long_term does not support native field forecasts"
+    return True, None
+
+
+def _decorate_source(config: ModelConfig, item: Mapping[str, Any],
+                     source_id: str = "aws_operational") -> dict[str, Any]:
+    descriptor = archive_sources.get_source_descriptor(source_id, config.model)
+    value = {**descriptor, **dict(item), "source_id": source_id,
+             "provider": descriptor["provider"], "archive_role": descriptor["archive_role"],
+             "container": descriptor["container"], "endpoint": descriptor["endpoint"],
+             "listing_endpoint": descriptor["listing_endpoint"]}
+    value.setdefault("url", archive_sources.canonical_object_url(source_id, config.model, str(value["key"])))
+    parsed = parse_object_key(str(value["key"]), config)
+    if parsed is not None:
+        semantic = {
+            "model": config.model, "product": parsed["product"],
+            "guidance": parsed["guidance"], "run_time": parsed["run_time"],
+            "valid_time": parsed["valid_time"], "lead": parsed["lead"],
+            "aggregate": parsed["aggregate"],
+        }
+        value["naming_era"] = parsed["naming"]
+        value["semantic_identity"] = semantic
+        value["semantic_identity_digest"] = archive_sources.semantic_identity_digest(semantic)
+    value["source_identity"] = archive_sources.source_identity_digest(value)
+    return value
 
 
 def _requests_module():
@@ -115,6 +158,12 @@ def canonical_json_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def source_objects_sha256(objects: Sequence[Mapping[str, Any]]) -> str:
+    """Hash complete approved source records independent of list ordering."""
+    ordered = sorted((dict(item) for item in objects), key=lambda item: str(item.get("key", "")))
+    return canonical_json_sha256(ordered)
+
+
 def load_request(path: str | Path, config: ModelConfig) -> dict[str, Any]:
     raw = read_json(path)
     if not isinstance(raw, Mapping):
@@ -135,12 +184,22 @@ def validate_request(mapping: Mapping[str, Any], config: ModelConfig) -> dict[st
         "missing_policy",
         "cache_policy",
         "max_workers",
+        "source_policy",
     }
     unknown = sorted(set(mapping) - allowed)
     if unknown:
         raise ValueError(f"unknown request properties: {', '.join(unknown)}")
-    if mapping.get("schema_version") != config.request_schema:
-        raise ValueError(f"schema_version must be {config.request_schema!r}")
+    input_schema = mapping.get("schema_version")
+    legacy_schema = f"{config.model}_request_v1"
+    if input_schema not in {legacy_schema, config.request_schema}:
+        raise ValueError(
+            f"schema_version must be {legacy_schema!r} or {config.request_schema!r}"
+        )
+    if input_schema == legacy_schema and "source_policy" in mapping:
+        raise ValueError(
+            "source_policy is not permitted in a v1 request; v1 always migrates "
+            "to source_policy=aws_then_ncei"
+        )
     start = parse_utc(mapping.get("start_utc"), "start_utc")
     end = parse_utc(mapping.get("end_utc_exclusive"), "end_utc_exclusive")
     if end <= start:
@@ -211,6 +270,11 @@ def validate_request(mapping: Mapping[str, Any], config: ModelConfig) -> dict[st
     max_workers = mapping.get("max_workers", 4)
     if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
         raise ValueError("max_workers must be a positive integer")
+    source_policy = mapping.get("source_policy", "aws_then_ncei")
+    if source_policy not in SOURCE_POLICIES:
+        raise ValueError(
+            "source_policy must be aws_then_ncei, aws_only, or ncei_only"
+        )
     result: dict[str, Any] = {
         "schema_version": config.request_schema,
         "start_utc": iso_utc(start),
@@ -220,6 +284,7 @@ def validate_request(mapping: Mapping[str, Any], config: ModelConfig) -> dict[st
         "missing_policy": missing_policy,
         "cache_policy": cache_policy,
         "max_workers": max_workers,
+        "source_policy": source_policy,
     }
     if run_cycle is not None:
         result["run_cycle_utc"] = iso_utc(run_cycle)
@@ -229,18 +294,41 @@ def validate_request(mapping: Mapping[str, Any], config: ModelConfig) -> dict[st
     return result
 
 
+def request_migration(request: Mapping[str, Any] | str | Path,
+                      config: ModelConfig) -> dict[str, Any]:
+    """Describe the lossless v1-to-v2 normalization recorded in v2 artifacts."""
+    raw = read_json(request) if isinstance(request, (str, Path)) else dict(request)
+    input_schema = raw.get("schema_version")
+    migrated = input_schema != config.request_schema
+    return {
+        "input_schema_version": input_schema,
+        "normalized_schema_version": config.request_schema,
+        "migration": (
+            {
+                "applied": True,
+                "name": f"{config.model}_request_v1_to_v2",
+                "defaults_applied": {"source_policy": "aws_then_ncei"},
+            }
+            if migrated else {"applied": False, "name": None, "defaults_applied": {}}
+        ),
+    }
+
+
 def _layout_for_key(key: str) -> str:
     if re.search(r"/\d{4}/\d{2}/\d{2}/", key):
         return "daily"
     if re.search(r"/\d{6}/", key):
         return "monthly"
+    if re.search(r"/access/[^/]+/\d{4}/\d{2}/", key):
+        return "ncei_monthly"
     return "unknown"
 
 
 def _approved_source_contract(item: Mapping[str, Any], config: ModelConfig) -> dict[str, Any]:
-    """Validate one reviewed-plan object against the fixed NOAA S3 scope."""
+    """Validate one reviewed-plan object against its exact NOAA source scope."""
+    source_id = str(item.get("source_id") or "aws_operational")
     key = item.get("key")
-    prefix = f"{config.model}/netcdf/"
+    prefix = archive_sources.get_source_descriptor(source_id, config.model)["root_prefix"]
     if not isinstance(key, str) or not key.startswith(prefix):
         raise RuntimeError(f"approved plan key is outside {prefix!r}: {key!r}")
     parsed = parse_object_key(key, config)
@@ -249,6 +337,7 @@ def _approved_source_contract(item: Mapping[str, Any], config: ModelConfig) -> d
     relative = key[len(prefix):]
     daily = re.fullmatch(r"(\d{4})/(\d{2})/(\d{2})/([^/]+)", relative)
     monthly = re.fullmatch(r"(\d{6})/([^/]+)", relative)
+    ncei_monthly = re.fullmatch(r"(\d{4})/(\d{2})/([^/]+)", relative)
     run = parse_utc(parsed["run_time"])
     if daily is not None:
         archive_date = "".join(daily.group(index) for index in (1, 2, 3))
@@ -257,11 +346,18 @@ def _approved_source_contract(item: Mapping[str, Any], config: ModelConfig) -> d
     elif monthly is not None:
         if monthly.group(1) != run.strftime("%Y%m"):
             raise RuntimeError(f"approved plan monthly-layout key month disagrees with filename run date: {key}")
+    elif source_id == "ncei_long_term" and ncei_monthly is not None:
+        if ncei_monthly.group(1) + ncei_monthly.group(2) != run.strftime("%Y%m"):
+            raise RuntimeError(f"approved plan NCEI key month disagrees with filename run date: {key}")
     else:
         raise RuntimeError(f"approved plan key has no exact daily or monthly archive layout: {key}")
-    expected_url = S3_ENDPOINT + "/" + quote(key, safe="/")
+    expected_url = archive_sources.canonical_object_url(source_id, config.model, key)
     if item.get("url") != expected_url:
-        raise RuntimeError(f"approved plan URL is not the exact NOAA S3 object URL for {key}")
+        raise RuntimeError(f"approved plan URL is not the exact NOAA archive object URL for {key}")
+    archive_sources.validate_source_object(
+        config.model, _decorate_source(config, item, source_id),
+        expected_source_id=source_id, require_metadata=True,
+    )
     if not _clean_etag(item.get("etag")):
         raise RuntimeError(f"approved plan object has no nonempty ETag: {key}")
     if not isinstance(item.get("last_modified"), str) or not item["last_modified"].strip():
@@ -334,7 +430,8 @@ def parse_object_key(key: str, config: ModelConfig) -> dict[str, Any] | None:
     else:
         code = values["code"].lower()
         lead = int(values["lead"])
-        if (code == "n" and not 1 <= lead <= 6) or (code == "f" and not 1 <= lead <= 48):
+        source_id = "ncei_long_term" if "/access/" in key else "aws_operational"
+        if (code == "n" and not ((1 <= lead <= 6) or (lead == 0 and source_id == "ncei_long_term"))) or (code == "f" and not 1 <= lead <= 48):
             return None
         guidance = "nowcast" if code == "n" else "forecast"
         if guidance == "nowcast":
@@ -359,6 +456,7 @@ def parse_object_key(key: str, config: ModelConfig) -> dict[str, Any] | None:
         "valid_time": iso_utc(valid),
         "expected_start_utc": iso_utc(expected_start),
         "expected_end_utc_exclusive": iso_utc(expected_end),
+        "semantic_id": f"{config.model}:{product}:{guidance}:{iso_utc(run)}:{iso_utc(valid) or 'aggregate'}",
     }
 
 
@@ -450,6 +548,20 @@ def discovery_prefixes(request: Mapping[str, Any], config: ModelConfig) -> list[
     return daily + monthly
 
 
+def source_discovery_prefixes(request: Mapping[str, Any], config: ModelConfig,
+                              source_id: str) -> list[str]:
+    if source_id == "aws_operational":
+        return discovery_prefixes(request, config)
+    descriptor = archive_sources.get_source_descriptor(source_id, config.model)
+    if request["guidance"] == "forecast":
+        center = parse_utc(request["run_cycle_utc"])
+        first, last = center - timedelta(days=1), center + timedelta(days=1)
+    else:
+        first = parse_utc(request["start_utc"]) - timedelta(days=1)
+        last = parse_utc(request["end_utc_exclusive"]) + timedelta(days=1)
+    return [f"{descriptor['root_prefix']}{month:%Y/%m}/" for month in _months(first, last)]
+
+
 def discover_objects(
     request: Mapping[str, Any],
     config: ModelConfig,
@@ -457,20 +569,145 @@ def discover_objects(
     session: Any | None = None,
     endpoint: str = S3_ENDPOINT,
 ) -> list[dict[str, Any]]:
+    return discover_objects_with_evidence(
+        request, config, session=session, endpoint=endpoint)[0]
+
+
+def _discover_one_source(request: Mapping[str, Any], config: ModelConfig,
+                         source_id: str, *, session: Any | None = None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     found: dict[str, dict[str, Any]] = {}
-    for prefix in discovery_prefixes(request, config):
-        for raw in list_s3_objects(prefix, session=session, endpoint=endpoint):
+    prefixes = source_discovery_prefixes(request, config, source_id)
+    for prefix in prefixes:
+        for raw in archive_sources.list_objects_v2(
+                source_id, config.model, prefix, session=session):
             parsed = parse_object_key(raw["key"], config)
             if parsed is None:
                 continue
-            item = {**raw, **parsed}
+            item = _decorate_source(config, {**raw, **parsed}, source_id)
             if item["product"] == request["product"] and item["guidance"] == request["guidance"]:
                 found[item["key"]] = item
-    return sorted(found.values(), key=lambda item: (item["run_time"], item.get("valid_time") or "", item["key"]))
+    objects = sorted(found.values(), key=lambda item: (item["run_time"], item.get("valid_time") or "", item["key"]))
+    return objects, {"source_id": source_id, "status": "success",
+                     "prefixes": prefixes, "object_count": len(objects), "error": None}
 
 
-def _preference(item: Mapping[str, Any]) -> tuple[int, int]:
+def _coverage_gaps(request: Mapping[str, Any], objects: Sequence[Mapping[str, Any]],
+                   config: ModelConfig) -> list[str]:
+    relaxed = {**request, "missing_policy": "skip"}
+    try:
+        return list(select_objects(relaxed, objects, config)["missing_times"])
+    except RuntimeError as exc:
+        if "did not contain matching" not in str(exc):
+            raise
+        start, end = parse_utc(request["start_utc"]), parse_utc(request["end_utc_exclusive"])
+        step = 360 if request["product"] == "stations" else 3600
+        return [iso_utc(stamp) for stamp in _expected_times(start, end, step)]
+
+
+def _scientific_fallback_times(request: Mapping[str, Any],
+                               objects: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Find station boundaries covered only by the following cycle's first record."""
+    if request["product"] != "stations" or request["guidance"] != "nowcast":
+        return []
+    start, end = parse_utc(request["start_utc"]), parse_utc(request["end_utc_exclusive"])
+    candidates = [item for item in objects
+                  if item.get("product") == "stations" and item.get("guidance") == "nowcast"]
+    unresolved: list[str] = []
+    for stamp in _expected_times(start, end, 360):
+        covering = [item for item in candidates if stamp in _nominal_item_times(item)]
+        if (covering
+                and any(parse_utc(item["expected_start_utc"]) == stamp for item in covering)
+                and not any(parse_utc(item["run_time"]) == stamp for item in covering)):
+            unresolved.append(iso_utc(stamp))
+    return unresolved
+
+
+def validate_fallback_decision(request: Mapping[str, Any],
+                               artifact: Mapping[str, Any],
+                               selected: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Return violations of the provider-ordering evidence contract."""
+    failures: list[str] = []
+    policy = request.get("source_policy")
+    selected_sources = {str(item.get("source_id")) for item in selected}
+    attempts = artifact.get("source_attempts")
+    if not isinstance(attempts, list) or any(not isinstance(item, Mapping) for item in attempts):
+        attempts = []
+    attempted = {str(item.get("source_id")) for item in attempts}
+    successful = {str(item.get("source_id")) for item in attempts
+                  if item.get("status") == "success"}
+    if policy == "aws_only":
+        if "ncei_long_term" in selected_sources or "ncei_long_term" in attempted:
+            failures.append("aws_only plan contains or attempted an NCEI object")
+        if "aws_operational" not in successful:
+            failures.append("aws_only plan lacks successful AWS discovery evidence")
+    elif policy == "ncei_only":
+        if "aws_operational" in selected_sources or "aws_operational" in attempted:
+            failures.append("ncei_only plan contains or attempted an AWS object")
+        if "ncei_long_term" not in successful:
+            failures.append("ncei_only plan lacks successful NCEI discovery evidence")
+    elif policy == "aws_then_ncei":
+        if "aws_operational" not in successful:
+            failures.append("aws_then_ncei plan lacks successful AWS discovery evidence")
+        if "ncei_long_term" in selected_sources:
+            semantic_gap = artifact.get("coverage_before_fallback")
+            scientific_gap = artifact.get("scientific_precedence_before_fallback")
+            if "ncei_long_term" not in successful:
+                failures.append("NCEI selection lacks successful NCEI discovery evidence")
+            if artifact.get("fallback_triggered") is not True:
+                failures.append("NCEI selection lacks an explicit fallback trigger")
+            if not ((isinstance(semantic_gap, list) and semantic_gap)
+                    or (isinstance(scientific_gap, list) and scientific_gap)):
+                failures.append("NCEI fallback lacks an unresolved AWS semantic/scientific record")
+    else:
+        failures.append("source policy is invalid")
+    return failures
+
+
+def discover_objects_with_evidence(request: Mapping[str, Any], config: ModelConfig, *,
+                                   session: Any | None = None,
+                                   endpoint: str = S3_ENDPOINT) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    del endpoint
+    policy = request["source_policy"]
+    attempts: list[dict[str, Any]] = []
+    if policy == "ncei_only":
+        capable, reason = _ncei_capability(request)
+        if not capable:
+            raise ValueError(reason)
+        objects, evidence = _discover_one_source(request, config, "ncei_long_term", session=session)
+        attempts.append(evidence)
+        before, after = _coverage_gaps(request, [], config), _coverage_gaps(request, objects, config)
+        return objects, {"source_attempts": attempts, "fallback_triggered": False,
+                         "fallback_reason": None, "coverage_before_fallback": before,
+                         "coverage_after_fallback": after, "ncei_filled_times": sorted(set(before) - set(after)),
+                         "unresolved_times": after}
+    aws, evidence = _discover_one_source(request, config, "aws_operational", session=session)
+    attempts.append(evidence)
+    before = _coverage_gaps(request, aws, config)
+    scientific_before = _scientific_fallback_times(request, aws)
+    combined, triggered, reason = list(aws), False, None
+    capable, capability_reason = _ncei_capability(request)
+    if policy == "aws_then_ncei" and (before or scientific_before) and capable:
+        ncei, evidence = _discover_one_source(request, config, "ncei_long_term", session=session)
+        attempts.append(evidence); combined.extend(ncei)
+        triggered = True
+        reason = ("aws_scientific_precedence_unresolved" if scientific_before and not before
+                  else "aws_semantic_coverage_unresolved")
+    elif policy == "aws_then_ncei" and (before or scientific_before):
+        attempts.append({"source_id": "ncei_long_term", "status": "not_capable",
+                         "prefixes": [], "object_count": 0, "error": capability_reason})
+        reason = capability_reason
+    after = _coverage_gaps(request, combined, config)
+    return combined, {"source_attempts": attempts, "fallback_triggered": triggered,
+                      "fallback_reason": reason, "coverage_before_fallback": before,
+                      "scientific_precedence_before_fallback": scientific_before,
+                      "coverage_after_fallback": after, "ncei_filled_times": sorted(set(before) - set(after)),
+                      "unresolved_times": after}
+
+
+def _preference(item: Mapping[str, Any]) -> tuple[int, int, int, int]:
     return (
+        1 if item.get("lead") != 0 else 0,
+        1 if item.get("source_id", "aws_operational") == "aws_operational" else 0,
         1 if item.get("naming") == "current" else 0,
         1 if item.get("layout") == "daily" else 0,
     )
@@ -539,7 +776,9 @@ def select_objects(
             raise RuntimeError(f"equal-rank conflicting semantic duplicates for {identity}: {keys}")
         winner = sorted(best, key=lambda item: item["key"])[0]
         selected.append(winner)
-        duplicates.extend({**item, "rejected_in_favor_of": winner["key"]} for item in group if item is not winner)
+        duplicates.extend({**item, "rejected_in_favor_of": winner["key"],
+                           "rejection_reason": "lower_archive_or_layout_preference"}
+                          for item in group if item is not winner)
     selected.sort(key=lambda item: (item.get("valid_time") or item["run_time"], item["key"]))
 
     # Aggregate station cycles share their boundary timestamp. Walk cycles from
@@ -602,16 +841,33 @@ def inventory_request(
     session: Any | None = None,
     endpoint: str = S3_ENDPOINT,
 ) -> dict[str, Any]:
+    migration = request_migration(request, config)
     normalized = normalize_request_input(request, config)
-    discovered = [dict(item) for item in (objects if objects is not None else discover_objects(normalized, config, session=session, endpoint=endpoint))]
+    if objects is None:
+        raw_objects, discovery = discover_objects_with_evidence(
+            normalized, config, session=session, endpoint=endpoint)
+    else:
+        raw_objects = list(objects)
+        gaps = _coverage_gaps(normalized, raw_objects, config)
+        discovery = {"source_attempts": [{"source_id": "provided", "status": "provided",
+                                           "prefixes": [], "object_count": len(raw_objects), "error": None}],
+                     "fallback_triggered": False, "fallback_reason": None,
+                     "coverage_before_fallback": gaps, "coverage_after_fallback": gaps,
+                     "ncei_filled_times": [], "unresolved_times": gaps}
+    discovered = [_decorate_source(config, item, str(item.get("source_id") or "aws_operational"))
+                  for item in raw_objects]
+    capable, reason = _ncei_capability(normalized)
     report = {
-        "schema_version": f"{config.model}_inventory_v1",
+        "schema_version": f"{config.model}_inventory_v2",
         "created_utc": iso_utc(datetime.now(UTC)),
         "request": normalized,
+        **migration,
+        "source_policy": normalized["source_policy"],
+        **discovery,
         "prefixes": discovery_prefixes(normalized, config),
         "object_count": len(discovered),
         "objects": discovered,
-        "source": {"bucket": BUCKET, "endpoint": endpoint, "access": "anonymous_https_listobjectsv2"},
+        "source": {"policy": normalized["source_policy"], "access": "anonymous_https_listobjectsv2"},
     }
     if output:
         write_json_atomic(output, report)
@@ -628,8 +884,24 @@ def plan_request(
     session: Any | None = None,
     endpoint: str = S3_ENDPOINT,
 ) -> dict[str, Any]:
+    migration = request_migration(request, config)
     normalized = normalize_request_input(request, config)
-    discovered = [dict(item) for item in (objects if objects is not None else discover_objects(normalized, config, session=session, endpoint=endpoint))]
+    capable, reason = _ncei_capability(normalized)
+    if normalized["source_policy"] == "ncei_only" and not capable:
+        raise ValueError(reason)
+    if objects is None:
+        raw_objects, discovery = discover_objects_with_evidence(
+            normalized, config, session=session, endpoint=endpoint)
+    else:
+        raw_objects = list(objects)
+        gaps = _coverage_gaps(normalized, raw_objects, config)
+        discovery = {"source_attempts": [{"source_id": "provided", "status": "provided",
+                                           "prefixes": [], "object_count": len(raw_objects), "error": None}],
+                     "fallback_triggered": False, "fallback_reason": None,
+                     "coverage_before_fallback": gaps, "coverage_after_fallback": gaps,
+                     "ncei_filled_times": [], "unresolved_times": gaps}
+    discovered = [_decorate_source(config, item, str(item.get("source_id") or "aws_operational"))
+                  for item in raw_objects]
     selection = select_objects(normalized, discovered, config)
     def exact_positive_size(item: Mapping[str, Any]) -> int | None:
         size = item.get("size")
@@ -647,7 +919,7 @@ def plan_request(
             metadata_incomplete.append({"key": key, "field": "last_modified"})
         try:
             _approved_source_contract(item, config)
-        except RuntimeError as exc:
+        except (RuntimeError, ValueError) as exc:
             source_contract_errors.append({"key": key, "error": str(exc)})
     known_bytes = sum(size for size in sizes if size is not None)
     total = None if incomplete else known_bytes
@@ -666,10 +938,28 @@ def plan_request(
     else:
         route, reason = "kestrel", "local_free_space_gate_failed"
     report = {
-        "schema_version": f"{config.model}_download_estimate_v1",
+        "schema_version": f"{config.model}_download_estimate_v2",
         "created_utc": iso_utc(datetime.now(UTC)),
         "request": normalized,
-        "source": {"bucket": BUCKET, "endpoint": endpoint, "access": "anonymous_https_listobjectsv2"},
+        "request_sha256": canonical_json_sha256(normalized),
+        "objects_sha256": source_objects_sha256(selection["selected"]),
+        **migration,
+        "source_policy": normalized["source_policy"],
+        **discovery,
+        "selected_source_counts": {
+            source_id: sum(item.get("source_id") == source_id for item in selection["selected"])
+            for source_id in ("aws_operational", "ncei_long_term")
+        },
+        "source_totals": {
+            source_id: {
+                "object_count": sum(item.get("source_id") == source_id
+                                    for item in selection["selected"]),
+                "bytes": sum(size for item, size in zip(selection["selected"], sizes)
+                             if item.get("source_id") == source_id and size is not None),
+            }
+            for source_id in ("aws_operational", "ncei_long_term")
+        },
+        "source": {"policy": normalized["source_policy"], "access": "anonymous_https_listobjectsv2"},
         "objects": selection["selected"],
         "object_count": len(selection["selected"]),
         "total_bytes": total,
@@ -776,13 +1066,60 @@ def _destination_lock(destination: Path):
             pass
 
 
-def _destination_for_key(run_dir: Path, key: str, config: ModelConfig) -> Path:
+def _destination_for_key(run_dir: Path, key: str, config: ModelConfig,
+                         item: Mapping[str, Any] | None = None) -> Path:
     prefix = f"{config.model}/netcdf/"
-    relative = key[len(prefix) :] if key.startswith(prefix) else Path(key).name
+    relative = archive_sources.cache_relpath(item) if item is not None else (
+        key[len(prefix) :] if key.startswith(prefix) else Path(key).name)
     parts = Path(relative).parts
     if not parts or Path(relative).is_absolute() or any(part in {"", ".", ".."} for part in parts):
         raise ValueError(f"unsafe S3 key path: {key!r}")
     return run_dir.joinpath("cache", "raw", *parts)
+
+
+def legacy_aws_cache_result(config: ModelConfig, item: Mapping[str, Any],
+                            run_dir: str | Path) -> dict[str, Any] | None:
+    """Reuse a fully verified pre-v2 AWS cache in place, without rewriting it."""
+    prefix = f"{config.model}/netcdf/"
+    if item.get("source_id") != "aws_operational" or not str(item.get("key", "")).startswith(prefix):
+        return None
+    relative = Path(str(item["key"])[len(prefix):])
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        return None
+    destination = Path(run_dir) / "cache" / "raw" / relative
+    sidecar_path = _sidecar(destination)
+    if not destination.is_file() or not sidecar_path.is_file():
+        return None
+    try:
+        metadata = read_json(sidecar_path)
+    except Exception:
+        return None
+    expected = {
+        "schema_version": f"{config.model}_cached_object_v1",
+        "key": item.get("key"), "url": item.get("url"), "size": item.get("size"),
+        "etag": _clean_etag(item.get("etag")),
+        "last_modified": item.get("last_modified"),
+    }
+    if any((_clean_etag(metadata.get(name)) if name == "etag" else metadata.get(name)) != value
+           for name, value in expected.items()):
+        return None
+    digest = metadata.get("sha256")
+    if (not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or destination.stat().st_size != item.get("size")
+            or sha256_file(destination) != digest):
+        return None
+    try:
+        _validate_object_payload(item, destination)
+    except Exception:
+        return None
+    return {
+        "key": item["key"], "url": item["url"],
+        "local_path": str(destination.resolve()), "status": "cache_hit",
+        "cache_location": "legacy_aws_v1", "size": item["size"],
+        "etag": _clean_etag(item["etag"]), "sha256": digest,
+        "resumed": False, "resumed_from_bytes": 0, "retry_count": 0,
+        "source": dict(item),
+    }
 
 
 def _sidecar(destination: Path) -> Path:
@@ -807,6 +1144,9 @@ def cache_result(item: Mapping[str, Any], destination: Path) -> dict[str, Any] |
     if destination.stat().st_size != expected_size or int(metadata.get("size", -2)) != expected_size:
         return None
     if expected_etag and _clean_etag(metadata.get("etag")) != expected_etag:
+        return None
+    if (metadata.get("source_id") != item.get("source_id")
+            or metadata.get("source_identity") != item.get("source_identity")):
         return None
     expected_hash = str(metadata.get("sha256", ""))
     if len(expected_hash) != 64 or sha256_file(destination) != expected_hash:
@@ -850,14 +1190,18 @@ def _download_object_locked(
     partial_metadata_path = _partial_sidecar(destination)
     partial_metadata = {
         "schema_version": f"{schema_prefix}_partial_object_v1",
-        "key": item["key"], "url": item["url"], "size": expected_size, "etag": expected_etag,
+        "source_id": item.get("source_id"),
+        "source_identity": item.get("source_identity"),
+        "key": item["key"], "url": item["url"], "size": expected_size,
+        "etag": expected_etag, "last_modified": item.get("last_modified"),
     }
     if partial.exists():
         try:
             existing = read_json(partial_metadata_path)
         except Exception:
             existing = None
-        if not isinstance(existing, Mapping) or any(existing.get(key) != partial_metadata[key] for key in ("key", "url", "size", "etag")):
+        if not isinstance(existing, Mapping) or any(
+                existing.get(key) != partial_metadata[key] for key in partial_metadata):
             partial.unlink(missing_ok=True)
             partial_metadata_path.unlink(missing_ok=True)
     if not partial.exists():
@@ -906,6 +1250,7 @@ def _download_object_locked(
                     expected_range = f"bytes {current}-{expected_size - 1}/{expected_size}"
                     if content_range is not None and content_range != expected_range:
                         raise RuntimeError(f"Content-Range mismatch: {content_range} != {expected_range}")
+                archive_sources.validate_download_response(response, item, offset=current)
                 with partial.open(mode) as stream:
                     for chunk in response.iter_content(chunk_size=chunk_size):
                         if chunk:
@@ -933,6 +1278,14 @@ def _download_object_locked(
             partial_metadata_path.unlink(missing_ok=True)
             write_json_atomic(_sidecar(destination), {
                 "schema_version": f"{schema_prefix}_cached_object_v1",
+                "model": schema_prefix,
+                "source_id": item.get("source_id"),
+                "provider": item.get("provider"),
+                "archive_role": item.get("archive_role"),
+                "container": item.get("container"),
+                "endpoint": item.get("endpoint"),
+                "listing_endpoint": item.get("listing_endpoint"),
+                "source_identity": item.get("source_identity"),
                 "key": item["key"], "url": item["url"], "size": expected_size,
                 "etag": expected_etag, "etag_is_multipart": "-" in expected_etag,
                 "etag_semantics": "opaque_provenance",
@@ -1006,11 +1359,20 @@ def fetch_from_plan(
     session: Any | None = None,
 ) -> dict[str, Any]:
     """Transfer only the objects in a previously written, locally approved plan."""
-    plan_path = Path(plan).resolve() if isinstance(plan, (str, Path)) else None
-    estimate = read_json(plan_path) if plan_path is not None else dict(plan)
-    if estimate.get("schema_version") != f"{config.model}_download_estimate_v1":
+    if not isinstance(plan, (str, Path)):
+        raise RuntimeError("fetch requires an existing reviewed plan file path, not an in-memory mapping")
+    plan_path = Path(plan).resolve()
+    if not plan_path.is_file():
+        raise RuntimeError("fetch requires an existing reviewed plan file")
+    estimate = read_json(plan_path)
+    if estimate.get("schema_version") != f"{config.model}_download_estimate_v2":
         raise RuntimeError("fetch requires a connector-generated download estimate")
     normalized = validate_request(estimate.get("request", {}), config)
+    if estimate.get("source_policy") != normalized["source_policy"]:
+        raise RuntimeError("approved plan source_policy does not match its request")
+    request_sha256 = canonical_json_sha256(normalized)
+    if estimate.get("request_sha256") != request_sha256:
+        raise RuntimeError("approved plan request_sha256 does not match its normalized request")
     if estimate.get("routing_decision") != "local":
         raise RuntimeError(
             f"local fetch is not approved: {estimate.get('routing_decision')} "
@@ -1028,9 +1390,27 @@ def fetch_from_plan(
         size = item.get("size")
         if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
             raise RuntimeError("approved plan does not contain exact positive object sizes")
-        _approved_source_contract(item, config)
+        try:
+            _approved_source_contract(item, config)
+        except (RuntimeError, ValueError) as exc:
+            raise RuntimeError(f"approved plan contains invalid source provenance: {exc}") from exc
         sizes.append(size)
     exact_total = sum(sizes)
+    objects_sha256 = source_objects_sha256(objects)
+    if estimate.get("objects_sha256") != objects_sha256:
+        raise RuntimeError("approved plan objects_sha256 does not match its selected source objects")
+    expected_source_totals = {
+        source_id: {
+            "object_count": sum(item.get("source_id") == source_id for item in objects),
+            "bytes": sum(item["size"] for item in objects if item.get("source_id") == source_id),
+        }
+        for source_id in ("aws_operational", "ncei_long_term")
+    }
+    if estimate.get("source_totals") != expected_source_totals:
+        raise RuntimeError("approved plan per-source object/byte totals are inconsistent")
+    fallback_failures = validate_fallback_decision(normalized, estimate, objects)
+    if fallback_failures:
+        raise RuntimeError("approved plan fallback decision is invalid: " + "; ".join(fallback_failures))
     exact_required = 4 * exact_total
     if estimate.get("total_bytes") != exact_total:
         raise RuntimeError("approved plan total_bytes does not match its source objects")
@@ -1039,7 +1419,7 @@ def fetch_from_plan(
     reselection = select_objects(normalized, objects, config)
     if [item["key"] for item in reselection["selected"]] != [item["key"] for item in objects]:
         raise RuntimeError("approved plan object selection is inconsistent with its request")
-    plan_sha256 = sha256_file(plan_path) if plan_path is not None else canonical_json_sha256(estimate)
+    plan_sha256 = sha256_file(plan_path)
     run_path = Path(run_dir)
     run_path.mkdir(parents=True, exist_ok=True)
     current_free = int(shutil.disk_usage(run_path).free)
@@ -1050,9 +1430,24 @@ def fetch_from_plan(
         )
 
     def transfer(item: Mapping[str, Any]) -> dict[str, Any]:
+        destination = _destination_for_key(run_path, str(item["key"]), config, item)
+        cached = cache_result(item, destination)
+        if cached is not None:
+            return cached
+        legacy_cached = legacy_aws_cache_result(config, item, run_path)
+        if legacy_cached is not None:
+            return legacy_cached
+        source_id = str(item["source_id"])
+        exact = [candidate for candidate in archive_sources.list_objects_v2(
+            source_id, config.model, str(item["key"]), session=session, max_keys=2,
+        ) if candidate.get("key") == item.get("key")]
+        if len(exact) != 1:
+            raise RuntimeError(
+                "planned source object is no longer uniquely listed; replan before fetching")
+        archive_sources.validate_remote_metadata(item, exact[0])
         return download_object(
             item,
-            _destination_for_key(run_path, str(item["key"]), config),
+            destination,
             session=session,
             schema_prefix=config.model,
         )
@@ -1065,13 +1460,18 @@ def fetch_from_plan(
     outcomes.sort(key=lambda item: str(item.get("key")))
     failures = [item for item in outcomes if item["status"] == "failed"]
     manifest = {
-        "schema_version": f"{config.model}_fetch_manifest_v1",
+        "schema_version": f"{config.model}_fetch_manifest_v2",
         "created_utc": iso_utc(datetime.now(UTC)),
         "request": normalized,
+        "source_policy": normalized["source_policy"],
         "approved_plan": {
-            "path": None if plan_path is None else str(plan_path),
+            "path": str(plan_path),
             "sha256": plan_sha256,
             "schema_version": estimate["schema_version"],
+            "request_sha256": request_sha256,
+            "objects_sha256": objects_sha256,
+            "object_count": len(objects),
+            "total_bytes": exact_total,
         },
         "transfer_storage_gate": {
             "total_bytes": exact_total,
@@ -1089,8 +1489,9 @@ def fetch_from_plan(
             "resumed": sum(bool(item.get("resumed")) for item in outcomes),
         },
         "source_provenance": {
-            "bucket": BUCKET,
-            "endpoint": estimate.get("source", {}).get("endpoint", S3_ENDPOINT),
+            "policy": normalized["source_policy"],
+            "source_counts": {source_id: sum(item.get("source", {}).get("source_id") == source_id for item in outcomes)
+                              for source_id in ("aws_operational", "ncei_long_term")},
             "access": "anonymous_https",
         },
     }
@@ -1114,6 +1515,89 @@ def fetch_request(
     )
 
 
+def verify_legacy_v1_transfers(run_path: Path, manifest: Mapping[str, Any],
+                               manifest_path: Path,
+                               expected_request: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Read and integrity-check immutable pre-v2 AWS evidence; never authorizes transfer."""
+    failures: list[str] = []
+    try:
+        normalized = validate_request(manifest.get("request", {}), ModelConfig(
+            model="dbofs", request_schema="dbofs_request_v2",
+            connector_name="dbofs-fetcher"))
+    except Exception as exc:
+        return {"status": "fail", "objects": [], "failures": [f"legacy request is invalid: {exc}"]}
+    if expected_request is not None and canonical_json_sha256(normalized) != canonical_json_sha256(expected_request):
+        failures.append("legacy fetch-manifest request does not match health request")
+    approved = manifest.get("approved_plan")
+    if not isinstance(approved, Mapping) or approved.get("schema_version") != "dbofs_download_estimate_v1":
+        failures.append("legacy approved plan schema is invalid")
+    else:
+        plan_path = Path(str(approved.get("path", ""))).resolve()
+        if not plan_path.is_file() or sha256_file(plan_path) != approved.get("sha256"):
+            failures.append("legacy approved plan path/SHA-256 is invalid")
+        else:
+            plan = read_json(plan_path)
+            if plan.get("schema_version") != "dbofs_download_estimate_v1":
+                failures.append("legacy approved plan file schema is invalid")
+    outcomes = manifest.get("outcomes")
+    if not isinstance(outcomes, list) or not outcomes:
+        failures.append("legacy fetch manifest has no outcomes")
+        outcomes = []
+    raw_root = (run_path / "cache" / "raw").resolve()
+    checks: list[dict[str, Any]] = []
+    for outcome in outcomes:
+        source = outcome.get("source") if isinstance(outcome, Mapping) else None
+        key = source.get("key") if isinstance(source, Mapping) else None
+        parsed = parse_object_key(str(key or ""), ModelConfig(
+            model="dbofs", request_schema="dbofs_request_v2",
+            connector_name="dbofs-fetcher"))
+        path = Path(str(outcome.get("local_path", ""))).resolve() if isinstance(outcome, Mapping) else Path()
+        reason = None
+        try:
+            path.relative_to(raw_root)
+        except ValueError:
+            reason = "legacy local path is outside raw cache"
+        expected_url = S3_ENDPOINT + "/" + quote(str(key), safe="/") if key else None
+        if parsed is None or source.get("url") != expected_url:
+            reason = reason or "legacy AWS source key/URL is invalid"
+        size, digest = outcome.get("size"), outcome.get("sha256")
+        sidecar_path = path.with_name(path.name + ".download.json")
+        if not path.is_file() or not sidecar_path.is_file():
+            reason = reason or "legacy raw file/sidecar is missing"
+        else:
+            sidecar = read_json(sidecar_path)
+            expected = {
+                "schema_version": "dbofs_cached_object_v1", "key": key,
+                "url": expected_url, "size": size,
+                "etag": _clean_etag(outcome.get("etag")),
+                "last_modified": source.get("last_modified"), "sha256": digest,
+            }
+            if any((_clean_etag(sidecar.get(name)) if name == "etag" else sidecar.get(name)) != value
+                   for name, value in expected.items()):
+                reason = reason or "legacy cache sidecar provenance mismatch"
+            elif path.stat().st_size != size or sha256_file(path) != digest:
+                reason = reason or "legacy raw size/SHA-256 mismatch"
+            else:
+                try:
+                    _validate_object_payload(source, path)
+                except Exception as exc:
+                    reason = reason or f"legacy raw NetCDF is invalid: {exc}"
+        check = {"key": key, "local_path": str(path),
+                 "status": "fail" if reason else "pass", "size": size,
+                 "sha256": digest, "etag": outcome.get("etag"),
+                 "source_id": "aws_operational", "source_archive": "aws_operational",
+                 "endpoint": S3_ENDPOINT, "url": expected_url,
+                 "legacy_evidence_schema": "v1"}
+        if reason:
+            check["reason"] = reason
+            failures.append(f"{key}: {reason}")
+        checks.append(check)
+    return {"status": "pass" if not failures else "fail", "objects": checks,
+            "failures": failures, "legacy_read_only": True,
+            "manifest_path": str(manifest_path),
+            "manifest_sha256": sha256_file(manifest_path), "request": normalized}
+
+
 def verify_transfers(
     run_dir: str | Path,
     expected_request: Mapping[str, Any] | None = None,
@@ -1128,12 +1612,15 @@ def verify_transfers(
         manifest = read_json(manifest_path)
     except Exception as exc:
         return {"status": "fail", "objects": [], "failures": [f"fetch manifest is unreadable: {type(exc).__name__}: {exc}"]}
+    if manifest.get("schema_version") == "dbofs_fetch_manifest_v1":
+        return verify_legacy_v1_transfers(
+            run_path, manifest, manifest_path, expected_request)
     checks: list[dict[str, Any]] = []
     failures: list[str] = []
     manifest_request = manifest.get("request")
     request_schema = manifest_request.get("schema_version") if isinstance(manifest_request, Mapping) else None
-    model = str(request_schema).removesuffix("_request_v1") if isinstance(request_schema, str) else ""
-    if not model or manifest.get("schema_version") != f"{model}_fetch_manifest_v1":
+    model = str(request_schema).removesuffix("_request_v2") if isinstance(request_schema, str) else ""
+    if not model or manifest.get("schema_version") != f"{model}_fetch_manifest_v2":
         failures.append("fetch manifest schema_version is missing or inconsistent")
     if expected_request is not None and canonical_json_sha256(manifest_request) != canonical_json_sha256(expected_request):
         failures.append("fetch manifest request does not match the requested health/extraction contract")
@@ -1162,7 +1649,7 @@ def verify_transfers(
                     failures.append("approved plan root is not a JSON object")
                 else:
                     approved_plan = loaded_plan
-                    expected_plan_schema = f"{model}_download_estimate_v1" if model else None
+                    expected_plan_schema = f"{model}_download_estimate_v2" if model else None
                     if (not expected_plan_schema
                             or approved_plan.get("schema_version") != expected_plan_schema
                             or approved.get("schema_version") != expected_plan_schema):
@@ -1172,6 +1659,9 @@ def verify_transfers(
                             or not isinstance(manifest_request, Mapping)
                             or canonical_json_sha256(plan_request) != canonical_json_sha256(manifest_request)):
                         failures.append("approved plan request does not match the fetch manifest request")
+                    elif (approved_plan.get("request_sha256") != canonical_json_sha256(plan_request)
+                          or approved.get("request_sha256") != approved_plan.get("request_sha256")):
+                        failures.append("approved plan request_sha256 is missing or inconsistent")
                     plan_objects = approved_plan.get("objects")
                     if not isinstance(plan_objects, list) or not plan_objects:
                         failures.append("approved plan has no selected source objects")
@@ -1179,6 +1669,16 @@ def verify_transfers(
                         failures.append("approved plan contains a non-object source entry")
                     else:
                         approved_objects = plan_objects
+                        for source_object in approved_objects:
+                            try:
+                                _approved_source_contract(source_object, ModelConfig(
+                                    model=model, request_schema=f"{model}_request_v2",
+                                    connector_name=f"{model}-fetcher"))
+                            except Exception as exc:
+                                failures.append(f"approved plan source object is invalid: {exc}")
+                        if isinstance(plan_request, Mapping):
+                            failures.extend(validate_fallback_decision(
+                                plan_request, approved_plan, approved_objects))
                         if approved_plan.get("object_count") != len(approved_objects):
                             failures.append("approved plan object_count is inconsistent")
                         sizes = [item.get("size") for item in approved_objects]
@@ -1186,6 +1686,24 @@ def verify_transfers(
                                     for size in sizes)
                                 or approved_plan.get("total_bytes") != sum(sizes)):
                             failures.append("approved plan total_bytes/source sizes are inconsistent")
+                        if (approved_plan.get("objects_sha256") != source_objects_sha256(approved_objects)
+                                or approved.get("objects_sha256") != approved_plan.get("objects_sha256")):
+                            failures.append("approved plan objects_sha256 is missing or inconsistent")
+                        if approved.get("object_count") != approved_plan.get("object_count"):
+                            failures.append("fetch manifest approved object_count is inconsistent")
+                        if approved.get("total_bytes") != approved_plan.get("total_bytes"):
+                            failures.append("fetch manifest approved total_bytes is inconsistent")
+                        expected_source_totals = {
+                            source_id: {
+                                "object_count": sum(item.get("source_id") == source_id
+                                                    for item in approved_objects),
+                                "bytes": sum(item.get("size", 0) for item in approved_objects
+                                             if item.get("source_id") == source_id),
+                            }
+                            for source_id in ("aws_operational", "ncei_long_term")
+                        }
+                        if approved_plan.get("source_totals") != expected_source_totals:
+                            failures.append("approved plan per-source object/byte totals are inconsistent")
     outcomes = manifest.get("outcomes")
     if not isinstance(outcomes, list) or not outcomes:
         failures.append("fetch manifest has no transfer outcomes")
@@ -1214,6 +1732,7 @@ def verify_transfers(
     raw_root = (run_path / "cache" / "raw").resolve()
     for outcome in outcomes:
         path = Path(str(outcome.get("local_path", ""))).resolve()
+        source = outcome.get("source")
         check = {"key": outcome.get("key"), "local_path": str(path), "status": "pass"}
         try:
             path.relative_to(raw_root)
@@ -1248,19 +1767,77 @@ def verify_transfers(
                 check["status"] = "fail"
                 check["reason"] = f"cache sidecar missing or unreadable: {type(exc).__name__}"
             else:
-                sidecar_matches = (
-                    metadata.get("key") == outcome.get("key")
-                    and metadata.get("size") == size
-                    and metadata.get("sha256") == digest
-                    and _clean_etag(metadata.get("etag")) == _clean_etag(outcome.get("etag"))
+                legacy = outcome.get("cache_location") == "legacy_aws_v1"
+                expected_sidecar = ({
+                    "schema_version": f"{model}_cached_object_v1",
+                    "key": outcome.get("key"), "url": outcome.get("url"),
+                    "size": size, "etag": _clean_etag(outcome.get("etag")),
+                    "last_modified": source.get("last_modified") if isinstance(source, Mapping) else None,
+                    "sha256": digest,
+                } if legacy else {
+                    "schema_version": f"{model}_cached_object_v1",
+                    "model": model,
+                    "source_id": source.get("source_id") if isinstance(source, Mapping) else None,
+                    "provider": source.get("provider") if isinstance(source, Mapping) else None,
+                    "archive_role": source.get("archive_role") if isinstance(source, Mapping) else None,
+                    "container": source.get("container") if isinstance(source, Mapping) else None,
+                    "endpoint": source.get("endpoint") if isinstance(source, Mapping) else None,
+                    "listing_endpoint": source.get("listing_endpoint") if isinstance(source, Mapping) else None,
+                    "source_identity": source.get("source_identity") if isinstance(source, Mapping) else None,
+                    "key": outcome.get("key"),
+                    "url": outcome.get("url"),
+                    "size": size,
+                    "etag": _clean_etag(outcome.get("etag")),
+                    "last_modified": source.get("last_modified") if isinstance(source, Mapping) else None,
+                    "etag_semantics": "opaque_provenance",
+                    "sha256": digest,
+                })
+                sidecar_matches = all(
+                    (_clean_etag(metadata.get(name)) if name == "etag" else metadata.get(name)) == value
+                    for name, value in expected_sidecar.items()
                 )
+                if legacy and (not isinstance(source, Mapping)
+                               or source.get("source_id") != "aws_operational"):
+                    sidecar_matches = False
+                if sidecar_matches and not legacy:
+                    try:
+                        archive_sources.validate_source_object(
+                            model, metadata,
+                            expected_source_id=str(expected_sidecar["source_id"]),
+                        )
+                    except Exception:
+                        sidecar_matches = False
                 if not sidecar_matches:
                     check["status"] = "fail"
                     check["reason"] = "cache sidecar provenance mismatch"
         if check["status"] == "pass":
+            if not isinstance(source, Mapping):
+                check["status"] = "fail"
+                check["reason"] = "fetch outcome has no source provenance"
+            else:
+                try:
+                    descriptor = archive_sources.get_source_descriptor(
+                        str(source.get("source_id")), model)
+                    _approved_source_contract(source, ModelConfig(
+                        model=model, request_schema=f"{model}_request_v2",
+                        connector_name=f"{model}-fetcher"))
+                except Exception as exc:
+                    check["status"] = "fail"
+                    check["reason"] = f"fetch source provenance is invalid: {exc}"
+        if check["status"] == "pass":
             check["size"] = path.stat().st_size
             check["sha256"] = digest
             check["etag"] = outcome.get("etag")
+            check["source_id"] = source.get("source_id")
+            check["source_archive"] = source.get("source_id")
+            check["archive_role"] = descriptor["archive_role"]
+            check["container"] = descriptor["container"]
+            check["endpoint"] = descriptor["endpoint"]
+            check["listing_endpoint"] = descriptor["listing_endpoint"]
+            check["url"] = source.get("url")
+            check["last_modified"] = source.get("last_modified")
+            check["source_identity"] = source.get("source_identity")
+            check["cache_location"] = outcome.get("cache_location", "source_isolated_v2")
         checks.append(check)
         if check["status"] != "pass":
             failures.append(f"{check['key']}: {check.get('reason')}")
