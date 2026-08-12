@@ -24,14 +24,14 @@ description: GitHub Copilot variant for PNNL Cloud VM access via Paramiko bridge
 Scripts live in the sibling folder:
 
 ```
-Agent_skill_dev/skill_catalog/model-execution-hpc/cloudvm-bridge/scripts/
+Agent_skill_dev/skill_catalog/workspace-bridging/cloudvm-bridge/scripts/
 ```
 
 ### Step 1: Create Bridge Session
 
 ```powershell
 # run_in_terminal (mode=sync)
-Set-Location "Agent_skill_dev\skill_catalog\model-execution-hpc\cloudvm-bridge\scripts"
+Set-Location "Agent_skill_dev\skill_catalog\workspace-bridging\cloudvm-bridge\scripts"
 python .\make_bridge_session.py --purpose "short purpose" --work-summary "summary" --project-root "C:\path\to\project"
 ```
 

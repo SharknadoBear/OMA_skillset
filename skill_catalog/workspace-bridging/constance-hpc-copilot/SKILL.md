@@ -26,14 +26,14 @@ description: GitHub Copilot variant for PNNL Constance HPC read-only access. Use
 Scripts live in the sibling folder:
 
 ```
-Agent_skill_dev/skill_catalog/model-execution-hpc/constance-hpc/hpc_bridge/
+Agent_skill_dev/skill_catalog/workspace-bridging/constance-hpc/hpc_bridge/
 ```
 
 ### Step 1: Create Bridge Session
 
 ```powershell
 # run_in_terminal (mode=sync)
-Set-Location "Agent_skill_dev\skill_catalog\model-execution-hpc\constance-hpc\hpc_bridge"
+Set-Location "Agent_skill_dev\skill_catalog\workspace-bridging\constance-hpc\hpc_bridge"
 python .\make_bridge_session.py --purpose "short purpose" --work-summary "summary" --project-root "C:\path\to\project"
 ```
 

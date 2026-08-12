@@ -134,7 +134,7 @@ bridge folders without `bridge_identity.json` are not reusable for new work.
 The checked-in staging copy lives at:
 
 ```text
-Agent_skill_dev\skill_catalog\model-execution-hpc\kestrel-hpc\hpc_bridge
+Agent_skill_dev\skill_catalog\workspace-bridging\kestrel-hpc\hpc_bridge
 ```
 
 Use that repo copy as the source of truth when updating and publishing the

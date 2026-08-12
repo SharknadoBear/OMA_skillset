@@ -28,14 +28,14 @@ description: GitHub Copilot variant for Kestrel HPC access. Use run_in_terminal 
 Scripts live in the sibling folder:
 
 ```
-Agent_skill_dev/skill_catalog/model-execution-hpc/kestrel-hpc/hpc_bridge/
+Agent_skill_dev/skill_catalog/workspace-bridging/kestrel-hpc/hpc_bridge/
 ```
 
 ### Step 1: Create Bridge Session
 
 ```powershell
 # Run via run_in_terminal (mode=sync)
-Set-Location "Agent_skill_dev\skill_catalog\model-execution-hpc\kestrel-hpc\hpc_bridge"
+Set-Location "Agent_skill_dev\skill_catalog\workspace-bridging\kestrel-hpc\hpc_bridge"
 python .\make_bridge_session.py --purpose "short purpose" --work-summary "summary" --project-root "C:\path\to\project"
 ```
 

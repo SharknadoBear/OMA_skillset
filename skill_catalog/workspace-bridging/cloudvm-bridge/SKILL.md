@@ -34,7 +34,7 @@ C:\Users\huan111\.codex\skills\cloudvm-bridge
 The versioned source-of-truth path is:
 
 ```text
-Agent_skill_dev\skill_catalog\model-execution-hpc\cloudvm-bridge
+Agent_skill_dev\skill_catalog\workspace-bridging\cloudvm-bridge
 ```
 
 Before starting or reusing a bridge, inspect the named bridge identity. Reuse
@@ -86,8 +86,8 @@ Supported bridge actions are `exec`, `upload`, `download`, and `stop`. Result JS
 After bridge changes, validate locally before live VM use:
 
 ```powershell
-python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py Agent_skill_dev\skill_catalog\model-execution-hpc\cloudvm-bridge
-python -c "from pathlib import Path; [compile(p.read_text(encoding='utf-8'), str(p), 'exec') for p in [Path('Agent_skill_dev/skill_catalog/model-execution-hpc/cloudvm-bridge/scripts/bridge_server.py'), Path('Agent_skill_dev/skill_catalog/model-execution-hpc/cloudvm-bridge/scripts/send_cloudvm_command.py')]]"
+python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py Agent_skill_dev\skill_catalog\workspace-bridging\cloudvm-bridge
+python -c "from pathlib import Path; [compile(p.read_text(encoding='utf-8'), str(p), 'exec') for p in [Path('Agent_skill_dev/skill_catalog/workspace-bridging/cloudvm-bridge/scripts/bridge_server.py'), Path('Agent_skill_dev/skill_catalog/workspace-bridging/cloudvm-bridge/scripts/send_cloudvm_command.py')]]"
 ```
 
 For a live smoke test, start the installed bridge, have Bear enter the password in the bridge window, then run:

@@ -17,10 +17,10 @@ by capability family rather than by the older broad project-stage folders.
   future mesh/refinement skills for FVCOM preprocessing.
 - `memory-control/`: project-memory workflow skills, currently
   `brain-dumping` and `brain-refreshing`.
-- `model-execution-hpc/`: execution and HPC bridge skills for Kestrel,
-  Constance, and the PNNL cloud VM, including Codex and Copilot-facing variants
-  where staged.
-- `model-analysis/`: active structured-grid POM, staggered-grid ROMS, and
+- `workspace-bridging/`: skills that bridge local workspaces to Kestrel,
+  Constance, and PNNL cloud VM execution environments, including Codex and
+  Copilot-facing variants where staged.
+- `visual-analysis/`: active structured-grid POM, staggered-grid ROMS, and
   sparse curvilinear EFDC map and movie post-processing, plus staged future
   scientific-analysis work.
 
@@ -149,14 +149,14 @@ usable skill families at different maturity levels:
   `sjrofs-fetcher` connectors. The five OFS connectors use reviewed v2 plans, anonymous NOAA
   access, and model-safe NCEI long-term fallback for supported historical
   records when operational AWS coverage is incomplete.
-- `model-execution-hpc/kestrel-hpc` is a robust operational bridge skill, not
+- `workspace-bridging/kestrel-hpc` is a robust operational bridge skill, not
   merely a copied placeholder. It records Bear's Kestrel account context,
   required SSH MAC option, Password+OTP handling rules, Slurm job inspection and
   monitoring patterns, upload/download guidance, and a reusable local Paramiko
   bridge workflow for multi-command sessions. It should be treated as the
   primary Kestrel access skill for controlled compile, transfer, job-monitoring,
   and compact-output retrieval tasks.
-- `model-execution-hpc/constance-hpc` and `model-execution-hpc/cloudvm-bridge`
+- `workspace-bridging/constance-hpc` and `workspace-bridging/cloudvm-bridge`
   are also staged as execution/connectivity skills, with Copilot sibling folders
   retained where migration work has been performed.
 - `grid-generation/` now contains active FVCOM preprocessing skills rather than
@@ -171,7 +171,7 @@ usable skill families at different maturity levels:
 - `memory-control/` now contains the two active HTML project-memory workflow
   skills: `brain-dumping` for durable session memos and `brain-refreshing` for
   workspace reorientation before continuing work.
-- `model-analysis/` now includes the active `pom-map-postprocessing`,
+- `visual-analysis/` now includes the active `pom-map-postprocessing`,
   `pom-movie-postprocessing`, `roms-map-postprocessing`, and
   `roms-movie-postprocessing` skills, together with
   `efdc-map-postprocessing` and `efdc-movie-postprocessing` for sparse
