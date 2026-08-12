@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oma.local/schemas/efdc_map_manifest_v1.json",
+  "title": "EFDC static map manifest v1",
+  "type": "object",
+  "required": ["schema_version", "status", "created_utc", "inputs", "request", "selection", "rendering", "quiver", "output"],
+  "properties": {
+    "schema_version": {"const": "efdc_map_manifest_v1"},
+    "status": {"const": "pass"},
+    "inputs": {"type": "array", "minItems": 1, "items": {"type": "object", "required": ["path", "bytes", "sha256"], "properties": {"bytes": {"type": "integer", "minimum": 1}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}}},
+    "selection": {
+      "type": "object",
+      "required": ["grid_shape", "geometry_sha256", "normalized_time_utc", "original_time_utc", "variable_requested", "layer", "resolution"],
+      "properties": {
+        "geometry_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "resolution": {"type": "object", "required": ["vertical_method", "vector_method"]}
+      }
+    },
+    "rendering": {
+      "type": "object",
+      "required": ["style", "vmin", "vmax", "wet_cells", "finite_wet_coverage", "rendering_method", "rendered_cell_count", "footprint_fallback_cell_count", "footprint_maximum_span_km"],
+      "properties": {
+        "style": {"enum": ["wet_cells", "pcolormesh", "contourf"]},
+        "finite_wet_coverage": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "output": {"type": "object", "required": ["path", "bytes", "sha256", "format"], "properties": {"bytes": {"type": "integer", "minimum": 1}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "format": {"const": "png"}}}
+  },
+  "additionalProperties": true
+}

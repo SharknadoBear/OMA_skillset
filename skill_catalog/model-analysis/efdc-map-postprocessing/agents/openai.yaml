@@ -1,0 +1,4 @@
+interface:
+  display_name: "EFDC Map Postprocessing"
+  short_description: "Map NOAA EFDC curvilinear-grid fields."
+  default_prompt: "Use $efdc-map-postprocessing to inspect and render a QA-ready static map from EFDC curvilinear NetCDF fields."
