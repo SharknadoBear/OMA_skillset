@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oma.pnnl.gov/schemas/cbofs_request_v1.json",
+  "title": "CBOFS public AWS request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "start_utc", "end_utc_exclusive", "product", "guidance"],
+  "properties": {
+    "schema_version": {"const": "cbofs_request_v1"},
+    "start_utc": {"type": "string", "format": "date-time"},
+    "end_utc_exclusive": {"type": "string", "format": "date-time"},
+    "product": {"enum": ["fields", "stations", "regulargrid"]},
+    "guidance": {"enum": ["nowcast", "forecast"]},
+    "run_cycle_utc": {"type": "string", "format": "date-time"},
+    "variables": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "vertical_views": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "oneOf": [
+          {"enum": ["surface", "near_surface", "bottom", "depth_average"]},
+          {"type": "integer", "minimum": 0}
+        ]
+      }
+    },
+    "missing_policy": {"enum": ["error", "skip"], "default": "error"},
+    "cache_policy": {"enum": ["keep", "delete_after_extract"], "default": "keep"},
+    "max_workers": {"type": "integer", "minimum": 1, "default": 4}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"guidance": {"const": "forecast"}}},
+      "then": {"required": ["run_cycle_utc"]},
+      "else": {"not": {"required": ["run_cycle_utc"]}}
+    },
+    {
+      "if": {"properties": {"product": {"const": "fields"}}},
+      "else": {
+        "not": {
+          "anyOf": [
+            {"required": ["variables"]},
+            {"required": ["vertical_views"]}
+          ]
+        }
+      }
+    }
+  ]
+}
