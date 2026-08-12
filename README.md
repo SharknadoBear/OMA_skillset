@@ -19,8 +19,8 @@ by capability family rather than by the older broad project-stage folders.
 - `model-execution-hpc/`: execution and HPC bridge skills for Kestrel,
   Constance, and the PNNL cloud VM, including Codex and Copilot-facing variants
   where staged.
-- `model-analysis/`: active structured-grid POM map and movie post-processing
-  plus staged future post-processing and scientific-analysis work.
+- `model-analysis/`: active structured-grid POM map and movie post-processing,
+  active staggered-grid ROMS map post-processing, plus staged future work.
 
 ## Installing Skills
 
@@ -167,8 +167,9 @@ usable skill families at different maturity levels:
 - `memory-control/` now contains the two active HTML project-memory workflow
   skills: `brain-dumping` for durable session memos and `brain-refreshing` for
   workspace reorientation before continuing work.
-- `model-analysis/` now includes the active `pom-map-postprocessing` and
-  `pom-movie-postprocessing` skills. Script-only FVCOM folders without
+- `model-analysis/` now includes the active `pom-map-postprocessing`,
+  `pom-movie-postprocessing`, and `roms-map-postprocessing` skills. Script-only
+  FVCOM folders without
   `SKILL.md` remain reference material rather than installable skills.
 - `common-core/` and `forcing-builders/` remain less mature catalog families and
   should be expanded only through explicit skill development work.

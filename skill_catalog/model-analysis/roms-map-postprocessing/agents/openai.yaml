@@ -1,0 +1,4 @@
+interface:
+  display_name: "ROMS Map Postprocessing"
+  short_description: "Map staggered ROMS curvilinear fields."
+  default_prompt: "Use $roms-map-postprocessing to inspect and render a QA-ready static map from staggered ROMS curvilinear NetCDF fields."

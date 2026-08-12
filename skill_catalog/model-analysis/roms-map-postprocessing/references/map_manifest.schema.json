@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oma.local/schemas/roms_map_manifest_v1.json",
+  "title": "ROMS map manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "status", "created_utc", "inputs", "request",
+    "selection", "rendering", "quiver", "output"
+  ],
+  "properties": {
+    "schema_version": {"const": "roms_map_manifest_v1"},
+    "status": {"enum": ["pass", "pass_with_warnings"]},
+    "created_utc": {"type": "string", "pattern": "Z$"},
+    "inputs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["path", "size_bytes", "sha256", "raw_record_count", "geometry_sha256", "input_kind", "input_schema_version"],
+        "properties": {
+          "path": {"type": "string", "minLength": 1},
+          "size_bytes": {"type": "integer", "minimum": 1},
+          "sha256": {"$ref": "#/$defs/sha256"},
+          "raw_record_count": {"type": "integer", "minimum": 1},
+          "geometry_sha256": {"$ref": "#/$defs/sha256"},
+          "input_kind": {"enum": ["raw", "compact", "unclassified"]},
+          "input_schema_version": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "required": [
+        "variable", "layer", "time", "time_index", "limits_scope", "quantiles",
+        "requested_vmin", "requested_vmax"
+      ],
+      "properties": {
+        "variable": {"type": "string", "minLength": 1},
+        "layer": {"type": "string", "minLength": 1},
+        "time": {"type": ["string", "null"]},
+        "time_index": {"type": ["integer", "null"]},
+        "limits_scope": {"enum": ["frame", "series"]},
+        "quantiles": {"$ref": "#/$defs/pair"},
+        "requested_vmin": {"type": ["number", "null"]},
+        "requested_vmax": {"type": ["number", "null"]}
+      }
+    },
+    "selection": {
+      "type": "object",
+      "required": [
+        "normalized_time_utc", "original_time_utc", "normalization_offset_seconds",
+        "source", "source_record_index", "series_record_count", "duplicates_removed",
+        "geometry_sha256", "grid_shape", "angle_units", "angle_convention", "resolution", "units", "long_name"
+      ],
+      "properties": {
+        "normalized_time_utc": {"type": "string", "pattern": "Z$"},
+        "original_time_utc": {"type": "string", "pattern": "Z$"},
+        "normalization_offset_seconds": {"type": "number"},
+        "source": {"type": "string", "minLength": 1},
+        "source_record_index": {"type": "integer", "minimum": 0},
+        "series_record_count": {"type": "integer", "minimum": 1},
+        "duplicates_removed": {"type": "integer", "minimum": 0},
+        "geometry_sha256": {"$ref": "#/$defs/sha256"},
+        "grid_shape": {
+          "type": "array", "prefixItems": [{"type": "integer", "minimum": 1}, {"type": "integer", "minimum": 1}],
+          "minItems": 2, "maxItems": 2
+        },
+        "angle_units": {"const": "radians"},
+        "angle_convention": {"const": "xi_axis_counterclockwise_from_east"},
+        "resolution": {
+          "type": "object",
+          "required": ["input_kind", "input_schema_version", "angle_units", "angle_convention"],
+          "properties": {
+            "input_kind": {"enum": ["raw", "compact", "unclassified"]},
+            "input_schema_version": {"type": ["string", "null"]},
+            "angle_units": {"const": "radians"},
+            "angle_convention": {"const": "xi_axis_counterclockwise_from_east"}
+          }
+        },
+        "units": {"type": "string"},
+        "long_name": {"type": "string", "minLength": 1}
+      }
+    },
+    "rendering": {
+      "type": "object",
+      "required": [
+        "style", "cmap", "vmin", "vmax", "color_limit_method", "finite_wet_coverage",
+        "wet_cells", "finite_wet_cells", "quiver_count", "quiver_stride", "title", "dpi"
+      ],
+      "properties": {
+        "style": {"enum": ["pcolormesh", "contourf"]},
+        "cmap": {"type": "string", "minLength": 1},
+        "vmin": {"type": "number"},
+        "vmax": {"type": "number"},
+        "color_limit_method": {"enum": ["explicit", "frame_quantiles", "series_quantiles"]},
+        "finite_wet_coverage": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "wet_cells": {"type": "integer", "minimum": 1},
+        "finite_wet_cells": {"type": "integer", "minimum": 1},
+        "quiver_count": {"type": ["integer", "null"], "minimum": 0},
+        "quiver_stride": {"type": ["integer", "null"], "minimum": 1},
+        "title": {"type": "string"},
+        "dpi": {"type": "integer", "minimum": 1}
+      }
+    },
+    "quiver": {"type": "object", "required": ["mode"]},
+    "output": {
+      "type": "object",
+      "required": ["path", "size_bytes", "sha256", "format"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "size_bytes": {"type": "integer", "minimum": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "format": {"const": "png"}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "pair": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}
+  }
+}
