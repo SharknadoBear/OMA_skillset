@@ -143,7 +143,8 @@ usable skill families at different maturity levels:
   appropriate, and downloaded-data health checks. The connector set now includes
   HYCOM, NOAA CO-OPS, CFSv2, CUDEM, CUSP, GSHHS, NHD/NHM river tools, USGS
   rivers, usSEABED, `glofas-data-fetcher`, and the public-AWS
-  `cbofs-fetcher`, DBOFS, `sscofs-fetcher`, and `nyofs-fetcher` connectors.
+  `cbofs-fetcher`, `dbofs-fetcher`, `sscofs-fetcher`, and `nyofs-fetcher`
+  connectors.
 - `model-execution-hpc/kestrel-hpc` is a robust operational bridge skill, not
   merely a copied placeholder. It records Bear's Kestrel account context,
   required SSH MAC option, Password+OTP handling rules, Slurm job inspection and

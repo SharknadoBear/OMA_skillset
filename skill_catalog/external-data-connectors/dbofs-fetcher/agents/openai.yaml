@@ -1,0 +1,4 @@
+interface:
+  display_name: "DBOFS Fetcher"
+  short_description: "Plan, fetch, and QA NOAA DBOFS ROMS data."
+  default_prompt: "Use $dbofs-fetcher to plan, download, concatenate, extract, and health-check bounded NOAA DBOFS ROMS data from public AWS."
