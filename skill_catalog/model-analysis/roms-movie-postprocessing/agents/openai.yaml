@@ -1,0 +1,4 @@
+interface:
+  display_name: "ROMS Movie Postprocessing"
+  short_description: "Animate staggered ROMS curvilinear fields."
+  default_prompt: "Use $roms-movie-postprocessing to create a fixed-scale GIF from time-varying staggered ROMS curvilinear NetCDF fields."
