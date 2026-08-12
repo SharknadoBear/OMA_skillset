@@ -10,6 +10,12 @@
 
 Use unsigned HTTPS and ListObjectsV2. Paginate with `NextContinuationToken`. Do not require `aws`, boto3, s3fs, or credentials. Treat every ETag as opaque provenance; a multipart ETag containing `-` is not an MD5 checksum.
 
+### NCEI long-term fallback
+
+After successful AWS discovery leaves coverage unresolved, or for `source_policy: ncei_only`, list bounded year/month prefixes in the anonymous NCEI `prod-model` container under `port-of-new-york-and-new-jersey-operational-forecast-system-nyofs/YYYY/MM/`. The verified NCEI contract supports coarse nowcast fields and station nowcast/forecast files. It does not support the fine grid or field forecasts. Never fill an unavailable fine/forecast identity with coarse nowcast data.
+
+Historical `nos.nyofs.fields.nowcast.YYYYMMDD.tHHz.nc` files are ambiguous by name: older archives can contain one record at any hour, while later cycle files contain six hourly records at 05/11/17/23 UTC. Prefilter candidates by product, guidance, grid, and conservative nominal request overlap before using a bounded HTTP Range NetCDF time-coordinate probe. Some object servers ignore Range and return the complete object (for example, a roughly 5.8 MB cycle aggregate), so inventory and plan artifacts record the exact probe object count and response bytes under `source_discovery.ncei.coverage_probe`. Revalidate decoded times after download. Treat listing/network errors as failures, not empty coverage, and keep provider-specific ETags and caches distinct.
+
 ## Models, products, and grids
 
 NYOFS is a Princeton Ocean Model (POM) system with a structured curvilinear coarse grid (`nyofs`) and a separate nested fine grid (`nyofs_fg`). Do not combine the grids or apply FVCOM/ROMS topology rules.
@@ -97,4 +103,14 @@ Set global attributes identifying NYOFS, POM, coarse/fine grid, curvilinear geom
 
 `download_estimate.json` is the approval artifact. `fetch_manifest.json` is the transfer ledger. `inspection.json`, `extraction_manifest.json`, and `health_check.json` cover source structure, compact outputs, and final integrity.
 
+New transfers accept only a reviewed `nyofs_download_estimate_v2` plan. Bind the
+fetch manifest to the plan path and SHA-256, normalized request digest, selected
+source-object digest, exact count, and exact bytes. Store cache objects below
+`cache/raw/<source_id>/YYYY/MM/`; bind every v2 sidecar to the full source key,
+canonical URL, size, opaque ETag, Last-Modified value, local SHA-256, and source
+identity digest. Full-run extraction and health must revalidate those bindings.
+Explicit ad hoc inputs may be inspected, but cannot pass full-run acceptance.
+
 Critical findings include incomplete required cadence, corrupt size/hash evidence, grid/schema drift, invalid coordinates/masks/sigma, unpaired velocity components, speed inconsistency, an all-NaN frame, or less than 95 percent finite coverage over wet cells. Salinity and temperature are not assumed to exist. Broad elevation/current/wind limits are warnings and are never used for clipping.
+
+When a long request crosses a model/grid era and geometry, dimensions, masks, sigma metadata, vector conventions, or variable schemas change, split the request at the era boundary. Do not coerce incompatible records across eras.

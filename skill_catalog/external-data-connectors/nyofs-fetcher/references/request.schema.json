@@ -1,13 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://oma.local/schemas/nyofs_request_v1.json",
-  "title": "NYOFS Fetcher Request v1",
+  "$id": "https://oma.local/schemas/nyofs_request_v2.json",
+  "title": "NYOFS Fetcher Request v2",
   "description": "A bounded request for NOAA NYOFS inventory, planning, anonymous download, and optional POM field extraction. Runtime defaults are shown as annotations.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "start_utc", "end_utc_exclusive", "product", "guidance"],
   "properties": {
-    "schema_version": {"const": "nyofs_request_v1"},
+    "schema_version": {"enum": ["nyofs_request_v1", "nyofs_request_v2"]},
     "start_utc": {
       "type": "string",
       "format": "date-time",
@@ -51,9 +51,19 @@
     },
     "missing_policy": {"type": "string", "enum": ["error", "skip"], "default": "error"},
     "cache_policy": {"type": "string", "enum": ["keep", "delete_after_extract"], "default": "keep"},
-    "max_workers": {"type": "integer", "minimum": 1, "default": 4}
+    "max_workers": {"type": "integer", "minimum": 1, "default": 4},
+    "source_policy": {
+      "type": "string",
+      "enum": ["aws_then_ncei", "aws_only", "ncei_only"],
+      "default": "aws_then_ncei",
+      "description": "Use operational AWS first and fill missing semantic records from NCEI, or constrain discovery to one archive."
+    }
   },
   "allOf": [
+    {
+      "if": {"properties": {"schema_version": {"const": "nyofs_request_v1"}}, "required": ["schema_version"]},
+      "then": {"not": {"required": ["source_policy"]}}
+    },
     {
       "if": {"properties": {"guidance": {"const": "forecast"}}, "required": ["guidance"]},
       "then": {"required": ["run_cycle_utc"]}

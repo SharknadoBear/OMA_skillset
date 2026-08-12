@@ -1,15 +1,15 @@
 ---
 name: nyofs-fetcher
-description: Plan, inventory, anonymously download, concatenate, extract, and health-check NOAA New York and New Jersey Operational Forecast System (NYOFS) POM NetCDF data from the public AWS archive. Use when Codex needs bounded coarse or nested-fine NYOFS structured curvilinear fields, station passthrough files, exact byte and storage estimates, resumable cached transfers, sigma-layer surface/bottom/depth-average currents, or provenance-preserving QA artifacts.
+description: Plan, inventory, anonymously download, concatenate, extract, and health-check NOAA New York and New Jersey Operational Forecast System (NYOFS) POM NetCDF data from operational AWS with bounded NCEI long-term fallback. Use when Codex needs coarse or fine NYOFS fields, historical coarse coverage, stations, exact storage estimates, resumable caches, vertical views, or provenance-preserving QA.
 ---
 
 # NYOFS Fetcher
 
-Use this skill as the source-specific connector for NOAA NYOFS public AWS data. Keep requests time-bounded, estimate before fetching, and preserve machine-readable evidence for every run.
+Use this skill as the source-specific connector for NOAA NYOFS data. Prefer operational AWS and use NCEI only for uncovered, supported semantic records. Keep requests time-bounded, estimate before fetching, and preserve machine-readable evidence.
 
 ## Follow the workflow
 
-1. Create a `nyofs_request_v1` JSON request. Read [references/request.schema.json](references/request.schema.json) for the exact contract. Use an inclusive UTC `start_utc` and exclusive `end_utc_exclusive`.
+1. Create a `nyofs_request_v2` JSON request. Read [references/request.schema.json](references/request.schema.json) for the exact contract. Use `source_policy: aws_then_ncei` (default), `aws_only`, or `ncei_only`. V1 requests migrate to v2 with recorded provenance.
 2. Read [references/source_contract.md](references/source_contract.md) before interpreting filenames, aggregate-cycle coverage, POM grids, sigma layers, masks, or source variables.
 3. Inventory and estimate before downloading:
 
@@ -22,7 +22,7 @@ python scripts/estimate_data_request.py --request request.json --run-dir runs/ca
 5. Fetch, inspect actual NetCDF metadata, and extract fields:
 
 ```bash
-python scripts/nyofs_fetcher.py fetch --request request.json --run-dir runs/case
+python scripts/nyofs_fetcher.py fetch --plan runs/case/download_estimate.json --run-dir runs/case
 python scripts/nyofs_fetcher.py inspect --request request.json --run-dir runs/case
 python scripts/nyofs_fetcher.py extract --request request.json --run-dir runs/case
 ```
@@ -35,11 +35,12 @@ python scripts/check_download_health.py --request request.json --run-dir runs/ca
 
 ## Use each command deliberately
 
-- Use `inventory` to discover matching objects in both current daily and legacy monthly layouts without downloading NetCDF payloads.
+- Use `inventory` to discover matching objects in both current daily and legacy monthly layouts. Ambiguous historical NCEI coarse-field names require a bounded HTTP Range NetCDF time-coordinate probe after product/grid/window prefiltering; a server may return the complete small aggregate despite the Range request. Review `source_discovery.ncei.coverage_probe.object_count` and `.bytes` as discovery transfer evidence.
 - Use `plan` through `nyofs_fetcher.py`, or the compatible `estimate_data_request.py` hook, to select cycle aggregates, calculate exact bytes, flag nominal time gaps, apply the four-times-free-space gate, and write `download_estimate.json`.
 - Use `fetch` only after plan review. Preserve resumable `.part` files, validated cache hits, SHA-256 hashes, source ETags, and transfer outcomes in `fetch_manifest.json`.
 - Use `inspect` to report actual variables, dimensions, time coordinates, mask values, grid geometry, and sigma ordering. Treat downloaded time coordinates as authoritative.
 - Use `extract` only for `product: fields`. Crop by normalized verified time, reject geometry/schema drift, and write one compressed compact NetCDF per requested grid.
+- If a long request crosses a model/grid era and triggers geometry, dimensions, masks, sigma, vector, or variable-schema drift, split it at the era boundary; never coerce incompatible records into one product.
 
 Run `python scripts/nyofs_fetcher.py <command> --help` before using unfamiliar options.
 
@@ -56,7 +57,8 @@ Run `python scripts/nyofs_fetcher.py <command> --help` before using unfamiliar o
 
 ## Preserve evidence and safety
 
-- Access `noaa-nos-ofs-pds` anonymously over HTTPS/ListObjectsV2. Do not request or store AWS credentials, tokens, passwords, or signed URLs.
+- Access operational AWS and NCEI `prod-model` anonymously over HTTPS/ListObjectsV2. Treat discovery errors as source failures, not missing coverage. Do not request or store credentials, tokens, passwords, or signed URLs.
+- NCEI supports coarse NYOFS nowcast fields and station nowcast/forecast files. Never substitute coarse nowcast data for fine-grid or field-forecast coverage.
 - Keep raw cache files by default. Honor `delete_after_extract` only after extraction and a passing health check.
 - Preserve source keys/URLs, sizes, opaque ETags, last-modified times, grids, cycles, hashes, retries, cache decisions, normalized request content, and routing decisions.
 - Fail on missing required timestamps under `missing_policy: error`; record skipped coverage explicitly under `missing_policy: skip`.

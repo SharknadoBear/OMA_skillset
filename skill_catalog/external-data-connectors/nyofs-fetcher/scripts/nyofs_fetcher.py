@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan, fetch, inspect, and extract NOAA NYOFS POM data from public AWS."""
+"""Plan, fetch, inspect, and extract NOAA NYOFS POM data from AWS/NCEI."""
 
 from __future__ import annotations
 
@@ -20,14 +20,21 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 from urllib.parse import quote
 
+try:
+    from . import ofs_archive_sources as archive_sources
+except ImportError:
+    import ofs_archive_sources as archive_sources
+
 BUCKET = "noaa-nos-ofs-pds"
 S3_ENDPOINT = f"https://{BUCKET}.s3.amazonaws.com"
-SCHEMA_VERSION = "nyofs_request_v1"
+SCHEMA_VERSION = "nyofs_request_v2"
+LEGACY_SCHEMA_VERSION = "nyofs_request_v1"
 COMPACT_SCHEMA_VERSION = "nyofs_compact_fields_v1"
 CYCLE_HOURS = {5, 11, 17, 23}
 DEFAULT_VARIABLES = ["zeta", "u", "v", "air_u", "air_v"]
 DEFAULT_VIEWS: list[str | int] = ["surface", "bottom", "depth_average"]
 UTC = timezone.utc
+SOURCE_POLICIES = {"aws_then_ncei", "aws_only", "ncei_only"}
 
 _CURRENT_RE = re.compile(
     r"^(?P<model>nyofs(?:_fg)?)\.t(?P<hour>\d{2})z\."
@@ -126,6 +133,11 @@ def _read_json(path: str | Path) -> Any:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(_json_clean(value), sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _view_suffix(view: str | int) -> str:
     return f"sigma_{view}" if isinstance(view, int) else str(view)
 
@@ -135,6 +147,17 @@ def load_request(path: str | Path) -> dict[str, Any]:
     if not isinstance(mapping, Mapping):
         raise ValueError("request root must be a JSON object")
     return validate_request(mapping)
+
+
+def request_migration(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    original = mapping.get("schema_version")
+    return {
+        "original_schema_version": original,
+        "normalized_schema_version": SCHEMA_VERSION,
+        "migrated": original == LEGACY_SCHEMA_VERSION,
+        "defaults_applied": ["source_policy=aws_then_ncei"]
+        if original == LEGACY_SCHEMA_VERSION and "source_policy" not in mapping else [],
+    }
 
 
 def validate_request(mapping: Mapping[str, Any]) -> dict[str, Any]:
@@ -151,12 +174,15 @@ def validate_request(mapping: Mapping[str, Any]) -> dict[str, Any]:
         "missing_policy",
         "cache_policy",
         "max_workers",
+        "source_policy",
     }
     unknown = sorted(set(mapping) - allowed)
     if unknown:
         raise ValueError(f"unknown request properties: {', '.join(unknown)}")
-    if mapping.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError(f"schema_version must be {SCHEMA_VERSION!r}")
+    if mapping.get("schema_version") not in {SCHEMA_VERSION, LEGACY_SCHEMA_VERSION}:
+        raise ValueError(f"schema_version must be {SCHEMA_VERSION!r} or {LEGACY_SCHEMA_VERSION!r}")
+    if mapping.get("schema_version") == LEGACY_SCHEMA_VERSION and "source_policy" in mapping:
+        raise ValueError("source_policy is a v2-only field; omit it from v1 requests and migrate first")
     start = _parse_utc(mapping.get("start_utc"), "start_utc")
     end = _parse_utc(mapping.get("end_utc_exclusive"), "end_utc_exclusive")
     if end <= start:
@@ -223,6 +249,9 @@ def validate_request(mapping: Mapping[str, Any]) -> dict[str, Any]:
     max_workers = mapping.get("max_workers", 4)
     if isinstance(max_workers, bool) or not isinstance(max_workers, int) or max_workers < 1:
         raise ValueError("max_workers must be a positive integer")
+    source_policy = mapping.get("source_policy", "aws_then_ncei")
+    if source_policy not in SOURCE_POLICIES:
+        raise ValueError(f"source_policy must be one of {sorted(SOURCE_POLICIES)}")
 
     normalized: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -234,6 +263,7 @@ def validate_request(mapping: Mapping[str, Any]) -> dict[str, Any]:
         "missing_policy": missing_policy,
         "cache_policy": cache_policy,
         "max_workers": max_workers,
+        "source_policy": source_policy,
     }
     if run_cycle is not None:
         normalized["run_cycle_utc"] = _iso(run_cycle)
@@ -244,6 +274,8 @@ def validate_request(mapping: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _layout_for_key(key: str) -> str:
+    if key.startswith(archive_sources.get_source_descriptor("ncei_long_term", "nyofs")["root_prefix"]):
+        return "ncei_monthly"
     if re.search(r"/\d{4}/\d{2}/\d{2}/", key):
         return "daily"
     if re.search(r"/\d{6}/", key):
@@ -268,12 +300,16 @@ def parse_object_key(key: str) -> dict[str, Any] | None:
     if legacy:
         guidance = values["guidance"].lower()
         lead = None
-        valid = None
-        aggregate = True
+        historical_single = product == "fields" and guidance == "nowcast" and run.hour not in CYCLE_HOURS
+        valid = run if historical_single else None
+        aggregate = not historical_single
         if guidance == "nowcast":
-            hours_back = 5 if product == "fields" else 6
-            expected_start = run - timedelta(hours=hours_back)
-            expected_end = run + (timedelta(hours=1) if product == "fields" else timedelta(minutes=6))
+            if historical_single:
+                expected_start, expected_end = run, run + timedelta(hours=1)
+            else:
+                hours_back = 5 if product == "fields" else 6
+                expected_start = run - timedelta(hours=hours_back)
+                expected_end = run + (timedelta(hours=1) if product == "fields" else timedelta(minutes=6))
         else:
             if product == "fields":
                 expected_start = run + timedelta(hours=1)
@@ -301,7 +337,7 @@ def parse_object_key(key: str) -> dict[str, Any] | None:
         "key": key,
         "name": name,
         "layout": _layout_for_key(key),
-        "naming": "legacy_aggregate" if legacy else "current_aggregate",
+        "naming": ("legacy_single" if legacy and not aggregate else "legacy_aggregate") if legacy else "current_aggregate",
         "aggregate": aggregate,
         "grid": grid,
         "model": model,
@@ -330,47 +366,39 @@ def list_s3_objects(
     endpoint: str = S3_ENDPOINT,
     timeout: float = 60.0,
 ) -> list[dict[str, Any]]:
-    requests = _requests_module()
-    client = session or requests.Session()
+    if endpoint != S3_ENDPOINT:
+        # Retain the injected endpoint hook only for the pre-v2 offline fixture.
+        descriptor_endpoint = archive_sources.AWS_ENDPOINT
+        if endpoint != descriptor_endpoint:
+            return _legacy_test_listing(prefix, session=session, endpoint=endpoint, timeout=timeout)
+    return archive_sources.list_objects_v2(
+        "aws_operational", "nyofs", prefix, session=session, timeout=timeout,
+    )
+
+
+def _legacy_test_listing(prefix: str, *, session: Any, endpoint: str, timeout: float) -> list[dict[str, Any]]:
+    """Compatibility shim for the existing in-memory pagination test only."""
     token: str | None = None
     objects: list[dict[str, Any]] = []
     while True:
         params: dict[str, Any] = {"list-type": "2", "prefix": prefix, "max-keys": 1000}
         if token:
             params["continuation-token"] = token
-        response = client.get(endpoint + "/", params=params, timeout=timeout)
+        response = session.get(endpoint + "/", params=params, timeout=timeout)
         response.raise_for_status()
         root = ET.fromstring(response.content)
         for node in root.iter():
-            if node.tag.rsplit("}", 1)[-1] != "Contents":
-                continue
-            key = _xml_text(node, "Key")
-            size = _xml_text(node, "Size")
-            if not key or size is None:
-                continue
-            objects.append(
-                {
-                    "key": key,
-                    "size": int(size),
-                    "etag": (_xml_text(node, "ETag") or "").strip('"'),
-                    "last_modified": _xml_text(node, "LastModified"),
-                    "storage_class": _xml_text(node, "StorageClass"),
-                    "url": endpoint + "/" + quote(key, safe="/"),
-                }
-            )
-        truncated = next(
-            (node.text for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "IsTruncated"),
-            "false",
-        )
+            if node.tag.rsplit("}", 1)[-1] == "Contents":
+                key, size = _xml_text(node, "Key"), _xml_text(node, "Size")
+                if key and size:
+                    objects.append({"key": key, "size": int(size), "etag": (_xml_text(node, "ETag") or "").strip('"'),
+                                    "last_modified": _xml_text(node, "LastModified"), "url": endpoint + "/" + quote(key, safe="/")})
+        truncated = next((node.text for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "IsTruncated"), "false")
         if str(truncated).lower() != "true":
-            break
-        token = next(
-            (node.text for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "NextContinuationToken"),
-            None,
-        )
+            return objects
+        token = next((node.text for node in root.iter() if node.tag.rsplit("}", 1)[-1] == "NextContinuationToken"), None)
         if not token:
             raise RuntimeError("S3 listing is truncated but has no continuation token")
-    return objects
 
 
 def _days(start: datetime, end: datetime) -> Iterable[datetime]:
@@ -402,29 +430,298 @@ def discovery_prefixes(request: Mapping[str, Any]) -> list[str]:
     return daily + monthly
 
 
-def discover_objects(
-    request: Mapping[str, Any],
-    *,
-    session: Any | None = None,
-    endpoint: str = S3_ENDPOINT,
-) -> list[dict[str, Any]]:
+def _source_ids(request: Mapping[str, Any]) -> list[str]:
+    return ["aws_operational"] if request["source_policy"] == "aws_only" else (["ncei_long_term"] if request["source_policy"] == "ncei_only" else ["aws_operational", "ncei_long_term"])
+
+
+def _ncei_capability(request: Mapping[str, Any]) -> tuple[bool, str | None]:
+    if request["product"] == "fields" and request["guidance"] == "forecast":
+        return False, "NCEI does not provide verified NYOFS field-forecast fallback"
+    if request["grid"] == "fine":
+        return False, "NCEI does not provide verified NYOFS fine-grid fallback"
+    return True, None
+
+
+def _ncei_prefixes(request: Mapping[str, Any]) -> list[str]:
+    descriptor = archive_sources.get_source_descriptor("ncei_long_term", "nyofs")
+    if request["guidance"] == "forecast":
+        center = _parse_utc(request["run_cycle_utc"])
+        first, last = center - timedelta(days=1), center + timedelta(days=1)
+    else:
+        first = _parse_utc(request["start_utc"]) - timedelta(days=1)
+        last = _parse_utc(request["end_utc_exclusive"]) + timedelta(days=1)
+    return [f"{descriptor['root_prefix']}{month:%Y/%m}/" for month in _month_starts(first, last)]
+
+
+def _decorate_source(item: Mapping[str, Any], source_id: str) -> dict[str, Any]:
+    descriptor = archive_sources.get_source_descriptor(source_id, "nyofs")
+    value = {**descriptor, **dict(item), "source_id": source_id}
+    if str(value.get("key", "")).startswith(descriptor["root_prefix"]):
+        value["url"] = archive_sources.canonical_object_url(source_id, "nyofs", str(value["key"]))
+    value.setdefault("size", int(value.get("size_bytes", 0)))
+    value["naming_era"] = value.get("naming")
+    identity = {
+        "model": "nyofs", "grid": value.get("grid"), "product": value.get("product"),
+        "guidance": value.get("guidance"), "run_time": value.get("run_time"),
+        "valid_time": value.get("valid_time"), "aggregate": value.get("aggregate"),
+    }
+    value["semantic_identity"] = identity
+    value["semantic_identity_digest"] = archive_sources.semantic_identity_digest(identity)
+    value["source_identity"] = archive_sources.source_identity_digest(value)
+    return value
+
+
+def probe_legacy_ncei_coverage(
+    item: Mapping[str, Any], *, session: Any | None = None, timeout: float = 60.0,
+    max_probe_bytes: int = 8 * 1024 * 1024,
+) -> dict[str, Any]:
+    """Decode ambiguous legacy NYOFS times from a bounded HTTP range probe."""
+    if item.get("source_id") != "ncei_long_term" or item.get("naming") != "legacy_aggregate" or item.get("product") != "fields":
+        return dict(item)
+    own = session is None
+    client = session or _requests_module().Session()
+    size = int(item["size"])
+    if size > max_probe_bytes:
+        raise RuntimeError(
+            f"ambiguous legacy NYOFS object is {size} bytes, above the reviewed "
+            f"{max_probe_bytes}-byte metadata-probe ceiling"
+        )
+    errors: list[str] = []
+    transferred_bytes = 0
+    request_count = 0
+    try:
+        probe_size = min(size, 1024 * 1024)
+        while probe_size <= min(size, max_probe_bytes):
+            response = client.get(
+                str(item["url"]), headers={"Range": f"bytes=0-{probe_size - 1}"},
+                timeout=timeout,
+            )
+            try:
+                response.raise_for_status()
+                remote_etag = _clean_etag(response.headers.get("ETag"))
+                if remote_etag != _clean_etag(item.get("etag")):
+                    raise RuntimeError("NCEI probe ETag differs from listing")
+                content_range = archive_sources.parse_content_range(response.headers.get("Content-Range"))
+                if response.status_code == 206 and content_range != (0, probe_size - 1, size):
+                    raise RuntimeError("NCEI probe Content-Range differs from the planned object")
+                content = bytes(response.content)
+                request_count += 1
+                transferred_bytes += len(content)
+                if response.status_code == 200:
+                    if len(content) != size:
+                        raise RuntimeError("NCEI server ignored Range but did not return the complete listed object")
+                elif len(content) != probe_size:
+                    raise RuntimeError("NCEI probe returned an unexpected byte count")
+                try:
+                    import netCDF4
+                    with netCDF4.Dataset("nyofs_probe.nc", memory=content) as ds:
+                        decoded = decode_times(ds, "fields")
+                    if not decoded:
+                        raise RuntimeError("bounded probe decoded no time records")
+                    times = [record.normalized for record in decoded]
+                    result = dict(item)
+                    result["aggregate"] = len(times) > 1
+                    result["naming"] = "legacy_aggregate" if len(times) > 1 else "legacy_single"
+                    result["valid_time"] = _iso(times[0]) if len(times) == 1 else None
+                    result["expected_start_utc"] = _iso(min(times))
+                    result["expected_end_utc_exclusive"] = _iso(max(times) + timedelta(hours=1))
+                    result["coverage_probe"] = {
+                        "method": "bounded_http_range_netcdf_time_decode",
+                        "bytes": transferred_bytes,
+                        "request_count": request_count,
+                        "final_response_bytes": len(content),
+                        "server_honored_range": response.status_code == 206,
+                        "record_count": len(times),
+                        "first_utc": _iso(min(times)), "last_utc": _iso(max(times)),
+                        "etag": remote_etag,
+                    }
+                    return _decorate_source(result, "ncei_long_term")
+                except Exception as exc:
+                    errors.append(f"{probe_size} bytes: {exc}")
+                    if response.status_code == 200:
+                        raise RuntimeError(
+                            "could not decode ambiguous legacy NYOFS coverage from the complete "
+                            "server-returned object: " + errors[-1]
+                        ) from exc
+            finally:
+                if hasattr(response, "close"):
+                    response.close()
+            if probe_size == size or probe_size == max_probe_bytes:
+                break
+            probe_size = min(size, max_probe_bytes, probe_size * 2)
+        raise RuntimeError("could not decode ambiguous legacy NYOFS coverage: " + "; ".join(errors[-3:]))
+    finally:
+        if own and hasattr(client, "close"):
+            client.close()
+
+
+def _nominally_relevant_before_probe(item: Mapping[str, Any], request: Mapping[str, Any]) -> bool:
+    """Cheap semantic/window gate applied before any ambiguous NetCDF probe."""
+    if item.get("product") != request["product"] or item.get("guidance") != request["guidance"]:
+        return False
+    if request["grid"] != "both" and item.get("grid") != request["grid"]:
+        return False
+    if request["guidance"] == "forecast" and item.get("run_time") != request.get("run_cycle_utc"):
+        return False
+    start = _parse_utc(request["start_utc"])
+    end = _parse_utc(request["end_utc_exclusive"])
+    return _overlaps(item, start, end)
+
+
+def _coverage_probe_summary(objects: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    probes = [item.get("coverage_probe") for item in objects if isinstance(item.get("coverage_probe"), Mapping)]
+    return {
+        "object_count": len(probes),
+        "bytes": sum(int(item.get("bytes", 0)) for item in probes),
+    }
+
+
+def _discover_source(request: Mapping[str, Any], source_id: str, *, session: Any | None = None) -> list[dict[str, Any]]:
+    prefixes = discovery_prefixes(request) if source_id == "aws_operational" else _ncei_prefixes(request)
     found: dict[str, dict[str, Any]] = {}
-    for prefix in discovery_prefixes(request):
-        for raw in list_s3_objects(prefix, session=session, endpoint=endpoint):
+    for prefix in prefixes:
+        for raw in archive_sources.list_objects_v2(source_id, "nyofs", prefix, session=session):
             parsed = parse_object_key(raw["key"])
             if parsed is None:
                 continue
-            item = {**raw, **parsed}
-            if item["product"] != request["product"] or item["guidance"] != request["guidance"]:
+            item = _decorate_source({**raw, **parsed}, source_id)
+            if not _nominally_relevant_before_probe(item, request):
                 continue
-            if request["grid"] != "both" and item["grid"] != request["grid"]:
+            if source_id == "ncei_long_term" and item.get("naming") == "legacy_aggregate" and item.get("product") == "fields":
+                item = probe_legacy_ncei_coverage(item, session=session)
+            archive_sources.validate_source_object("nyofs", item, expected_source_id=source_id)
+            # The decoded time coordinate is authoritative and may narrow the
+            # conservative pre-probe span out of the requested window.
+            if not _nominally_relevant_before_probe(item, request):
                 continue
             found[item["key"]] = item
     return sorted(found.values(), key=lambda x: (x["run_time"], x["grid"], x["key"]))
 
 
-def _preference(item: Mapping[str, Any]) -> tuple[int, int, str]:
+def _selection_probe(request: Mapping[str, Any], objects: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    probe = dict(request)
+    probe["missing_policy"] = "skip"
+    return select_objects(probe, objects)
+
+
+def _scientific_fallback_times(
+    request: Mapping[str, Any], objects: Sequence[Mapping[str, Any]]
+) -> list[str]:
+    """Find station boundaries covered only by a following cycle's initial record."""
+    if request["product"] != "stations" or request["guidance"] != "nowcast":
+        return []
+    start = _parse_utc(request["start_utc"])
+    end = _parse_utc(request["end_utc_exclusive"])
+    candidates = [
+        item for item in objects
+        if item.get("product") == "stations" and item.get("guidance") == "nowcast"
+    ]
+    unresolved: list[str] = []
+    for stamp in _expected_times(start, end, 360):
+        covering = [item for item in candidates if stamp in _nominal_item_times(item, "stations")]
+        if (
+            covering
+            and any(_parse_utc(item["expected_start_utc"]) == stamp for item in covering)
+            and not any(_parse_utc(item["run_time"]) == stamp for item in covering)
+        ):
+            unresolved.append(_iso(stamp))
+    return unresolved
+
+
+def validate_fallback_decision(
+    request: Mapping[str, Any], trace: Mapping[str, Any], selected: Sequence[Mapping[str, Any]]
+) -> list[str]:
+    """Validate source policy, provider order, and fallback trigger evidence."""
+    failures: list[str] = []
+    policy = request.get("source_policy")
+    selected_sources = {str(item.get("source_id")) for item in selected}
+    aws = trace.get("aws") if isinstance(trace.get("aws"), Mapping) else {}
+    ncei = trace.get("ncei") if isinstance(trace.get("ncei"), Mapping) else {}
+    if trace.get("policy") != policy:
+        failures.append("source-discovery policy differs from the normalized request")
+    if trace.get("injected_inventory"):
+        failures.append("reviewed transfer plan contains injected rather than provider discovery evidence")
+    if policy == "aws_only":
+        if "ncei_long_term" in selected_sources or ncei.get("status") not in {None, "not_requested"}:
+            failures.append("aws_only plan contains or attempted NCEI objects")
+        if aws.get("status") != "success":
+            failures.append("aws_only plan lacks successful AWS discovery evidence")
+    elif policy == "ncei_only":
+        if "aws_operational" in selected_sources or aws.get("status") not in {None, "not_requested"}:
+            failures.append("ncei_only plan contains or attempted AWS objects")
+        if ncei.get("status") != "success":
+            failures.append("ncei_only plan lacks successful NCEI discovery evidence")
+    elif policy == "aws_then_ncei":
+        if aws.get("status") != "success":
+            failures.append("aws_then_ncei plan lacks successful primary AWS discovery evidence")
+        if "ncei_long_term" in selected_sources:
+            before = trace.get("coverage_before_fallback")
+            missing = before if isinstance(before, list) else (
+                before.get("missing_times") if isinstance(before, Mapping) else None
+            )
+            scientific = trace.get("scientific_precedence_before_fallback")
+            if trace.get("fallback_triggered") is not True:
+                failures.append("NCEI selection lacks an explicit fallback trigger")
+            if ncei.get("status") != "success":
+                failures.append("NCEI selection lacks successful NCEI discovery evidence")
+            if not ((isinstance(missing, list) and missing) or (isinstance(scientific, list) and scientific)):
+                failures.append("NCEI fallback lacks an unresolved AWS semantic/scientific record")
+    else:
+        failures.append("source policy is invalid")
+    return failures
+
+
+def discover_objects(
+    request: Mapping[str, Any],
+    *,
+    session: Any | None = None,
+    endpoint: str = S3_ENDPOINT,
+    with_trace: bool = False,
+) -> Any:
+    normalized = validate_request(request)
+    policy = normalized["source_policy"]
+    trace: dict[str, Any] = {
+        "policy": policy, "aws": {"status": "not_requested", "object_count": 0},
+        "ncei": {"status": "not_requested", "object_count": 0},
+        "fallback_triggered": False, "fallback_reason": None,
+    }
+    if policy == "ncei_only":
+        capable, reason = _ncei_capability(normalized)
+        if not capable:
+            raise ValueError(reason)
+        ncei = _discover_source(normalized, "ncei_long_term", session=session)
+        trace["ncei"] = {"status": "success", "object_count": len(ncei), "prefixes": _ncei_prefixes(normalized),
+                         "coverage_probe": _coverage_probe_summary(ncei)}
+        trace["coverage_after_fallback"] = _selection_probe(normalized, ncei)["missing_times"]
+        return (ncei, trace) if with_trace else ncei
+    # Any AWS listing exception propagates; it never triggers fallback.
+    aws = _discover_source(normalized, "aws_operational", session=session)
+    trace["aws"] = {"status": "success", "object_count": len(aws), "prefixes": discovery_prefixes(normalized)}
+    before = _selection_probe(normalized, aws)
+    unresolved = list(before["missing_times"])
+    scientific = _scientific_fallback_times(normalized, aws)
+    trace["scientific_precedence_before_fallback"] = scientific
+    trace["coverage_before_fallback"] = unresolved
+    combined = list(aws)
+    if policy == "aws_then_ncei" and (unresolved or scientific):
+        capable, reason = _ncei_capability(normalized)
+        if capable:
+            trace["fallback_triggered"] = True
+            trace["fallback_reason"] = "AWS discovery succeeded but semantic coverage remained unresolved"
+            ncei = _discover_source(normalized, "ncei_long_term", session=session)
+            trace["ncei"] = {"status": "success", "object_count": len(ncei), "prefixes": _ncei_prefixes(normalized),
+                             "coverage_probe": _coverage_probe_summary(ncei)}
+            combined.extend(ncei)
+        else:
+            trace["ncei"] = {"status": "unsupported", "object_count": 0, "reason": reason}
+            trace["fallback_reason"] = reason
+    trace["coverage_after_fallback"] = _selection_probe(normalized, combined)["missing_times"]
+    return (combined, trace) if with_trace else combined
+
+
+def _preference(item: Mapping[str, Any]) -> tuple[int, int, int, str]:
     return (
+        1 if item.get("source_id", "aws_operational") == "aws_operational" else 0,
         1 if item.get("naming") == "current_aggregate" else 0,
         1 if item.get("layout") == "daily" else 0,
         str(item.get("key", "")),
@@ -506,7 +803,7 @@ def select_objects(request: Mapping[str, Any], objects: Sequence[Mapping[str, An
     if missing and request["missing_policy"] == "error":
         preview = ", ".join(f"{item['grid']} {item['time_utc']}" for item in missing[:8])
         raise RuntimeError(f"source inventory is missing {len(missing)} required timestamps: {preview}")
-    if not selected:
+    if not selected and request["missing_policy"] == "error":
         raise RuntimeError("source inventory did not contain any matching NYOFS objects")
     return {
         "selected": selected,
@@ -535,16 +832,22 @@ def inventory_request(
     session: Any | None = None,
     endpoint: str = S3_ENDPOINT,
 ) -> dict[str, Any]:
-    normalized = load_request(request) if isinstance(request, (str, Path)) else validate_request(request)
-    discovered = [dict(item) for item in (objects if objects is not None else discover_objects(normalized, session=session, endpoint=endpoint))]
+    raw_request = _read_json(request) if isinstance(request, (str, Path)) else request
+    lineage = request_migration(raw_request)
+    normalized = validate_request(raw_request)
+    if objects is not None:
+        discovered = [dict(item) for item in objects]
+        trace = {"policy": normalized["source_policy"], "injected_inventory": True}
+    else:
+        discovered, trace = discover_objects(normalized, session=session, endpoint=endpoint, with_trace=True)
     report = {
-        "schema_version": "nyofs_inventory_v1",
+        "schema_version": "nyofs_inventory_v2",
         "created_utc": _iso(datetime.now(UTC)),
         "request": normalized,
-        "prefixes": discovery_prefixes(normalized),
+        "request_lineage": lineage,
+        "source_discovery": trace,
         "object_count": len(discovered),
         "objects": discovered,
-        "source": {"bucket": BUCKET, "endpoint": endpoint, "access": "anonymous_https_listobjectsv2"},
     }
     write_json_atomic(Path(run_dir) / "inventory.json", report)
     return report
@@ -559,11 +862,18 @@ def plan_request(
     session: Any | None = None,
     endpoint: str = S3_ENDPOINT,
 ) -> dict[str, Any]:
-    normalized = load_request(request) if isinstance(request, (str, Path)) else validate_request(request)
-    discovered = [dict(item) for item in (objects if objects is not None else discover_objects(normalized, session=session, endpoint=endpoint))]
+    raw_request = _read_json(request) if isinstance(request, (str, Path)) else request
+    lineage = request_migration(raw_request)
+    normalized = validate_request(raw_request)
+    if objects is not None:
+        discovered = [dict(item) for item in objects]
+        trace = {"policy": normalized["source_policy"], "injected_inventory": True}
+    else:
+        discovered, trace = discover_objects(normalized, session=session, endpoint=endpoint, with_trace=True)
     selection = select_objects(normalized, discovered)
-    incomplete = [item["key"] for item in selection["selected"] if not isinstance(item.get("size"), int) or item["size"] < 0]
-    total = sum(int(item.get("size", 0)) for item in selection["selected"])
+    selected = [_decorate_source(item, str(item.get("source_id") or "aws_operational")) for item in selection["selected"]]
+    incomplete = [item["key"] for item in selected if not isinstance(item.get("size"), int) or item["size"] <= 0 or not item.get("etag") or not item.get("last_modified")]
+    total = sum(int(item.get("size", 0)) for item in selected)
     run_path = Path(run_dir)
     free = _disk_free(run_path)
     required = 4 * total
@@ -577,18 +887,28 @@ def plan_request(
         route = "kestrel"
         decision = "local_free_space_gate_failed"
     report = {
-        "schema_version": "nyofs_download_estimate_v1",
+        "schema_version": "nyofs_download_estimate_v2",
         "created_utc": _iso(datetime.now(UTC)),
         "request": normalized,
-        "source": {"bucket": BUCKET, "endpoint": endpoint, "access": "anonymous_https_listobjectsv2"},
-        "objects": selection["selected"],
-        "object_count": len(selection["selected"]),
+        "request_lineage": lineage,
+        "normalized_request_sha256": _canonical_json_sha256(normalized),
+        "source_discovery": trace,
+        "objects": selected,
+        "object_count": len(selected),
+        "selected_objects_sha256": _canonical_json_sha256(sorted(selected, key=lambda item: (str(item.get("source_id")), str(item.get("key"))))),
         "total_bytes": total,
         "total_gib": total / 1024**3,
         "incomplete_size_keys": incomplete,
         "missing_times": selection["missing_times"],
         "duplicate_times": selection["duplicate_times"],
         "duplicate_objects": selection["duplicate_objects"],
+        "source_totals": {
+            source_id: {
+                "object_count": sum(item.get("source_id") == source_id for item in selected),
+                "bytes": sum(int(item["size"]) for item in selected if item.get("source_id") == source_id),
+            }
+            for source_id in ("aws_operational", "ncei_long_term")
+        },
         "nominal_time_count": selection["nominal_time_count"],
         "nominal_time_count_by_grid": selection["nominal_time_count_by_grid"],
         "coverage_note": selection["coverage_note"],
@@ -637,6 +957,47 @@ def _destination_for_key(run_dir: Path, key: str) -> Path:
     return destination
 
 
+def _destination_for_object(run_dir: Path, item: Mapping[str, Any]) -> Path:
+    return run_dir / "cache" / "raw" / archive_sources.cache_relpath(item)
+
+
+def _legacy_aws_cache_result(item: Mapping[str, Any], destination: Path) -> dict[str, Any] | None:
+    """Strictly bind and reuse a historical v1 AWS cache in place."""
+    if item.get("source_id") != "aws_operational" or not destination.is_file():
+        return None
+    sidecar_path = _download_sidecar(destination)
+    if not sidecar_path.is_file() or destination.stat().st_size != int(item["size"]):
+        return None
+    try:
+        sidecar = _read_json(sidecar_path)
+    except Exception:
+        return None
+    digest = _sha256(destination)
+    if any((
+        sidecar.get("schema_version") != "nyofs_cached_object_v1",
+        sidecar.get("key") != item.get("key"), sidecar.get("url") != item.get("url"),
+        int(sidecar.get("size", -1)) != int(item["size"]),
+        _clean_etag(sidecar.get("etag")) != _clean_etag(item.get("etag")),
+        sidecar.get("last_modified") != item.get("last_modified"),
+        sidecar.get("sha256") != digest,
+    )):
+        return None
+    try:
+        netCDF4, _ = _netcdf_modules()
+        with netCDF4.Dataset(destination) as ds:
+            if not ds.dimensions or not ds.variables or "time" not in ds.variables:
+                return None
+    except Exception:
+        return None
+    return {
+        "key": item["key"], "url": item["url"], "local_path": str(destination.resolve()),
+        "status": "cache_hit", "size": int(item["size"]), "etag": _clean_etag(item.get("etag")),
+        "sha256": digest, "resumed": False, "resumed_from_bytes": 0, "retry_count": 0,
+        "legacy_cache_reused": True, "cache_layout": "legacy_aws_v1", "source": dict(item),
+        "source_id": "aws_operational", "source_identity": archive_sources.source_identity_digest(item),
+    }
+
+
 def _cache_result(item: Mapping[str, Any], destination: Path) -> dict[str, Any] | None:
     sidecar = _download_sidecar(destination)
     if not destination.is_file() or not sidecar.is_file():
@@ -650,6 +1011,17 @@ def _cache_result(item: Mapping[str, Any], destination: Path) -> dict[str, Any] 
         return None
     expected_etag = _clean_etag(item.get("etag"))
     if expected_etag and _clean_etag(metadata.get("etag")) != expected_etag:
+        return None
+    expected_identity = archive_sources.source_identity_digest(item) if item.get("source_id") else None
+    if (
+        metadata.get("schema_version") != "nyofs_cached_object_v2"
+        or metadata.get("source_id") != item.get("source_id")
+        or metadata.get("source_identity") != expected_identity
+        or metadata.get("key") != item.get("key")
+        or metadata.get("url") != item.get("url")
+        or metadata.get("last_modified") != item.get("last_modified")
+        or metadata.get("etag_semantics") != "opaque_provenance"
+    ):
         return None
     expected_hash = str(metadata.get("sha256", ""))
     if len(expected_hash) != 64:
@@ -669,6 +1041,8 @@ def _cache_result(item: Mapping[str, Any], destination: Path) -> dict[str, Any] 
         "resumed_from_bytes": 0,
         "retry_count": 0,
         "source": dict(item),
+        "source_id": item.get("source_id"),
+        "source_identity": expected_identity,
     }
 
 
@@ -680,6 +1054,7 @@ def download_object(
     timeout: float = 120.0,
     max_attempts: int = 4,
     chunk_size: int = 4 * 1024 * 1024,
+    revalidate_remote: bool = False,
 ) -> dict[str, Any]:
     requests = _requests_module()
     destination = Path(destination)
@@ -691,14 +1066,28 @@ def download_object(
     if expected_size < 0:
         raise RuntimeError(f"object has no exact non-negative size: {item.get('key')}")
     expected_etag = _clean_etag(item.get("etag"))
+    # V2 plans always carry a validated source_id. Preserve direct helper
+    # compatibility for synthetic/offline callers that predate provider IDs.
+    if item.get("source_id") is not None:
+        archive_sources.validate_source_object("nyofs", item, expected_source_id=str(item["source_id"]))
+        if revalidate_remote:
+            exact = [candidate for candidate in archive_sources.list_objects_v2(
+                str(item["source_id"]), "nyofs", str(item["key"]), session=session, max_keys=2,
+            ) if candidate.get("key") == item.get("key")]
+            if len(exact) != 1:
+                raise RuntimeError("planned source object is no longer uniquely listed; replan before fetching")
+            archive_sources.validate_remote_metadata(item, exact[0])
     partial = destination.with_name(destination.name + ".part")
     partial_metadata_path = _partial_sidecar(destination)
     partial_metadata = {
-        "schema_version": "nyofs_partial_object_v1",
+        "schema_version": "nyofs_partial_object_v2",
         "key": item["key"],
         "url": item["url"],
         "size": expected_size,
         "etag": expected_etag,
+        "source_id": item.get("source_id"),
+        "source_identity": archive_sources.source_identity_digest(item) if item.get("source_id") else None,
+        "last_modified": item.get("last_modified"),
     }
     if partial.exists():
         try:
@@ -707,7 +1096,7 @@ def download_object(
             existing_partial_metadata = None
         if not isinstance(existing_partial_metadata, Mapping) or any(
             existing_partial_metadata.get(name) != partial_metadata[name]
-            for name in ("key", "url", "size", "etag")
+            for name in ("key", "url", "size", "etag", "source_id", "source_identity", "last_modified")
         ):
             partial.unlink(missing_ok=True)
             partial_metadata_path.unlink(missing_ok=True)
@@ -722,7 +1111,7 @@ def download_object(
         os.replace(partial, destination)
         partial_metadata_path.unlink(missing_ok=True)
         metadata = {
-            "schema_version": "nyofs_cached_object_v1",
+            "schema_version": "nyofs_cached_object_v2",
             "key": item["key"],
             "url": item["url"],
             "size": expected_size,
@@ -731,6 +1120,9 @@ def download_object(
             "last_modified": item.get("last_modified"),
             "sha256": digest,
             "completed_utc": _iso(datetime.now(UTC)),
+            "source_id": item.get("source_id"),
+            "source_identity": archive_sources.source_identity_digest(item) if item.get("source_id") else None,
+            "etag_semantics": "opaque_provenance",
         }
         write_json_atomic(_download_sidecar(destination), metadata)
         return {
@@ -745,29 +1137,19 @@ def download_object(
             "resumed_from_bytes": resumed_from,
             "retry_count": 0,
             "source": dict(item),
+            "source_id": item.get("source_id"),
+            "source_identity": archive_sources.source_identity_digest(item),
         }
     client = session or requests.Session()
     errors: list[str] = []
     for attempt in range(max_attempts):
         current = partial.stat().st_size if partial.exists() else 0
-        headers = {"Range": f"bytes={current}-"} if current else {}
+        headers = archive_sources.build_resume_headers(current)
         try:
             response = client.get(item["url"], headers=headers, stream=True, timeout=timeout)
             response.raise_for_status()
-            if current and response.status_code != 206:
-                partial.unlink(missing_ok=True)
-                current = 0
-            mode = "ab" if current and response.status_code == 206 else "wb"
-            response_etag = _clean_etag(response.headers.get("ETag"))
-            if expected_etag and response_etag and response_etag != expected_etag:
-                raise RuntimeError(f"ETag changed during transfer: {response_etag} != {expected_etag}")
-            content_length = response.headers.get("Content-Length")
-            if content_length is not None:
-                expected_response = expected_size - current if mode == "ab" else expected_size
-                if int(content_length) != expected_response:
-                    raise RuntimeError(
-                        f"Content-Length mismatch: {content_length} != {expected_response}"
-                    )
+            archive_sources.validate_download_response(response, item, offset=current)
+            mode = "ab" if current else "wb"
             with partial.open(mode) as stream:
                 for chunk in response.iter_content(chunk_size=chunk_size):
                     if chunk:
@@ -779,7 +1161,7 @@ def download_object(
             os.replace(partial, destination)
             partial_metadata_path.unlink(missing_ok=True)
             metadata = {
-                "schema_version": "nyofs_cached_object_v1",
+                "schema_version": "nyofs_cached_object_v2",
                 "key": item["key"],
                 "url": item["url"],
                 "size": expected_size,
@@ -788,6 +1170,9 @@ def download_object(
                 "last_modified": item.get("last_modified"),
                 "sha256": digest,
                 "completed_utc": _iso(datetime.now(UTC)),
+                "source_id": item.get("source_id"),
+                "source_identity": archive_sources.source_identity_digest(item) if item.get("source_id") else None,
+                "etag_semantics": "opaque_provenance",
             }
             write_json_atomic(_download_sidecar(destination), metadata)
             return {
@@ -802,6 +1187,8 @@ def download_object(
                 "resumed_from_bytes": resumed_from,
                 "retry_count": attempt,
                 "source": dict(item),
+                "source_id": item.get("source_id"),
+                "source_identity": archive_sources.source_identity_digest(item) if item.get("source_id") else None,
             }
         except Exception as exc:  # preserve .part for a later retry/run
             errors.append(f"attempt {attempt + 1}: {type(exc).__name__}: {exc}")
@@ -830,30 +1217,63 @@ def fetch_request(
     session: Any | None = None,
     endpoint: str = S3_ENDPOINT,
 ) -> dict[str, Any]:
-    normalized = load_request(request) if isinstance(request, (str, Path)) else validate_request(request)
+    if not isinstance(request, (str, Path)):
+        raise TypeError("fetch requires an existing reviewed plan path, not an in-memory mapping")
+    plan_path = Path(request).resolve()
+    if not plan_path.is_file():
+        raise FileNotFoundError(f"reviewed plan path does not exist: {plan_path}")
+    estimate = _read_json(plan_path)
+    if estimate.get("schema_version") != "nyofs_download_estimate_v2":
+        raise ValueError("fetch requires a reviewed nyofs_download_estimate_v2 plan")
+    normalized = validate_request(estimate["request"])
     run_path = Path(run_dir)
-    estimate = plan_request(normalized, run_path, objects=objects, session=session, endpoint=endpoint)
-    if estimate["routing_decision"] != "local":
+    selected = list(estimate.get("objects", []))
+    if estimate.get("normalized_request_sha256") != _canonical_json_sha256(normalized):
+        raise ValueError("reviewed plan request digest is invalid")
+    selected_sha = _canonical_json_sha256(sorted(selected, key=lambda item: (str(item.get("source_id")), str(item.get("key")))))
+    if estimate.get("selected_objects_sha256") != selected_sha:
+        raise ValueError("reviewed plan selected-object digest is invalid")
+    if int(estimate.get("object_count", -1)) != len(selected) or int(estimate.get("total_bytes", -1)) != sum(int(item["size"]) for item in selected):
+        raise ValueError("reviewed plan object count or byte binding is invalid")
+    fallback_failures = validate_fallback_decision(normalized, estimate.get("source_discovery") or {}, selected)
+    if fallback_failures:
+        raise ValueError("reviewed plan fallback decision is invalid: " + "; ".join(fallback_failures))
+    for item in selected:
+        archive_sources.validate_source_object("nyofs", item, expected_source_id=str(item.get("source_id")))
+    if estimate["routing_decision"] != "local" or _disk_free(run_path) <= 4 * int(estimate["total_bytes"]):
         raise RuntimeError(
-            f"local fetch is not approved by estimate: {estimate['routing_decision']} "
+            f"local fetch is not approved by reviewed estimate/current storage: {estimate['routing_decision']} "
             f"({estimate['routing_reason']})"
         )
+    plan_sha256 = _sha256(plan_path)
     outcomes: list[dict[str, Any]] = []
 
     def transfer(item: Mapping[str, Any]) -> dict[str, Any]:
-        return download_object(item, _destination_for_key(run_path, str(item["key"])), session=session)
+        destination = _destination_for_object(run_path, item)
+        cached = _cache_result(item, destination)
+        if cached is not None:
+            return cached
+        legacy = _legacy_aws_cache_result(item, _destination_for_key(run_path, str(item["key"])))
+        if legacy is not None:
+            return legacy
+        return download_object(item, destination, session=session, revalidate_remote=True)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=normalized["max_workers"]) as pool:
-        futures = [pool.submit(transfer, item) for item in estimate["objects"]]
+        futures = [pool.submit(transfer, item) for item in selected]
         for future in concurrent.futures.as_completed(futures):
             outcomes.append(future.result())
     outcomes.sort(key=lambda x: str(x.get("key")))
     failures = [item for item in outcomes if item["status"] == "failed"]
     manifest = {
-        "schema_version": "nyofs_fetch_manifest_v1",
+        "schema_version": "nyofs_fetch_manifest_v2",
         "created_utc": _iso(datetime.now(UTC)),
         "request": normalized,
-        "estimate_path": str((run_path / "download_estimate.json").resolve()),
+        "estimate_path": str(plan_path),
+        "reviewed_plan_sha256": plan_sha256,
+        "normalized_request_sha256": estimate["normalized_request_sha256"],
+        "selected_objects_sha256": estimate["selected_objects_sha256"],
+        "selected_object_count_binding": len(selected),
+        "selected_total_bytes_binding": int(estimate["total_bytes"]),
         "outcomes": outcomes,
         "counts": {
             "objects": len(outcomes),
@@ -862,7 +1282,8 @@ def fetch_request(
             "failed": len(failures),
             "resumed": sum(bool(item.get("resumed")) for item in outcomes),
         },
-        "source_provenance": {"bucket": BUCKET, "endpoint": endpoint, "access": "anonymous_https"},
+        "source_discovery": estimate.get("source_discovery"),
+        "source_totals": estimate.get("source_totals"),
     }
     write_json_atomic(run_path / "fetch_manifest.json", manifest)
     if failures:
@@ -1003,6 +1424,60 @@ def _manifest_paths(run_dir: Path) -> list[Path]:
         if candidate.is_file():
             paths.append(candidate)
     return paths
+
+
+def _verified_manifest_outcomes(run_dir: Path, request: Mapping[str, Any]) -> list[dict[str, Any]]:
+    manifest_path = run_dir / "fetch_manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError("v2 reviewed plan and fetch manifest are required for extraction")
+    manifest = _read_json(manifest_path)
+    plan_path = Path(str(manifest.get("estimate_path") or "")).resolve()
+    if not plan_path.is_file():
+        raise RuntimeError("fetch manifest reviewed plan path does not exist")
+    plan = _read_json(plan_path)
+    if plan.get("schema_version") != "nyofs_download_estimate_v2" or manifest.get("schema_version") != "nyofs_fetch_manifest_v2":
+        raise RuntimeError("v2 reviewed plan and fetch manifest are required for extraction")
+    normalized = validate_request(request)
+    selected = list(plan.get("objects", []))
+    selected_sha = _canonical_json_sha256(sorted(selected, key=lambda item: (str(item.get("source_id")), str(item.get("key")))))
+    if plan.get("normalized_request_sha256") != _canonical_json_sha256(normalized) or plan.get("selected_objects_sha256") != selected_sha:
+        raise RuntimeError("reviewed plan request/object binding is invalid")
+    if manifest.get("reviewed_plan_sha256") != _sha256(plan_path) or manifest.get("selected_objects_sha256") != selected_sha:
+        raise RuntimeError("fetch manifest reviewed-plan binding is invalid")
+    expected = {f"{item.get('source_id')}:{item.get('key')}": item for item in selected}
+    outcomes = list(manifest.get("outcomes", []))
+    if len(outcomes) != len(selected) or any(item.get("status") not in {"downloaded", "cache_hit"} for item in outcomes):
+        raise RuntimeError("fetch manifest is incomplete")
+    raw_root = (run_dir / "cache" / "raw").resolve()
+    for outcome in outcomes:
+        item = expected.get(f"{outcome.get('source_id')}:{outcome.get('key')}")
+        if item is None:
+            raise RuntimeError("fetch manifest contains an unplanned source object")
+        path = Path(str(outcome.get("local_path", ""))).resolve()
+        provider_path = raw_root / archive_sources.cache_relpath(item)
+        uses_legacy = bool(outcome.get("legacy_cache_reused"))
+        expected_path = _destination_for_key(run_dir, str(item["key"])).resolve() if uses_legacy else provider_path
+        try:
+            path.relative_to(raw_root)
+        except ValueError as exc:
+            raise RuntimeError(f"cache path escapes the run directory: {path}") from exc
+        if path != expected_path or not path.is_file() or path.stat().st_size != int(item["size"]) or _sha256(path) != outcome.get("sha256"):
+            raise RuntimeError(f"cache payload binding is invalid: {path}")
+        if uses_legacy:
+            if _legacy_aws_cache_result(item, path) is None:
+                raise RuntimeError(f"legacy AWS cache binding is invalid: {path}")
+        else:
+            sidecar = _read_json(_download_sidecar(path))
+            if any((
+                sidecar.get("schema_version") != "nyofs_cached_object_v2",
+                sidecar.get("source_identity") != archive_sources.source_identity_digest(item),
+                sidecar.get("key") != item.get("key"), sidecar.get("url") != item.get("url"),
+                sidecar.get("last_modified") != item.get("last_modified"),
+                _clean_etag(sidecar.get("etag")) != _clean_etag(item.get("etag")),
+                sidecar.get("sha256") != outcome.get("sha256"),
+            )):
+                raise RuntimeError(f"cache sidecar binding is invalid: {path}")
+    return outcomes
 
 
 def inspect_request(request: Mapping[str, Any] | str | Path, run_dir: str | Path) -> dict[str, Any]:
@@ -1189,6 +1664,8 @@ def _field_records(
                             "source_time_calendar": source_time_calendar,
                             "run_time": _parse_utc(source["run_time"]),
                             "key": source.get("key", outcome.get("key")),
+                            "source_id": source.get("source_id", outcome.get("source_id", "unknown")),
+                            "source_url": source.get("url", outcome.get("url")),
                         }
                     )
     records: list[dict[str, Any]] = []
@@ -1267,6 +1744,21 @@ def _write_char_rows(variable: Any, strings: Sequence[str], width: int) -> None:
         if raw:
             encoded[row, : len(raw)] = np.frombuffer(raw, dtype="S1")
     variable[:] = encoded
+
+
+def _decode_char_rows(values: Any) -> list[str]:
+    """Decode fixed-width NetCDF character rows without lossy coercion."""
+    _, np = _netcdf_modules()
+    array = np.asanyarray(values)
+    rows = array if array.ndim > 1 else array.reshape(1, -1)
+    result: list[str] = []
+    for row in rows:
+        pieces = [
+            value.decode("utf-8", errors="strict") if isinstance(value, bytes) else str(value)
+            for value in row
+        ]
+        result.append("".join(pieces).replace("\x00", "").strip())
+    return result
 
 
 def _extract_grid(
@@ -1360,7 +1852,9 @@ def _extract_grid(
             output.createDimension("y", reference_geometry["lon"].shape[0])
             output.createDimension("x", reference_geometry["lon"].shape[1])
             source_width = max(1, max(len(str(record["key"]).encode("utf-8")) for record in records))
+            archive_width = max(1, max(len(str(record["source_id"]).encode("utf-8")) for record in records))
             output.createDimension("source_key_strlen", source_width)
+            output.createDimension("source_archive_strlen", archive_width)
             time_units_width = max(1, max(len(record["source_time_units"].encode("utf-8")) for record in records))
             calendar_width = max(1, max(len(record["source_time_calendar"].encode("utf-8")) for record in records))
             output.createDimension("source_time_units_strlen", time_units_width)
@@ -1378,6 +1872,15 @@ def _extract_grid(
                     "time_coverage_start": request["start_utc"],
                     "time_coverage_end_exclusive": request["end_utc_exclusive"],
                     "source_keys_json": json.dumps(sorted({str(record["key"]) for record in records})),
+                    "source_archives_json": json.dumps(sorted({str(record["source_id"]) for record in records})),
+                    "source_summary_json": json.dumps({
+                        source_id: sum(record["source_id"] == source_id for record in records)
+                        for source_id in sorted({record["source_id"] for record in records})
+                    }, sort_keys=True),
+                    "source_objects_json": json.dumps([
+                        {"source_id": record["source_id"], "key": record["key"], "url": record["source_url"]}
+                        for record in records
+                    ], sort_keys=True),
                     "created_utc": _iso(datetime.now(UTC)),
                     "history": "Created by OMA nyofs-fetcher",
                 }
@@ -1405,8 +1908,11 @@ def _extract_grid(
             cycle_var.calendar = "proleptic_gregorian"
             cycle_var[:] = [_timestamp(record["run_time"]) for record in records]
             key_var = output.createVariable("source_key", "S1", ("time", "source_key_strlen"))
-            key_var.long_name = "public AWS source object key"
+            key_var.long_name = "source archive object key"
             _write_char_rows(key_var, [str(record["key"]) for record in records], source_width)
+            archive_var = output.createVariable("source_archive", "S1", ("time", "source_archive_strlen"))
+            archive_var.long_name = "source archive identifier"
+            _write_char_rows(archive_var, [str(record["source_id"]) for record in records], archive_width)
 
             for name, data, units, long_name in (
                 ("lon", reference_geometry["lon"], "degrees_east", "longitude"),
@@ -1454,6 +1960,14 @@ def _extract_grid(
             "end_utc": _iso(records[-1]["time"]),
             "variables": sorted(list(arrays) + list(derived)),
             "source_keys": sorted({str(record["key"]) for record in records}),
+            "source_records": [
+                {"source_id": record["source_id"], "key": record["key"], "url": record["source_url"]}
+                for record in records
+            ],
+            "source_summary": {
+                source_id: sum(record["source_id"] == source_id for record in records)
+                for source_id in sorted({record["source_id"] for record in records})
+            },
             "sigma_weights": [float(x) for x in weights],
         }
     finally:
@@ -1470,10 +1984,11 @@ def extract_request(request: Mapping[str, Any] | str | Path, run_dir: str | Path
     if not manifest_path.is_file():
         raise RuntimeError("fetch_manifest.json is required before extraction")
     fetch_manifest = _read_json(manifest_path)
+    outcomes = _verified_manifest_outcomes(run_path, normalized)
     grids = ["coarse", "fine"] if normalized["grid"] == "both" else [normalized["grid"]]
-    outputs = [_extract_grid(normalized, fetch_manifest.get("outcomes", []), grid, run_path) for grid in grids]
+    outputs = [_extract_grid(normalized, outcomes, grid, run_path) for grid in grids]
     report = {
-        "schema_version": "nyofs_extraction_manifest_v1",
+        "schema_version": "nyofs_extraction_manifest_v2",
         "created_utc": _iso(datetime.now(UTC)),
         "request": normalized,
         "outputs": outputs,
@@ -1532,6 +2047,7 @@ def _raw_consistency(
                         "count": len(records),
                         "times": records,
                         "run_time": _parse_utc(source["run_time"]),
+                        "source_id": source.get("source_id", outcome.get("source_id")),
                     }
                 )
                 if request["product"] == "fields":
@@ -1551,14 +2067,27 @@ def _raw_consistency(
     for grid in requested_grids:
         candidates: dict[datetime, list[dict[str, Any]]] = {}
         for item in by_grid[grid]:
-            for record in item["times"]:
+            for time_index, record in enumerate(item["times"]):
                 if start <= record.normalized < end:
                     candidates.setdefault(record.normalized, []).append(
-                        {"record": record, "run_time": item["run_time"], "key": item["key"]}
+                        {"record": record, "run_time": item["run_time"], "key": item["key"],
+                         "source_id": item["source_id"], "time_index": time_index}
                     )
         unique = sorted(candidates)
         missing = [stamp for stamp in expected if stamp not in candidates]
         duplicate_count = sum(max(0, len(group) - 1) for group in candidates.values())
+        selected_records = []
+        for stamp in unique:
+            winner = min(candidates[stamp], key=lambda item: (item["run_time"], str(item["key"])))
+            selected_records.append({
+                "normalized_time_utc": _iso(stamp),
+                "source_id": winner["source_id"],
+                "source_key": winner["key"],
+                "source_cycle_utc": _iso(winner["run_time"]),
+                "source_time_index": winner["time_index"],
+                "candidate_count": len(candidates[stamp]),
+                "deduplication_rank": "earliest_cycle_terminal_before_following_cycle_initial",
+            })
         nonmonotonic = any(right <= left for left, right in zip(unique, unique[1:]))
         summary[grid] = {
             "object_count": len(by_grid[grid]),
@@ -1567,6 +2096,7 @@ def _raw_consistency(
             "missing_times": [_iso(stamp) for stamp in missing],
             "source_duplicate_record_count": duplicate_count,
             "deduplication": "preceding cycle terminal record wins",
+            "selected_time_records": selected_records,
             "monotonic": not nonmonotonic,
             "first_time_utc": _iso(unique[0]) if unique else None,
             "last_time_utc": _iso(unique[-1]) if unique else None,
@@ -1609,6 +2139,29 @@ def _check_compact(
         report["schema_version"] = getattr(ds, "schema_version", None)
         if report["schema_version"] != COMPACT_SCHEMA_VERSION:
             critical.append(f"unexpected compact schema version in {path}")
+        try:
+            compact_sources = json.loads(str(getattr(ds, "source_objects_json")))
+        except Exception as exc:
+            compact_sources = []
+            critical.append(f"compact output source_objects_json is invalid in {path}: {exc}")
+        expected_sources = [
+            {"source_id": item.get("source_id"), "key": item.get("key"), "url": item.get("url")}
+            for item in output.get("source_records", [])
+        ]
+        if compact_sources != expected_sources:
+            critical.append(f"compact NetCDF source records differ from extraction manifest in {path}")
+        try:
+            compact_archives = json.loads(str(getattr(ds, "source_archives_json")))
+            compact_summary = json.loads(str(getattr(ds, "source_summary_json")))
+        except Exception as exc:
+            compact_archives, compact_summary = [], {}
+            critical.append(f"compact output global source provenance is invalid in {path}: {exc}")
+        expected_summary = output.get("source_summary", {})
+        if compact_archives != sorted(expected_summary):
+            critical.append(f"compact source_archives_json differs from extraction manifest in {path}")
+        if compact_summary != expected_summary:
+            critical.append(f"compact source_summary_json differs from extraction manifest in {path}")
+        report["source_records"] = compact_sources
         required_geometry = {
             "lon",
             "lat",
@@ -1623,11 +2176,18 @@ def _check_compact(
             "source_time_calendar",
             "source_cycle_time",
             "source_key",
+            "source_archive",
         }
         absent_geometry = sorted(required_geometry - set(ds.variables))
         if absent_geometry:
             critical.append(f"compact output lacks required coordinates: {', '.join(absent_geometry)}")
             return report, critical, warnings
+        archive_rows = _decode_char_rows(ds.variables["source_archive"][:])
+        key_rows = _decode_char_rows(ds.variables["source_key"][:])
+        if archive_rows != [str(item.get("source_id") or "") for item in output.get("source_records", [])]:
+            critical.append(f"compact source_archive rows differ from extraction manifest in {path}")
+        if key_rows != [str(item.get("key") or "") for item in output.get("source_records", [])]:
+            critical.append(f"compact source_key rows differ from extraction manifest in {path}")
         lon = _finite_values(ds.variables["lon"])
         lat = _finite_values(ds.variables["lat"])
         mask = _finite_values(ds.variables["mask"])
@@ -1801,12 +2361,73 @@ def _check_compact(
 
 
 def _verify_transfers(
-    estimate: Mapping[str, Any], manifest: Mapping[str, Any]
+    estimate: Mapping[str, Any], manifest: Mapping[str, Any], run_dir: Path | None = None,
 ) -> tuple[dict[str, Any], list[str], list[str]]:
     critical: list[str] = []
     warnings: list[str] = []
+    if estimate.get("schema_version") == "nyofs_download_estimate_v2":
+        normalized = validate_request(estimate.get("request", {}))
+        selected = list(estimate.get("objects", []))
+        raw_outcomes = manifest.get("outcomes", [])
+        if manifest.get("schema_version") != "nyofs_fetch_manifest_v2":
+            critical.append("fetch manifest schema is not nyofs_fetch_manifest_v2")
+        try:
+            manifest_request = validate_request(manifest.get("request", {}))
+        except Exception as exc:
+            critical.append(f"fetch manifest request is invalid: {exc}")
+        else:
+            if _canonical_json_sha256(manifest_request) != _canonical_json_sha256(normalized):
+                critical.append("fetch manifest request differs from reviewed plan request")
+        if not isinstance(raw_outcomes, list) or any(not isinstance(item, Mapping) for item in raw_outcomes):
+            critical.append("fetch manifest outcomes are not a valid list")
+            raw_outcomes = []
+        identities = [(str(item.get("source_id")), str(item.get("key"))) for item in raw_outcomes]
+        if len(set(identities)) != len(identities):
+            critical.append("fetch manifest contains duplicate source outcomes")
+        if len(raw_outcomes) != len(selected):
+            critical.append("fetch manifest outcome cardinality differs from reviewed plan")
+        if int(manifest.get("selected_object_count_binding", -1)) != len(selected):
+            critical.append("fetch manifest selected-object count binding is invalid")
+        if int(manifest.get("selected_total_bytes_binding", -1)) != sum(int(item["size"]) for item in selected):
+            critical.append("fetch manifest selected-byte binding is invalid")
+        counts = manifest.get("counts") if isinstance(manifest.get("counts"), Mapping) else {}
+        expected_counts = {
+            "objects": len(raw_outcomes),
+            "downloaded": sum(item.get("status") == "downloaded" for item in raw_outcomes),
+            "cache_hits": sum(item.get("status") == "cache_hit" for item in raw_outcomes),
+            "failed": sum(item.get("status") == "failed" for item in raw_outcomes),
+            "resumed": sum(bool(item.get("resumed")) for item in raw_outcomes),
+        }
+        if any(counts.get(name) != value for name, value in expected_counts.items()):
+            critical.append("fetch manifest counts do not match its exact outcomes")
+        expected_selected_sha = _canonical_json_sha256(sorted(selected, key=lambda item: (str(item.get("source_id")), str(item.get("key")))))
+        if estimate.get("normalized_request_sha256") != _canonical_json_sha256(normalized):
+            critical.append("download estimate normalized-request binding is invalid")
+        if estimate.get("selected_objects_sha256") != expected_selected_sha:
+            critical.append("download estimate selected-object binding is invalid")
+        critical.extend(validate_fallback_decision(
+            normalized, estimate.get("source_discovery") or {}, selected
+        ))
+        expected_totals = {
+            source_id: {
+                "object_count": sum(item.get("source_id") == source_id for item in selected),
+                "bytes": sum(int(item["size"]) for item in selected if item.get("source_id") == source_id),
+            }
+            for source_id in ("aws_operational", "ncei_long_term")
+        }
+        if estimate.get("source_totals") != expected_totals:
+            critical.append("download estimate per-source object/byte totals are invalid")
+        if manifest.get("source_totals") != expected_totals:
+            critical.append("fetch manifest per-source object/byte totals differ from reviewed plan")
+        estimate_path = Path(str(manifest.get("estimate_path", "")))
+        if not estimate_path.is_file() or manifest.get("reviewed_plan_sha256") != _sha256(estimate_path):
+            critical.append("fetch manifest reviewed-plan path/SHA binding is invalid")
+        for field in ("normalized_request_sha256", "selected_objects_sha256"):
+            if manifest.get(field) != estimate.get(field):
+                critical.append(f"fetch manifest {field} differs from reviewed plan")
     expected = {item["key"]: item for item in estimate.get("objects", [])}
-    outcomes = {item["key"]: item for item in manifest.get("outcomes", [])}
+    raw_outcomes = manifest.get("outcomes", []) if isinstance(manifest.get("outcomes"), list) else []
+    outcomes = {item["key"]: item for item in raw_outcomes if isinstance(item, Mapping) and item.get("key")}
     rows: list[dict[str, Any]] = []
     for key, source in expected.items():
         outcome = outcomes.get(key)
@@ -1820,6 +2441,21 @@ def _verify_transfers(
             continue
         path = Path(outcome["local_path"])
         row["path"] = str(path)
+        if run_dir is not None:
+            raw_root = (run_dir / "cache" / "raw").resolve()
+            resolved = path.resolve()
+            try:
+                resolved.relative_to(raw_root)
+            except ValueError:
+                critical.append(f"cache path escapes the run directory for {key}")
+            if estimate.get("schema_version") == "nyofs_download_estimate_v2":
+                uses_legacy = bool(outcome.get("legacy_cache_reused"))
+                expected_path = (
+                    _destination_for_key(run_dir, str(source["key"])).resolve()
+                    if uses_legacy else raw_root / archive_sources.cache_relpath(source)
+                )
+                if resolved != expected_path:
+                    critical.append(f"cache path is not the provider-isolated planned path for {key}")
         if not path.is_file():
             critical.append(f"downloaded object is missing locally: {path}")
             rows.append(row)
@@ -1840,6 +2476,20 @@ def _verify_transfers(
         else:
             try:
                 metadata = _read_json(sidecar)
+                expected_identity = archive_sources.source_identity_digest(source) if source.get("source_id") else None
+                uses_legacy = bool(outcome.get("legacy_cache_reused"))
+                if estimate.get("schema_version") != "nyofs_download_estimate_v2":
+                    if metadata.get("schema_version") != "nyofs_cached_object_v1":
+                        critical.append(f"legacy cache sidecar schema is invalid for {key}")
+                elif uses_legacy:
+                    if _legacy_aws_cache_result(source, path) is None:
+                        critical.append(f"legacy AWS cache sidecar binding is invalid for {key}")
+                elif metadata.get("schema_version") != "nyofs_cached_object_v2":
+                    critical.append(f"cache sidecar schema is not v2 for {key}")
+                elif metadata.get("source_id") != source.get("source_id") or metadata.get("source_identity") != expected_identity:
+                    critical.append(f"cache sidecar source identity mismatch for {key}")
+                if metadata.get("last_modified") != source.get("last_modified") or metadata.get("url") != source.get("url"):
+                    critical.append(f"cache sidecar source metadata mismatch for {key}")
                 if int(metadata.get("size", -1)) != int(source["size"]):
                     critical.append(f"cache sidecar size mismatch for {key}")
                 if _clean_etag(metadata.get("etag")) != _clean_etag(source.get("etag")):
@@ -1851,14 +2501,18 @@ def _verify_transfers(
         rows.append(row)
     extra = sorted(set(outcomes) - set(expected))
     if extra:
-        warnings.append(f"fetch manifest contains {len(extra)} objects absent from the current estimate")
+        critical.append(f"fetch manifest contains {len(extra)} objects absent from the reviewed plan")
     return {"objects": rows, "expected_count": len(expected), "verified_count": len(rows)}, critical, warnings
 
 
 def _delete_raw_cache(run_dir: Path, manifest: MutableMapping[str, Any]) -> dict[str, Any]:
     deleted: list[dict[str, Any]] = []
     for outcome in manifest.get("outcomes", []):
-        path = Path(str(outcome.get("local_path", "")))
+        path = Path(str(outcome.get("local_path", ""))).resolve()
+        try:
+            path.relative_to((run_dir / "cache" / "raw").resolve())
+        except ValueError as exc:
+            raise RuntimeError(f"refusing to delete cache outside run directory: {path}") from exc
         if not path.is_file():
             continue
         size = path.stat().st_size
@@ -1883,7 +2537,7 @@ def _delete_raw_cache(run_dir: Path, manifest: MutableMapping[str, Any]) -> dict
         "files": deleted,
         "source_bytes": sum(item["bytes"] for item in deleted),
         "sidecar_bytes": sum(item["sidecar_bytes"] for item in deleted),
-        "recovery": "re-download from public AWS using download_estimate.json",
+        "recovery": "re-download from the provider-bound source in download_estimate.json",
     }
 
 
@@ -1896,13 +2550,15 @@ def evaluate_health(
 ) -> dict[str, Any]:
     normalized = load_request(request) if isinstance(request, (str, Path)) else validate_request(request)
     run_path = Path(run_dir)
-    estimate_path = run_path / "download_estimate.json"
     manifest_path = run_path / "fetch_manifest.json"
-    if not estimate_path.is_file() or not manifest_path.is_file():
-        raise RuntimeError("download_estimate.json and fetch_manifest.json are required for health checking")
-    estimate = _read_json(estimate_path)
+    if not manifest_path.is_file():
+        raise RuntimeError("fetch_manifest.json is required for health checking")
     manifest = _read_json(manifest_path)
-    transfer, critical, warnings = _verify_transfers(estimate, manifest)
+    estimate_path = Path(str(manifest.get("estimate_path") or "")).resolve()
+    if not estimate_path.is_file():
+        raise RuntimeError("fetch manifest reviewed plan path does not exist")
+    estimate = _read_json(estimate_path)
+    transfer, critical, warnings = _verify_transfers(estimate, manifest, run_path)
     raw, raw_critical, raw_warnings = _raw_consistency(manifest.get("outcomes", []), normalized)
     critical.extend(raw_critical)
     warnings.extend(raw_warnings)
@@ -1926,6 +2582,17 @@ def evaluate_health(
             expected_outputs = 2 if normalized["grid"] == "both" else 1
             if len(compact_checks) != expected_outputs:
                 critical.append(f"expected {expected_outputs} compact grid outputs, found {len(compact_checks)}")
+            planned_sources = {
+                (str(item.get("source_id")), str(item.get("key")), str(item.get("url")))
+                for item in estimate.get("objects", [])
+            }
+            extracted_sources = {
+                (str(item.get("source_id")), str(item.get("key")), str(item.get("url")))
+                for output_item in extraction.get("outputs", [])
+                for item in output_item.get("source_records", [])
+            }
+            if extracted_sources != planned_sources:
+                critical.append("compact extraction source records do not exactly match the reviewed plan")
     deletion: dict[str, Any] | None = None
     passed_before_deletion = not critical
     if passed_before_deletion and normalized["cache_policy"] == "delete_after_extract":
@@ -1935,7 +2602,7 @@ def evaluate_health(
             extraction["raw_cache_deletion"] = deletion
             write_json_atomic(run_path / "extraction_manifest.json", extraction)
     report = {
-        "schema_version": "nyofs_health_check_v1",
+        "schema_version": "nyofs_health_check_v2",
         "created_utc": _iso(datetime.now(UTC)),
         "request": normalized,
         "status": "pass" if not critical else "fail",
@@ -1951,7 +2618,7 @@ def evaluate_health(
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--request", required=True, help="Path to a nyofs_request_v1 JSON file")
+    parser.add_argument("--request", required=True, help="Path to a nyofs_request_v2 (or migratable v1) JSON file")
     parser.add_argument("--run-dir", required=True, help="Run/evidence directory outside the skill package")
 
 
@@ -1964,7 +2631,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common_arguments(plan_parser)
     plan_parser.add_argument("--output", help="Optional estimate JSON path")
     fetch_parser = subparsers.add_parser("fetch", help="Plan and download selected objects")
-    _add_common_arguments(fetch_parser)
+    fetch_parser.add_argument("--plan", required=True, help="Reviewed nyofs_download_estimate_v2 JSON path")
+    fetch_parser.add_argument("--run-dir", required=True)
     inspect_parser = subparsers.add_parser("inspect", help="Inspect cached NetCDF metadata")
     _add_common_arguments(inspect_parser)
     extract_parser = subparsers.add_parser("extract", help="Concatenate and derive compact POM fields")
@@ -1980,7 +2648,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "plan":
             result = plan_request(args.request, args.run_dir, output=args.output)
         elif args.command == "fetch":
-            result = fetch_request(args.request, args.run_dir)
+            result = fetch_request(args.plan, args.run_dir)
         elif args.command == "inspect":
             result = inspect_request(args.request, args.run_dir)
         elif args.command == "extract":
