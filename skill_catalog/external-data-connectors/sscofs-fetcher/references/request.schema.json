@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://oma.local/schemas/sscofs_request_v1.json",
-  "title": "SSCOFS Fetcher Request v1",
+  "$id": "https://oma.local/schemas/sscofs_request_v2.json",
+  "title": "SSCOFS Fetcher Request v2",
   "description": "A bounded request for NOAA SSCOFS inventory, planning, download, and optional native-field extraction. Defaults are applied by the runtime; JSON Schema default values are annotations.",
   "type": "object",
   "additionalProperties": false,
@@ -14,7 +14,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "sscofs_request_v1"
+      "enum": ["sscofs_request_v1", "sscofs_request_v2"]
     },
     "start_utc": {
       "type": "string",
@@ -99,9 +99,23 @@
       "type": "integer",
       "minimum": 1,
       "default": 4
+    },
+    "source_policy": {
+      "type": "string",
+      "enum": ["aws_then_ncei", "aws_only", "ncei_only"],
+      "default": "aws_then_ncei",
+      "description": "Use operational AWS first and fill missing semantic records from NCEI, or constrain discovery to one archive."
     }
   },
   "allOf": [
+    {
+      "if": {"properties": {"schema_version": {"const": "sscofs_request_v1"}}, "required": ["schema_version"]},
+      "then": {"not": {"required": ["source_policy"]}}
+    },
+    {
+      "if": {"properties": {"guidance": {"const": "nowcast"}}, "required": ["guidance"]},
+      "then": {"not": {"required": ["run_cycle_utc"]}}
+    },
     {
       "if": {
         "properties": {

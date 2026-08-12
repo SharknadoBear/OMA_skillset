@@ -28,6 +28,12 @@ sscofs/netcdf/YYYYMM/        legacy monthly layout
 
 Exclude `sscofs/pre_operation/` by default because it contains developmental/pre-operational data. Never hard-code archive start dates, retention, or the date when a layout changed.
 
+## NCEI long-term fallback
+
+Use the anonymous NCEI `prod-model` object store only after successful AWS discovery leaves semantic coverage unresolved, or when `source_policy` is `ncei_only`. List bounded year/month prefixes below `salish-sea-and-columbia-river-operational-forecast-system-sscofs/YYYY/MM/`. NCEI supports SSCOFS nowcast native fields and station nowcast/forecast files in this connector. Field forecasts and regular-grid products are outside the verified fallback contract. Never substitute CREOFS or a different product/guidance type.
+
+Treat AWS and NCEI ETags as independent opaque source versions. Prefer the scientific `n006` record over equivalent `n000` before applying AWS-over-NCEI source preference. Record provider, container, endpoints, key, canonical URL, size, ETag, Last-Modified, naming era, semantic identity, and rejected alternatives. A listing/network failure is not evidence of missing coverage.
+
 ## Products and filenames
 
 Support the current NOAA names:
@@ -82,6 +88,8 @@ Do not expect native depth-averaged `ua` or `va`. Do not substitute regular-grid
 
 Validate that connectivity indices are in range after normalizing the file's one-based or zero-based convention. Reject changes in node/element counts, coordinates, connectivity, sigma geometry, critical dimensions, or requested variable centering across a concatenated run.
 
+When a long request crosses a model/grid era and these invariants change, split the request at the era boundary. Do not coerce incompatible geometries or schemas across eras.
+
 ## Vertical views and averages
 
 Determine layer order from `siglay`, not from an assumed index. The surface layer has the sigma midpoint closest to zero; the bottom layer has the most negative/deepest midpoint. Current operational files place them at indices 0 and 9, but reversed or changed ordering must remain valid. Define `near_surface` as the second layer from the detected surface; this corresponds to the layer NOAA uses for its displayed near-surface currents.
@@ -117,5 +125,14 @@ For surface, near-surface, bottom, or explicit sigma-index views, compute speed 
 ## Required provenance and QA
 
 Write the request, listed keys, object URLs, sizes, ETags, last-modified timestamps, parsed cycle/lead/valid times, layout and naming convention, duplicate decisions, missing timestamps, transfer status, resume/retry counts, SHA-256 hashes, cache paths, and software identity into JSON run artifacts.
+
+New transfers accept only a reviewed `sscofs_download_estimate_v2` plan. Bind
+the fetch manifest to its path and SHA-256, normalized request digest, selected
+source-object digest, exact count, and exact bytes. Store cache objects below
+`cache/raw/<source_id>/YYYY/MM/`; bind every partial/download sidecar to the full
+provider-local source identity and validate NetCDF payloads before promotion.
+Full-run extraction and health must revalidate the plan, manifest, sidecars,
+cache containment, source archives, and compact provenance. Explicit ad hoc
+inputs cannot pass full-run acceptance.
 
 Verify object integrity, unique monotonic cadence, requested time completeness, mesh/topology consistency, sigma weight sums, requested-variable presence and centering, paired `u`/`v`, no all-NaN frame, and at least 95 percent finite coverage over applicable wet nodes/cells. Make broad physical plausibility ranges warnings rather than destructive filters or clipping rules.

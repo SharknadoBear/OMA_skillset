@@ -19,10 +19,16 @@ from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import quote
 import xml.etree.ElementTree as ET
 
+try:
+    from . import ofs_archive_sources as archive_sources
+except ImportError:
+    import ofs_archive_sources as archive_sources
+
 
 UTC = timezone.utc
-SCHEMA_VERSION = "sscofs_request_v1"
-SOFTWARE_VERSION = "1.0.0"
+SCHEMA_VERSION = "sscofs_request_v2"
+LEGACY_SCHEMA_VERSION = "sscofs_request_v1"
+SOFTWARE_VERSION = "2.0.0"
 BUCKET = "noaa-nos-ofs-pds"
 S3_ROOT = f"https://{BUCKET}.s3.amazonaws.com"
 LIST_URL = f"{S3_ROOT}/"
@@ -30,6 +36,7 @@ ARCHIVE_ROOT = "sscofs/netcdf"
 CYCLE_HOURS = {3, 9, 15, 21}
 PRODUCTS = {"fields", "stations", "regulargrid"}
 GUIDANCE = {"nowcast", "forecast"}
+SOURCE_POLICIES = {"aws_then_ncei", "aws_only", "ncei_only"}
 NAMED_VIEWS = {"surface", "near_surface", "bottom", "depth_average"}
 
 _CURRENT_FIELD = re.compile(
@@ -107,20 +114,33 @@ def load_request(path: str | Path) -> dict[str, Any]:
     return validate_request(value)
 
 
+def request_migration(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    original = mapping.get("schema_version", mapping.get("schema"))
+    return {
+        "original_schema_version": original,
+        "normalized_schema_version": SCHEMA_VERSION,
+        "migrated": original == LEGACY_SCHEMA_VERSION,
+        "defaults_applied": ["source_policy=aws_then_ncei"]
+        if original == LEGACY_SCHEMA_VERSION and "source_policy" not in mapping else [],
+    }
+
+
 def validate_request(mapping: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate and normalize an ``sscofs_request_v1`` mapping."""
+    """Validate v2 or migrate a v1 request to normalized v2."""
 
     allowed = {
         "schema_version", "schema", "start_utc", "end_utc_exclusive", "product",
         "guidance", "run_cycle_utc", "variables", "vertical_views", "missing_policy",
-        "cache_policy", "max_workers",
+        "cache_policy", "max_workers", "source_policy",
     }
     unknown = sorted(set(mapping) - allowed)
     if unknown:
         raise ValueError(f"Unknown request properties: {', '.join(unknown)}")
     schema = mapping.get("schema_version", mapping.get("schema"))
-    if schema != SCHEMA_VERSION:
-        raise ValueError(f"schema_version must be {SCHEMA_VERSION!r}")
+    if schema not in {SCHEMA_VERSION, LEGACY_SCHEMA_VERSION}:
+        raise ValueError(f"schema_version must be {SCHEMA_VERSION!r} or {LEGACY_SCHEMA_VERSION!r}")
+    if schema == LEGACY_SCHEMA_VERSION and "source_policy" in mapping:
+        raise ValueError("source_policy is a v2-only field; omit it from v1 requests and migrate first")
     start = _parse_utc(mapping.get("start_utc"), "start_utc")
     end = _parse_utc(mapping.get("end_utc_exclusive"), "end_utc_exclusive")
     if end <= start:
@@ -143,6 +163,8 @@ def validate_request(mapping: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("run_cycle_utc must be a 03, 09, 15, or 21 UTC cycle")
     if guidance == "forecast" and run_cycle is None:
         raise ValueError("run_cycle_utc is required for forecast requests")
+    if guidance == "nowcast" and run_cycle is not None:
+        raise ValueError("run_cycle_utc is permitted only for forecast requests")
 
     variables_present = "variables" in mapping
     views_present = "vertical_views" in mapping
@@ -181,6 +203,9 @@ def validate_request(mapping: Mapping[str, Any]) -> dict[str, Any]:
     max_workers = int(mapping.get("max_workers", 4))
     if max_workers < 1 or max_workers > 32:
         raise ValueError("max_workers must be between 1 and 32")
+    source_policy = str(mapping.get("source_policy", "aws_then_ncei")).lower()
+    if source_policy not in SOURCE_POLICIES:
+        raise ValueError(f"source_policy must be one of {sorted(SOURCE_POLICIES)}")
 
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -191,6 +216,7 @@ def validate_request(mapping: Mapping[str, Any]) -> dict[str, Any]:
         "missing_policy": missing_policy,
         "cache_policy": cache_policy,
         "max_workers": max_workers,
+        "source_policy": source_policy,
     }
     if run_cycle is not None:
         result["run_cycle_utc"] = _iso(run_cycle)
@@ -201,6 +227,8 @@ def validate_request(mapping: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _layout_for_key(key: str) -> str:
+    if key.startswith(archive_sources.get_source_descriptor("ncei_long_term", "sscofs")["root_prefix"]):
+        return "ncei_monthly"
     if re.search(r"/\d{4}/\d{2}/\d{2}/", key):
         return "nested_daily"
     if re.search(r"/\d{6}/", key):
@@ -265,47 +293,14 @@ def list_s3_objects(
     max_keys: int = 1000,
 ) -> list[dict[str, Any]]:
     """List and parse all anonymous S3 objects beneath *prefix*."""
-
-    own_session = session is None
-    if session is None:
-        session = _requests_module().Session()
     results: list[dict[str, Any]] = []
-    token: str | None = None
-    try:
-        while True:
-            params: dict[str, Any] = {"list-type": "2", "prefix": prefix, "max-keys": max_keys}
-            if token:
-                params["continuation-token"] = token
-            response = session.get(LIST_URL, params=params, timeout=timeout)
-            response.raise_for_status()
-            root = ET.fromstring(response.content)
-            for item in root.findall("{*}Contents"):
-                key = _xml_text(item, "Key")
-                size_text = _xml_text(item, "Size")
-                if not key or not size_text or int(size_text) <= 0:
-                    continue
-                parsed = parse_object_key(key)
-                if parsed is None:
-                    continue
-                parsed.update(
-                    {
-                        "size_bytes": int(size_text),
-                        "size": int(size_text),
-                        "etag": (_xml_text(item, "ETag") or "").strip('"'),
-                        "last_modified": _xml_text(item, "LastModified"),
-                        "url": f"{S3_ROOT}/{quote(key, safe='/')}",
-                    }
-                )
-                results.append(parsed)
-            truncated = (_xml_text(root, "IsTruncated") or "false").lower() == "true"
-            if not truncated:
-                break
-            token = _xml_text(root, "NextContinuationToken")
-            if not token:
-                raise RuntimeError("S3 listing was truncated without a continuation token")
-    finally:
-        if own_session and hasattr(session, "close"):
-            session.close()
+    for raw in archive_sources.list_objects_v2(
+        "aws_operational", "sscofs", prefix, session=session,
+        timeout=timeout, max_keys=max_keys,
+    ):
+        parsed = parse_object_key(raw["key"])
+        if parsed is not None:
+            results.append({**raw, **parsed})
     return results
 
 
@@ -341,33 +336,210 @@ def _discovery_prefixes(request: Mapping[str, Any]) -> list[str]:
     return list(dict.fromkeys(prefixes))
 
 
-def discover_objects(
-    request: Mapping[str, Any], *, session: Any | None = None, timeout: float = 60.0
+def _ncei_capability(request: Mapping[str, Any]) -> tuple[bool, str | None]:
+    if request["product"] == "regulargrid":
+        return False, "NCEI does not provide verified SSCOFS regular-grid fallback"
+    if request["product"] == "fields" and request["guidance"] == "forecast":
+        return False, "NCEI does not provide verified SSCOFS field-forecast fallback"
+    return True, None
+
+
+def _ncei_prefixes(request: Mapping[str, Any]) -> list[str]:
+    descriptor = archive_sources.get_source_descriptor("ncei_long_term", "sscofs")
+    if request.get("guidance") == "forecast" and request.get("run_cycle_utc"):
+        center = _parse_utc(request["run_cycle_utc"])
+        first, last = center - timedelta(days=1), center + timedelta(days=1)
+    else:
+        first = _parse_utc(request["start_utc"]) - timedelta(days=1)
+        last = _parse_utc(request["end_utc_exclusive"]) + timedelta(days=1)
+    return [f"{descriptor['root_prefix']}{month:%Y/%m}/" for month in _month_starts(first, last)]
+
+
+def _discover_source(
+    request: Mapping[str, Any], source_id: str, *, session: Any | None = None,
+    timeout: float = 60.0,
 ) -> list[dict[str, Any]]:
-    """Discover live objects from both supported archive layouts."""
+    prefixes = _discovery_prefixes(request) if source_id == "aws_operational" else _ncei_prefixes(request)
+    found: dict[str, dict[str, Any]] = {}
+    for prefix in prefixes:
+        for raw in archive_sources.list_objects_v2(
+            source_id, "sscofs", prefix, session=session, timeout=timeout,
+        ):
+            parsed = parse_object_key(raw["key"])
+            if parsed is None:
+                continue
+            item = {**raw, **parsed, "source_id": source_id}
+            item["naming_era"] = item.get("naming")
+            item["semantic_identity"] = {
+                "model": "sscofs", "product": item.get("product"),
+                "guidance": item.get("guidance"), "run_time_utc": item.get("run_time_utc"),
+                "valid_time_utc": item.get("valid_time_utc"), "lead_hour": item.get("lead_hour"),
+            }
+            item["semantic_identity_digest"] = archive_sources.semantic_identity_digest(item["semantic_identity"])
+            archive_sources.validate_source_object("sscofs", item, expected_source_id=source_id)
+            found[item["key"]] = item
+    return sorted(found.values(), key=lambda item: item["key"])
+
+
+def _selection_without_missing_error(request: Mapping[str, Any], objects: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    probe = dict(request)
+    probe["missing_policy"] = "skip"
+    return select_objects(probe, objects)
+
+
+def _scientific_fallback_times(
+    request: Mapping[str, Any], objects: Sequence[Mapping[str, Any]]
+) -> list[str]:
+    """Find lower-ranked records that must not suppress an archive fallback."""
+    if request["guidance"] != "nowcast":
+        return []
+    if request["product"] != "stations":
+        start = _parse_utc(request["start_utc"])
+        end = _parse_utc(request["end_utc_exclusive"])
+        relevant = [
+            item for item in objects
+            if item.get("product") == request["product"]
+            and item.get("guidance") == "nowcast"
+            and item.get("valid_time_utc")
+            and start <= _parse_utc(str(item["valid_time_utc"])) < end
+        ]
+        preferred_times = {
+            _iso(_parse_utc(str(item["valid_time_utc"])))
+            for item in relevant if item.get("lead_hour") == 6
+        }
+        # n000 is the following cycle's duplicate of the preceding cycle's
+        # terminal n006.  Query the long-term archive only when an in-window
+        # n000 is all AWS supplied for that valid time.  Broad discovery also
+        # returns records outside the request window; those must never trigger
+        # fallback for an otherwise complete request.
+        return sorted({
+            _iso(_parse_utc(str(item["valid_time_utc"]))) or ""
+            for item in relevant
+            if item.get("lead_hour") == 0
+            and _iso(_parse_utc(str(item["valid_time_utc"]))) not in preferred_times
+        })
+    start = _parse_utc(request["start_utc"])
+    end = _parse_utc(request["end_utc_exclusive"])
+    stations = [
+        item for item in objects
+        if item.get("product") == "stations" and item.get("guidance") == "nowcast"
+    ]
+    unresolved: list[str] = []
+    stamp = start
+    while stamp < end:
+        covering = []
+        for item in stations:
+            run = _parse_utc(item["run_time_utc"])
+            if run - timedelta(hours=6) <= stamp <= run:
+                covering.append(item)
+        if (
+            covering
+            and any(_parse_utc(item["run_time_utc"]) - timedelta(hours=6) == stamp for item in covering)
+            and not any(_parse_utc(item["run_time_utc"]) == stamp for item in covering)
+        ):
+            unresolved.append(_iso(stamp) or "")
+        stamp += timedelta(minutes=6)
+    return unresolved
+
+
+def validate_fallback_decision(
+    request: Mapping[str, Any], trace: Mapping[str, Any], selected: Sequence[Mapping[str, Any]]
+) -> list[str]:
+    """Validate source policy, ordered discovery, and the reason for fallback."""
+    failures: list[str] = []
+    policy = request.get("source_policy")
+    selected_sources = {str(item.get("source_id")) for item in selected}
+    aws = trace.get("aws") if isinstance(trace.get("aws"), Mapping) else {}
+    ncei = trace.get("ncei") if isinstance(trace.get("ncei"), Mapping) else {}
+    if trace.get("policy") != policy:
+        failures.append("source-discovery policy differs from the normalized request")
+    if trace.get("injected_inventory"):
+        failures.append("reviewed transfer plan contains injected rather than provider discovery evidence")
+    if policy == "aws_only":
+        if "ncei_long_term" in selected_sources or ncei.get("status") not in {None, "not_requested"}:
+            failures.append("aws_only plan contains or attempted NCEI objects")
+        if aws.get("status") != "success":
+            failures.append("aws_only plan lacks successful AWS discovery evidence")
+    elif policy == "ncei_only":
+        if "aws_operational" in selected_sources or aws.get("status") not in {None, "not_requested"}:
+            failures.append("ncei_only plan contains or attempted AWS objects")
+        if ncei.get("status") != "success":
+            failures.append("ncei_only plan lacks successful NCEI discovery evidence")
+    elif policy == "aws_then_ncei":
+        if aws.get("status") != "success":
+            failures.append("aws_then_ncei plan lacks successful primary AWS discovery evidence")
+        if "ncei_long_term" in selected_sources:
+            before = trace.get("coverage_before_fallback")
+            missing = before.get("missing_times") if isinstance(before, Mapping) else None
+            scientific = trace.get("scientific_precedence_before_fallback")
+            if trace.get("fallback_triggered") is not True:
+                failures.append("NCEI selection lacks an explicit fallback trigger")
+            if ncei.get("status") != "success":
+                failures.append("NCEI selection lacks successful NCEI discovery evidence")
+            if not ((isinstance(missing, list) and missing) or (isinstance(scientific, list) and scientific)):
+                failures.append("NCEI fallback lacks an unresolved AWS semantic/scientific record")
+    else:
+        failures.append("source policy is invalid")
+    return failures
+
+
+def discover_objects(
+    request: Mapping[str, Any], *, session: Any | None = None, timeout: float = 60.0,
+    with_trace: bool = False,
+) -> Any:
+    """Discover AWS first and query NCEI only for unresolved semantic coverage."""
 
     normalized = validate_request(request)
-    objects: dict[str, dict[str, Any]] = {}
-    own_session = session is None
-    if session is None:
-        session = _requests_module().Session()
-    try:
-        for prefix in _discovery_prefixes(normalized):
-            for item in list_s3_objects(prefix, session=session, timeout=timeout):
-                objects[item["key"]] = item
-    finally:
-        if own_session and hasattr(session, "close"):
-            session.close()
-    return sorted(objects.values(), key=lambda item: item["key"])
+    policy = normalized["source_policy"]
+    trace: dict[str, Any] = {
+        "policy": policy, "aws": {"status": "not_requested", "object_count": 0},
+        "ncei": {"status": "not_requested", "object_count": 0},
+        "fallback_triggered": False, "fallback_reason": None,
+        "coverage_before_fallback": None, "coverage_after_fallback": None,
+    }
+    if policy == "ncei_only":
+        capable, reason = _ncei_capability(normalized)
+        if not capable:
+            raise ValueError(reason)
+        ncei = _discover_source(normalized, "ncei_long_term", session=session, timeout=timeout)
+        trace["ncei"] = {"status": "success", "object_count": len(ncei), "prefixes": _ncei_prefixes(normalized)}
+        after = _selection_without_missing_error(normalized, ncei)
+        trace["coverage_after_fallback"] = {"missing_times": after["missing_times"], "selected_count": after["selected_count"]}
+        return (ncei, trace) if with_trace else ncei
+
+    # Exceptions intentionally propagate: an AWS listing error is never empty coverage.
+    aws = _discover_source(normalized, "aws_operational", session=session, timeout=timeout)
+    trace["aws"] = {"status": "success", "object_count": len(aws), "prefixes": _discovery_prefixes(normalized)}
+    before = _selection_without_missing_error(normalized, aws)
+    unresolved = list(before["missing_times"])
+    scientific = _scientific_fallback_times(normalized, aws)
+    trace["scientific_precedence_before_fallback"] = scientific
+    trace["coverage_before_fallback"] = {"missing_times": unresolved, "selected_count": before["selected_count"]}
+    combined = list(aws)
+    if policy == "aws_then_ncei" and (unresolved or scientific):
+        capable, reason = _ncei_capability(normalized)
+        if capable:
+            trace["fallback_triggered"] = True
+            trace["fallback_reason"] = "AWS discovery succeeded but semantic coverage remained unresolved"
+            ncei = _discover_source(normalized, "ncei_long_term", session=session, timeout=timeout)
+            trace["ncei"] = {"status": "success", "object_count": len(ncei), "prefixes": _ncei_prefixes(normalized)}
+            combined.extend(ncei)
+        else:
+            trace["ncei"] = {"status": "unsupported", "object_count": 0, "reason": reason}
+            trace["fallback_reason"] = reason
+    after = _selection_without_missing_error(normalized, combined)
+    trace["coverage_after_fallback"] = {"missing_times": after["missing_times"], "selected_count": after["selected_count"]}
+    return (combined, trace) if with_trace else combined
 
 
-def _preference(item: Mapping[str, Any]) -> tuple[int, int, int, str]:
+def _preference(item: Mapping[str, Any]) -> tuple[int, int, int, int, str]:
     lead = item.get("lead_hour")
     return (
         # At a cycle boundary n006 is the continuous nowcast record and n000
         # is its duplicate in the following run.  Guidance continuity outranks
         # which archive layout happens to contain the copy.
         1 if lead == 6 else (0 if lead == 0 else -1),
+        1 if item.get("source_id", "aws_operational") == "aws_operational" else 0,
         1 if item.get("layout") == "nested_daily" else 0,
         1 if item.get("naming") == "current" else 0,
         str(item.get("key", "")),
@@ -465,20 +637,58 @@ def _disk_free(path: Path) -> int:
     return int(shutil.disk_usage(candidate).free)
 
 
+def _canonical_sha256(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _source_id(item: Mapping[str, Any]) -> str:
+    return str(item.get("source_id") or "aws_operational")
+
+
+def _decorate_object(item: Mapping[str, Any], source_id: str = "aws_operational") -> dict[str, Any]:
+    descriptor = archive_sources.get_source_descriptor(source_id, "sscofs")
+    result = {**descriptor, **dict(item), "source_id": source_id}
+    if str(result.get("key", "")).startswith(descriptor["root_prefix"]):
+        result["url"] = archive_sources.canonical_object_url(source_id, "sscofs", str(result["key"]))
+    result.setdefault("size", _object_size(result))
+    result.setdefault("size_bytes", int(result["size"]))
+    result.setdefault("naming_era", result.get("naming"))
+    result["semantic_identity"] = {
+        "model": "sscofs", "product": result.get("product"), "guidance": result.get("guidance"),
+        "run_time_utc": result.get("run_time_utc"), "valid_time_utc": result.get("valid_time_utc"),
+        "lead_hour": result.get("lead_hour"),
+    }
+    identity_digest = archive_sources.source_identity_digest(result)
+    result["source_identity"] = identity_digest
+    result["source_identity_digest"] = identity_digest
+    return result
+
+
+def _request_lineage(request: Mapping[str, Any]) -> dict[str, Any]:
+    return request_migration(request)
+
+
 def inventory_request(
     request: Mapping[str, Any], *, objects: Sequence[Mapping[str, Any]] | None = None,
     session: Any | None = None,
 ) -> dict[str, Any]:
+    lineage = request_migration(request)
     normalized = validate_request(request)
-    found = list(objects) if objects is not None else discover_objects(normalized, session=session)
+    if objects is not None:
+        found = [dict(item) for item in objects]
+        trace = {"policy": normalized["source_policy"], "injected_inventory": True}
+    else:
+        found, trace = discover_objects(normalized, session=session, with_trace=True)
     relevant = [
         dict(item) for item in found
         if item.get("product") == normalized["product"] and item.get("guidance") == normalized["guidance"]
     ]
     return {
-        "schema_version": "sscofs_inventory_v1",
+        "schema_version": "sscofs_inventory_v2",
         "generated_utc": _iso(datetime.now(UTC)),
-        "source": {"bucket": BUCKET, "access": "anonymous_https_listobjectsv2"},
+        "request_lineage": lineage,
+        "source_discovery": trace,
         "request": normalized,
         "prefixes": _discovery_prefixes(normalized),
         "object_count": len(relevant),
@@ -495,10 +705,15 @@ def plan_request(
 ) -> dict[str, Any]:
     """Resolve exact objects, bytes, gaps, and the OMA storage route."""
 
+    lineage = request_migration(request)
     normalized = validate_request(request)
-    found = list(objects) if objects is not None else discover_objects(normalized, session=session)
+    if objects is not None:
+        found = [dict(item) for item in objects]
+        trace = {"policy": normalized["source_policy"], "injected_inventory": True}
+    else:
+        found, trace = discover_objects(normalized, session=session, with_trace=True)
     selection = select_objects(normalized, found)
-    selected = selection["objects"]
+    selected = [_decorate_object(item, _source_id(item)) for item in selection["objects"]]
     total = int(sum(int(item["size_bytes"]) for item in selected))
     path = Path(run_dir or ".")
     path.mkdir(parents=True, exist_ok=True)
@@ -511,18 +726,28 @@ def plan_request(
         f"Local free space ({free} bytes) does not exceed four times the exact request ({4 * total} bytes)."
     )
     estimate = {
-        "schema_version": "sscofs_download_estimate_v1",
+        "schema_version": "sscofs_download_estimate_v2",
         "generated_utc": _iso(datetime.now(UTC)),
         "software_version": SOFTWARE_VERSION,
         "request": normalized,
-        "source": {"bucket": BUCKET, "region": "us-east-1", "access": "anonymous_https"},
+        "request_lineage": lineage,
+        "normalized_request_sha256": _canonical_sha256(normalized),
+        "source_discovery": trace,
         "objects": selected,
         "selected_object_count": len(selected),
+        "selected_objects_sha256": _canonical_sha256(sorted(selected, key=lambda item: (_source_id(item), str(item.get("key"))))),
         "candidate_object_count": selection["candidate_count"],
         "total_bytes": total,
         "total_gib": total / 1024 ** 3,
         "missing_times": selection["missing_times"],
         "duplicate_records": selection["duplicate_records"],
+        "source_totals": {
+            source_id: {
+                "object_count": sum(_source_id(item) == source_id for item in selected),
+                "bytes": sum(_object_size(item) for item in selected if _source_id(item) == source_id),
+            }
+            for source_id in ("aws_operational", "ncei_long_term")
+        },
         "local_free_bytes": free,
         "required_free_bytes": 4 * total,
         "routing_decision": route,
@@ -558,7 +783,68 @@ def _download_sidecar(destination: Path) -> Path:
     return destination.with_name(destination.name + ".download.json")
 
 
-def _cache_result(item: Mapping[str, Any], destination: Path) -> dict[str, Any] | None:
+def _partial_sidecar(destination: Path) -> Path:
+    return destination.with_name(destination.name + ".part.json")
+
+
+def _legacy_aws_destination(run_dir: Path, item: Mapping[str, Any]) -> Path:
+    """Return the flat v1 AWS cache location without changing it in place."""
+    return run_dir / "cache" / "raw" / Path(str(item.get("key", ""))).name
+
+
+def _legacy_aws_cache_result(
+    item: Mapping[str, Any], destination: Path, *, validate_netcdf: bool = False,
+) -> dict[str, Any] | None:
+    """Strictly bind and reuse a historical v1 AWS cache in its original path."""
+    if _source_id(item) != "aws_operational" or not destination.is_file():
+        return None
+    sidecar_path = _download_sidecar(destination)
+    if not sidecar_path.is_file() or destination.stat().st_size != _object_size(item):
+        return None
+    try:
+        sidecar = _read_json(sidecar_path)
+    except Exception:
+        return None
+    digest = _sha256(destination)
+    if any((
+        sidecar.get("schema_version") != "sscofs_cached_object_v1",
+        sidecar.get("key") != item.get("key"), sidecar.get("url") != item.get("url"),
+        int(sidecar.get("size_bytes", sidecar.get("size", -1))) != _object_size(item),
+        _clean_etag(sidecar.get("etag")) != _clean_etag(item.get("etag")),
+        sidecar.get("last_modified") != item.get("last_modified"),
+        sidecar.get("sha256") != digest,
+    )):
+        return None
+    if validate_netcdf:
+        try:
+            _validate_netcdf_payload(destination, item)
+        except RuntimeError:
+            return None
+    return {
+        "key": item["key"], "url": item["url"], "local_path": str(destination.resolve()),
+        "status": "cache_hit", "cache_hit": True, "legacy_cache_reused": True,
+        "cache_layout": "legacy_aws_v1", "size_bytes": _object_size(item),
+        "etag": _clean_etag(item.get("etag")), "sha256": digest, "retries": 0,
+        "resumed_bytes": 0, "valid_time_utc": item.get("valid_time_utc"),
+        "run_time_utc": item.get("run_time_utc"), "product": item.get("product"),
+        "guidance": item.get("guidance"), "source_id": "aws_operational",
+        "source_identity": archive_sources.source_identity_digest(item), "source": dict(item),
+    }
+
+
+def _validate_netcdf_payload(path: Path, item: Mapping[str, Any]) -> None:
+    try:
+        from netCDF4 import Dataset
+        with Dataset(path) as ds:
+            if not ds.dimensions or not ds.variables:
+                raise RuntimeError("NetCDF payload has no dimensions or variables")
+            if item.get("product") == "fields" and not ({"time", "Times"} & set(ds.variables)):
+                raise RuntimeError("SSCOFS fields payload has no time coordinate")
+    except Exception as exc:
+        raise RuntimeError(f"downloaded object is not a usable SSCOFS NetCDF: {exc}") from exc
+
+
+def _cache_result(item: Mapping[str, Any], destination: Path, *, validate_netcdf: bool = False) -> dict[str, Any] | None:
     if not destination.is_file() or destination.stat().st_size != _object_size(item):
         return None
     sidecar_path = _download_sidecar(destination)
@@ -573,7 +859,16 @@ def _cache_result(item: Mapping[str, Any], destination: Path) -> dict[str, Any] 
         # object, especially when the source ETag is multipart.
         return None
     expected_etag = _clean_etag(item.get("etag"))
+    expected_identity = archive_sources.source_identity_digest(item)
     if sidecar and (
+        sidecar.get("schema_version") != "sscofs_cached_object_v2"
+        or sidecar.get("source_id") != _source_id(item)
+        or sidecar.get("source_identity") != expected_identity
+        or sidecar.get("key") != item.get("key")
+        or sidecar.get("url") != item.get("url")
+        or sidecar.get("last_modified") != item.get("last_modified")
+        or sidecar.get("etag_semantics") != "opaque_provenance"
+        or
         int(sidecar.get("size_bytes", -1)) != _object_size(item)
         or _clean_etag(sidecar.get("etag")) != expected_etag
     ):
@@ -582,6 +877,11 @@ def _cache_result(item: Mapping[str, Any], destination: Path) -> dict[str, Any] 
     digest = _sha256(destination)
     if len(recorded_digest) == 64 and digest.lower() != recorded_digest.lower():
         return None
+    if validate_netcdf:
+        try:
+            _validate_netcdf_payload(destination, item)
+        except RuntimeError:
+            return None
     result = {
         "key": item["key"],
         "url": item["url"],
@@ -597,8 +897,10 @@ def _cache_result(item: Mapping[str, Any], destination: Path) -> dict[str, Any] 
         "run_time_utc": item.get("run_time_utc"),
         "product": item.get("product"),
         "guidance": item.get("guidance"),
+        "source_id": _source_id(item),
+        "source_identity": expected_identity,
+        "source": dict(item),
     }
-    write_json_atomic(sidecar_path, result)
     return result
 
 
@@ -611,21 +913,40 @@ def download_object(
     timeout: float = 120.0,
     chunk_size: int = 8 * 1024 * 1024,
     retry_delay: float = 1.0,
+    validate_netcdf: bool = False,
 ) -> dict[str, Any]:
     """Download one object atomically with safe range resumption."""
 
     target = Path(destination)
     target.parent.mkdir(parents=True, exist_ok=True)
-    cached = _cache_result(item, target)
+    cached = _cache_result(item, target, validate_netcdf=validate_netcdf)
     if cached is not None:
         return cached
     expected_size = _object_size(item)
     if expected_size <= 0:
         raise ValueError(f"Object {item.get('key')} has an invalid size")
     expected_etag = _clean_etag(item.get("etag"))
+    archive_sources.validate_source_object("sscofs", item, expected_source_id=_source_id(item))
     part = target.with_name(target.name + ".part")
+    part_sidecar = _partial_sidecar(target)
+    partial_metadata = {
+        "schema_version": "sscofs_partial_object_v2",
+        "source_id": _source_id(item), "source_identity": archive_sources.source_identity_digest(item),
+        "key": item.get("key"), "url": item.get("url"), "size_bytes": expected_size,
+        "etag": expected_etag, "last_modified": item.get("last_modified"),
+    }
+    if part.exists():
+        try:
+            previous = _read_json(part_sidecar)
+        except Exception:
+            previous = None
+        if previous != partial_metadata:
+            part.unlink(missing_ok=True)
+            part_sidecar.unlink(missing_ok=True)
     if part.exists() and part.stat().st_size > expected_size:
         part.unlink()
+    if not part.exists():
+        write_json_atomic(part_sidecar, partial_metadata)
     own_session = session is None
     if session is None:
         session = _requests_module().Session()
@@ -636,25 +957,11 @@ def download_object(
         for attempt in range(max_retries + 1):
             try:
                 start = part.stat().st_size if part.exists() else 0
-                headers = {"Range": f"bytes={start}-"} if start else {}
+                headers = archive_sources.build_resume_headers(start)
                 response = session.get(item["url"], headers=headers, stream=True, timeout=timeout)
                 response.raise_for_status()
-                status = int(getattr(response, "status_code", 200))
-                response_etag = _clean_etag(getattr(response, "headers", {}).get("ETag"))
-                if expected_etag and response_etag and response_etag != expected_etag:
-                    raise IOError(f"ETag changed for {item['key']}: {response_etag} != {expected_etag}")
-                if start and status == 206:
-                    content_range = getattr(response, "headers", {}).get("Content-Range", "")
-                    if content_range and not content_range.startswith(f"bytes {start}-"):
-                        raise IOError(f"Server returned an incompatible Content-Range: {content_range}")
-                    mode = "ab"
-                elif start and status == 200:
-                    mode = "wb"
-                    start = 0
-                elif not start and status in {200, 206}:
-                    mode = "wb"
-                else:
-                    raise IOError(f"Unexpected HTTP status {status} for {item['key']}")
+                archive_sources.validate_download_response(response, item, offset=start)
+                mode = "ab" if start else "wb"
                 with part.open(mode) as handle:
                     for block in response.iter_content(chunk_size=chunk_size):
                         if block:
@@ -665,7 +972,10 @@ def download_object(
                 if actual_size != expected_size:
                     raise IOError(f"Downloaded size {actual_size} does not match listed size {expected_size}")
                 digest = _sha256(part)
+                if validate_netcdf:
+                    _validate_netcdf_payload(part, item)
                 os.replace(part, target)
+                part_sidecar.unlink(missing_ok=True)
                 result = {
                     "key": item["key"],
                     "url": item["url"],
@@ -681,8 +991,17 @@ def download_object(
                     "run_time_utc": item.get("run_time_utc"),
                     "product": item.get("product"),
                     "guidance": item.get("guidance"),
+                    "source_id": _source_id(item),
+                    "source_identity": archive_sources.source_identity_digest(item),
+                    "source": dict(item),
                 }
-                write_json_atomic(_download_sidecar(target), result)
+                write_json_atomic(_download_sidecar(target), {
+                    **result,
+                    "schema_version": "sscofs_cached_object_v2",
+                    "size_bytes": expected_size,
+                    "last_modified": item.get("last_modified"),
+                    "etag_semantics": "opaque_provenance",
+                })
                 return result
             except Exception as exc:  # Network/filesystem retries are recorded.
                 last_error = exc
@@ -697,39 +1016,70 @@ def download_object(
 
 
 def fetch_request(
-    request_or_plan: Mapping[str, Any],
+    request_or_plan: Mapping[str, Any] | str | Path,
     run_dir: str | Path,
     *,
-    cache_dir: str | Path | None = None,
     max_retries: int = 4,
-    force_route: bool = False,
 ) -> dict[str, Any]:
     """Fetch all objects in a request/plan and write ``fetch_manifest.json``."""
 
+    if not isinstance(request_or_plan, (str, Path)):
+        raise TypeError("fetch requires an existing reviewed plan path, not an in-memory mapping")
     run_path = Path(run_dir)
     run_path.mkdir(parents=True, exist_ok=True)
-    if request_or_plan.get("schema_version") == "sscofs_download_estimate_v1":
-        plan = dict(request_or_plan)
-        request = validate_request(plan["request"])
-        if not (run_path / "download_estimate.json").is_file():
-            write_json_atomic(run_path / "download_estimate.json", plan)
-    else:
-        request = validate_request(request_or_plan)
-        plan = plan_request(request, run_dir=run_path)
-    if plan.get("routing_decision") != "local" and not force_route:
-        raise RuntimeError(
-            "The four-times-free-space gate recommends Kestrel; pass --force-route only after explicit review."
-        )
-    raw_dir = Path(cache_dir) if cache_dir else run_path / "cache" / "raw"
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    plan_path = Path(request_or_plan).resolve()
+    if not plan_path.is_file():
+        raise FileNotFoundError(f"reviewed plan path does not exist: {plan_path}")
+    plan = _read_json(plan_path)
+    if plan.get("schema_version") != "sscofs_download_estimate_v2":
+        raise ValueError("fetch requires a reviewed sscofs_download_estimate_v2 plan")
+    request = validate_request(plan["request"])
     objects = list(plan.get("objects", []))
+    if plan.get("normalized_request_sha256") != _canonical_sha256(request):
+        raise ValueError("reviewed plan request digest is invalid")
+    expected_objects_sha = _canonical_sha256(sorted(objects, key=lambda item: (_source_id(item), str(item.get("key")))))
+    if plan.get("selected_objects_sha256") != expected_objects_sha:
+        raise ValueError("reviewed plan selected-object digest is invalid")
+    if int(plan.get("selected_object_count", -1)) != len(objects):
+        raise ValueError("reviewed plan object count is invalid")
+    if int(plan.get("total_bytes", -1)) != sum(_object_size(item) for item in objects):
+        raise ValueError("reviewed plan exact byte total is invalid")
+    fallback_failures = validate_fallback_decision(request, plan.get("source_discovery") or {}, objects)
+    if fallback_failures:
+        raise ValueError("reviewed plan fallback decision is invalid: " + "; ".join(fallback_failures))
+    for item in objects:
+        archive_sources.validate_source_object("sscofs", item, expected_source_id=_source_id(item))
+    free_now = _disk_free(run_path)
+    if plan.get("routing_decision") != "local" or free_now <= 4 * int(plan["total_bytes"]):
+        raise RuntimeError("local fetch is not approved by the reviewed plan and current four-times-free-space gate")
+    raw_dir = run_path / "cache" / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    plan_sha256 = _sha256(plan_path)
     started = datetime.now(UTC)
     records: list[dict[str, Any]] = []
 
+    def revalidate_remote(item: Mapping[str, Any]) -> None:
+        matches = archive_sources.list_objects_v2(
+            _source_id(item), "sscofs", str(item["key"]), max_keys=2,
+        )
+        exact = [candidate for candidate in matches if candidate.get("key") == item.get("key")]
+        if len(exact) != 1:
+            raise RuntimeError("planned source object is no longer uniquely listed")
+        archive_sources.validate_remote_metadata(item, exact[0])
+
     def job(item: Mapping[str, Any]) -> dict[str, Any]:
-        target = raw_dir / Path(str(item["key"])).name
+        target = raw_dir / archive_sources.cache_relpath(item)
         try:
-            return download_object(item, target, max_retries=max_retries)
+            cached = _cache_result(item, target, validate_netcdf=True)
+            if cached is not None:
+                return cached
+            legacy = _legacy_aws_cache_result(
+                item, _legacy_aws_destination(run_path, item), validate_netcdf=True
+            )
+            if legacy is not None:
+                return legacy
+            revalidate_remote(item)
+            return download_object(item, target, max_retries=max_retries, validate_netcdf=True)
         except Exception as exc:
             return {
                 "key": item.get("key"), "url": item.get("url"),
@@ -739,6 +1089,8 @@ def fetch_request(
                 "valid_time_utc": item.get("valid_time_utc"),
                 "run_time_utc": item.get("run_time_utc"),
                 "product": item.get("product"), "guidance": item.get("guidance"),
+                "source_id": _source_id(item), "source_identity": archive_sources.source_identity_digest(item),
+                "source": dict(item),
             }
 
     with ThreadPoolExecutor(max_workers=request["max_workers"]) as pool:
@@ -747,25 +1099,33 @@ def fetch_request(
             records.append(future.result())
             records.sort(key=lambda item: (str(item.get("valid_time_utc")), str(item.get("key"))))
             checkpoint = {
-                "schema_version": "sscofs_fetch_manifest_v1",
+                "schema_version": "sscofs_fetch_manifest_v2",
                 "generated_utc": _iso(datetime.now(UTC)),
                 "software_version": SOFTWARE_VERSION,
                 "request": request,
-                "estimate_path": str((run_path / "download_estimate.json").resolve()),
-                "source": plan.get("source"),
+                "estimate_path": str(plan_path),
+                "reviewed_plan_sha256": plan_sha256,
+                "normalized_request_sha256": plan["normalized_request_sha256"],
+                "selected_objects_sha256": plan["selected_objects_sha256"],
                 "records": records,
                 "complete": len(records) == len(objects) and all(item["status"] != "failed" for item in records),
             }
             write_json_atomic(run_path / "fetch_manifest.json", checkpoint)
     failures = [item for item in records if item["status"] == "failed"]
     manifest = {
-        "schema_version": "sscofs_fetch_manifest_v1",
+        "schema_version": "sscofs_fetch_manifest_v2",
         "generated_utc": _iso(datetime.now(UTC)),
         "started_utc": _iso(started),
         "software_version": SOFTWARE_VERSION,
         "request": request,
-        "estimate_path": str((run_path / "download_estimate.json").resolve()),
-        "source": plan.get("source"),
+        "estimate_path": str(plan_path),
+        "reviewed_plan_sha256": plan_sha256,
+        "normalized_request_sha256": plan["normalized_request_sha256"],
+        "selected_objects_sha256": plan["selected_objects_sha256"],
+        "selected_object_count_binding": len(objects),
+        "selected_total_bytes_binding": int(plan["total_bytes"]),
+        "source_discovery": plan.get("source_discovery"),
+        "source_totals": plan.get("source_totals"),
         "selected_object_count": len(objects),
         "successful_object_count": len(records) - len(failures),
         "failure_count": len(failures),
@@ -775,7 +1135,7 @@ def fetch_request(
         "complete": len(records) == len(objects) and not failures,
     }
     write_json_atomic(run_path / "fetch_manifest.json", manifest)
-    if failures and request["missing_policy"] == "error":
+    if failures:
         raise RuntimeError(f"{len(failures)} required SSCOFS object download(s) failed")
     return manifest
 
@@ -980,7 +1340,10 @@ def _requested_source_names(request: Mapping[str, Any], available: set[str]) -> 
     return names
 
 
-def _records_from_files(paths: Sequence[str | Path], request: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _records_from_files(
+    paths: Sequence[str | Path], request: Mapping[str, Any],
+    source_by_path: Mapping[str, Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     from netCDF4 import Dataset
     normalized = validate_request(request)
     start = _parse_utc(normalized["start_utc"])
@@ -992,14 +1355,22 @@ def _records_from_files(paths: Sequence[str | Path], request: Mapping[str, Any])
             times = _decode_times(ds)
         if not times:
             raise ValueError(f"Could not decode Times/time in {path}")
-        parsed = parse_object_key(path.name)
+        if source_by_path is not None and str(path.resolve()) not in source_by_path:
+            raise ValueError(f"Input file is not bound to the reviewed fetch manifest: {path}")
+        provenance = dict((source_by_path or {}).get(str(path.resolve()), {}))
+        parsed = parse_object_key(str(provenance.get("key") or path.name))
         for index, valid in enumerate(times):
             if parsed and parsed.get("valid_time_utc") and len(times) == 1:
                 expected = _parse_utc(parsed["valid_time_utc"])
                 if abs((valid - expected).total_seconds()) > 1:
                     raise ValueError(f"Filename/NetCDF valid-time mismatch in {path}: {_iso(expected)} != {_iso(valid)}")
             if start <= valid < end:
-                records.append({"path": path, "time_index": index, "time": valid})
+                records.append({
+                    "path": path, "time_index": index, "time": valid,
+                    "source_id": provenance.get("source_id", "explicit_input"),
+                    "source_key": provenance.get("key", path.name),
+                    "source_url": provenance.get("url"),
+                })
     records.sort(key=lambda item: item["time"])
     observed = [item["time"] for item in records]
     if len(set(observed)) != len(observed):
@@ -1054,6 +1425,8 @@ def extract_fields(
     paths: Sequence[str | Path],
     request: Mapping[str, Any],
     output_path: str | Path,
+    *,
+    source_records: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Concatenate verified native fields and derive requested sigma views."""
 
@@ -1063,7 +1436,11 @@ def extract_fields(
     normalized = validate_request(request)
     if normalized["product"] != "fields":
         raise ValueError("extract_fields supports only product='fields'")
-    records = _records_from_files(paths, normalized)
+    source_by_path = None if source_records is None else {
+        str(Path(str(item["local_path"])).resolve()): item
+        for item in source_records if item.get("local_path")
+    }
+    records = _records_from_files(paths, normalized, source_by_path)
     target = Path(output_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     part = target.with_name(target.name + ".part")
@@ -1101,12 +1478,22 @@ def extract_fields(
         first_dimensions = {name: len(dim) for name, dim in first.dimensions.items()}
         geometry_schema = {name: first.variables[name] for name in geometry}
 
+    record_source_summary = {
+        source_id: sum(item["source_id"] == source_id for item in records)
+        for source_id in sorted({item["source_id"] for item in records})
+    }
     with Dataset(part, "w", format="NETCDF4") as output:
         output.setncattr("title", "Compact NOAA SSCOFS native fields")
-        output.setncattr("source", "NOAA noaa-nos-ofs-pds public AWS archive")
+        output.setncattr("source", "NOAA operational AWS and NCEI long-term OFS archives")
         output.setncattr("software", f"sscofs-fetcher {SOFTWARE_VERSION}")
         output.setncattr("request_json", json.dumps(normalized, sort_keys=True))
         output.setncattr("source_files_json", json.dumps([str(item["path"].resolve()) for item in records]))
+        output.setncattr("source_archives_json", json.dumps(sorted({item["source_id"] for item in records})))
+        output.setncattr("source_objects_json", json.dumps([
+            {"source_id": item["source_id"], "key": item["source_key"], "url": item["source_url"]}
+            for item in records
+        ], sort_keys=True))
+        output.setncattr("source_summary_json", json.dumps(record_source_summary, sort_keys=True))
         output.setncattr("surface_sigma_index", surface_index)
         output.setncattr("near_surface_sigma_index", near_surface_index)
         output.setncattr("bottom_sigma_index", bottom_index)
@@ -1163,6 +1550,22 @@ def extract_fields(
                 chars = np.frombuffer(text.encode("ascii"), dtype="S1")
                 encoded[: chars.size] = chars
                 times_var[index, :] = encoded
+
+            source_id_width = max(1, max(len(str(item["source_id"])) for item in records))
+            source_key_width = max(1, max(len(str(item["source_key"])) for item in records))
+            output.createDimension("source_id_strlen", source_id_width)
+            output.createDimension("source_key_strlen", source_key_width)
+            source_id_var = output.createVariable("source_archive", "S1", (time_dim, "source_id_strlen"))
+            source_key_var = output.createVariable("source_key", "S1", (time_dim, "source_key_strlen"))
+            for index, item in enumerate(records):
+                for variable, value, width in (
+                    (source_id_var, str(item["source_id"]), source_id_width),
+                    (source_key_var, str(item["source_key"]), source_key_width),
+                ):
+                    row = np.full(width, b" ", dtype="S1")
+                    encoded = np.frombuffer(value.encode("utf-8")[:width], dtype="S1")
+                    row[: encoded.size] = encoded
+                    variable[index, :] = row
 
             wet_nodes_var = _create_compressed_variable(output, "wet_nodes", "i1", (time_dim, "node"))
             wet_nodes_var.flag_values = np.asarray([0, 1], dtype=np.int8)
@@ -1272,12 +1675,17 @@ def extract_fields(
 
     os.replace(part, target)
     return {
-        "schema_version": "sscofs_extraction_v1",
+        "schema_version": "sscofs_extraction_v2",
         "output_path": str(target.resolve()),
         "record_count": len(records),
         "start_utc": _iso(records[0]["time"]),
         "end_utc": _iso(records[-1]["time"]),
         "source_files": [str(item["path"].resolve()) for item in records],
+        "source_records": [
+            {"source_id": item["source_id"], "key": item["source_key"], "url": item["source_url"]}
+            for item in records
+        ],
+        "source_summary": record_source_summary,
         "source_variables": source_names,
         "derived_variables": sorted(derived),
         "surface_sigma_index": surface_index,
@@ -1311,10 +1719,67 @@ def _manifest_paths(run_dir: Path) -> list[Path]:
     return paths
 
 
-def _delete_raw_after_extract(run_dir: Path) -> int:
+def _verified_manifest_records(run_dir: Path, request: Mapping[str, Any]) -> list[dict[str, Any]]:
+    manifest_path = run_dir / "fetch_manifest.json"
+    if not manifest_path.is_file():
+        raise RuntimeError("reviewed plan and fetch manifest are required")
+    manifest = _read_json(manifest_path)
+    plan_path = Path(str(manifest.get("estimate_path") or "")).resolve()
+    if not plan_path.is_file():
+        raise RuntimeError("fetch manifest reviewed plan path does not exist")
+    plan = _read_json(plan_path)
+    if plan.get("schema_version") != "sscofs_download_estimate_v2" or manifest.get("schema_version") != "sscofs_fetch_manifest_v2":
+        raise RuntimeError("v2 reviewed plan and fetch manifest are required for extraction")
+    normalized = validate_request(request)
+    selected = list(plan.get("objects", []))
+    if plan.get("normalized_request_sha256") != _canonical_sha256(normalized):
+        raise RuntimeError("request does not match the reviewed plan")
+    selected_sha = _canonical_sha256(sorted(selected, key=lambda item: (_source_id(item), str(item.get("key")))))
+    if plan.get("selected_objects_sha256") != selected_sha or manifest.get("selected_objects_sha256") != selected_sha:
+        raise RuntimeError("selected-object binding is invalid")
+    if manifest.get("reviewed_plan_sha256") != _sha256(plan_path):
+        raise RuntimeError("fetch manifest does not bind the reviewed plan file")
+    expected = {f"{_source_id(item)}:{item.get('key')}": item for item in selected}
+    records = list(manifest.get("records", []))
+    if len(records) != len(selected) or any(record.get("status") not in {"downloaded", "cache_hit"} for record in records):
+        raise RuntimeError("fetch manifest is incomplete")
+    raw_root = (run_dir / "cache" / "raw").resolve()
+    for record in records:
+        item = expected.get(f"{record.get('source_id')}:{record.get('key')}")
+        if item is None:
+            raise RuntimeError("fetch manifest contains an unplanned source object")
+        path = Path(str(record.get("local_path", ""))).resolve()
+        try:
+            path.relative_to(raw_root)
+        except ValueError as exc:
+            raise RuntimeError(f"cache path escapes the run directory: {path}") from exc
+        provider_path = raw_root / archive_sources.cache_relpath(item)
+        legacy_path = _legacy_aws_destination(run_dir, item).resolve()
+        uses_legacy = bool(record.get("legacy_cache_reused"))
+        expected_path = legacy_path if uses_legacy else provider_path
+        if path != expected_path or not path.is_file() or path.stat().st_size != _object_size(item) or _sha256(path) != record.get("sha256"):
+            raise RuntimeError(f"cache payload binding is invalid: {path}")
+        if uses_legacy:
+            if _legacy_aws_cache_result(item, path, validate_netcdf=True) is None:
+                raise RuntimeError(f"legacy AWS cache binding is invalid: {path}")
+        else:
+            sidecar = _read_json(_download_sidecar(path))
+            if any((
+                sidecar.get("schema_version") != "sscofs_cached_object_v2",
+                sidecar.get("source_identity") != archive_sources.source_identity_digest(item),
+                sidecar.get("key") != item.get("key"), sidecar.get("url") != item.get("url"),
+                sidecar.get("last_modified") != item.get("last_modified"),
+                _clean_etag(sidecar.get("etag")) != _clean_etag(item.get("etag")),
+                sidecar.get("sha256") != record.get("sha256"),
+            )):
+                raise RuntimeError(f"cache sidecar binding is invalid: {path}")
+    return records
+
+
+def _delete_raw_after_extract(run_dir: Path) -> dict[str, Any]:
     manifest_path = run_dir / "fetch_manifest.json"
     manifest = _read_json(manifest_path)
-    deleted = 0
+    deleted: list[dict[str, Any]] = []
     run_resolved = run_dir.resolve()
     for record in manifest.get("records", []):
         if record.get("status") not in {"downloaded", "cache_hit"} or not record.get("local_path"):
@@ -1325,23 +1790,39 @@ def _delete_raw_after_extract(run_dir: Path) -> int:
         except ValueError as exc:
             raise RuntimeError(f"Refusing to delete cache outside run directory: {path}") from exc
         if path.is_file():
+            size = path.stat().st_size
+            digest = record.get("sha256") or _sha256(path)
             path.unlink()
-            deleted += 1
+            deleted.append({
+                "path": str(path), "key": record.get("key"),
+                "source_id": record.get("source_id"), "bytes": size, "sha256": digest,
+            })
         sidecar = _download_sidecar(path)
         if sidecar.is_file():
             sidecar.unlink()
-        record["status"] = "deleted_after_extract"
-        record["deleted_utc"] = _iso(datetime.now(UTC))
-    manifest["cache_cleanup"] = {
-        "policy": "delete_after_extract", "deleted_file_count": deleted,
+    record_bindings = [
+        {name: item.get(name) for name in ("source_id", "key", "url", "local_path", "size_bytes", "sha256")}
+        for item in manifest.get("records", [])
+    ]
+    cleanup = {
+        "schema_version": "sscofs_cache_cleanup_v2",
+        "policy": "delete_after_extract", "deleted_file_count": len(deleted),
+        "deleted_bytes": sum(item["bytes"] for item in deleted), "files": deleted,
         "completed_utc": _iso(datetime.now(UTC)),
+        "recovery": "re-download provider-bound objects from the reviewed plan",
+        "reviewed_plan_sha256": manifest.get("reviewed_plan_sha256"),
+        "normalized_request_sha256": manifest.get("normalized_request_sha256"),
+        "selected_objects_sha256": manifest.get("selected_objects_sha256"),
+        "fetch_records_sha256": _canonical_sha256(record_bindings),
     }
+    manifest["cache_cleanup"] = cleanup
     write_json_atomic(manifest_path, manifest)
-    return deleted
+    write_json_atomic(run_dir / "cache_cleanup.json", cleanup)
+    return cleanup
 
 
 def _add_common_request_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--request", required=True, help="Path to an sscofs_request_v1 JSON file.")
+    parser.add_argument("--request", required=True, help="Path to an sscofs_request_v2 (or migratable v1) JSON file.")
     parser.add_argument("--run-dir", required=True, help="Run directory for estimates, manifests, cache, and products.")
 
 
@@ -1358,10 +1839,9 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--output", default=None, help="Defaults to <run-dir>/download_estimate.json.")
 
     fetch = subparsers.add_parser("fetch", help="Download a planned request with resume/cache support.")
-    _add_common_request_arguments(fetch)
-    fetch.add_argument("--cache-dir", default=None)
+    fetch.add_argument("--plan", required=True, help="Reviewed sscofs_download_estimate_v2 JSON path.")
+    fetch.add_argument("--run-dir", required=True)
     fetch.add_argument("--max-retries", type=int, default=4)
-    fetch.add_argument("--force-route", action="store_true", help="Override a non-local routing recommendation after review.")
 
     inspect = subparsers.add_parser("inspect", help="Inspect cached NetCDF variables and dimensions.")
     _add_common_request_arguments(inspect)
@@ -1378,9 +1858,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        request = load_request(args.request)
         run_dir = Path(args.run_dir)
         run_dir.mkdir(parents=True, exist_ok=True)
+        request = None if args.command == "fetch" else load_request(args.request)
         if args.command == "inventory":
             result = inventory_request(request)
             output = Path(args.output) if args.output else run_dir / "inventory.json"
@@ -1391,6 +1871,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             output = Path(args.output) if args.output else run_dir / "download_estimate.json"
             if output != run_dir / "download_estimate.json":
                 write_json_atomic(output, result)
+                (run_dir / "download_estimate.json").unlink(missing_ok=True)
             summary = {
                 "selected_object_count": result["selected_object_count"],
                 "total_bytes": result["total_bytes"],
@@ -1398,11 +1879,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "output": str(output),
             }
         elif args.command == "fetch":
-            estimate_path = run_dir / "download_estimate.json"
-            estimate = _read_json(estimate_path) if estimate_path.is_file() else plan_request(request, run_dir=run_dir)
             result = fetch_request(
-                estimate, run_dir, cache_dir=args.cache_dir,
-                max_retries=args.max_retries, force_route=args.force_route,
+                args.plan, run_dir, max_retries=args.max_retries,
             )
             summary = {
                 "complete": result["complete"], "downloaded_count": result["downloaded_count"],
@@ -1422,12 +1900,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             paths = [Path(path) for path in args.path] if args.path else _manifest_paths(run_dir)
             output = Path(args.output) if args.output else run_dir / "compact" / "sscofs_fields_compact.nc"
-            result = extract_fields(paths, request, output)
+            verified_records = _verified_manifest_records(run_dir, request) if not args.path else None
+            result = extract_fields(paths, request, output, source_records=verified_records)
             write_json_atomic(run_dir / "extraction_manifest.json", result)
-            deleted = _delete_raw_after_extract(run_dir) if request["cache_policy"] == "delete_after_extract" else 0
             summary = {
                 "record_count": result["record_count"], "output": str(output),
-                "size_bytes": result["size_bytes"], "deleted_raw_count": deleted,
+                "size_bytes": result["size_bytes"], "raw_cleanup": (
+                    "deferred_until_health_passes" if request["cache_policy"] == "delete_after_extract" else "kept"
+                ),
                 "manifest": str(run_dir / "extraction_manifest.json"),
             }
         print(json.dumps(summary, indent=2))

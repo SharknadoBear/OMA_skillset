@@ -1056,19 +1056,32 @@ def _netcdf_check(path: Path, request: dict[str, Any], plots_dir: Path) -> tuple
         return {"path": str(path), "error": str(exc)}, [], [f"Could not inspect NetCDF {path.name}: {exc}"], warnings
 
 
-def _aggregate_passthrough_times(paths: Sequence[Path]) -> tuple[list[datetime], dict[str, Any], list[str]]:
+def _aggregate_passthrough_times(
+    paths: Sequence[Path], manifest: Mapping[str, Any] | None = None,
+) -> tuple[list[datetime], dict[str, Any], list[str]]:
     records: list[dict[str, Any]] = []
-    all_times: list[datetime] = []
+    candidates: dict[datetime, list[dict[str, Any]]] = {}
     warnings: list[str] = []
     try:
         from netCDF4 import Dataset
     except Exception as exc:
         return [], {"file_count": 0, "error": str(exc)}, [f"Cannot aggregate passthrough Times: {exc}"]
+    provenance = {
+        str(Path(str(item.get("local_path", ""))).resolve()): item
+        for item in (manifest or {}).get("records", []) if item.get("local_path")
+    }
     for path in paths:
         try:
             with Dataset(path, "r") as ds:
                 times = _netcdf_times(ds)
-            all_times.extend(times)
+            source = provenance.get(str(path.resolve()), {})
+            run_time = _parse_utc(source.get("run_time_utc"))
+            for time_index, stamp in enumerate(times):
+                candidates.setdefault(stamp, []).append({
+                    "path": str(path), "source_id": source.get("source_id"),
+                    "source_key": source.get("key", path.name), "run_time": run_time,
+                    "time_index": time_index,
+                })
             records.append({
                 "path": str(path),
                 "time_count": len(times),
@@ -1078,18 +1091,33 @@ def _aggregate_passthrough_times(paths: Sequence[Path]) -> tuple[list[datetime],
         except Exception as exc:
             records.append({"path": str(path), "error": str(exc), "time_count": 0})
             warnings.append(f"Could not decode passthrough Times from {path.name}: {exc}")
-    sorted_times = sorted(all_times)
-    unique_times = sorted(set(sorted_times))
-    duplicate_count = len(sorted_times) - len(unique_times)
+    unique_times = sorted(candidates)
+    decoded_count = sum(len(group) for group in candidates.values())
+    duplicate_count = decoded_count - len(unique_times)
+    selected_records = []
+    for stamp in unique_times:
+        winner = min(
+            candidates[stamp],
+            key=lambda item: (item["run_time"] or datetime.max.replace(tzinfo=UTC), str(item["source_key"])),
+        )
+        selected_records.append({
+            "normalized_time_utc": _iso(stamp), "source_id": winner["source_id"],
+            "source_key": winner["source_key"],
+            "source_cycle_utc": _iso(winner["run_time"]),
+            "source_time_index": winner["time_index"], "candidate_count": len(candidates[stamp]),
+            "deduplication_rank": "earliest_cycle_terminal_before_following_cycle_initial",
+        })
     if duplicate_count:
         warnings.append(
             f"Passthrough files contain {duplicate_count} overlapping internal timestamp(s); coverage uses their unique union."
         )
     return unique_times, {
         "file_count": len(paths),
-        "decoded_time_count": len(sorted_times),
+        "decoded_time_count": decoded_count,
         "unique_time_count": len(unique_times),
         "overlap_count": duplicate_count,
+        "deduplication": "preceding cycle terminal record wins",
+        "selected_time_records": selected_records,
         "files": records,
     }, warnings
 
@@ -1166,11 +1194,21 @@ def _source_summary(estimate: Any, manifest: Any) -> dict[str, Any]:
     urls: set[str] = set()
     etags: set[str] = set()
     layouts: set[str] = set()
+    source_counts: dict[str, int] = {}
+    source_descriptors: dict[str, dict[str, Any]] = {}
     for item in list(_walk_dicts(estimate)) + list(_walk_dicts(manifest)):
         key = item.get("key") or item.get("object_key")
-        if isinstance(key, str) and key.startswith("sscofs/"):
+        if isinstance(key, str) and "sscofs" in key.lower() and key.lower().endswith(".nc"):
             keys.add(key)
-            layouts.add("nested_daily" if "/netcdf/" in key and len(key.split("/")) > 6 else "legacy_monthly")
+            source_id = str(item.get("source_id") or "unknown")
+            source_counts[source_id] = source_counts.get(source_id, 0) + 1
+            layouts.add(str(item.get("layout") or "unknown"))
+            if source_id in {"aws_operational", "ncei_long_term"}:
+                source_descriptors[source_id] = {
+                    name: item.get(name)
+                    for name in ("provider", "archive_role", "container", "endpoint", "listing_endpoint")
+                    if item.get(name) is not None
+                }
         url = item.get("url") or item.get("source_url")
         if isinstance(url, str) and url.startswith("http"):
             urls.add(url)
@@ -1180,13 +1218,14 @@ def _source_summary(estimate: Any, manifest: Any) -> dict[str, Any]:
     return {
         "provider": "NOAA/NOS Operational Forecast Systems",
         "system": "SSCOFS",
-        "bucket": "noaa-nos-ofs-pds",
-        "access": "anonymous HTTPS and S3 ListObjectsV2",
+        "access": "anonymous HTTPS ListObjectsV2",
+        "archives": source_descriptors,
         "object_count": len(keys),
         "keys": sorted(keys),
         "urls": sorted(urls),
         "etag_count": len(etags),
         "layouts_observed": sorted(layouts),
+        "source_record_occurrences": source_counts,
     }
 
 
@@ -1194,13 +1233,16 @@ def _keyed_objects(value: Any) -> dict[str, dict[str, Any]]:
     objects: dict[str, dict[str, Any]] = {}
     for item in _walk_dicts(value):
         key = item.get("key") or item.get("object_key")
-        if not isinstance(key, str) or not key.startswith("sscofs/"):
+        if not isinstance(key, str) or "sscofs" not in key.lower() or not key.lower().endswith(".nc"):
             continue
+        object_id = f"{item.get('source_id') or 'unknown'}:{key}"
         size = _integer(_first(item, SIZE_KEYS))
-        current = objects.get(key)
+        current = objects.get(object_id)
         # Prefer the richest occurrence when a record contains nested copies.
         if current is None or (current.get("size") is None and size is not None):
-            objects[key] = {
+            objects[object_id] = {
+                "key": key,
+                "source_id": item.get("source_id"),
                 "size": size,
                 "etag": item.get("etag") or item.get("ETag"),
                 "sha256": _first(item, HASH_KEYS),
@@ -1234,7 +1276,7 @@ def _crosscheck_estimate_manifest(estimate: Any, manifest: Any) -> tuple[dict[st
     if etag_mismatches:
         critical.append(f"Estimate/manifest ETags disagree for {len(etag_mismatches)} object(s).")
     if unexpected:
-        warnings.append(f"fetch_manifest.json contains {len(unexpected)} object(s) not selected by the estimate.")
+        critical.append(f"fetch_manifest.json contains {len(unexpected)} object(s) not selected by the reviewed plan.")
     return {
         "estimated_object_count": len(estimated),
         "manifest_object_count": len(fetched),
@@ -1242,7 +1284,7 @@ def _crosscheck_estimate_manifest(estimate: Any, manifest: Any) -> tuple[dict[st
         "unexpected_in_manifest": unexpected,
         "size_mismatches": size_mismatches,
         "etag_mismatches": etag_mismatches,
-        "consistent": not missing_from_manifest and not size_mismatches and not etag_mismatches,
+        "consistent": not missing_from_manifest and not unexpected and not size_mismatches and not etag_mismatches,
     }, critical, warnings
 
 
@@ -1263,6 +1305,162 @@ def _json_clean(value: Any) -> Any:
     return value
 
 
+def _source_record_triplets(records: Iterable[Mapping[str, Any]]) -> list[tuple[str, str, str]]:
+    """Return a deterministic, duplicate-preserving source-record identity list."""
+    return sorted(
+        (
+            str(item.get("source_id") or ""),
+            str(item.get("key") or ""),
+            str(item.get("url") or ""),
+        )
+        for item in records
+    )
+
+
+def _verify_v2_extraction_provenance(
+    extraction: Mapping[str, Any],
+    selected: Sequence[Mapping[str, Any]],
+    manifest: Mapping[str, Any],
+    run_path: Path,
+) -> tuple[dict[str, Any], list[str]]:
+    """Bind a v2 compact fields product exactly to plan and fetch evidence."""
+    critical: list[str] = []
+    extraction_records = list(extraction.get("source_records") or [])
+    successful_records = [
+        item for item in manifest.get("records", [])
+        if item.get("status") in {"downloaded", "cache_hit"}
+    ]
+    planned_ids = _source_record_triplets(selected)
+    fetched_ids = _source_record_triplets(successful_records)
+    extracted_ids = _source_record_triplets(extraction_records)
+    if fetched_ids != planned_ids:
+        critical.append("successful fetch outcomes do not exactly match reviewed-plan source records")
+    if extracted_ids != planned_ids:
+        critical.append("extraction source records do not exactly match reviewed-plan source records")
+
+    output_text = str(extraction.get("output_path") or "")
+    output_path = Path(output_text).resolve() if output_text else None
+    output_size: int | None = None
+    output_sha: str | None = None
+    compact_records: list[dict[str, Any]] = []
+    compact_archives: list[str] = []
+    compact_summary: dict[str, int] = {}
+    compact_source_ids: list[str] = []
+    compact_source_keys: list[str] = []
+    expected_summary = {
+        source_id: sum(str(item.get("source_id") or "") == source_id for item in extraction_records)
+        for source_id in sorted({str(item.get("source_id") or "") for item in extraction_records})
+        if source_id
+    }
+    if extraction.get("source_summary") != expected_summary:
+        critical.append("extraction source summary does not match its exact source records")
+    if output_path is None or not output_path.is_file():
+        critical.append("extraction output path is absent or does not exist")
+    else:
+        try:
+            output_path.relative_to(run_path.resolve())
+        except ValueError:
+            critical.append("extraction output path escapes the reviewed run directory")
+        output_size = output_path.stat().st_size
+        output_sha = _sha256(output_path)
+        if int(extraction.get("size_bytes", -1)) != output_size:
+            critical.append("extraction output byte size differs from extraction manifest")
+        if extraction.get("sha256") != output_sha:
+            critical.append("extraction output SHA-256 differs from extraction manifest")
+        try:
+            from netCDF4 import Dataset
+            with Dataset(output_path) as ds:
+                compact_records = json.loads(str(ds.getncattr("source_objects_json")))
+                compact_archives = json.loads(str(ds.getncattr("source_archives_json")))
+                compact_summary = json.loads(str(ds.getncattr("source_summary_json")))
+                compact_source_ids = _decode_char_rows(ds.variables["source_archive"][:])
+                compact_source_keys = _decode_char_rows(ds.variables["source_key"][:])
+        except Exception as exc:
+            critical.append(f"compact extraction provenance cannot be decoded: {type(exc).__name__}: {exc}")
+
+    expected_records = [
+        {
+            "source_id": item.get("source_id"),
+            "key": item.get("key"),
+            "url": item.get("url"),
+        }
+        for item in extraction_records
+    ]
+    expected_archives = sorted(expected_summary)
+    if compact_records != expected_records:
+        critical.append("compact source_objects_json differs from extraction manifest source records")
+    if compact_archives != expected_archives:
+        critical.append("compact source_archives_json differs from extraction manifest archives")
+    if compact_summary != expected_summary:
+        critical.append("compact source_summary_json differs from extraction manifest summary")
+    if compact_source_ids != [str(item.get("source_id") or "") for item in extraction_records]:
+        critical.append("compact source_archive rows differ from extraction manifest source records")
+    if compact_source_keys != [str(item.get("key") or "") for item in extraction_records]:
+        critical.append("compact source_key rows differ from extraction manifest source records")
+
+    return {
+        "planned_source_records": len(planned_ids),
+        "successful_fetch_records": len(fetched_ids),
+        "extraction_source_records": len(extracted_ids),
+        "source_summary": expected_summary,
+        "output_path": str(output_path) if output_path else None,
+        "output_size_bytes": output_size,
+        "output_sha256": output_sha,
+        "exact_plan_fetch_extraction_match": fetched_ids == planned_ids == extracted_ids,
+        "compact_provenance_matches": not any("compact" in item for item in critical),
+    }, critical
+
+
+def _verify_v2_cleanup_evidence(
+    cleanup: Mapping[str, Any], manifest: Mapping[str, Any], run_path: Path,
+) -> tuple[dict[str, Any], list[str]]:
+    """Authenticate a completed delete-after-health cleanup against fetch records."""
+    critical: list[str] = []
+    records = list(manifest.get("records") or [])
+    record_bindings = [
+        {name: item.get(name) for name in ("source_id", "key", "url", "local_path", "size_bytes", "sha256")}
+        for item in records
+    ]
+    if cleanup.get("schema_version") != "sscofs_cache_cleanup_v2":
+        critical.append("cache cleanup evidence schema is not v2")
+    for name in ("reviewed_plan_sha256", "normalized_request_sha256", "selected_objects_sha256"):
+        if cleanup.get(name) != manifest.get(name):
+            critical.append(f"cache cleanup {name} binding differs from fetch manifest")
+    try:
+        import sscofs_fetcher as core
+        if cleanup.get("fetch_records_sha256") != core._canonical_sha256(record_bindings):
+            critical.append("cache cleanup fetch-record binding is invalid")
+    except Exception as exc:
+        critical.append(f"cache cleanup record binding cannot be verified: {exc}")
+    expected = {
+        str(Path(str(item.get("local_path", ""))).resolve()): item for item in records
+    }
+    cleanup_files = cleanup.get("files") if isinstance(cleanup.get("files"), list) else []
+    actual_paths = [str(Path(str(item.get("path", ""))).resolve()) for item in cleanup_files]
+    if len(actual_paths) != len(set(actual_paths)) or set(actual_paths) != set(expected):
+        critical.append("cache cleanup file inventory does not exactly match fetch records")
+    for item in cleanup_files:
+        path = Path(str(item.get("path", ""))).resolve()
+        record = expected.get(str(path))
+        try:
+            path.relative_to((run_path / "cache" / "raw").resolve())
+        except ValueError:
+            critical.append(f"cache cleanup path escapes the run raw cache: {path}")
+        if path.exists() or path.with_name(path.name + ".download.json").exists():
+            critical.append(f"cache cleanup claims a payload or sidecar that still exists: {path}")
+        if record and any((
+            item.get("key") != record.get("key"), item.get("source_id") != record.get("source_id"),
+            int(item.get("bytes", -1)) != int(record.get("size_bytes", -2)),
+            item.get("sha256") != record.get("sha256"),
+        )):
+            critical.append(f"cache cleanup file provenance differs from fetch record: {path}")
+    if int(cleanup.get("deleted_file_count", -1)) != len(cleanup_files):
+        critical.append("cache cleanup deleted-file count is invalid")
+    if int(cleanup.get("deleted_bytes", -1)) != sum(int(item.get("bytes", 0)) for item in cleanup_files):
+        critical.append("cache cleanup deleted-byte total is invalid")
+    return {"verified": not critical, "file_count": len(cleanup_files)}, critical
+
+
 def evaluate_health(request_path: str | Path, run_dir: str | Path, output: str | Path, plots_dir: str | Path) -> dict[str, Any]:
     request = _read_json(request_path)
     if not isinstance(request, dict):
@@ -1271,14 +1469,145 @@ def evaluate_health(request_path: str | Path, run_dir: str | Path, output: str |
     output_path = Path(output)
     plots_path = Path(plots_dir)
     manifest_path = _find_json(run_path, "fetch_manifest.json")
-    estimate_path = _find_json(run_path, "download_estimate.json")
     manifest = _read_json(manifest_path) if manifest_path else {}
-    estimate = _read_json(estimate_path) if estimate_path else {}
+    bound_estimate = str(manifest.get("estimate_path") or "") if isinstance(manifest, Mapping) else ""
+    estimate_path = Path(bound_estimate).resolve() if bound_estimate else _find_json(run_path, "download_estimate.json")
+    estimate = _read_json(estimate_path) if estimate_path and Path(estimate_path).is_file() else {}
     critical: list[str] = []
     warnings: list[str] = []
+    extraction_provenance: dict[str, Any] = {"checked": False}
+    cleanup_report: dict[str, Any] = {"verified": False}
+    cleanup_path = run_path / "cache_cleanup.json"
+    cleanup = _read_json(cleanup_path) if cleanup_path.is_file() else {}
+    cleanup_verified = False
+    if estimate.get("schema_version") == "sscofs_download_estimate_v2":
+        try:
+            import sscofs_fetcher as core
+            normalized = core.validate_request(estimate.get("request", {}))
+            selected = list(estimate.get("objects", []))
+            raw_records = manifest.get("records", [])
+            if manifest.get("schema_version") != "sscofs_fetch_manifest_v2":
+                critical.append("fetch manifest schema is not sscofs_fetch_manifest_v2")
+            try:
+                manifest_request = core.validate_request(manifest.get("request", {}))
+            except Exception as exc:
+                critical.append(f"fetch manifest request is invalid: {exc}")
+            else:
+                if core._canonical_sha256(manifest_request) != core._canonical_sha256(normalized):
+                    critical.append("fetch manifest request differs from reviewed plan request")
+            if not isinstance(raw_records, list) or any(not isinstance(item, Mapping) for item in raw_records):
+                critical.append("fetch manifest records are not a valid list")
+                raw_records = []
+            identities = [(str(item.get("source_id")), str(item.get("key"))) for item in raw_records]
+            if len(set(identities)) != len(identities):
+                critical.append("fetch manifest contains duplicate source records")
+            if len(raw_records) != len(selected):
+                critical.append("fetch manifest record cardinality differs from reviewed plan")
+            if int(manifest.get("selected_object_count_binding", -1)) != len(selected):
+                critical.append("fetch manifest selected-object count binding is invalid")
+            if int(manifest.get("selected_total_bytes_binding", -1)) != sum(core._object_size(item) for item in selected):
+                critical.append("fetch manifest selected-byte binding is invalid")
+            if int(manifest.get("selected_object_count", -1)) != len(raw_records):
+                critical.append("fetch manifest selected_object_count differs from its records")
+            successful = [item for item in raw_records if item.get("status") in {"downloaded", "cache_hit"}]
+            failures_recorded = [item for item in raw_records if item.get("status") == "failed"]
+            exact_counts = {
+                "successful_object_count": len(successful),
+                "failure_count": len(failures_recorded),
+                "downloaded_count": sum(item.get("status") == "downloaded" for item in raw_records),
+                "cache_hit_count": sum(item.get("status") == "cache_hit" for item in raw_records),
+            }
+            if any(int(manifest.get(name, -1)) != value for name, value in exact_counts.items()):
+                critical.append("fetch manifest counters do not match its exact records")
+            if manifest.get("complete") != (len(raw_records) == len(selected) and not failures_recorded):
+                critical.append("fetch manifest completion flag does not match its exact records")
+            selected_sha = core._canonical_sha256(sorted(selected, key=lambda item: (str(item.get("source_id")), str(item.get("key")))))
+            if estimate.get("normalized_request_sha256") != core._canonical_sha256(normalized):
+                critical.append("download estimate normalized-request binding is invalid")
+            if estimate.get("selected_objects_sha256") != selected_sha:
+                critical.append("download estimate selected-object binding is invalid")
+            if int(estimate.get("selected_object_count", -1)) != len(selected):
+                critical.append("download estimate object-count binding is invalid")
+            if int(estimate.get("total_bytes", -1)) != sum(core._object_size(item) for item in selected):
+                critical.append("download estimate byte-total binding is invalid")
+            reviewed = Path(str(manifest.get("estimate_path", ""))).resolve()
+            if not reviewed.is_file() or manifest.get("reviewed_plan_sha256") != _sha256(reviewed):
+                critical.append("fetch manifest reviewed-plan path/SHA binding is invalid")
+            else:
+                try:
+                    if _read_json(reviewed) != estimate:
+                        critical.append("health estimate artifact differs from the reviewed plan bound by the fetch manifest")
+                except Exception as exc:
+                    critical.append(f"reviewed plan cannot be compared with health estimate: {exc}")
+            for field in ("normalized_request_sha256", "selected_objects_sha256"):
+                if manifest.get(field) != estimate.get(field):
+                    critical.append(f"fetch manifest {field} differs from reviewed plan")
+            expected = {f"{item.get('source_id')}:{item.get('key')}": item for item in selected}
+            selected_sources = {str(item.get("source_id")) for item in selected}
+            discovery = estimate.get("source_discovery") or {}
+            critical.extend(core.validate_fallback_decision(normalized, discovery, selected))
+            expected_totals = {
+                source_id: {
+                    "object_count": sum(str(item.get("source_id")) == source_id for item in selected),
+                    "bytes": sum(core._object_size(item) for item in selected if str(item.get("source_id")) == source_id),
+                }
+                for source_id in ("aws_operational", "ncei_long_term")
+            }
+            if estimate.get("source_totals") != expected_totals:
+                critical.append("download estimate per-source object/byte totals are invalid")
+            if manifest.get("source_totals") != expected_totals:
+                critical.append("fetch manifest per-source object/byte totals differ from reviewed plan")
+            if cleanup:
+                cleanup_report, cleanup_failures = _verify_v2_cleanup_evidence(cleanup, manifest, run_path)
+                critical.extend(cleanup_failures)
+                cleanup_verified = not cleanup_failures
+            for record in manifest.get("records", []):
+                source = expected.get(f"{record.get('source_id')}:{record.get('key')}")
+                if source is None or record.get("source_id") != source.get("source_id"):
+                    critical.append(f"fetch record source binding is invalid for {record.get('key')}")
+                    continue
+                sidecar_path = Path(str(record.get("local_path", ""))).with_name(Path(str(record.get("local_path", ""))).name + ".download.json")
+                sidecar = _read_json(sidecar_path) if sidecar_path.is_file() else {}
+                local_path = Path(str(record.get("local_path", ""))).resolve()
+                try:
+                    local_path.relative_to((run_path / "cache" / "raw").resolve())
+                except ValueError:
+                    critical.append(f"fetch record path escapes the run cache for {record.get('key')}")
+                core.archive_sources.validate_source_object("sscofs", source, expected_source_id=str(source.get("source_id")))
+                if cleanup_verified:
+                    continue
+                if record.get("legacy_cache_reused"):
+                    if core._legacy_aws_cache_result(source, local_path, validate_netcdf=True) is None:
+                        critical.append(f"legacy AWS cache source identity is invalid for {record.get('key')}")
+                elif (
+                    sidecar.get("schema_version") != "sscofs_cached_object_v2"
+                    or sidecar.get("source_identity") != core.archive_sources.source_identity_digest(source)
+                    or sidecar.get("source_id") != source.get("source_id")
+                    or sidecar.get("key") != source.get("key")
+                    or sidecar.get("url") != source.get("url")
+                    or int(sidecar.get("size_bytes", -1)) != core._object_size(source)
+                    or str(sidecar.get("etag", "")).strip('"') != str(source.get("etag", "")).strip('"')
+                    or sidecar.get("last_modified") != source.get("last_modified")
+                    or sidecar.get("sha256") != record.get("sha256")
+                ):
+                    critical.append(f"cache sidecar source identity is invalid for {record.get('key')}")
+            if normalized.get("product") == "fields":
+                extraction_path = run_path / "extraction_manifest.json"
+                extraction = _read_json(extraction_path) if extraction_path.is_file() else {}
+                if extraction.get("schema_version") != "sscofs_extraction_v2":
+                    critical.append("fields extraction manifest is not v2")
+                else:
+                    extraction_provenance, failures = _verify_v2_extraction_provenance(
+                        extraction, selected, manifest, run_path
+                    )
+                    extraction_provenance["checked"] = True
+                    critical.extend(failures)
+        except Exception as exc:
+            critical.append(f"v2 reviewed-plan/source validation failed: {exc}")
     dataset_path, candidates = _select_dataset(run_path)
     allow_deleted = bool(
         request.get("cache_policy") == "delete_after_extract"
+        and cleanup_verified
         and dataset_path is not None
         and _dataset_score(dataset_path)[0] >= 10
     )
@@ -1302,7 +1631,7 @@ def evaluate_health(request_path: str | Path, run_dir: str | Path, output: str |
         critical.extend(failures)
         warnings.extend(notes)
         if request.get("product") in {"stations", "regulargrid"}:
-            aggregate_times, aggregate_report, notes = _aggregate_passthrough_times(candidates)
+            aggregate_times, aggregate_report, notes = _aggregate_passthrough_times(candidates, manifest)
             if aggregate_times:
                 dataset_times = aggregate_times
             dataset_report["passthrough_time_aggregate"] = aggregate_report
@@ -1334,13 +1663,15 @@ def evaluate_health(request_path: str | Path, run_dir: str | Path, output: str |
     warnings = [item for item in dict.fromkeys(warnings) if item not in critical]
     status = "fail" if critical else ("warning" if warnings else "pass")
     result = {
-        "schema_version": "sscofs_health_v1",
+        "schema_version": "sscofs_health_v2",
         "generated_utc": _iso(datetime.now(UTC)),
         "status": status,
         "request_path": str(Path(request_path)),
         "run_dir": str(run_path),
         "request": request,
         "source_provenance": _source_summary(estimate, manifest),
+        "extraction_provenance": extraction_provenance,
+        "raw_cache_cleanup_evidence": cleanup_report,
         "estimate_path": str(estimate_path) if estimate_path else None,
         "manifest_path": str(manifest_path) if manifest_path else None,
         "manifest_integrity": manifest_report,
@@ -1366,6 +1697,19 @@ def evaluate_health(request_path: str | Path, run_dir: str | Path, output: str |
         },
         "reporting_policy": "Critical caveats fail acceptance. Broad physical-range checks are warnings only; source values are never clipped.",
     }
+    if not critical and request.get("cache_policy") == "delete_after_extract":
+        try:
+            if cleanup_verified:
+                completed_cleanup = cleanup
+            else:
+                import sscofs_fetcher as core
+                completed_cleanup = core._delete_raw_after_extract(run_path)
+            result["raw_cache_deletion"] = {**completed_cleanup, "completed_after_health_pass": True}
+        except Exception as exc:
+            critical.append(f"post-health raw-cache deletion failed: {type(exc).__name__}: {exc}")
+            result["status"] = "fail"
+            result["acceptance"]["passed"] = False
+            result["critical_caveats"] = critical
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result = _json_clean(result)
     output_path.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n", encoding="utf-8")
@@ -1374,7 +1718,7 @@ def evaluate_health(request_path: str | Path, run_dir: str | Path, output: str |
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--request", required=True, help="Path to an sscofs_request_v1 JSON request.")
+    parser.add_argument("--request", required=True, help="Path to an sscofs_request_v2 or migratable v1 JSON request.")
     parser.add_argument("--run-dir", required=True, help="Run directory containing estimate, manifest, raw cache, and/or compact NetCDF.")
     parser.add_argument("--output", required=True, help="Health JSON path to write.")
     parser.add_argument("--plots-dir", required=True, help="Directory for representative midpoint PNG maps.")

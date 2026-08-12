@@ -9,9 +9,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .sscofs_fetcher import load_request, plan_request, write_json_atomic
+    from .sscofs_fetcher import plan_request, write_json_atomic
 except ImportError:  # Support direct execution from the scripts directory.
-    from sscofs_fetcher import load_request, plan_request, write_json_atomic
+    from sscofs_fetcher import plan_request, write_json_atomic
 
 
 DEFAULT_SKILL_NAME = "sscofs-fetcher"
@@ -20,7 +20,7 @@ DEFAULT_OUTPUT_NAME = "download_estimate.json"
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--request", required=True, help="Path to an sscofs_request_v1 JSON file.")
+    parser.add_argument("--request", required=True, help="Path to an sscofs_request_v2 or migratable v1 JSON file.")
     parser.add_argument(
         "--run-dir",
         default=".",
@@ -61,7 +61,9 @@ def _apply_compatibility_metadata(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     run_dir = Path(args.run_dir)
-    request = load_request(args.request)
+    # Preserve the caller's original schema/version for planner migration
+    # lineage; plan_request performs the authoritative normalization.
+    request = json.loads(Path(args.request).read_text(encoding="utf-8"))
 
     # Pass run_dir so the canonical planner performs its exact local-free-space
     # check and writes the conventional artifact used by the main CLI.
