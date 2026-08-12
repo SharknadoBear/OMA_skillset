@@ -48,6 +48,13 @@ def object_for(key: str, size: int = 100, etag: str = "opaque-8"):
             "url": core.S3_ENDPOINT + "/" + key}
 
 
+def authorize_aws_fixture_plan(path: Path) -> dict:
+    plan = core.read_json(path)
+    plan["source_attempts"] = [{"source_id": "aws_operational", "status": "success"}]
+    core.write_json_atomic(path, plan)
+    return plan
+
+
 class FakeResponse:
     def __init__(self, content=b"", *, status=200, headers=None):
         self.content = content
@@ -74,6 +81,20 @@ class FakeSession:
 
     def get(self, url, **kwargs):
         self.calls.append((url, kwargs))
+        params = kwargs.get("params")
+        if (isinstance(params, dict) and params.get("list-type") == "2"
+                and str(params.get("prefix", "")).lower().endswith(".nc")):
+            key = str(params["prefix"])
+            response = self.responses[0]
+            etag = str(response.headers.get("ETag", ""))
+            size = len(response.content)
+            xml = (
+                "<ListBucketResult>"
+                f"<Contents><Key>{key}</Key><LastModified>2026-07-21T00:00:00Z</LastModified>"
+                f"<ETag>{etag}</ETag><Size>{size}</Size></Contents>"
+                "<IsTruncated>false</IsTruncated></ListBucketResult>"
+            ).encode()
+            return FakeResponse(xml)
         if not self.responses:
             raise AssertionError("unexpected request")
         return self.responses.pop(0)
@@ -96,7 +117,7 @@ def create_fixture(path: Path, stamp: datetime, *, vtransform=1, lon_offset=0.0,
                    reverse_sigma=False, missing_layer=False,
                    angle_units="radians", angle_standard_name="grid_angle_of_rotation_from_east_to_y",
                    angle_long_name="angle between XI-axis and EAST", angle_value=0.0,
-                   angle_on_u_grid=False):
+                   angle_on_u_grid=False, source_calendar="gregorian"):
     import netCDF4
     import numpy as np
     eta, xi, n = 4, 5, 3
@@ -158,7 +179,7 @@ def create_fixture(path: Path, stamp: datetime, *, vtransform=1, lon_offset=0.0,
         ds.hc = 2.0
         time = ds.createVariable("ocean_time", "f8", ("ocean_time",))
         time.units = "seconds since 1970-01-01 00:00:00 UTC"
-        time.calendar = "gregorian"
+        time.calendar = source_calendar
         time[:] = stamp.replace(tzinfo=timezone.utc).timestamp() + 20.0
         zeta = ds.createVariable("zeta", "f4", ("ocean_time", "eta_rho", "xi_rho"), fill_value=1e37)
         zeta.standard_name = "sea_surface_height_above_geoid"
@@ -189,9 +210,10 @@ def create_run_fixture(root: Path, req: dict | None = None):
     source.parent.mkdir(parents=True, exist_ok=True)
     create_fixture(source, datetime(2026, 7, 20, 0))
     size, digest = source.stat().st_size, core.sha256_file(source)
-    item = object_for(key, size=size, etag="fixture-etag")
+    item = core._decorate_source(cbofs.CONFIG, object_for(key, size=size, etag="fixture-etag"))
     core.write_json_atomic(source.with_name(source.name + ".download.json"), {
         "schema_version": "roms_cached_object_v1", "model": "cbofs",
+        "source_id": item["source_id"], "source_identity": item["source_identity"],
         "key": key, "url": item["url"], "size": size, "etag": item["etag"],
         "etag_is_multipart": False, "etag_semantics": "opaque_provenance",
         "last_modified": item["last_modified"], "sha256": digest,
@@ -203,14 +225,22 @@ def create_run_fixture(root: Path, req: dict | None = None):
                "retry_count": 0, "source": item}
     plan_path = root / "download_estimate.json"
     plan = {
-        "schema_version": "cbofs_download_estimate_v1", "request": normalized,
+        "schema_version": "cbofs_download_estimate_v2", "request": normalized,
+        "request_sha256": core.canonical_json_sha256(normalized),
+        "objects_sha256": core.source_objects_sha256([item]),
         "objects": [item], "object_count": 1, "total_bytes": size,
-        "source": {"bucket": core.BUCKET, "endpoint": core.S3_ENDPOINT,
+        "source_totals": {
+            "aws_operational": {"object_count": 1, "bytes": size},
+            "ncei_long_term": {"object_count": 0, "bytes": 0},
+        },
+        "source": {"policy": normalized["source_policy"],
                    "access": "anonymous_https_listobjectsv2"},
+        "source_attempts": [{"source_id": "aws_operational", "status": "success"}],
     }
     core.write_json_atomic(plan_path, plan)
     core.write_json_atomic(root / "fetch_manifest.json", {
-        "schema_version": "cbofs_fetch_manifest_v1", "created_utc": "2026-07-20T00:00:00Z",
+        "schema_version": "cbofs_fetch_manifest_v2", "created_utc": "2026-07-20T00:00:00Z",
+        "source_policy": normalized["source_policy"],
         "request": normalized,
         "approved_plan": {
             "path": str(plan_path.resolve()), "sha256": core.sha256_file(plan_path),
@@ -241,6 +271,30 @@ def netcdf_payload() -> bytes:
 
 
 class RequestAndInventoryTests(unittest.TestCase):
+    def test_v1_migrates_to_v2_and_source_policy_is_strict(self):
+        normalized = cbofs.validate_request(request())
+        self.assertEqual(normalized["schema_version"], "cbofs_request_v2")
+        self.assertEqual(normalized["source_policy"], "aws_then_ncei")
+        with self.assertRaisesRegex(ValueError, "source_policy"):
+            cbofs.validate_request(request(source_policy="silent_fallback"))
+
+    def test_ordered_fallback_queries_ncei_only_for_aws_gaps(self):
+        req = cbofs.validate_request(request(
+            schema_version="cbofs_request_v2", start_utc="2026-07-20T01:00:00Z",
+            end_utc_exclusive="2026-07-20T02:00:00Z"))
+        aws = core._decorate_source(cbofs.CONFIG, object_for(
+            "cbofs/netcdf/2026/07/20/cbofs.t06z.20260720.fields.n001.nc"))
+        calls = []
+        def complete(_config, _request, source_id, **_kwargs):
+            calls.append(source_id)
+            return ([aws] if source_id == "aws_operational" else []), {
+                "source_id": source_id, "status": "success", "prefixes": [],
+                "object_count": 1 if source_id == "aws_operational" else 0, "error": None}
+        with mock.patch.object(core, "_discover_one_source", side_effect=complete):
+            _, evidence = core.discover_objects_with_evidence(cbofs.CONFIG, req)
+        self.assertEqual(calls, ["aws_operational"])
+        self.assertFalse(evidence["fallback_triggered"])
+
     def test_request_contract_and_aliases(self):
         validated = cbofs.validate_request(request(variables=["salinity", "u", "v"]))
         self.assertEqual(validated["variables"], ["salt", "u", "v"])
@@ -312,6 +366,58 @@ class RequestAndInventoryTests(unittest.TestCase):
             self.assertEqual(audit["selected_count"], 1)
             self.assertIn("t00z", audit["duplicate_records"][0]["preferred"])
 
+    def test_station_boundary_triggers_ncei_discovery_for_preceding_terminal(self):
+        station_request = cbofs.validate_request({
+            "schema_version": "cbofs_request_v2",
+            "start_utc": "2026-07-20T00:00:00Z",
+            "end_utc_exclusive": "2026-07-20T00:06:00Z",
+            "product": "stations", "guidance": "nowcast",
+            "source_policy": "aws_then_ncei", "missing_policy": "error",
+            "cache_policy": "keep", "max_workers": 1,
+        })
+        aws = core._decorate_source(
+            cbofs.CONFIG,
+            object_for("cbofs/netcdf/2026/07/20/cbofs.t06z.20260720.stations.nowcast.nc"),
+            "aws_operational",
+        )
+        descriptor = core.archive_sources.get_source_descriptor("ncei_long_term", "cbofs")
+        ncei_key = (
+            descriptor["root_prefix"]
+            + "2026/07/nos.cbofs.stations.nowcast.20260720.t00z.nc"
+        )
+        parsed = cbofs.parse_object_key(ncei_key)
+        self.assertIsNotNone(parsed)
+        ncei = core._decorate_source(
+            cbofs.CONFIG,
+            {**parsed, "size": 101, "etag": "ncei-station",
+             "last_modified": "2026-07-22T00:00:00Z"},
+            "ncei_long_term",
+        )
+
+        def discover(_config, _request, source_id, **_kwargs):
+            values = [aws] if source_id == "aws_operational" else [ncei]
+            return values, {"source_id": source_id, "status": "success",
+                            "prefixes": [], "object_count": 1, "error": None}
+
+        with mock.patch.object(core, "_discover_one_source", side_effect=discover) as mocked:
+            combined, evidence = core.discover_objects_with_evidence(
+                cbofs.CONFIG, station_request)
+        self.assertEqual(mocked.call_count, 2)
+        self.assertTrue(evidence["fallback_triggered"])
+        self.assertEqual(evidence["fallback_reason"],
+                         "aws_scientific_precedence_unresolved")
+        self.assertEqual(evidence["scientific_precedence_before_fallback"],
+                         ["2026-07-20T00:00:00Z"])
+        selection = cbofs.select_objects(station_request, combined)
+        self.assertEqual([item["key"] for item in selection["selected"]], [ncei_key])
+
+    def test_v1_cannot_override_migrated_source_policy(self):
+        with self.assertRaisesRegex(ValueError, "v1 always migrates"):
+            cbofs.validate_request(request(source_policy="ncei_only"))
+        explicit_v2 = cbofs.validate_request(request(
+            schema_version="cbofs_request_v2", source_policy="ncei_only"))
+        self.assertEqual(explicit_v2["source_policy"], "ncei_only")
+
     def test_duplicate_preference_and_conflict(self):
         current = object_for("cbofs/netcdf/2026/07/20/cbofs.t06z.20260720.fields.n001.nc")
         legacy = object_for("cbofs/netcdf/202607/nos.cbofs.fields.n001.20260720.t06z.nc")
@@ -337,8 +443,29 @@ class RequestAndInventoryTests(unittest.TestCase):
                                                 end_utc_exclusive="2026-07-20T02:00:00Z"),
                                         temporary, objects=[one])
             self.assertEqual(report["total_bytes"], 123)
+            self.assertEqual(report["source_totals"], {
+                "aws_operational": {"object_count": 1, "bytes": 123},
+                "ncei_long_term": {"object_count": 0, "bytes": 0},
+            })
             self.assertEqual(report["required_free_bytes"], 492)
             self.assertEqual(report["routing_decision"], "local")
+
+    def test_mixed_source_plan_totals_are_exact(self):
+        aws = object_for(
+            "cbofs/netcdf/2026/07/20/cbofs.t00z.20260720.fields.n006.nc", 11)
+        descriptor = core.archive_sources.get_source_descriptor("ncei_long_term", "cbofs")
+        key = descriptor["root_prefix"] + "2026/07/nos.cbofs.fields.n001.20260720.t06z.nc"
+        ncei = {**cbofs.parse_object_key(key), "source_id": "ncei_long_term",
+                "size": 13, "etag": "ncei", "last_modified": "2026-07-21T00:00:00Z"}
+        with tempfile.TemporaryDirectory() as temporary:
+            report = cbofs.plan_request(request(
+                schema_version="cbofs_request_v2", source_policy="aws_then_ncei"),
+                temporary, objects=[aws, ncei])
+        self.assertEqual(report["source_totals"], {
+            "aws_operational": {"object_count": 1, "bytes": 11},
+            "ncei_long_term": {"object_count": 1, "bytes": 13},
+        })
+        self.assertEqual(report["total_bytes"], 24)
 
     def test_non_positive_or_unknown_sizes_never_approve_local_fetch(self):
         for bad_size in (None, -1, 0, True, "100"):
@@ -369,7 +496,7 @@ class RequestAndInventoryTests(unittest.TestCase):
             self.assertIn("Last-Modified", report["incomplete_source_metadata"][0]["reason"])
         with tempfile.TemporaryDirectory() as temporary:
             wrong_url = dict(good, url="https://example.invalid/object.nc")
-            with self.assertRaisesRegex(ValueError, "exact NOAA S3 URL"):
+            with self.assertRaisesRegex(ValueError, "exact NOAA archive URL"):
                 cbofs.plan_request(req, temporary, objects=[wrong_url])
         with tempfile.TemporaryDirectory() as temporary:
             bad_key = dict(good,
@@ -390,8 +517,98 @@ class RequestAndInventoryTests(unittest.TestCase):
                 "fetch", "--request", "request.json", "--run-dir", "run",
             ])
 
+    def test_injected_object_plan_cannot_authorize_transfer(self):
+        item = object_for(
+            "cbofs/netcdf/2026/07/20/cbofs.t00z.20260720.fields.n006.nc")
+        req = request(end_utc_exclusive="2026-07-20T01:00:00Z")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "approved.json"
+            cbofs.plan_request(req, temporary, objects=[item], output=path)
+            with self.assertRaisesRegex(RuntimeError, "discovery evidence"):
+                cbofs.fetch_plan(path, temporary)
+
 
 class DownloadTests(unittest.TestCase):
+    def test_partial_sidecar_source_identity_drift_restarts_from_zero(self):
+        payload = netcdf_payload()
+        raw = object_for(
+            "cbofs/netcdf/2026/07/20/cbofs.t00z.20260720.fields.n006.nc",
+            len(payload), "opaque-etag",
+        )
+        item = core._decorate_source(cbofs.CONFIG, raw, "aws_operational")
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "field.nc"
+            destination.with_name("field.nc.part").write_bytes(payload[:7])
+            core.write_json_atomic(destination.with_name("field.nc.part.json"), {
+                "schema_version": "roms_partial_object_v1",
+                "source_id": item["source_id"], "source_identity": "stale-identity",
+                "key": item["key"], "url": item["url"], "size": item["size"],
+                "etag": item["etag"], "last_modified": "stale-modified",
+            })
+            response = FakeResponse(
+                payload, headers={"Content-Length": str(len(payload)), "ETag": item["etag"]})
+            session = FakeSession([response])
+            result = cbofs.download_object(item, destination, session=session)
+            self.assertFalse(result["resumed"])
+            self.assertNotIn("Range", session.calls[0][1]["headers"])
+
+    def test_fetch_relists_exact_key_and_rejects_changed_remote_metadata(self):
+        payload = netcdf_payload()
+        item = object_for(
+            "cbofs/netcdf/2026/07/20/cbofs.t00z.20260720.fields.n006.nc",
+            len(payload), "approved-etag",
+        )
+        req = request(end_utc_exclusive="2026-07-20T01:00:00Z")
+        with tempfile.TemporaryDirectory() as temporary:
+            plan_path = Path(temporary) / "approved.json"
+            plan = cbofs.plan_request(req, temporary, objects=[item], output=plan_path)
+            plan = authorize_aws_fixture_plan(plan_path)
+            changed = dict(plan["objects"][0], etag="changed-etag")
+            changed["source_identity"] = core.archive_sources.source_identity_digest(changed)
+            with mock.patch.object(
+                core.archive_sources, "list_objects_v2", return_value=[changed],
+            ) as relist:
+                with self.assertRaisesRegex(RuntimeError, "remote ETag differs"):
+                    cbofs.fetch_plan(plan_path, temporary, session=FakeSession([]))
+            relist.assert_called_once_with(
+                "aws_operational", "cbofs", item["key"],
+                session=mock.ANY, max_keys=2,
+            )
+
+    def test_fetch_rejects_in_memory_plan_mapping(self):
+        with self.assertRaisesRegex(RuntimeError, "reviewed plan file path"):
+            cbofs.fetch_plan({}, ".")
+
+    def test_verified_legacy_aws_cache_is_reused_in_place(self):
+        payload = netcdf_payload()
+        raw = object_for(
+            "cbofs/netcdf/2026/07/20/cbofs.t00z.20260720.fields.n006.nc",
+            len(payload), "opaque-etag",
+        )
+        req = request(end_utc_exclusive="2026-07-20T01:00:00Z")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            plan_path = root / "approved.json"
+            plan = cbofs.plan_request(req, root, objects=[raw], output=plan_path)
+            plan = authorize_aws_fixture_plan(plan_path)
+            item = plan["objects"][0]
+            legacy = root / "cache" / "raw" / "2026" / "07" / "20" / Path(item["key"]).name
+            legacy.parent.mkdir(parents=True)
+            legacy.write_bytes(payload)
+            core.write_json_atomic(legacy.with_name(legacy.name + ".download.json"), {
+                "schema_version": "roms_cached_object_v1", "model": "cbofs",
+                "key": item["key"], "url": item["url"], "size": len(payload),
+                "etag": item["etag"], "last_modified": item["last_modified"],
+                "etag_semantics": "opaque_provenance", "sha256": core.sha256_file(legacy),
+            })
+            manifest = cbofs.fetch_plan(plan_path, root, session=FakeSession([]))
+            outcome = manifest["outcomes"][0]
+            self.assertEqual(outcome["cache_location"], "legacy_aws_v1")
+            self.assertEqual(Path(outcome["local_path"]), legacy.resolve())
+            self.assertEqual(core.verified_manifest_inputs(
+                cbofs.CONFIG, root / "fetch_manifest.json", request=req, run_dir=root)[0],
+                [legacy.resolve()])
+
     def test_resume_multipart_and_cache_hit(self):
         payload = netcdf_payload()
         item = object_for("cbofs/netcdf/2026/07/20/cbofs.t06z.20260720.fields.n001.nc",
@@ -402,12 +619,15 @@ class DownloadTests(unittest.TestCase):
             split = len(payload) // 3
             part.write_bytes(payload[:split])
             core.write_json_atomic(destination.with_name(destination.name + ".part.json"), {
-                "schema_version": "roms_partial_object_v1", "key": item["key"], "url": item["url"],
+                "schema_version": "roms_partial_object_v1", "source_id": None,
+                "source_identity": None, "key": item["key"], "url": item["url"],
                 "size": len(payload), "etag": item["etag"],
+                "last_modified": item["last_modified"],
             })
             response = FakeResponse(payload[split:], status=206,
                                     headers={"Content-Length": str(len(payload) - split),
-                                             "ETag": item["etag"]})
+                                             "ETag": item["etag"],
+                                             "Content-Range": f"bytes {split}-{len(payload)-1}/{len(payload)}"})
             session = FakeSession([response])
             result = cbofs.download_object(item, destination, session=session)
             self.assertTrue(result["resumed"])
@@ -427,8 +647,10 @@ class DownloadTests(unittest.TestCase):
             destination = Path(temporary) / "field.nc"
             destination.with_name(destination.name + ".part").write_bytes(payload)
             core.write_json_atomic(destination.with_name(destination.name + ".part.json"), {
-                "schema_version": "roms_partial_object_v1", "key": item["key"],
+                "schema_version": "roms_partial_object_v1", "source_id": None,
+                "source_identity": None, "key": item["key"],
                 "url": item["url"], "size": len(payload), "etag": item["etag"],
+                "last_modified": item["last_modified"],
             })
             result = cbofs.download_object(item, destination, session=FakeSession([]))
             self.assertEqual(result["status"], "downloaded")
@@ -445,8 +667,10 @@ class DownloadTests(unittest.TestCase):
             part = destination.with_name(destination.name + ".part")
             part.write_bytes(corrupt)
             core.write_json_atomic(destination.with_name(destination.name + ".part.json"), {
-                "schema_version": "roms_partial_object_v1", "key": item["key"],
+                "schema_version": "roms_partial_object_v1", "source_id": None,
+                "source_identity": None, "key": item["key"],
                 "url": item["url"], "size": len(payload), "etag": item["etag"],
+                "last_modified": item["last_modified"],
             })
             response = FakeResponse(payload, headers={"Content-Length": str(len(payload)),
                                                       "ETag": item["etag"]})
@@ -541,6 +765,7 @@ class DownloadTests(unittest.TestCase):
             root = Path(temporary)
             plan_path = root / "approved.json"
             cbofs.plan_request(req, root, objects=[item], output=plan_path)
+            authorize_aws_fixture_plan(plan_path)
             manifest = cbofs.fetch_plan(
                 plan_path, root,
                 session=FakeSession([FakeResponse(
@@ -553,6 +778,46 @@ class DownloadTests(unittest.TestCase):
             plan_path.write_text("{}", encoding="utf-8")
             failures = core.verify_approved_plan_provenance(cbofs.CONFIG, manifest)
             self.assertTrue(any("SHA-256 mismatch" in finding for finding in failures))
+
+    def test_fallback_evidence_is_required_at_fetch_and_health(self):
+        payload = netcdf_payload()
+        descriptor = core.archive_sources.get_source_descriptor("ncei_long_term", "cbofs")
+        key = descriptor["root_prefix"] + "2020/01/nos.cbofs.fields.n006.20200101.t00z.nc"
+        parsed = cbofs.parse_object_key(key)
+        ncei = {**parsed, "source_id": "ncei_long_term",
+                "size": len(payload), "etag": "ncei-etag",
+                "last_modified": "2026-07-21T00:00:00Z"}
+        req = request(
+            schema_version="cbofs_request_v2", source_policy="aws_then_ncei",
+            start_utc="2020-01-01T00:00:00Z",
+            end_utc_exclusive="2020-01-01T01:00:00Z", max_workers=1,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); plan_path = root / "approved.json"
+            plan = cbofs.plan_request(req, root, objects=[ncei], output=plan_path)
+            with self.assertRaisesRegex(RuntimeError, "fallback decision"):
+                cbofs.fetch_plan(plan_path, root, session=FakeSession([]))
+            plan.update({
+                "source_attempts": [
+                    {"source_id": "aws_operational", "status": "success"},
+                    {"source_id": "ncei_long_term", "status": "success"},
+                ],
+                "fallback_triggered": True,
+                "coverage_before_fallback": ["2020-01-01T00:00:00Z"],
+            })
+            core.write_json_atomic(plan_path, plan)
+            manifest = cbofs.fetch_plan(
+                plan_path, root,
+                session=FakeSession([FakeResponse(
+                    payload, headers={"Content-Length": str(len(payload)), "ETag": ncei["etag"]})]),
+            )
+            self.assertEqual(core.verify_approved_plan_provenance(cbofs.CONFIG, manifest), [])
+            plan["fallback_triggered"] = False
+            core.write_json_atomic(plan_path, plan)
+            manifest["approved_plan"]["sha256"] = core.sha256_file(plan_path)
+            core.write_json_atomic(root / "fetch_manifest.json", manifest)
+            failures = core.verify_approved_plan_provenance(cbofs.CONFIG, manifest)
+            self.assertTrue(any("fallback" in finding for finding in failures), failures)
 
     def test_transfer_requires_exact_response_etag(self):
         payload = netcdf_payload()
@@ -639,8 +904,94 @@ class RomsMathTests(unittest.TestCase):
         self.assertTrue(any(item.category is DeprecationWarning for item in caught))
         self.assertTrue(cbofs._legacy_field_url("2026-07-20", "t00z", 0).endswith("fields.n006.nc"))
 
+    def test_legacy_fetch_hands_off_written_plan_path(self):
+        item = object_for(
+            "cbofs/netcdf/2026/07/20/cbofs.t00z.20260720.fields.n006.nc")
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(cbofs, "discover_objects", return_value=[item]), \
+                mock.patch.object(cbofs, "plan_request") as planner, \
+                mock.patch.object(cbofs, "fetch_plan", return_value={
+                    "outcomes": [{"local_path": str(Path(temporary) / "field.nc")}]
+                }) as fetcher:
+            result = cbofs._legacy_fetch_one(
+                "2026-07-20", "t00z", 0, Path(temporary))
+        plan_path = Path(temporary) / "download_estimate.json"
+        self.assertEqual(result, Path(temporary) / "field.nc")
+        self.assertEqual(planner.call_args.kwargs["output"], plan_path)
+        self.assertEqual(fetcher.call_args.args[0], plan_path)
+
 
 class ExtractionTests(unittest.TestCase):
+    def test_historical_calendar_alias_decodes_and_preserves_provenance(self):
+        import netCDF4
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "historical.nc"
+            create_fixture(source, datetime(2026, 7, 20, 0),
+                           source_calendar="gregorian_proleptic")
+            with netCDF4.Dataset(source) as dataset:
+                decoded = core.decode_times(dataset)
+            self.assertEqual(decoded[0]["source_calendar"], "gregorian_proleptic")
+            self.assertEqual(decoded[0]["decoder_calendar"], "proleptic_gregorian")
+            self.assertTrue(decoded[0]["calendar_alias_applied"])
+            report = cbofs.extract_request(
+                request(end_utc_exclusive="2026-07-20T01:00:00Z"), [source],
+                root / "compact.nc")
+            self.assertEqual(report["records"][0]["source_calendar"],
+                             "gregorian_proleptic")
+            self.assertEqual(report["source_time_metadata"][0]["decoder_calendar"],
+                             "proleptic_gregorian")
+            with netCDF4.Dataset(root / "compact.nc") as dataset:
+                metadata = json.loads(dataset.source_time_metadata_json)
+                self.assertEqual(metadata[0]["source_calendar"], "gregorian_proleptic")
+            unsupported = root / "unsupported-calendar.nc"
+            create_fixture(unsupported, datetime(2026, 7, 20, 0),
+                           source_calendar="not_a_cf_calendar")
+            with netCDF4.Dataset(unsupported) as dataset:
+                with self.assertRaises(ValueError):
+                    core.decode_times(dataset)
+
+    def test_matching_mixed_archive_extraction_provenance_and_drift_rejection(self):
+        import netCDF4
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); aws_path = root / "aws.nc"; ncei_path = root / "ncei.nc"
+            create_fixture(aws_path, datetime(2026, 7, 20, 0))
+            create_fixture(ncei_path, datetime(2026, 7, 20, 1))
+            aws_desc = core.archive_sources.get_source_descriptor("aws_operational", "cbofs")
+            ncei_desc = core.archive_sources.get_source_descriptor("ncei_long_term", "cbofs")
+            binding = {
+                "schema_version": "cbofs_verified_fetch_binding_v2", "verified": True,
+                "request_sha256": core.canonical_json_sha256(cbofs.validate_request(request())),
+                "fetch_manifest_path": str(root / "fetch_manifest.json"),
+                "fetch_manifest_sha256": "a" * 64,
+                "approved_plan_path": str(root / "download_estimate.json"),
+                "approved_plan_sha256": "b" * 64,
+                "objects": [
+                    {**aws_desc, "source_archive": "aws_operational",
+                     "key": "cbofs/netcdf/2026/07/20/cbofs.t00z.20260720.fields.n006.nc",
+                     "url": core.archive_sources.canonical_object_url("aws_operational", "cbofs", "cbofs/netcdf/2026/07/20/cbofs.t00z.20260720.fields.n006.nc"),
+                     "local_path": str(aws_path.resolve())},
+                    {**ncei_desc, "source_archive": "ncei_long_term",
+                     "key": ncei_desc["root_prefix"] + "2026/07/nos.cbofs.fields.n001.20260720.t06z.nc",
+                     "url": core.archive_sources.canonical_object_url("ncei_long_term", "cbofs", ncei_desc["root_prefix"] + "2026/07/nos.cbofs.fields.n001.20260720.t06z.nc"),
+                     "local_path": str(ncei_path.resolve())},
+                ],
+            }
+            output = root / "mixed.nc"
+            report = cbofs.extract_request(request(), [aws_path, ncei_path], output,
+                                           provenance=binding)
+            self.assertEqual(report["source_provenance"]["archive_count"], 2)
+            self.assertEqual({item["source_archive"] for item in report["records"]},
+                             {"aws_operational", "ncei_long_term"})
+            extraction_manifest = core.read_json(root / "extraction_manifest.json")
+            self.assertEqual(extraction_manifest["schema_version"],
+                             "cbofs_extraction_manifest_v2")
+            with netCDF4.Dataset(ncei_path, "a") as ds:
+                ds.variables["lon_rho"][:] += 0.25
+            with self.assertRaisesRegex((ValueError, RuntimeError), "geometry.*drift"):
+                cbofs.extract_request(request(), [aws_path, ncei_path], root / "bad.nc",
+                                      provenance=binding)
+
     def test_extract_reversed_sigma_and_health(self):
         import netCDF4
         import numpy as np
@@ -745,6 +1096,15 @@ class ExtractionTests(unittest.TestCase):
 
 
 class HealthAndProvenanceTests(unittest.TestCase):
+    def test_existing_v1_station_evidence_remains_readable(self):
+        run = HERE.parents[2] / "runs" / "station_smoke"
+        if not (run / "fetch_manifest.json").is_file():
+            self.skipTest("retained v1 station evidence is unavailable")
+        req = core.read_json(run / "request.json")
+        report = cbofs.evaluate_health(req, run)
+        self.assertEqual(report["status"], "healthy", report)
+        self.assertTrue(any("legacy v1" in item for item in report["warnings"]))
+
     def test_health_is_fail_closed_without_manifest_or_fields_compact(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

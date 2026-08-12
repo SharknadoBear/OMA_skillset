@@ -1,4 +1,4 @@
 interface:
   display_name: "CBOFS Fetcher"
   short_description: "Plan, fetch, and QA NOAA CBOFS ROMS data."
-  default_prompt: "Use $cbofs-fetcher to plan, download, concatenate, extract, and health-check bounded NOAA CBOFS ROMS data from public AWS."
+  default_prompt: "Use $cbofs-fetcher to plan, download, concatenate, extract, and health-check bounded NOAA CBOFS ROMS data from operational AWS with explicit NCEI long-term fallback."

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility entry point for exact CBOFS public-AWS estimates."""
+"""Compatibility entry point for exact CBOFS NOAA-archive estimates."""
 
 from __future__ import annotations
 

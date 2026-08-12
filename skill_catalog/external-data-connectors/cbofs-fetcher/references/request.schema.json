@@ -1,16 +1,22 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://oma.pnnl.gov/schemas/cbofs_request_v1.json",
-  "title": "CBOFS public AWS request",
+  "$id": "https://oma.pnnl.gov/schemas/cbofs_request_v2.json",
+  "title": "CBOFS NOAA archive request",
+  "description": "A bounded CBOFS request. Version 1 remains accepted for migration and normalizes to version 2 with source_policy=aws_then_ncei.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "start_utc", "end_utc_exclusive", "product", "guidance"],
   "properties": {
-    "schema_version": {"const": "cbofs_request_v1"},
+    "schema_version": {"enum": ["cbofs_request_v1", "cbofs_request_v2"]},
     "start_utc": {"type": "string", "format": "date-time"},
     "end_utc_exclusive": {"type": "string", "format": "date-time"},
     "product": {"enum": ["fields", "stations", "regulargrid"]},
     "guidance": {"enum": ["nowcast", "forecast"]},
+    "source_policy": {
+      "enum": ["aws_then_ncei", "aws_only", "ncei_only"],
+      "default": "aws_then_ncei",
+      "description": "Ordered NOAA archive policy. Version 1 input is migrated to aws_then_ncei."
+    },
     "run_cycle_utc": {"type": "string", "format": "date-time"},
     "variables": {
       "type": "array",
@@ -34,6 +40,13 @@
     "max_workers": {"type": "integer", "minimum": 1, "default": 4}
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "cbofs_request_v1"}},
+        "required": ["schema_version"]
+      },
+      "then": {"not": {"required": ["source_policy"]}}
+    },
     {
       "if": {"properties": {"guidance": {"const": "forecast"}}},
       "then": {"required": ["run_cycle_utc"]},

@@ -1,11 +1,12 @@
 ---
 name: cbofs-fetcher
-description: Plan, inventory, anonymously download, concatenate, extract, and health-check NOAA Chesapeake Bay Operational Forecast System (CBOFS) ROMS NetCDF data from the public AWS archive. Use when Codex needs bounded CBOFS native fields, practical salinity, earth-relative surface/bottom/depth-average currents, station or regular-grid passthrough files, exact storage estimates, resumable cached transfers, or provenance-preserving ROMS QA artifacts.
+description: Plan, inventory, anonymously download, concatenate, extract, and health-check NOAA Chesapeake Bay Operational Forecast System (CBOFS) ROMS NetCDF data from operational AWS with bounded NCEI long-term fallback. Use when Codex needs bounded CBOFS native fields, practical salinity, earth-relative surface/bottom/depth-average currents, station or regular-grid passthrough files, exact storage estimates, resumable source-isolated caches, or provenance-preserving ROMS QA artifacts.
 ---
 
 # CBOFS Fetcher
 
-Use the bundled CLI for deterministic public-AWS access. Require no AWS
+Use the bundled CLI for deterministic NOAA operational-AWS access with bounded
+NCEI long-term fallback. Require no AWS
 credentials, AWS CLI, boto3, or s3fs. Read
 [`references/source_contract.md`](references/source_contract.md) before
 changing archive selection, valid-time rules, or ROMS calculations. Validate
@@ -13,8 +14,10 @@ requests against [`references/request.schema.json`](references/request.schema.js
 
 ## Workflow
 
-1. Write a bounded `cbofs_request_v1` JSON request with an inclusive start and
-   exclusive end.
+1. Write a bounded `cbofs_request_v2` JSON request with an inclusive start and
+   exclusive end. Choose `source_policy=aws_then_ncei` (default), `aws_only`,
+   or `ncei_only`. Version 1 requests remain accepted and are explicitly
+   migrated to v2.
 2. Run `inventory` when source availability or variable packaging is uncertain.
 3. Always run `plan` and review `download_estimate.json` before transferring.
    Download locally only when its routing decision is `local`; otherwise stage
@@ -72,7 +75,8 @@ the request workflow for new work.
 
 ## Outputs
 
-`plan` writes exact source keys, byte counts, gaps, duplicates, free-space
+`plan` writes exact source identities, keys, byte counts, gaps, cross-archive
+duplicates, capability and fallback decisions, free-space
 routing, ETags, and timestamps. `fetch` writes resumable-transfer and cache-hit
 provenance with SHA-256 hashes. `extract` writes `roms_compact_fields_v1`,
 including native grids and metadata plus requested salinity and earth-relative

@@ -429,18 +429,89 @@ def _source_key(config: aws.ModelConfig, path: Path) -> str:
     return path.name
 
 
+def _source_metadata(config: aws.ModelConfig, path: Path,
+                     bound: Mapping[str, Any] | None = None) -> dict[str, str]:
+    """Resolve record provenance, preferring a verified manifest binding."""
+    if bound is not None:
+        source_id = str(bound.get("source_archive") or bound.get("source_id") or "")
+        key = str(bound.get("key") or "")
+        url = str(bound.get("url") or "")
+        endpoint = str(bound.get("endpoint") or "")
+        if not source_id or not key or not url or not endpoint:
+            raise ValueError("verified fetch binding has incomplete source archive provenance")
+        return {
+            "source_key": key, "source_archive": source_id, "source_url": url,
+            "archive_role": str(bound.get("archive_role") or ""),
+            "container": str(bound.get("container") or ""),
+            "endpoint": endpoint,
+            "listing_endpoint": str(bound.get("listing_endpoint") or ""),
+        }
+    sidecar = path.with_name(path.name + ".download.json")
+    value: Mapping[str, Any] = {}
+    if sidecar.is_file():
+        try:
+            candidate = aws.read_json(sidecar)
+            if isinstance(candidate, Mapping):
+                value = candidate
+        except Exception:
+            pass
+    source_id = str(value.get("source_id") or "unbound")
+    key = str(value.get("key") or _source_key(config, path))
+    url = str(value.get("url") or "")
+    if source_id in {"aws_operational", "ncei_long_term"}:
+        descriptor = aws.archive_sources.get_source_descriptor(source_id, config.model)
+    else:
+        descriptor = {"archive_role": "unbound", "container": "", "endpoint": "",
+                      "listing_endpoint": ""}
+    return {
+        "source_key": key, "source_archive": source_id, "source_url": url,
+        "archive_role": descriptor["archive_role"], "container": descriptor["container"],
+        "endpoint": descriptor["endpoint"],
+        "listing_endpoint": descriptor["listing_endpoint"],
+    }
+
+
+def _source_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    archives: dict[tuple[str, str], dict[str, str]] = {}
+    for record in records:
+        identity = (str(record["source_archive"]), str(record["endpoint"]))
+        archives[identity] = {
+            "source_archive": identity[0],
+            "archive_role": str(record.get("archive_role") or ""),
+            "container": str(record.get("container") or ""),
+            "endpoint": identity[1],
+            "listing_endpoint": str(record.get("listing_endpoint") or ""),
+        }
+    values = sorted(archives.values(), key=lambda item: (item["source_archive"], item["endpoint"]))
+    return {
+        "record_count": len(records), "archive_count": len(values), "archives": values,
+        "endpoints": {item["source_archive"]: item["endpoint"] for item in values},
+    }
+
+
+def _source_time_metadata(records: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Summarize lossless source calendar metadata used during decoding."""
+    fields = ("source_time_units", "source_calendar", "decoder_calendar",
+              "calendar_alias_applied")
+    unique = {tuple(item.get(name) for name in fields) for item in records}
+    return [dict(zip(fields, values))
+            for values in sorted(unique, key=lambda row: tuple(map(str, row)))]
+
+
 def collect_records(config: aws.ModelConfig, paths: Sequence[str | Path],
-                    start: datetime, end: datetime) -> list[dict[str, Any]]:
+                    start: datetime, end: datetime, *,
+                    bound_objects: Mapping[str, Mapping[str, Any]] | None = None) -> list[dict[str, Any]]:
     netCDF4, _ = _modules()
     records: list[dict[str, Any]] = []
     for raw_path in paths:
-        path = Path(raw_path)
+        path = Path(raw_path).resolve()
+        bound = None if bound_objects is None else bound_objects.get(str(path))
+        source = _source_metadata(config, path, bound)
         with netCDF4.Dataset(path) as dataset:
             for item in aws.decode_times(dataset):
                 stamp = aws.parse_utc(item["normalized_time_utc"])
                 if start <= stamp < end:
-                    records.append({**item, "time": stamp, "path": path,
-                                    "source_key": _source_key(config, path)})
+                    records.append({**item, **source, "time": stamp, "path": path})
     # Stable first-source preference; field files normally contain one unique hour.
     records.sort(key=lambda item: (item["time"], str(item["path"])))
     unique: dict[datetime, dict[str, Any]] = {}
@@ -520,7 +591,7 @@ def extract_fields(config: aws.ModelConfig, request: Mapping[str, Any] | str | P
     fetch_binding: dict[str, Any] | None = None
     if provenance is not None:
         fetch_binding = dict(provenance)
-        if (fetch_binding.get("schema_version") != f"{config.model}_verified_fetch_binding_v1"
+        if (fetch_binding.get("schema_version") != f"{config.model}_verified_fetch_binding_v2"
                 or fetch_binding.get("verified") is not True):
             raise ValueError("extraction provenance is not a verified fetch binding")
         if fetch_binding.get("request_sha256") != aws.canonical_json_sha256(normalized):
@@ -534,7 +605,13 @@ def extract_fields(config: aws.ModelConfig, request: Mapping[str, Any] | str | P
         if len(bound_paths) != len(bound_objects) or supplied_paths != bound_paths:
             raise ValueError("extraction inputs do not exactly match the verified fetch binding")
     start, end = aws.parse_utc(normalized["start_utc"]), aws.parse_utc(normalized["end_utc_exclusive"])
-    records = collect_records(config, paths, start, end)
+    bound_by_path = None
+    if fetch_binding:
+        bound_by_path = {
+            str(Path(str(item["local_path"])).resolve()): item
+            for item in fetch_binding["objects"]
+        }
+    records = collect_records(config, paths, start, end, bound_objects=bound_by_path)
     expected = aws.expected_times(start, end, 3600)
     missing = [aws.iso(stamp) for stamp in expected if stamp not in {item["time"] for item in records}]
     if missing and normalized["missing_policy"] == "error":
@@ -573,18 +650,28 @@ def extract_fields(config: aws.ModelConfig, request: Mapping[str, Any] | str | P
     temporary = destination.with_name(destination.name + ".tmp")
     coverage: dict[str, list[float]] = {}
     thickness_errors: list[float] = []
+    source_summary = _source_summary(records)
+    source_time_metadata = _source_time_metadata(records)
     with netCDF4.Dataset(temporary, "w", format="NETCDF4") as output:
         output.createDimension("time", None)
-        output.createDimension("source_strlen", 512)
+        output.createDimension("source_key_strlen", max(1, max(len(item["source_key"]) for item in records)))
+        output.createDimension("source_archive_strlen", max(1, max(len(item["source_archive"]) for item in records)))
+        output.createDimension("source_url_strlen", max(1, max(len(item["source_url"]) for item in records)))
         _create_grid(output, geometry)
         time_var = output.createVariable("time", "f8", ("time",))
         time_var.units = "seconds since 1970-01-01 00:00:00 UTC"
         time_var.calendar = "proleptic_gregorian"
         original_var = output.createVariable("original_time", "f8", ("time",))
         original_var.units = time_var.units
+        original_var.calendar = time_var.calendar
         adjustment_var = output.createVariable("time_adjustment_seconds", "f8", ("time",))
-        key_var = output.createVariable("source_key", "S1", ("time", "source_strlen"))
-        key_var.long_name = "public AWS source object key"
+        key_var = output.createVariable("source_key", "S1", ("time", "source_key_strlen"))
+        key_var.long_name = "NOAA source object key"
+        archive_var = output.createVariable(
+            "source_archive", "S1", ("time", "source_archive_strlen"))
+        archive_var.long_name = "NOAA archive source identifier"
+        url_var = output.createVariable("source_url", "S1", ("time", "source_url_strlen"))
+        url_var.long_name = "canonical NOAA source object URL"
         created: dict[str, Any] = {}
 
         with netCDF4.Dataset(records[0]["path"]) as sample:
@@ -633,6 +720,14 @@ def extract_fields(config: aws.ModelConfig, request: Mapping[str, Any] | str | P
         output.setncattr("velocity_processing", "vertically reduce native u/v, wet-aware destagger to rho, rotate by angle")
         output.setncattr("request_json", json.dumps(
             aws.json_clean(normalized), sort_keys=True, separators=(",", ":")))
+        output.setncattr("source_provenance_json", json.dumps(
+            source_summary, sort_keys=True, separators=(",", ":")))
+        output.setncattr("source_archives_json", json.dumps(
+            source_summary["archives"], sort_keys=True, separators=(",", ":")))
+        output.setncattr("source_endpoints_json", json.dumps(
+            source_summary["endpoints"], sort_keys=True, separators=(",", ":")))
+        output.setncattr("source_time_metadata_json", json.dumps(
+            source_time_metadata, sort_keys=True, separators=(",", ":")))
         output.setncattr("input_provenance_mode", "verified_fetch_manifest" if fetch_binding else "explicit_unbound_inputs")
         if fetch_binding:
             output.setncattr("fetch_manifest_sha256", fetch_binding["fetch_manifest_sha256"])
@@ -653,10 +748,16 @@ def extract_fields(config: aws.ModelConfig, request: Mapping[str, Any] | str | P
                 time_var[out_index] = record["time"].timestamp()
                 original_var[out_index] = aws.parse_utc(record["original_time_utc"]).timestamp()
                 adjustment_var[out_index] = record["adjustment_seconds"]
-                text = record["source_key"].encode("utf-8")[:512]
-                row = np.zeros(512, dtype="S1")
-                row[:len(text)] = np.frombuffer(text, dtype="S1")
-                key_var[out_index, :] = row
+                for variable, dimension, value in (
+                    (key_var, "source_key_strlen", record["source_key"]),
+                    (archive_var, "source_archive_strlen", record["source_archive"]),
+                    (url_var, "source_url_strlen", record["source_url"]),
+                ):
+                    width = len(output.dimensions[dimension])
+                    text = value.encode("utf-8")[:width]
+                    row = np.zeros(width, dtype="S1")
+                    row[:len(text)] = np.frombuffer(text, dtype="S1")
+                    variable[out_index, :] = row
                 reduced: dict[tuple[str, str], Any] = {}
                 for name in normalized["variables"]:
                     source = dataset.variables[name]
@@ -728,7 +829,7 @@ def extract_fields(config: aws.ModelConfig, request: Mapping[str, Any] | str | P
     selected_input_paths = sorted({str(Path(item["path"]).resolve()) for item in records})
     selected_input_keys = sorted({str(item["source_key"]) for item in records})
     report = {
-        "schema_version": f"{config.model}_extraction_report_v1",
+        "schema_version": f"{config.model}_extraction_report_v2",
         "created_utc": aws.iso(datetime.now(UTC)), "request": normalized,
         "output": str(destination.resolve()), "output_size": destination.stat().st_size,
         "output_sha256": aws.sha256_file(destination), "record_count": len(records),
@@ -743,6 +844,20 @@ def extract_fields(config: aws.ModelConfig, request: Mapping[str, Any] | str | P
         },
         "input_provenance_mode": "verified_fetch_manifest" if fetch_binding else "explicit_unbound_inputs",
         "fetch_binding": aws.json_clean(fetch_binding),
+        "records": [
+            {"path": str(Path(item["path"]).resolve()),
+             "source_key": item["source_key"],
+             "source_archive": item["source_archive"],
+             "source_url": item["source_url"],
+             "normalized_time_utc": aws.iso(item["time"]),
+             "source_time_units": item["source_time_units"],
+             "source_calendar": item["source_calendar"],
+             "decoder_calendar": item["decoder_calendar"],
+             "calendar_alias_applied": item["calendar_alias_applied"]}
+            for item in records
+        ],
+        "source_provenance": source_summary,
+        "source_time_metadata": source_time_metadata,
         "selected_input_paths": selected_input_paths,
         "selected_input_keys": selected_input_keys,
         "max_thickness_relative_error": max((value for value in thickness_errors if math.isfinite(value)), default=None),
@@ -751,6 +866,8 @@ def extract_fields(config: aws.ModelConfig, request: Mapping[str, Any] | str | P
         "status": "healthy" if not critical else "critical",
     }
     aws.write_json_atomic(destination.with_suffix(".health.json"), report)
+    manifest = {**report, "schema_version": f"{config.model}_extraction_manifest_v2"}
+    aws.write_json_atomic(destination.parent / "extraction_manifest.json", manifest)
     return report
 
 
@@ -763,6 +880,7 @@ def evaluate_health(config: aws.ModelConfig, request: Mapping[str, Any] | str | 
     manifest_path = run_path / "fetch_manifest.json"
     cleanup_path = run_path / "cache_cleanup.json"
     cleanup_record: Mapping[str, Any] | None = None
+    legacy_v1_handled = False
     if cleanup_path.is_file():
         try:
             candidate = aws.read_json(cleanup_path)
@@ -774,8 +892,39 @@ def evaluate_health(config: aws.ModelConfig, request: Mapping[str, Any] | str | 
 
     if manifest_path.is_file():
         try:
+            legacy_candidate = aws.read_json(manifest_path)
+        except Exception:
+            legacy_candidate = None
+        if (isinstance(legacy_candidate, Mapping)
+                and legacy_candidate.get("schema_version") == f"{config.model}_fetch_manifest_v1"):
+            legacy = aws.verify_legacy_v1_manifest(
+                config, legacy_candidate, manifest_path, normalized)
+            transfers = [{
+                "key": item.get("key"), "path": item.get("local_path"),
+                "integrity_ok": item.get("status") == "pass", "state": "legacy_v1_present",
+                "etag": item.get("etag"), "etag_semantics": "opaque_provenance",
+                "findings": ([item.get("reason")] if item.get("reason") else []),
+            } for item in legacy.get("objects", [])]
+            if legacy.get("status") == "pass":
+                actual_paths = [item["local_path"] for item in legacy["objects"]
+                                if item.get("status") == "pass"]
+                try:
+                    time_audit = aws.audit_time_records(config, normalized, actual_paths)
+                except Exception as exc:
+                    time_audit = {"error": f"{type(exc).__name__}: {exc}"}
+                    critical.append("legacy v1 raw time-coordinate audit failed")
+                warnings.append(
+                    "read-only legacy v1 AWS evidence was validated; create a new v2 plan before any transfer")
+            else:
+                time_audit = {"error": "; ".join(legacy.get("failures", []))}
+                critical.extend(f"legacy v1 integrity failure: {item}"
+                                for item in legacy.get("failures", []))
+            legacy_v1_handled = True
+
+    if manifest_path.is_file() and not legacy_v1_handled:
+        try:
             manifest = aws.read_json(manifest_path)
-            if manifest.get("schema_version") != f"{config.model}_fetch_manifest_v1":
+            if manifest.get("schema_version") != f"{config.model}_fetch_manifest_v2":
                 raise ValueError("unexpected fetch-manifest schema")
             if aws.validate_request(config, manifest.get("request", {})) != normalized:
                 raise ValueError("fetch-manifest request does not match the health request")
@@ -856,7 +1005,7 @@ def evaluate_health(config: aws.ModelConfig, request: Mapping[str, Any] | str | 
         except Exception as exc:
             time_audit = {"error": f"{type(exc).__name__}: {exc}"}
             critical.append("raw manifest/time-coordinate audit failed")
-    else:
+    elif not legacy_v1_handled:
         time_audit = None
         critical.append("fetch_manifest.json is absent; raw transfer integrity cannot be verified")
 
@@ -871,7 +1020,7 @@ def evaluate_health(config: aws.ModelConfig, request: Mapping[str, Any] | str | 
             continue
         try:
             report = aws.read_json(report_path)
-            if report.get("schema_version") != f"{config.model}_extraction_report_v1":
+            if report.get("schema_version") != f"{config.model}_extraction_report_v2":
                 raise ValueError("unexpected compact health schema")
             if aws.validate_request(config, report.get("request", {})) != normalized:
                 raise ValueError("compact health request does not match")
@@ -881,6 +1030,16 @@ def evaluate_health(config: aws.ModelConfig, request: Mapping[str, Any] | str | 
                 raise ValueError("compact size/SHA-256 does not match its health report")
             if Path(str(report.get("output", ""))).resolve() != path:
                 raise ValueError("compact health report names a different output")
+            extraction_manifest_path = path.parent / "extraction_manifest.json"
+            if not extraction_manifest_path.is_file():
+                raise ValueError("extraction_manifest.json is missing")
+            extraction_manifest = aws.read_json(extraction_manifest_path)
+            if extraction_manifest.get("schema_version") != f"{config.model}_extraction_manifest_v2":
+                raise ValueError("extraction manifest schema is invalid")
+            comparable_manifest = dict(extraction_manifest)
+            comparable_manifest["schema_version"] = report["schema_version"]
+            if aws.canonical_json_sha256(comparable_manifest) != aws.canonical_json_sha256(report):
+                raise ValueError("extraction manifest does not match compact report")
             binding = report.get("fetch_binding")
             if expected_fetch_binding is None:
                 raise ValueError("compact extraction cannot be bound to a verified fetch manifest")
@@ -891,6 +1050,24 @@ def evaluate_health(config: aws.ModelConfig, request: Mapping[str, Any] | str | 
             expected_keys = sorted(item["key"] for item in expected_fetch_binding["objects"])
             if report.get("selected_input_paths") != expected_paths or report.get("selected_input_keys") != expected_keys:
                 raise ValueError("compact selected input keys/paths do not match verified outcomes")
+            report_records = report.get("records")
+            if not isinstance(report_records, list) or not report_records:
+                raise ValueError("compact extraction report has no record-level source provenance")
+            binding_by_key = {item["key"]: item for item in expected_fetch_binding["objects"]}
+            for record in report_records:
+                if not isinstance(record, Mapping) or record.get("source_key") not in binding_by_key:
+                    raise ValueError("compact record source key is outside the verified fetch binding")
+                source = binding_by_key[record["source_key"]]
+                if (record.get("source_archive") != source.get("source_archive")
+                        or record.get("source_url") != source.get("url")
+                        or str(Path(str(record.get("path", ""))).resolve()) != source.get("local_path")):
+                    raise ValueError("compact record archive/URL/path provenance is inconsistent")
+            expected_summary = _source_summary([
+                {**item, "source_archive": item["source_archive"]}
+                for item in expected_fetch_binding["objects"]
+            ])
+            if report.get("source_provenance") != expected_summary:
+                raise ValueError("compact global archive/endpoint provenance is inconsistent")
             angle_metadata = report.get("angle_metadata")
             if (not isinstance(angle_metadata, Mapping)
                     or angle_metadata.get("convention") != ANGLE_CONVENTION
@@ -907,6 +1084,27 @@ def evaluate_health(config: aws.ModelConfig, request: Mapping[str, Any] | str | 
                     raise ValueError("compact NetCDF fetch-manifest digest does not match")
                 if getattr(dataset, "fetch_binding_sha256", None) != aws.canonical_json_sha256(expected_fetch_binding):
                     raise ValueError("compact NetCDF fetch-binding digest does not match")
+                embedded_sources = {}
+                for name in ("source_key", "source_archive", "source_url"):
+                    variable = dataset.variables.get(name)
+                    if variable is None or tuple(variable.dimensions)[:1] != ("time",):
+                        raise ValueError(f"compact NetCDF has no time-indexed {name} provenance")
+                    embedded_sources[name] = [str(value).rstrip("\x00") for value in netCDF4.chartostring(variable[:]).tolist()]
+                for name in embedded_sources:
+                    expected_values = [str(item[name]) for item in report_records]
+                    if embedded_sources[name] != expected_values:
+                        raise ValueError(f"compact NetCDF {name} does not match extraction provenance")
+                for attr, expected_value in (
+                    ("source_provenance_json", expected_summary),
+                    ("source_archives_json", expected_summary["archives"]),
+                    ("source_endpoints_json", expected_summary["endpoints"]),
+                ):
+                    try:
+                        actual_value = json.loads(getattr(dataset, attr, ""))
+                    except Exception as exc:
+                        raise ValueError(f"compact NetCDF {attr} is invalid") from exc
+                    if actual_value != expected_value:
+                        raise ValueError(f"compact NetCDF {attr} does not match verified sources")
                 if getattr(dataset, "angle_convention", None) != ANGLE_CONVENTION:
                     raise ValueError("compact NetCDF angle convention is missing or invalid")
                 angle = dataset.variables.get("angle")
@@ -931,7 +1129,7 @@ def evaluate_health(config: aws.ModelConfig, request: Mapping[str, Any] | str | 
         except Exception as exc:
             critical.append(f"post-health cache cleanup failed: {type(exc).__name__}: {exc}")
     report = {
-        "schema_version": f"{config.model}_download_health_v1",
+        "schema_version": f"{config.model}_download_health_v2",
         "created_utc": aws.iso(datetime.now(UTC)), "request": normalized,
         "transfers": transfers, "time_audit": time_audit, "compact_products": compact,
         "cache_cleanup": cleanup,
@@ -950,9 +1148,9 @@ def delete_raw_cache(run_dir: str | Path, *, time_audit: Mapping[str, Any] | Non
         raise RuntimeError("cannot clean raw cache without fetch_manifest.json")
     manifest = aws.read_json(manifest_path)
     manifest_schema = str(manifest.get("schema_version", ""))
-    if not manifest_schema.endswith("_fetch_manifest_v1"):
+    if not manifest_schema.endswith("_fetch_manifest_v2"):
         raise RuntimeError("cannot clean raw cache from an invalid manifest schema")
-    model = manifest_schema[:-len("_fetch_manifest_v1")]
+    model = manifest_schema[:-len("_fetch_manifest_v2")]
     outcomes = manifest.get("outcomes")
     if not isinstance(outcomes, list) or not outcomes:
         raise RuntimeError("cannot clean raw cache from an empty manifest")

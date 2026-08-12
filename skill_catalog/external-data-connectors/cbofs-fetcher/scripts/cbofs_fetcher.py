@@ -20,7 +20,7 @@ except ImportError:
 
 CONFIG = core.ModelConfig(
     model="cbofs",
-    schema_version="cbofs_request_v1",
+    schema_version="cbofs_request_v2",
     compact_filename="cbofs_fields.nc",
     display_name="CBOFS",
 )
@@ -160,8 +160,9 @@ def _legacy_fetch_one(date_str: str, cycle: str, fhour: int, work_dir: Path,
     objects = discover_objects(request)
     run = datetime.strptime(date_str, "%Y-%m-%d").replace(hour=_cycle_hour(cycle), tzinfo=timezone.utc)
     matches = [item for item in objects if item["run_time"] == core.iso(run)]
-    plan = plan_request(request, work_dir, objects=matches)
-    manifest = fetch_plan(plan, work_dir)
+    plan_path = work_dir / "download_estimate.json"
+    plan_request(request, work_dir, objects=matches, output=plan_path)
+    manifest = fetch_plan(plan_path, work_dir)
     if len(manifest["outcomes"]) != 1:
         raise RuntimeError(f"expected one legacy compatibility object, found {len(manifest['outcomes'])}")
     return Path(manifest["outcomes"][0]["local_path"])
