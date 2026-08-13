@@ -131,18 +131,38 @@ def _boundary_metadata(
         return [], fixed, kinds, hard, lineage
     document = json.loads(Path(path_value).read_text(encoding="utf-8-sig"))
     grouped: dict[int, list[tuple[int, int]]] = {}
+    chain_positions: dict[int, int] = {}
     for feature in document.get("features", []):
         props = feature.get("properties", {})
-        node = int(props.get("node_index_zero_based", int(props["node_id_1based"]) - 1))
+        if props.get("node_index_zero_based") is not None:
+            node = int(props["node_index_zero_based"])
+        elif props.get("node_id_1based") is not None:
+            node = int(props["node_id_1based"]) - 1
+        else:
+            continue
         if not 0 <= node < node_count:
             continue
-        chain = int(props["constraint_chain_id"])
-        position = int(props["constraint_chain_position"])
+        chain_value = props.get(
+            "constraint_chain_id",
+            props.get("reconciliation_source_chain_index_zero_based"),
+        )
+        if chain_value is None:
+            continue
+        chain = int(chain_value)
+        position_value = props.get("constraint_chain_position")
+        if position_value is None:
+            position = chain_positions.get(chain, 0)
+        else:
+            position = int(position_value)
+        chain_positions[chain] = max(chain_positions.get(chain, 0), position + 1)
         grouped.setdefault(chain, []).append((position, node))
         fixed[node] = True
         hard[node] = bool(props.get("is_hard_anchor", False))
         kinds[node] = str(props.get("boundary_kind", "open" if props.get("is_open_boundary") else "land"))
-        source = props.get("source_node_index_zero_based")
+        source = props.get(
+            "source_node_index_zero_based",
+            props.get("reconciliation_source_node_index_zero_based"),
+        )
         if source is not None:
             lineage[node] = int(source)
     chains = [[node for _, node in sorted(grouped[key])] for key in sorted(grouped)]

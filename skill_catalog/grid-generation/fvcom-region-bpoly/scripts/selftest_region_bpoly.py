@@ -516,6 +516,82 @@ def main() -> None:
         assert adjusted["source_region_bpoly"]["polygon_lonlat"] != adjusted["adjusted_region_bpoly"]["polygon_lonlat"]
         assert adjusted["adjustment_map_basemap"]["enabled"] is True
 
+        # Geometry-only arc feedback preserves the exact feature document and
+        # rejects candidates that move the RegionBPoly into an obstruction guard.
+        arc_source = load(test_dir / "region_bpoly.json")
+        arc_source_path = run_dir / "arc_source.json"
+        arc_source_path.write_text(json.dumps(arc_source, indent=2), encoding="utf-8")
+        import hashlib
+
+        source_sha = hashlib.sha256(arc_source_path.read_bytes()).hexdigest()
+        feedback_path = run_dir / "arc_feedback.json"
+        feedback_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": "region_bpoly_arc_feedback_v1",
+                    "status": "adjust_bpoly",
+                    "input_sha256": {"region_bpoly_json": source_sha},
+                    "candidate_recommendations": [
+                        {
+                            "candidate_id": "safe-east-5km",
+                            "operation": "reshape",
+                            "side_index": 3,
+                            "profile": "full_edge",
+                            "displacement_km": 5.0,
+                            "vertex_delta_km": {"3": [5.0, 0.0], "0": [5.0, 0.0]},
+                            "semantic_feature_changes": [],
+                        }
+                    ],
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        feedback_dir = run_dir / "arc_feedback_adjusted"
+        run(
+            [
+                "apply_arc_feedback.py",
+                "--input-json",
+                arc_source_path,
+                "--feedback-json",
+                feedback_path,
+                "--candidate-id",
+                "safe-east-5km",
+                "--output-dir",
+                feedback_dir,
+                "--basemap-provider",
+                "none",
+            ]
+        )
+        arc_adjusted = load(feedback_dir / "region_bpoly.json")
+        assert arc_adjusted["final_status"] == "pass"
+        assert arc_adjusted["target_region_features"] == arc_source["target_region_features"]
+        assert arc_adjusted["region_bpoly"]["offshore_azimuth_deg"] == arc_source["region_bpoly"]["offshore_azimuth_deg"]
+        assert arc_adjusted["region_bpoly"]["edge_labels"] == arc_source["region_bpoly"]["edge_labels"]
+        assert arc_adjusted["offshore_boundary_artifacts"]["selected_side_index"] == arc_source["offshore_boundary_artifacts"]["selected_side_index"]
+        lineage = arc_adjusted["arc_feedback_lineage"]
+        assert lineage["semantic_feature_changes"] == []
+        assert lineage["target_region_features_sha256_before"] == lineage["target_region_features_sha256_after"]
+
+        stale_feedback = load(feedback_path)
+        stale_feedback["input_sha256"]["region_bpoly_json"] = "0" * 64
+        stale_path = run_dir / "stale_feedback.json"
+        stale_path.write_text(json.dumps(stale_feedback), encoding="utf-8")
+        run(
+            [
+                "apply_arc_feedback.py",
+                "--input-json",
+                arc_source_path,
+                "--feedback-json",
+                stale_path,
+                "--candidate-id",
+                "safe-east-5km",
+                "--output-dir",
+                run_dir / "stale_output",
+            ],
+            expect_ok=False,
+        )
+
     print("fvcom-region-bpoly selftest passed")
 
 

@@ -1,6 +1,6 @@
 ---
 name: fvcom-region-bpoly
-description: Create map-guided, feature-first four-sided RegionBPoly envelopes for FVCOM preprocessing, with target-region feature boxes, road/topographic background maps, offshore-side identification artifacts, QA scoring, and perturbative polygon adjustment tools.
+description: Create and geometrically adjust map-guided, feature-first four-sided RegionBPoly envelopes for FVCOM preprocessing, including post-arc GSHHS clipping feedback, target-feature preservation, offshore-side artifacts, and QA scoring.
 ---
 
 # fvcom-region-bpoly
@@ -12,6 +12,8 @@ Use this skill to turn a natural-language FVCOM regional ocean, estuary, lake, i
 The four-sided `polygon_lonlat` is the controlling model-domain envelope. The `envelope_bbox` is only a helper for bathymetry/coastline fetching, source-coverage checks, and plot limits.
 
 Do not generate meshes or coastline boundary arcs in this skill.
+
+GSHHS remains downstream in `fvcom-bdry-arc`. This skill may consume its `region_bpoly_arc_feedback_v1` artifact to reshape the four-corner polygon, but it must not fetch or interpret coastline data itself.
 
 ## Offshore Point Purpose
 
@@ -135,6 +137,8 @@ Every accepted bpoly needs a domain type in final JSON:
 
 Use `scripts/adjust_region_bpoly.py` when the agent needs direct final-stage polygon edits from map review.
 
+Use `scripts/apply_arc_feedback.py` for a geometry-only adjustment requested by `fvcom-bdry-arc`. The command verifies the feedback hash, applies one named full-edge or tapered reshape candidate, preserves `target_region_features` exactly by canonical hash, recomputes required-feature and obstruction QA, resnaps the offshore reference, and writes a complete downstream-compatible RegionBPoly plus comparison map. Reject stale feedback, semantic mutations, invalid polygons, lost required features, and new obstruction conflicts.
+
 The adjustment manifest supports:
 
 - `rotate`: rotate the four-corner bpoly around `center`, `offshore_midpoint`, or explicit `pivot_lonlat`.
@@ -166,6 +170,7 @@ Pass downstream:
 - `scripts/run_region_bpoly.py`: primary final-output workflow.
 - `scripts/propose_region_bpoly.py`: request/direct polygon to feature plan, candidate maps, zoom maps, and JSON.
 - `scripts/adjust_region_bpoly.py`: perturbative rotate/scale/reshape adjustment CLI with dashed-old/solid-new comparison map.
+- `scripts/apply_arc_feedback.py`: apply one hash-bound, geometry-only boundary-arc feedback candidate and rerun RegionBPoly QA.
 - `scripts/classify_region_bpoly_domain.py`: bpoly candidate to domain-type note.
 - `scripts/review_region_bpoly.py`: visual QA to accepted `region_bpoly.json`.
 - `scripts/selftest_region_bpoly.py`: static workflow and adjustment-tool checks.

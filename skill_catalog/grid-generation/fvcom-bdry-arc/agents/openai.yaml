@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM Boundary Arc"
-  short_description: "Build adaptive FVCOM boundary chains"
-  default_prompt: "Use $fvcom-bdry-arc to build legacy or adaptive mission-protected FVCOM boundary loops, island treatments, and graded open-boundary chains."
+  short_description: "Build and correct FVCOM boundary chains"
+  default_prompt: "Use $fvcom-bdry-arc to build FVCOM boundary loops, preserve exact delivered-OBC lineage, detect GSHHS frame clipping, derive passage spacing from protected passage geometry, and return bounded RegionBPoly feedback when needed."

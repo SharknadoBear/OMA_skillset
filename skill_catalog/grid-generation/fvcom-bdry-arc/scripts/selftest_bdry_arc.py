@@ -20,6 +20,7 @@ from fvcom_bdry_arc import (  # noqa: E402
     analyze_boundary_resolution,
     build_boundary_resolution,
     build_model_boundary_loops,
+    build_region_bpoly_arc_feedback,
     run_bdry_arc,
 )
 from fvcom_bdry_arc.boundary_resolution import (  # noqa: E402
@@ -28,7 +29,9 @@ from fvcom_bdry_arc.boundary_resolution import (  # noqa: E402
     _sample_landward_v2,
     _sample_open_arc_v2,
 )
+from fvcom_bdry_arc.feedback import _read_layer as _read_feedback_layer  # noqa: E402
 from fvcom_bdry_arc.projection import local_utm_projection, project_geometry  # noqa: E402
+from run_bpoly_arc_feedback_loop import _select_trial  # noqa: E402
 from fvcom_bdry_arc.workflow import (  # noqa: E402
     _classify_relevant_lines,
     _coastline_bpoly_anchor_points,
@@ -279,6 +282,7 @@ def test_synthetic_package() -> None:
         assert Path(manifest["outputs"]["model_boundary_segments_geojson"]).exists()
         assert Path(manifest["outputs"]["model_boundary_colored_map"]).exists()
         assert manifest["model_boundary_loops"]["final_status"] in {"pass", "needs_review"}
+        assert Path(manifest["outputs"]["feedback_json"]).exists()
         assert Path(manifest["outputs"]["visual_review_dir"], "preliminary_arc_map.png").exists()
         assert Path(manifest["outputs"]["visual_review_dir"], "arc_candidate_contact_sheet.png").exists()
         assert manifest["wet_domain"]["area_m2"] > 0
@@ -687,6 +691,7 @@ def test_model_boundary_loop_package() -> None:
             "model_outer_boundary_segments",
             "island_boundary_polygons",
             "island_boundary_lines",
+            "delivered_open_boundary_arc",
             "source_open_boundary_arc",
         }
         assert required.issubset(layers), sorted(required - layers)
@@ -808,6 +813,67 @@ def test_adaptive_boundary_resolution_package() -> None:
         assert all(item["hard_anchor"] for item in v2_diagnostics["boundary_sampling"]["junctions"])
 
 
+def test_adaptive_uses_exact_delivered_obc_not_proximity_tails() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        exterior = [
+            (-75.0, 39.0),
+            (-74.9, 39.0),
+            (-74.9, 39.1),
+            (-75.0, 39.1),
+            (-75.0, 39.0),
+        ]
+        domain = Polygon(exterior)
+        loops = root / "loops.gpkg"
+        gpd.GeoDataFrame(
+            [{"geometry": domain}], geometry="geometry", crs="EPSG:4326"
+        ).to_file(loops, layer="model_domain_polygon", driver="GPKG")
+        records = []
+        for index, (start, end) in enumerate(zip(exterior[:-1], exterior[1:])):
+            records.append(
+                {
+                    "sequence_id": index,
+                    "segment_class": "open_boundary" if index == 1 else "land_outer_boundary",
+                    "geometry": LineString([start, end]),
+                }
+            )
+        gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326").to_file(
+            loops, layer="model_outer_boundary_segments", driver="GPKG"
+        )
+        exact_delivered = LineString([(-74.9, 39.02), (-74.9, 39.08)])
+        gpd.GeoDataFrame(
+            [{"segment_class": "delivered_open_boundary_arc", "geometry": exact_delivered}],
+            geometry="geometry",
+            crs="EPSG:4326",
+        ).to_file(loops, layer="delivered_open_boundary_arc", driver="GPKG")
+        coast = root / "coast.gpkg"
+        gpd.GeoDataFrame(
+            [{"geometry": box(-75.01, 39.0, -75.005, 39.1)}],
+            geometry="geometry",
+            crs="EPSG:4326",
+        ).to_file(coast, layer="land_polygons", driver="GPKG")
+        manifest = build_boundary_resolution(
+            loops,
+            None,
+            None,
+            coast,
+            root / "resolution",
+            "exact_delivered_obc",
+            BoundaryResolutionV2Config(passage_max_width_m=100.0),
+        )
+        assert manifest["final_status"] == "pass", manifest["failure_taxonomy"]
+        assert manifest["qa"]["open_arc_source"] == "exact_delivered_open_boundary_arc"
+        assert manifest["qa"]["proximity_classified_excess_length_m"] > 0.0
+        resolved = gpd.read_file(
+            manifest["outputs"]["boundary_resolution_gpkg"],
+            layer="resolved_open_boundary",
+        ).to_crs("EPSG:4326").geometry.iloc[0]
+        assert abs(resolved.coords[0][1] - 39.02) <= 1.0e-8
+        assert abs(resolved.coords[-1][1] - 39.08) <= 1.0e-8
+        assert min(point[1] for point in resolved.coords) >= 39.02 - 1.0e-8
+        assert max(point[1] for point in resolved.coords) <= 39.08 + 1.0e-8
+
+
 def test_v2_feature_anchors_and_junction_spacing() -> None:
     config = BoundaryResolutionV2Config(
         land_spacing_m=150.0,
@@ -856,12 +922,15 @@ def test_v2_passage_inventory_harmonizes_or_gates_without_closure() -> None:
     assert paired[0]["action"] == "harmonize_paired_spacing"
     assert abs(paired[0]["required_target_spacing_m"] - 250.0) <= 1.0e-8
     assert island_targets[0] == 250.0 and island_targets[1] == 250.0
+    assert report["minimum_spacing_policy"] == "adaptive_from_minimum_protected_passage_width"
+    assert abs(report["minimum_protected_passage_width_m"] - 1000.0) <= 1.0e-8
+    assert abs(report["minimum_permitted_spacing_m"] - 250.0) <= 1.0e-8
     assert report["automatic_topology_operation_count"] == 0
     assert controls == []
 
     narrow_second = box(x0 + 4850.0, y0 + 4000.0, x0 + 5850.0, y0 + 6000.0)
     narrow_domain = Polygon(outer, holes=[list(first.exterior.coords), list(narrow_second.exterior.coords)])
-    narrow_report, _, _ = _inventory_narrow_passages(
+    narrow_report, _, narrow_targets = _inventory_narrow_passages(
         landward,
         [first, narrow_second],
         narrow_domain,
@@ -869,9 +938,191 @@ def test_v2_passage_inventory_harmonizes_or_gates_without_closure() -> None:
         BoundaryResolutionV2Config(passage_max_width_m=1000.0),
         projection,
     )
-    assert narrow_report["protected_unresolved_count"] >= 1
-    assert any(item["action"] == "retain_needs_review" for item in narrow_report["passages"])
+    assert narrow_report["protected_unresolved_count"] == 0
+    assert narrow_report["minimum_spacing_policy"] == "adaptive_from_minimum_protected_passage_width"
+    assert abs(narrow_report["minimum_protected_passage_width_m"] - 350.0) <= 1.0e-8
+    assert abs(narrow_report["minimum_permitted_spacing_m"] - 87.5) <= 1.0e-8
+    assert all(item["action"] == "harmonize_paired_spacing" for item in narrow_report["passages"])
+    assert narrow_targets[0] == 87.5 and narrow_targets[1] == 87.5
     assert narrow_report["automatic_topology_operation_count"] == 0
+
+    override_report, _, _ = _inventory_narrow_passages(
+        landward,
+        [first, narrow_second],
+        narrow_domain,
+        mission,
+        BoundaryResolutionV2Config(passage_max_width_m=1000.0, passage_min_spacing_m=100.0),
+        projection,
+    )
+    assert override_report["minimum_spacing_policy"] == "explicit_configuration"
+    assert override_report["protected_unresolved_count"] >= 1
+    assert any(item["action"] == "retain_needs_review" for item in override_report["passages"])
+
+    no_protected_config = BoundaryResolutionV2Config(passage_max_width_m=1000.0)
+    no_protected_report, _, _ = _inventory_narrow_passages(
+        landward,
+        [first, narrow_second],
+        narrow_domain,
+        None,
+        no_protected_config,
+        projection,
+    )
+    assert no_protected_report["minimum_spacing_policy"] == "configured_land_spacing_no_protected_passage"
+    assert no_protected_report["minimum_permitted_spacing_m"] == no_protected_config.land_spacing_m
+    assert no_protected_report["protected_unresolved_count"] == 0
+    assert no_protected_report["unprotected_unresolved_count"] >= 1
+
+
+def test_region_bpoly_feedback_classifies_landward_clip_and_obc() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        region_path = root / "region_bpoly.json"
+        offshore_path = root / "offshore_boundary_artifacts.json"
+        _write_json(
+            region_path,
+            {
+                "name": "feedback_synthetic",
+                "domain_type": "coastal",
+                "boundary_policy": "coastal_arc_with_land_anchors",
+                "expected_obc_count": 1,
+                "polygon_lonlat": [[4.0, 0.0], [0.0, 0.0], [0.0, 4.0], [4.0, 4.0], [4.0, 0.0]],
+                "region_bpoly": {
+                    "polygon_lonlat": [[4.0, 0.0], [0.0, 0.0], [0.0, 4.0], [4.0, 4.0], [4.0, 0.0]],
+                    "edge_labels": ["south", "west", "north", "east"],
+                },
+            },
+        )
+        _write_json(offshore_path, {"expected_obc_count": 1, "selected_side_index": 3})
+        package = root / "package.gpkg"
+        wet = Polygon([(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)])
+        gpd.GeoDataFrame([{"geometry": wet}], geometry="geometry", crs="EPSG:4326").to_file(package, layer="wet_domain", driver="GPKG")
+        gpd.GeoDataFrame([{"geometry": LineString([(4.0, 0.0), (4.0, 4.0)])}], geometry="geometry", crs="EPSG:4326").to_file(package, layer="open_boundary_arc", driver="GPKG")
+        gpd.GeoDataFrame(
+            [
+                {"geometry": LineString([(0.0, 0.8), (0.0, 2.8)])},
+                {"geometry": LineString([(4.0, 0.0), (4.0, 4.0)])},
+            ],
+            geometry="geometry",
+            crs="EPSG:4326",
+        ).to_file(package, layer="frame_clip_boundary_arcs", driver="GPKG")
+        land_path = root / "land.gpkg"
+        land = gpd.GeoDataFrame(
+            [{"geometry": Polygon([(-1.0, -1.0), (-0.3, -1.0), (-0.3, 5.0), (-1.0, 5.0)])}],
+            geometry="geometry",
+            crs="EPSG:4326",
+        )
+        land.to_file(land_path, layer="land_polygons", driver="GPKG")
+        land.boundary.to_frame("geometry").set_crs("EPSG:4326").to_file(land_path, layer="coastline_lines", driver="GPKG")
+        loop_path = root / "loop.json"
+        _write_json(loop_path, {"final_status": "needs_review", "failure_taxonomy": ["unintended_frame_clip_nontrivial"], "qa": {"open_boundary_exterior_overlap_fraction": 1.0}})
+        feedback = build_region_bpoly_arc_feedback(
+            region_path,
+            offshore_path,
+            package,
+            land_path,
+            loop_path,
+            root / "feedback",
+            {
+                "inputs": {"coastline_source": "gshhs", "coastline_load": {"source_version": "GSHHG 2.3.7"}},
+                "settings": {"target_resolution_m": 1000.0, "gshhs_resolution": "h", "gshhs_levels": "1"},
+                "wet_domain": {"arc_land_intersection_length_m": 0.0},
+            },
+            frame_clip_policy="reject-unintended",
+            frame_clip_tolerance_m=250.0,
+            candidate_max_km=100.0,
+        )
+        assert feedback["status"] == "adjust_bpoly"
+        assert feedback["metrics"]["delivered_obc_count"] == 1
+        unintended = [item for item in feedback["frame_clip_segments"] if item["classification"] == "unintended_frame_clip"]
+        intentional = [item for item in feedback["frame_clip_segments"] if item["classification"] == "intentional_open_boundary"]
+        assert len(unintended) == 1 and unintended[0]["side_index"] == 1
+        assert len(intentional) == 1 and intentional[0]["side_index"] == 3
+        assert feedback["candidate_recommendations"]
+        assert feedback["candidate_recommendations"][0]["displacement_km"] <= 100.0
+        assert Path(feedback["outputs"]["feedback_map"]).exists()
+        assert Path(feedback["outputs"]["segments_geojson"]).exists()
+
+
+def test_region_bpoly_feedback_numerical_sliver_passes() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        region_path = root / "region.json"
+        offshore_path = root / "offshore.json"
+        _write_json(region_path, {"domain_type": "coastal", "polygon_lonlat": [[0.02, 0.0], [0.0, 0.0], [0.0, 0.02], [0.02, 0.02], [0.02, 0.0]], "expected_obc_count": 1})
+        _write_json(offshore_path, {"expected_obc_count": 1})
+        package = root / "package.gpkg"
+        wet = Polygon([(0.0, 0.0), (0.02, 0.0), (0.02, 0.02), (0.0, 0.02)])
+        gpd.GeoDataFrame([{"geometry": wet}], geometry="geometry", crs="EPSG:4326").to_file(package, layer="wet_domain", driver="GPKG")
+        gpd.GeoDataFrame([{"geometry": LineString([(0.02, 0.0), (0.02, 0.02)])}], geometry="geometry", crs="EPSG:4326").to_file(package, layer="open_boundary_arc", driver="GPKG")
+        gpd.GeoDataFrame([{"geometry": LineString([(0.0, 0.0), (0.0, 0.001)])}], geometry="geometry", crs="EPSG:4326").to_file(package, layer="frame_clip_boundary_arcs", driver="GPKG")
+        land_path = root / "land.gpkg"
+        gpd.GeoDataFrame([{"geometry": Polygon([(-0.01, -0.01), (-0.002, -0.01), (-0.002, 0.03), (-0.01, 0.03)])}], geometry="geometry", crs="EPSG:4326").to_file(land_path, layer="land_polygons", driver="GPKG")
+        loop_path = root / "loop.json"
+        _write_json(loop_path, {"final_status": "pass", "failure_taxonomy": [], "qa": {"open_boundary_exterior_overlap_fraction": 1.0}})
+        feedback = build_region_bpoly_arc_feedback(
+            region_path,
+            offshore_path,
+            package,
+            land_path,
+            loop_path,
+            root / "feedback",
+            {"inputs": {"coastline_source": "gshhs"}, "settings": {"target_resolution_m": 1000.0}, "wet_domain": {}},
+            frame_clip_policy="reject-unintended",
+            frame_clip_tolerance_m=250.0,
+            adaptive_status="pass",
+        )
+        assert feedback["diagnostic_status"] == "pass"
+        assert feedback["status"] == "pass"
+
+
+def test_feedback_reader_drops_empty_geometry_placeholders() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "empty.gpkg"
+        gpd.GeoDataFrame([{"geometry": None}], geometry="geometry", crs="EPSG:4326").to_file(path, layer="frame_clip_boundary_arcs", driver="GPKG")
+        assert _read_feedback_layer(path, "frame_clip_boundary_arcs").empty
+
+
+def test_adaptive_failure_after_clip_closure_stops_bbox_adjustment() -> None:
+    adaptive_only = {
+        "status": "input_needs_review",
+        "diagnostic_status": "pass",
+        "failure_taxonomy": ["adaptive_boundary_resolution_failed"],
+        "adaptive": {
+            "status": "needs_review",
+            "failure_taxonomy": ["adaptive_boundary_resolution_failed"],
+        },
+        "metrics": {"unintended_frame_clip_length_m": 0.0},
+    }
+    still_clipped = {
+        "status": "adjust_bpoly",
+        "diagnostic_status": "fail",
+        "failure_taxonomy": ["unintended_frame_clip_nontrivial"],
+        "adaptive": {"status": "pending", "failure_taxonomy": []},
+        "metrics": {"unintended_frame_clip_length_m": 20_000.0},
+        "policy": {"frame_clip_tolerance_m": 250.0},
+    }
+    trials = [
+        {
+            "manifest": {"final_status": "needs_review"},
+            "feedback": adaptive_only,
+            "candidate": {"candidate_id": "closed", "displacement_km": 52.0},
+            "area_growth_fraction": 0.2,
+        },
+        {
+            "manifest": {"final_status": "needs_review"},
+            "feedback": still_clipped,
+            "candidate": {"candidate_id": "residual", "displacement_km": 40.0},
+            "area_growth_fraction": 0.1,
+        },
+    ]
+    selected, status, reason = _select_trial(
+        trials,
+        {"metrics": {"unintended_frame_clip_length_m": 65_000.0}},
+        "adaptive-coastal-v2",
+    )
+    assert selected is trials[0]
+    assert status == "input_needs_review"
+    assert reason == "adaptive_failure_after_frame_clip_closed"
 
 
 def main() -> int:
@@ -895,8 +1146,13 @@ def main() -> int:
     test_model_boundary_loop_package()
     test_model_boundary_loop_unclassified_needs_review()
     test_adaptive_boundary_resolution_package()
+    test_adaptive_uses_exact_delivered_obc_not_proximity_tails()
     test_v2_feature_anchors_and_junction_spacing()
     test_v2_passage_inventory_harmonizes_or_gates_without_closure()
+    test_region_bpoly_feedback_classifies_landward_clip_and_obc()
+    test_region_bpoly_feedback_numerical_sliver_passes()
+    test_feedback_reader_drops_empty_geometry_placeholders()
+    test_adaptive_failure_after_clip_closure_stops_bbox_adjustment()
     print("fvcom-bdry-arc selftests passed")
     return 0
 

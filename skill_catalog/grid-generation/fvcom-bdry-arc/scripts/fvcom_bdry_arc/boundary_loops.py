@@ -80,6 +80,24 @@ def build_model_boundary_loops(
     open_overlap_fraction = _line_fraction_near(open_xy, exterior_xy, tolerance_m)
     class_lengths = _class_lengths(segments_xy)
     unclassified_threshold_m = max(2.0 * target_resolution_m, 0.001 * max(exterior_xy.length, 1.0))
+    frame_clip_policy = str(source_manifest.get("settings", {}).get("frame_clip_policy", "report-only"))
+    coastline_source = str(source_manifest.get("inputs", {}).get("coastline_source", ""))
+    configured_frame_tolerance = source_manifest.get("settings", {}).get("frame_clip_tolerance_m")
+    frame_clip_tolerance_m = float(
+        configured_frame_tolerance
+        if configured_frame_tolerance is not None
+        else max(250.0, 0.05 * target_resolution_m)
+    )
+    source_frame_clip_length_m = float(
+        source_manifest.get("wet_domain", {}).get("frame_clip_boundary_length_m", 0.0) or 0.0
+    )
+    classified_frame_clip_length_m = float(class_lengths.get("frame_clip_boundary", 0.0))
+    gate_frame_clip_length_m = max(source_frame_clip_length_m, classified_frame_clip_length_m)
+    landward_length_m = max(float(exterior_xy.length) - float(getattr(open_xy, "length", 0.0)), 1.0)
+    unintended_frame_clip_fraction = float(gate_frame_clip_length_m / landward_length_m)
+    intended_exterior_coverage_fraction = float(
+        max(0.0, min(1.0, 1.0 - gate_frame_clip_length_m / max(float(exterior_xy.length), 1.0)))
+    )
     failures: list[str] = []
     if source_manifest.get("final_status") == "needs_review":
         failures.append("upstream_bdry_arc_needs_review")
@@ -93,6 +111,14 @@ def build_model_boundary_loops(
         failures.append("open_boundary_not_sufficiently_on_model_exterior")
     if class_lengths.get("unclassified_outer_boundary", 0.0) > unclassified_threshold_m:
         failures.append("unclassified_outer_boundary_length_nontrivial")
+    frame_gate_enabled = frame_clip_policy == "reject-unintended" and coastline_source == "gshhs"
+    if frame_gate_enabled and gate_frame_clip_length_m > frame_clip_tolerance_m:
+        failures.append("unintended_frame_clip_nontrivial")
+    if frame_gate_enabled and (
+        unintended_frame_clip_fraction > 0.001
+        or intended_exterior_coverage_fraction < 0.999
+    ):
+        failures.append("gshhs_coastline_incomplete_on_landward_boundary")
     final_status = "pass" if not failures else "needs_review"
 
     layers = _build_layers(
@@ -130,6 +156,11 @@ def build_model_boundary_loops(
             "unclassified_length_threshold_m": float(unclassified_threshold_m),
             "open_boundary_overlap_threshold": float(open_overlap_threshold),
             "lake_no_open_boundary": bool(lake_no_open_boundary),
+            "frame_clip_policy": frame_clip_policy,
+            "frame_clip_tolerance_m": float(frame_clip_tolerance_m),
+            "frame_clip_fraction_threshold": 0.001,
+            "intended_exterior_coverage_threshold": 0.999,
+            "frame_clip_gate_enabled": bool(frame_gate_enabled),
         },
         "qa": {
             "outer_boundary_closed": outer_closed,
@@ -138,11 +169,40 @@ def build_model_boundary_loops(
             "land_outer_boundary_length_m": float(class_lengths.get("land_outer_boundary", 0.0)),
             "land_patch_boundary_length_m": float(class_lengths.get("land_patch_boundary", 0.0)),
             "frame_clip_boundary_length_m": float(class_lengths.get("frame_clip_boundary", 0.0)),
+            "source_frame_clip_boundary_length_m": float(source_frame_clip_length_m),
+            "gate_frame_clip_boundary_length_m": float(gate_frame_clip_length_m),
+            "unintended_frame_clip_fraction": float(unintended_frame_clip_fraction),
+            "intended_exterior_coverage_fraction": float(intended_exterior_coverage_fraction),
             "open_boundary_length_m": float(class_lengths.get("open_boundary", 0.0)),
             "unclassified_outer_boundary_length_m": float(class_lengths.get("unclassified_outer_boundary", 0.0)),
             "island_count": int(len(island_polygons_xy)),
             "largest_island_area_m2": float(max((poly.area for poly in island_polygons_xy), default=0.0)),
             "model_domain_area_m2": float(domain_xy.area),
+        },
+        "open_boundary_lineage": {
+            "adaptive_source_layer": "delivered_open_boundary_arc",
+            "compatibility_alias_layer": "source_open_boundary_arc",
+            "consumption_policy": "exact_delivered_geometry_not_proximity_classification",
+            "delivered_open_boundary_length_m": float(getattr(open_xy, "length", 0.0)),
+            "proximity_classified_open_boundary_length_m": float(
+                class_lengths.get("open_boundary", 0.0)
+            ),
+            "proximity_classified_excess_length_m": float(
+                max(
+                    0.0,
+                    class_lengths.get("open_boundary", 0.0)
+                    - float(getattr(open_xy, "length", 0.0)),
+                )
+            ),
+            "delivered_source_start_position_m": source_manifest.get("wet_domain", {}).get(
+                "delivered_source_start_position_m"
+            ),
+            "delivered_source_end_position_m": source_manifest.get("wet_domain", {}).get(
+                "delivered_source_end_position_m"
+            ),
+            "discarded_source_open_arc_length_m": source_manifest.get("wet_domain", {}).get(
+                "discarded_source_open_arc_length_m"
+            ),
         },
         "outputs": {
             **outputs,
@@ -317,6 +377,7 @@ def _build_layers(
         }
         for idx, line in enumerate(island_lines_xy)
     ]
+    delivered_open = _geometry_gdf(open_xy, projection, "delivered_open_boundary_arc")
     source_open = _geometry_gdf(open_xy, projection, "source_open_boundary_arc")
     if island_poly_records:
         island_polygons = gpd.GeoDataFrame(island_poly_records, geometry="geometry", crs="EPSG:4326")
@@ -340,6 +401,7 @@ def _build_layers(
         "model_outer_boundary_segments": segments,
         "island_boundary_polygons": island_polygons,
         "island_boundary_lines": island_lines,
+        "delivered_open_boundary_arc": delivered_open,
         "source_open_boundary_arc": source_open,
     }
 

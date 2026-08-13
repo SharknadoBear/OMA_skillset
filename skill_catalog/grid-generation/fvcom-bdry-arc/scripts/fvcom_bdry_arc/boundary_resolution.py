@@ -65,7 +65,7 @@ class BoundaryResolutionV2Config(BoundaryResolutionConfig):
     passage_search_spacing_m: float = 300.0
     passage_max_width_m: float = 5000.0
     passage_min_along_separation_m: float = 1500.0
-    passage_min_spacing_m: float = 150.0
+    passage_min_spacing_m: float | None = None
 
 
 def boundary_resolution_config(profile: str) -> BoundaryResolutionConfig:
@@ -146,7 +146,12 @@ def build_boundary_resolution(
     mission_xy = _mission_geometry(region_bpoly_json, projection, config.mission_buffer_m)
     land_union = _load_land_union(coastline_gpkg, projection)
 
-    open_xy, landward_xy = _canonical_open_and_landward(package["segments_xy"], source_domain)
+    open_xy, landward_xy, open_lineage = _canonical_open_and_landward(
+        package["segments_xy"],
+        source_domain,
+        package.get("delivered_open_xy"),
+        package.get("delivered_open_source_layer"),
+    )
     repaired_open, repair_report = _repair_open_arc(open_xy, source_domain, land_union, config)
     outer_shell = _compose_shell(repaired_open, landward_xy, source_domain)
     shell_polygon = Polygon(outer_shell)
@@ -331,6 +336,7 @@ def build_boundary_resolution(
             "protected_count": int(sum(bool(item["protected_mission"]) for item in source_metrics)),
         },
         "open_arc_repair": repair_report,
+        "open_boundary_lineage": open_lineage,
         "topology_actions": action_report,
         "resolved_islands": resolved_records,
         "chains": chain_summaries,
@@ -406,6 +412,16 @@ def build_boundary_resolution(
             "protected_mission_operation_count": int(action_report["protected_operation_count"]),
             "open_arc_land_intersection_m": float(max(repair_report["land_intersection_length_m"], sampled_land_length)),
             "open_arc_exterior_overlap_fraction": exterior_overlap,
+            "open_arc_source": open_lineage["source"],
+            "exact_delivered_open_boundary_length_m": open_lineage.get(
+                "delivered_open_boundary_length_m"
+            ),
+            "proximity_classified_open_boundary_length_m": open_lineage.get(
+                "proximity_classified_open_boundary_length_m"
+            ),
+            "proximity_classified_excess_length_m": open_lineage.get(
+                "proximity_classified_excess_length_m"
+            ),
             "resolved_domain_valid": bool(resolved_domain.is_valid),
             **(
                 {
@@ -415,6 +431,16 @@ def build_boundary_resolution(
                     "passage_count": int(passage_report["passage_count"]),
                     "protected_underresolved_passage_count": int(passage_report["protected_unresolved_count"]),
                     "unprotected_underresolved_passage_count": int(passage_report["unprotected_unresolved_count"]),
+                    "passage_minimum_spacing_policy": passage_report["minimum_spacing_policy"],
+                    "passage_minimum_permitted_spacing_m": float(
+                        passage_report["minimum_permitted_spacing_m"]
+                    ),
+                    "passage_minimum_controlling_passage_id": passage_report[
+                        "minimum_spacing_controlling_passage_id"
+                    ],
+                    "minimum_protected_passage_width_m": passage_report[
+                        "minimum_protected_passage_width_m"
+                    ],
                     "automatic_passage_topology_operation_count": int(
                         passage_report["automatic_topology_operation_count"]
                     ),
@@ -515,11 +541,28 @@ def _load_loop_package(path: Path) -> dict[str, Any]:
     if "island_boundary_polygons" in layers:
         islands = gpd.read_file(path, layer="island_boundary_polygons").to_crs("EPSG:4326")
         islands_xy = [project_geometry(geom, projection).buffer(0) for geom in islands.geometry if isinstance(geom, Polygon) and not geom.is_empty]
+    delivered_open_xy = None
+    delivered_open_source_layer = None
+    for layer in ("delivered_open_boundary_arc", "source_open_boundary_arc"):
+        if layer not in layers:
+            continue
+        delivered = gpd.read_file(path, layer=layer).to_crs("EPSG:4326")
+        delivered_lines = [
+            project_geometry(geom, projection)
+            for geom in delivered.geometry
+            if isinstance(geom, LineString) and not geom.is_empty
+        ]
+        if delivered_lines:
+            delivered_open_xy = LineString(_ordered_segment_coords(delivered_lines))
+            delivered_open_source_layer = layer
+            break
     return {
         "projection": projection,
         "domain_xy": _select_polygon(domain_xy, domain_xy.representative_point()),
         "segments_xy": segment_records,
         "islands_xy": islands_xy,
+        "delivered_open_xy": delivered_open_xy,
+        "delivered_open_source_layer": delivered_open_source_layer,
     }
 
 
@@ -564,7 +607,47 @@ def _load_land_union(coastline_gpkg: str | Path | None, projection):
     return unary_union([project_geometry(geom, projection) for geom in gdf.geometry if geom is not None and not geom.is_empty])
 
 
-def _canonical_open_and_landward(records: list[dict[str, Any]], domain: Polygon) -> tuple[LineString, LineString]:
+def _canonical_open_and_landward(
+    records: list[dict[str, Any]],
+    domain: Polygon,
+    delivered_open: LineString | None = None,
+    delivered_source_layer: str | None = None,
+) -> tuple[LineString, LineString, dict[str, Any]]:
+    classified_open, classified_landward = _classified_open_and_landward(records, domain)
+    classified_length = float(classified_open.length)
+    if delivered_open is None or delivered_open.is_empty:
+        return classified_open, classified_landward, {
+            "source": "proximity_classified_model_outer_boundary_segments",
+            "source_layer": "model_outer_boundary_segments",
+            "exact_delivered_geometry_available": False,
+            "delivered_open_boundary_length_m": classified_length,
+            "proximity_classified_open_boundary_length_m": classified_length,
+            "proximity_classified_excess_length_m": 0.0,
+            "exterior_overlap_fraction": 1.0,
+        }
+    exact_open, exact_landward, exact_report = _exact_delivered_open_and_landward(
+        delivered_open,
+        domain,
+    )
+    exact_report.update(
+        {
+            "source": "exact_delivered_open_boundary_arc",
+            "source_layer": delivered_source_layer,
+            "exact_delivered_geometry_available": True,
+            "delivered_open_boundary_length_m": float(exact_open.length),
+            "proximity_classified_open_boundary_length_m": classified_length,
+            "proximity_classified_excess_length_m": float(
+                max(0.0, classified_length - float(exact_open.length))
+            ),
+        }
+    )
+    return exact_open, exact_landward, exact_report
+
+
+def _classified_open_and_landward(
+    records: list[dict[str, Any]],
+    domain: Polygon,
+) -> tuple[LineString, LineString]:
     records = sorted(records, key=lambda item: item["sequence_id"])
     flags = [item["segment_class"] == "open_boundary" for item in records]
     if not any(flags):
@@ -597,6 +680,90 @@ def _canonical_open_and_landward(records: list[dict[str, Any]], domain: Polygon)
     if np.linalg.norm(np.asarray(land_coords[0]) - np.asarray(open_coords[-1])) > np.linalg.norm(np.asarray(land_coords[-1]) - np.asarray(open_coords[-1])):
         land_coords.reverse()
     return LineString(open_coords), LineString(land_coords)
+
+
+def _exact_delivered_open_and_landward(
+    delivered_open: LineString,
+    domain: Polygon,
+) -> tuple[LineString, LineString, dict[str, Any]]:
+    """Pair an exact delivered OBC with the complementary domain exterior."""
+    if not delivered_open.is_simple or len(delivered_open.coords) < 2:
+        raise ValueError("Exact delivered open-boundary geometry is not a simple LineString")
+    exterior = LineString(domain.exterior.coords)
+    tolerance_m = max(5.0, 1.0e-6 * float(exterior.length))
+    exterior_overlap = float(
+        delivered_open.intersection(exterior.buffer(tolerance_m)).length
+        / max(float(delivered_open.length), 1.0)
+    )
+    if exterior_overlap < 1.0 - 1.0e-9:
+        raise ValueError("Exact delivered open-boundary geometry is not on the model exterior")
+
+    if delivered_open.is_ring:
+        if abs(float(delivered_open.length) - float(exterior.length)) > tolerance_m:
+            raise ValueError("Closed delivered open-boundary geometry does not match the model exterior")
+        junction = delivered_open.coords[0]
+        return delivered_open, LineString([junction, junction]), {
+            "exterior_overlap_fraction": exterior_overlap,
+            "matched_exterior_interval_fraction": 1.0,
+            "matched_exterior_direction": "closed_exterior_loop",
+            "landward_boundary_length_m": 0.0,
+            "start_junction_gap_m": 0.0,
+            "end_junction_gap_m": 0.0,
+        }
+
+    start_distance = float(exterior.project(Point(delivered_open.coords[0])))
+    end_distance = float(exterior.project(Point(delivered_open.coords[-1])))
+    forward = _cyclic_exterior_substring(exterior, start_distance, end_distance)
+    backward = _cyclic_exterior_substring(exterior, end_distance, start_distance)
+    reverse_backward = LineString(list(backward.coords)[::-1])
+    forward_match = _line_overlap_fraction(delivered_open, forward, tolerance_m)
+    backward_match = _line_overlap_fraction(delivered_open, reverse_backward, tolerance_m)
+    if max(forward_match, backward_match) < 1.0 - 1.0e-9:
+        raise ValueError("Exact delivered open-boundary anchors do not isolate one exterior interval")
+
+    if forward_match >= backward_match:
+        landward = backward
+        matched_direction = "exterior_forward"
+        matched_fraction = forward_match
+    else:
+        landward = LineString(list(forward.coords)[::-1])
+        matched_direction = "exterior_reverse"
+        matched_fraction = backward_match
+    land_coords = list(landward.coords)
+    land_coords[0] = delivered_open.coords[-1]
+    land_coords[-1] = delivered_open.coords[0]
+    landward = LineString(land_coords)
+    return delivered_open, landward, {
+        "exterior_overlap_fraction": exterior_overlap,
+        "matched_exterior_interval_fraction": float(matched_fraction),
+        "matched_exterior_direction": matched_direction,
+        "landward_boundary_length_m": float(landward.length),
+        "start_junction_gap_m": float(
+            Point(delivered_open.coords[-1]).distance(Point(landward.coords[0]))
+        ),
+        "end_junction_gap_m": float(
+            Point(landward.coords[-1]).distance(Point(delivered_open.coords[0]))
+        ),
+    }
+
+
+def _cyclic_exterior_substring(
+    exterior: LineString,
+    start_distance: float,
+    end_distance: float,
+) -> LineString:
+    if end_distance >= start_distance:
+        return substring(exterior, start_distance, end_distance)
+    first = substring(exterior, start_distance, exterior.length)
+    second = substring(exterior, 0.0, end_distance)
+    return LineString(list(first.coords) + list(second.coords)[1:])
+
+
+def _line_overlap_fraction(line: LineString, reference: LineString, tolerance_m: float) -> float:
+    return float(
+        line.intersection(reference.buffer(tolerance_m)).length
+        / max(float(line.length), 1.0)
+    )
 
 
 def _ordered_segment_coords(lines: Iterable[LineString]) -> list[tuple[float, float]]:
@@ -1047,7 +1214,6 @@ def _inventory_narrow_passages(
     max_width = float(getattr(config, "passage_max_width_m", 5000.0))
     search_spacing = float(getattr(config, "passage_search_spacing_m", 300.0))
     min_along = float(getattr(config, "passage_min_along_separation_m", 1500.0))
-    min_spacing = float(getattr(config, "passage_min_spacing_m", config.land_spacing_m))
     raw_candidates: list[dict[str, Any]] = []
 
     # Same-chain search captures opposite banks of a narrow inlet/channel.
@@ -1151,13 +1317,9 @@ def _inventory_narrow_passages(
         if not duplicate:
             accepted.append(candidate)
 
-    passages: list[dict[str, Any]] = []
-    land_controls: list[dict[str, Any]] = []
-    island_targets: dict[int, float] = {}
-    protected_unresolved = 0
-    unprotected_unresolved = 0
+    passage_candidates: list[dict[str, Any]] = []
     for passage_id, candidate in enumerate(accepted):
-        connector = candidate.pop("connector")
+        connector = candidate["connector"]
         protected = bool(mission is not None and not mission.is_empty and connector.intersects(mission))
         elements = int(
             getattr(config, "protected_elements_across", 4)
@@ -1165,6 +1327,51 @@ def _inventory_narrow_passages(
             else getattr(config, "unprotected_elements_across", 3)
         )
         required_h = float(candidate["width_m"] / max(elements, 1))
+        passage_candidates.append(
+            {
+                **candidate,
+                "passage_id": int(passage_id),
+                "protected_mission": protected,
+                "required_elements_across": elements,
+                "required_target_spacing_m": required_h,
+            }
+        )
+
+    configured_min_spacing = getattr(config, "passage_min_spacing_m", None)
+    controlling_passage: dict[str, Any] | None = None
+    if configured_min_spacing is not None:
+        min_spacing = float(configured_min_spacing)
+        if not math.isfinite(min_spacing) or min_spacing <= 0.0:
+            raise ValueError("passage_min_spacing_m must be positive and finite when explicitly configured")
+        min_spacing_policy = "explicit_configuration"
+    else:
+        protected_candidates = [item for item in passage_candidates if item["protected_mission"]]
+        if protected_candidates:
+            controlling_passage = min(
+                protected_candidates,
+                key=lambda item: (
+                    float(item["required_target_spacing_m"]),
+                    float(item["width_m"]),
+                    int(item["passage_id"]),
+                ),
+            )
+            min_spacing = float(controlling_passage["required_target_spacing_m"])
+            min_spacing_policy = "adaptive_from_minimum_protected_passage_width"
+        else:
+            min_spacing = float(config.land_spacing_m)
+            min_spacing_policy = "configured_land_spacing_no_protected_passage"
+
+    passages: list[dict[str, Any]] = []
+    land_controls: list[dict[str, Any]] = []
+    island_targets: dict[int, float] = {}
+    protected_unresolved = 0
+    unprotected_unresolved = 0
+    for candidate in passage_candidates:
+        passage_id = int(candidate["passage_id"])
+        connector = candidate["connector"]
+        protected = bool(candidate["protected_mission"])
+        elements = int(candidate["required_elements_across"])
+        required_h = float(candidate["required_target_spacing_m"])
         unresolved = bool(required_h < min_spacing - 1.0e-9)
         if unresolved and protected:
             protected_unresolved += 1
@@ -1197,12 +1404,12 @@ def _inventory_narrow_passages(
         connector_ll = unproject_geometry(connector, projection)
         passages.append(
             {
-                "passage_id": int(passage_id),
-                **candidate,
+                **{key: value for key, value in candidate.items() if key != "connector"},
                 "protected_mission": protected,
                 "required_elements_across": elements,
                 "required_target_spacing_m": required_h,
                 "minimum_permitted_spacing_m": min_spacing,
+                "minimum_spacing_policy": min_spacing_policy,
                 "resolvable_at_minimum_spacing": not unresolved,
                 "action": action,
                 "automatic_topology_change": False,
@@ -1219,6 +1426,21 @@ def _inventory_narrow_passages(
             "search_spacing_m": search_spacing,
             "maximum_inventory_width_m": max_width,
             "minimum_permitted_spacing_m": min_spacing,
+            "minimum_spacing_policy": min_spacing_policy,
+            "configured_minimum_spacing_override_m": (
+                float(configured_min_spacing) if configured_min_spacing is not None else None
+            ),
+            "minimum_spacing_controlling_passage_id": (
+                int(controlling_passage["passage_id"]) if controlling_passage is not None else None
+            ),
+            "minimum_protected_passage_width_m": (
+                float(controlling_passage["width_m"]) if controlling_passage is not None else None
+            ),
+            "minimum_protected_passage_required_spacing_m": (
+                float(controlling_passage["required_target_spacing_m"])
+                if controlling_passage is not None
+                else None
+            ),
             "all_component_pair_count": int(all_component_pair_count),
             "spatially_indexed_component_pair_count": int(indexed_component_pair_count),
             "passages": passages,

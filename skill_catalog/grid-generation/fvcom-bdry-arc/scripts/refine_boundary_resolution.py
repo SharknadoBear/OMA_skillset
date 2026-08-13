@@ -36,12 +36,24 @@ def main() -> int:
         type=float,
         help="V2-only maximum width for special narrow-passage inventory; wider gaps use ordinary sizing.",
     )
+    parser.add_argument(
+        "--passage-min-spacing-m",
+        type=float,
+        help=(
+            "Optional V2-only explicit passage-spacing floor. By default the floor is derived "
+            "from the minimum protected passage width divided by its required elements across."
+        ),
+    )
     args = parser.parse_args()
     config = boundary_resolution_config(args.profile)
     if args.passage_max_width_m is not None:
         if args.profile != "adaptive-coastal-v2" or args.passage_max_width_m <= 0.0:
             parser.error("--passage-max-width-m requires adaptive-coastal-v2 and a positive value")
         config = replace(config, passage_max_width_m=float(args.passage_max_width_m))
+    if args.passage_min_spacing_m is not None:
+        if args.profile != "adaptive-coastal-v2" or args.passage_min_spacing_m <= 0.0:
+            parser.error("--passage-min-spacing-m requires adaptive-coastal-v2 and a positive value")
+        config = replace(config, passage_min_spacing_m=float(args.passage_min_spacing_m))
     manifest = build_boundary_resolution(
         args.model_boundary_loops_gpkg,
         args.model_boundary_loop_manifest,

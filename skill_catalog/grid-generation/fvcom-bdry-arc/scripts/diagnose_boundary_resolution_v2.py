@@ -70,6 +70,12 @@ def main() -> int:
                 "protected_unresolved_count",
                 "unprotected_unresolved_count",
                 "maximum_inventory_width_m",
+                "minimum_permitted_spacing_m",
+                "minimum_spacing_policy",
+                "configured_minimum_spacing_override_m",
+                "minimum_spacing_controlling_passage_id",
+                "minimum_protected_passage_width_m",
+                "minimum_protected_passage_required_spacing_m",
                 "all_component_pair_count",
                 "spatially_indexed_component_pair_count",
             )

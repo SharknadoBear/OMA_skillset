@@ -241,9 +241,10 @@ class RegionBPoly:
     @classmethod
     def from_dict(cls, data: dict) -> "RegionBPoly":
         if "polygon_lonlat" in data:
+            nested = data.get("region_bpoly", {}) or {}
             pts = data["polygon_lonlat"]
-            offshore = data.get("offshore_azimuth_deg", 90.0)
-            edge_labels = data.get("edge_labels")
+            offshore = data.get("offshore_azimuth_deg", nested.get("offshore_azimuth_deg", 90.0))
+            edge_labels = data.get("edge_labels", nested.get("edge_labels"))
         elif "region_bpoly" in data:
             src = data["region_bpoly"]
             pts = src["polygon_lonlat"]
