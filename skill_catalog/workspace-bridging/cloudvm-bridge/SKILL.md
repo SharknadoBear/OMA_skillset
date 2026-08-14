@@ -1,99 +1,81 @@
 ---
 name: cloudvm-bridge
-description: Use when working with Bear's PNNL cloud VM account at huan111@automodeldev01.pnl.gov for secure SSH command execution, file upload/download, Hermes/FVCOM setup checks, VM evidence collection, and controlled project-workspace operations through a local Paramiko bridge. Never store passwords or secrets.
+description: Use for secure SSH command execution and controlled file transfer on an authorized cloud VM through a local Paramiko bridge. Obtain the SSH target, approved workspace paths, and credentials privately at runtime; never store account identifiers, infrastructure addresses, secrets, or task details in the skill repository.
 ---
 
 # Cloud VM Bridge
 
-## Core Context
+## Runtime configuration
 
-- Account username: `huan111`
-- Host: `automodeldev01.pnl.gov`
-- SSH target: `huan111@automodeldev01.pnl.gov`
-- Bridge scripts: `scripts/`
-- Research/data constraint: use only public or non-sensitive OMI/FVCOM project material unless a separate approved pathway exists.
+- Obtain the SSH target as `<username>@<hostname>` at runtime.
+- Obtain approved remote workspace paths from the current task.
+- Keep the target, account, paths, credentials, and task details out of the versioned package.
+- Use only data and operations permitted for the configured VM.
 
-## Credential Rules
+## Credential rules
 
-- Never store, write, commit, echo, log, or repeat the cloud VM password.
-- Never put the password in this skill, command JSON, result JSON, shell history, prompts, memory, scripts, or generated outputs.
-- Ask Bear to enter the password only in the visible local bridge window when `Password:` appears.
-- Do not ask Bear to paste the password into chat.
-- If the available terminal cannot securely answer an interactive password prompt, use the local bridge window, an existing authenticated session, or another approved secure workflow.
+- Never store, write, commit, echo, log, or repeat the VM password.
+- Enter the password only in the visible local bridge window.
+- Do not place credentials in chat, commands, JSON, results, prompts, memory, scripts, or generated evidence.
+- If secure interactive entry is unavailable, use an approved key, authenticated session, or user-run workflow.
 
-## Local Bridge Workflow
+## Local bridge workflow
 
-Use the bridge when Codex needs several rounds of VM navigation or file transfer. The bridge keeps one authenticated Paramiko SSH session open. Bear enters the password only in the visible PowerShell window; Codex queues JSON command files in a named session folder, the bridge executes them on the VM, and results are written locally.
-
-The active installed skill path is:
+The versioned helper is in:
 
 ```text
-C:\Users\huan111\.codex\skills\cloudvm-bridge
+Agent_skill_dev\skill_catalog\workspace-bridging\cloudvm-bridge\scripts
 ```
 
-The versioned source-of-truth path is:
-
-```text
-Agent_skill_dev\skill_catalog\workspace-bridging\cloudvm-bridge
-```
-
-Before starting or reusing a bridge, inspect the named bridge identity. Reuse
-an existing bridge only when its Japanese `bridge_name` is intended and its
-purpose/project root match the current task. If the purpose or project root is
-different, create a new bridge session.
-
-Create a named bridge session from the reusable helper folder:
+Create a purpose-bound session with the private target supplied at runtime:
 
 ```powershell
-Set-Location "C:\Users\huan111\.codex\skills\cloudvm-bridge\scripts"
-python .\make_bridge_session.py --purpose "short purpose" --work-summary "1-3 sentence work summary" --project-root "C:\path\to\project"
+Set-Location "Agent_skill_dev\skill_catalog\workspace-bridging\cloudvm-bridge\scripts"
+python .\make_bridge_session.py `
+  --purpose "short purpose" `
+  --work-summary "brief work summary" `
+  --project-root "<local-project-root>" `
+  --remote-target "<username>@<hostname>"
 ```
 
-The command prints a `session_dir`. Start the bridge from that session
-directory using the existing launcher:
+Start the bridge from the printed `session_dir`:
 
 ```powershell
-Set-Location "<session_dir>"
+Set-Location "<session-dir>"
 .\start_bridge_window.ps1
 ```
 
-The first launch creates a local `.venv` and installs `paramiko` from `requirements.txt`. Runtime folders such as `.venv/`, `commands/`, and `results/` are disposable session state and must not be committed. Legacy bridge folders without `bridge_identity.json` are not reusable for new work.
-
-Inspect identity and queue commands from Codex or a local shell:
+Inspect identity and submit operations:
 
 ```powershell
 .\.venv\Scripts\python.exe .\send_cloudvm_command.py identity
-.\.venv\Scripts\python.exe .\send_cloudvm_command.py --bridge-name Akatsuki exec "hostname; whoami; pwd"
-.\.venv\Scripts\python.exe .\send_cloudvm_command.py --purpose "short purpose" --project-root "C:\path\to\project" upload local_file ~/remote_file
-.\.venv\Scripts\python.exe .\send_cloudvm_command.py --bridge-name Akatsuki download ~/remote_file local_file
-.\.venv\Scripts\python.exe .\send_cloudvm_command.py --bridge-name Akatsuki stop
+.\.venv\Scripts\python.exe .\send_cloudvm_command.py --bridge-name <name> exec "hostname; whoami; pwd"
+.\.venv\Scripts\python.exe .\send_cloudvm_command.py --bridge-name <name> upload <local-file> <remote-path>
+.\.venv\Scripts\python.exe .\send_cloudvm_command.py --bridge-name <name> download <remote-file> <local-path>
+.\.venv\Scripts\python.exe .\send_cloudvm_command.py --bridge-name <name> stop
 ```
 
-Supported bridge actions are `exec`, `upload`, `download`, and `stop`. Result JSON files contain only `id`, `status`, `exit_status`, `stdout`, and `stderr`.
+Supported actions are `exec`, `upload`, `download`, and `stop`. Result JSON contains only the command ID, status, exit status, standard output, and standard error.
 
-## Operating Rules
+Runtime folders and files—including sessions, identities, project roots, purposes, commands, results, and status—must remain local and uncommitted.
 
-1. Inspect the intended remote command before queueing it.
-2. Keep remote work inside approved project/workspace paths.
-3. Prefer read-only inspection and small smoke tests before setup changes.
-4. Upload only intended files and avoid broad recursive transfers unless the user explicitly approves them.
-5. Use single-file archives for bundles if directory transfers become fragile.
-6. Do not place secrets, credentials, tokens, SSH keys, or sensitive files in uploaded paths, command output, logs, or evidence packages.
-7. Stop the bridge when finished so the authenticated SSH session closes.
+## Operating rules
 
-## Validation Pattern
+1. Inspect each command before queueing it.
+2. Confirm the runtime identity with `hostname`, `whoami`, and `pwd`.
+3. Keep remote work inside approved paths.
+4. Prefer read-only inspection and small smoke tests before setup changes.
+5. Upload only intended files and avoid broad recursive transfers.
+6. Use a single archive for bundles when directory transfer is unreliable.
+7. Stop the bridge when the workplan no longer needs the authenticated session.
 
-After bridge changes, validate locally before live VM use:
+## Validation
+
+Validate the catalog package with the installed skill validator, then compile the Python helpers without creating repository bytecode:
 
 ```powershell
-python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py Agent_skill_dev\skill_catalog\workspace-bridging\cloudvm-bridge
-python -c "from pathlib import Path; [compile(p.read_text(encoding='utf-8'), str(p), 'exec') for p in [Path('Agent_skill_dev/skill_catalog/workspace-bridging/cloudvm-bridge/scripts/bridge_server.py'), Path('Agent_skill_dev/skill_catalog/workspace-bridging/cloudvm-bridge/scripts/send_cloudvm_command.py')]]"
+python "<skill-creator-root>\scripts\quick_validate.py" "Agent_skill_dev\skill_catalog\workspace-bridging\cloudvm-bridge"
+python -c "from pathlib import Path; [compile(p.read_text(encoding='utf-8'), str(p), 'exec') for p in Path('Agent_skill_dev/skill_catalog/workspace-bridging/cloudvm-bridge/scripts').glob('*.py')]"
 ```
 
-For a live smoke test, start the installed bridge, have Bear enter the password in the bridge window, then run:
-
-```powershell
-.\.venv\Scripts\python.exe .\send_cloudvm_command.py exec "hostname; whoami; pwd; uname -a"
-```
-
-Accept the smoke test only if `whoami` is `huan111` and the hostname matches the approved cloud VM.
+For a live smoke test, accept only when `whoami` and `hostname` match the privately configured and approved target.

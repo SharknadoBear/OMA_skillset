@@ -1,128 +1,77 @@
 ---
 name: constance-hpc
-description: Use when working with Bear's PNNL Constance HPC account at huan111@constance.pnl.gov for secure SSH command execution, small text downloads, read-only project data inspection, module/tool discovery, and NetCDF metadata inventory. Do not run Python analysis, plotting, or install Python analysis environments on the HPC server unless Bear explicitly overrides this; download compact outputs and do Python analysis locally. Never store passwords, MFA codes, or other secrets; keep project data folders read-only unless the user explicitly asks for a separate write workflow.
+description: Use for secure, read-only SSH inspection of an authorized Constance HPC account, including small text downloads, module discovery, and compact NetCDF metadata inventory. Obtain the SSH target, approved host-key fingerprint, and project paths privately at runtime; never store account identifiers or task details in the skill repository.
 ---
 
 # Constance HPC
 
-## Core Context
+## Runtime configuration
 
-- Account username: `huan111`
-- Host: `constance.pnl.gov`
-- SSH form: `ssh huan111@constance.pnl.gov`
-- Known ED25519 host-key fingerprint observed on 2026-06-22:
-  `SHA256:tb23nJucub3vtSE3254A7U1AVajet/ITL3eiTE6zUtE`
-- Current project data path:
-  `/rcfs/projects/mhk_modeling/pic/waveResource/salishSea`
+- Obtain the SSH target as `<username>@<hostname>` at runtime.
+- Obtain the approved SHA256 host-key fingerprint through a trusted channel at runtime.
+- Obtain each project or data path from the current task; do not embed it in this package.
+- Keep access read-only unless the user explicitly authorizes a separately reviewed write workflow.
+- Use remote tools only for inspection or compact metadata generation. Download small artifacts for local analysis.
 
-Treat Constance as a PNNL HPC environment. For resource-assessment discovery,
-prefer read-only commands such as `ls`, `find`, `stat`, `module avail`,
-`ncdump -h`, and `ncks -m`.
+## Credential rules
 
-Do not use Constance for Python analysis, plotting, or dependency installs by
-default. Use it for read-only inspection and compact metadata/output generation,
-then download compact artifacts for local Python analysis.
+- Never store, write, commit, echo, log, or repeat passwords or MFA values.
+- Enter credentials only in the visible bridge window.
+- Do not place credentials in commands, JSON, shell history, logs, memos, or results.
+- Stop if the available interface cannot securely handle the authentication challenge.
 
-## Credential Rules
+## Local bridge workflow
 
-- Never store, write, commit, echo, log, or repeat Bear's Constance password,
-  MFA code, or combined credential.
-- Never put credentials in command lines, bridge command JSON, shell history,
-  scripts, logs, memos, or result files.
-- Use the local bridge when Codex needs several remote commands. Bear enters
-  credentials only in the visible PowerShell bridge window.
-- If authentication requires an unsupported interactive challenge, stop and ask
-  Bear to run the provided SSH commands manually or configure key/GSSAPI access.
-
-## Local Bridge Workflow
-
-The reusable bridge helper lives inside this skill:
+The versioned helper is in:
 
 ```text
-C:\Users\huan111\.codex\skills\constance-hpc\hpc_bridge
+Agent_skill_dev\skill_catalog\workspace-bridging\constance-hpc\hpc_bridge
 ```
 
-Before starting or reusing a bridge, inspect the named bridge identity. Reuse
-an existing bridge only when its Japanese `bridge_name` is intended and its
-purpose/project root match the current task. If the purpose or project root is
-different, create a new bridge session.
-
-Create a named bridge session from the reusable helper folder:
+Create a purpose-bound session with private connection values supplied at runtime:
 
 ```powershell
-Set-Location "C:\Users\huan111\.codex\skills\constance-hpc\hpc_bridge"
-python .\make_bridge_session.py --purpose "short purpose" --work-summary "1-3 sentence work summary" --project-root "C:\path\to\project"
+Set-Location "Agent_skill_dev\skill_catalog\workspace-bridging\constance-hpc\hpc_bridge"
+python .\make_bridge_session.py `
+  --purpose "short purpose" `
+  --work-summary "brief work summary" `
+  --project-root "<local-project-root>" `
+  --remote-target "<username>@<hostname>" `
+  --host-key-fingerprint "SHA256:<approved-fingerprint>"
 ```
 
-The command prints a `session_dir`. Start the bridge from that session
-directory using the existing launcher:
+Start the bridge from the printed `session_dir`, then inspect its identity before sending commands:
 
 ```powershell
-Set-Location "<session_dir>"
+Set-Location "<session-dir>"
 .\start_bridge_window.ps1
-```
-
-The first launch creates a local `.venv` and installs Paramiko from
-`requirements.txt`. Runtime folders such as `.venv/`, `commands/`, and
-`results/` are disposable session state. Legacy bridge folders without
-`bridge_identity.json` are not reusable for new work.
-
-Inspect identity and queue commands from Codex or a local shell:
-
-```powershell
 .\.venv\Scripts\python.exe .\send_constance_command.py identity
-.\.venv\Scripts\python.exe .\send_constance_command.py --bridge-name Akatsuki exec "hostname; whoami; pwd"
-.\.venv\Scripts\python.exe .\send_constance_command.py --purpose "short purpose" --project-root "C:\path\to\project" download /remote/small.txt local_small.txt
-.\.venv\Scripts\python.exe .\send_constance_command.py --bridge-name Akatsuki stop
+.\.venv\Scripts\python.exe .\send_constance_command.py --bridge-name <name> exec "hostname; whoami; pwd"
+.\.venv\Scripts\python.exe .\send_constance_command.py --bridge-name <name> download <remote-small-file> <local-path>
+.\.venv\Scripts\python.exe .\send_constance_command.py --bridge-name <name> stop
 ```
 
-Bridge actions are intentionally narrow:
+Supported actions are `exec`, `download`, and `stop`. Upload is intentionally unavailable. Downloads are size-limited by the helper.
 
-- `exec`: run shell commands on Constance.
-- `download`: retrieve small text artifacts only; the bridge rejects large
-  downloads.
-- `stop`: close the persistent SSH session.
+Runtime folders and files—including sessions, identities, project roots, purposes, commands, results, and status—must remain local and uncommitted.
 
-There is no upload action in v1.
+## Read-only inventory pattern
 
-## Read-Only NetCDF Inventory Pattern
-
-For the Salish Sea wave-resource folder, begin with:
+Use a task-supplied approved root:
 
 ```bash
-set -e
-ROOT=/rcfs/projects/mhk_modeling/pic/waveResource/salishSea
+ROOT=<approved-remote-root>
 hostname; whoami; pwd
 ls -ld "$ROOT"
 find "$ROOT" -maxdepth 2 -type d | sort
 find "$ROOT" -maxdepth 4 -type f \( -name '*.nc' -o -name '*.nc4' -o -name '*.cdf' \) -printf '%TY-%Tm-%Td %TH:%TM %12s %p\n' | sort
 ```
 
-Discover available tools with:
+Discover metadata tools with:
 
 ```bash
 module avail 2>&1 | grep -Ei 'netcdf|nco|cdo|ncl|hdf' || true
-for t in ncdump ncks cdo; do command -v "$t" || true; done
+for tool in ncdump ncks cdo; do command -v "$tool" || true; done
 ```
 
-Inspect representative NetCDF files with `ncdump -h` when available, then
-`ncks -m` or `cdo sinfo` when present. Keep metadata output compact and avoid
-reading full arrays remotely. If these tools are unavailable, transfer a small
-sample or metadata task back to the local workspace rather than using Python on
-Constance.
-
-## Project Reference Schema
-
-The local sample
-`Resource/Stations_CG_201101.nc` is a NetCDF4 SWAN/UnSWAN `COMPGRID` file:
-
-- Dimensions: `time=744`, `npnt=120073`, `nele=217388`, `three=3`.
-- Coordinates: `Xp`, `Yp` in degrees.
-- Connectivity: zero-based triangular `elements`.
-- Wave and wind fields: `Depth`, `Hsig`, `Dir`, `RTpeak`, `Period`,
-  `X-Windv`, `Y-Windv`.
-- Friday Harbor reference node: zero-based node `25434`, approximately
-  `(-123.016, 48.5359)`.
-
-Use this schema to plan winter/summer wave maps, wave roses, Hsig-period
-frequency plots, wind composites, wave age, and wave steepness diagnostics.
+Inspect representative headers with `ncdump -h`, `ncks -m`, or `cdo sinfo` when available. Avoid reading full arrays remotely.

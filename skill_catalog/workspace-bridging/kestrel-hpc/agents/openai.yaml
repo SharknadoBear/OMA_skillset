@@ -1,4 +1,4 @@
 interface:
   display_name: "Kestrel HPC"
-  short_description: "Connect and run Slurm jobs on Kestrel."
-  default_prompt: "Use the Kestrel HPC workflow to connect, upload files, compile, submit Slurm jobs, inspect logs, and retrieve results. Ask for OTP and any required secret at runtime."
+  short_description: "Private runtime bridge for Kestrel HPC"
+  default_prompt: "Use $kestrel-hpc with a privately supplied SSH target to run an authorized HPC workflow."

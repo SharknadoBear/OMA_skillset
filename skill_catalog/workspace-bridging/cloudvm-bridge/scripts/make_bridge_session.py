@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Iterable
 
 
-REMOTE_TARGET = "huan111@automodeldev01.pnl.gov"
 ROOT = Path(__file__).resolve().parent
 SKILL_ROOT = ROOT.parent if ROOT.name in {"hpc_bridge", "scripts"} else ROOT
 DEFAULT_SESSIONS_ROOT = SKILL_ROOT / "bridge_sessions"
@@ -39,6 +38,13 @@ def normalize_purpose(value: str) -> str:
 
 def normalize_project_root(value: str) -> str:
     return str(Path(value).expanduser().resolve())
+
+
+def normalize_remote_target(value: str) -> str:
+    target = value.strip()
+    if target.count("@") != 1 or any(not part for part in target.split("@", 1)):
+        raise ValueError("--remote-target must be username@hostname")
+    return target
 
 
 def build_purpose_key(purpose: str, project_root: str) -> str:
@@ -124,7 +130,7 @@ def write_identity(path: Path, args: argparse.Namespace, bridge_name: str, times
         "purpose_key": build_purpose_key(args.purpose, project_root),
         "work_summary": args.work_summary.strip(),
         "local_project_root": project_root,
-        "remote_target": REMOTE_TARGET,
+        "remote_target": normalize_remote_target(args.remote_target),
     }
     path.write_text(json.dumps(identity, indent=2), encoding="utf-8", newline="\n")
     return identity
@@ -135,6 +141,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--purpose", required=True, help="Short purpose for this bridge session.")
     parser.add_argument("--work-summary", required=True, help="One to three sentence summary of intended bridge work.")
     parser.add_argument("--project-root", required=True, help="Absolute or relative local project root this bridge serves.")
+    parser.add_argument("--remote-target", required=True, help="Private runtime SSH target in username@hostname form.")
     parser.add_argument("--sessions-root", type=Path, default=DEFAULT_SESSIONS_ROOT, help="Directory where session folders are created.")
     parser.add_argument("--installed-skills-root", type=Path, default=DEFAULT_INSTALLED_SKILLS_ROOT, help="Root used to scan installed bridge session names.")
     return parser.parse_args()

@@ -13,7 +13,7 @@ Write-Host "Ensuring bridge Python dependencies are installed..."
 & $venvPython -m pip install --disable-pip-version-check --quiet -r $requirements
 
 Write-Host ""
-Write-Host "Starting cloud VM bridge for huan111@automodeldev01.pnl.gov."
+Write-Host "Starting cloud VM bridge for the runtime target in bridge_identity.json."
 Write-Host "Enter the VM password only in this window when prompted."
 Write-Host ""
 Set-Location $bridgeDir

@@ -21,8 +21,6 @@ IDENTITY = ROOT / "bridge_identity.json"
 COMMANDS = ROOT / "commands"
 PROCESSED = COMMANDS / "processed"
 RESULTS = ROOT / "results"
-HOST = "kestrel.nlr.gov"
-USER = "yhuang168"
 
 
 def ensure_dirs() -> None:
@@ -54,19 +52,31 @@ def print_identity(identity: dict) -> None:
     print("")
 
 
+def connection_from_identity(identity: dict) -> tuple[str, str]:
+    target = str(identity.get("remote_target", "")).strip()
+    if target.count("@") != 1:
+        raise ValueError("bridge_identity.json remote_target must be username@hostname")
+    user, host = target.split("@", 1)
+    if not user or not host:
+        raise ValueError("bridge_identity.json remote_target must be username@hostname")
+    return user, host
+
+
 def connect() -> paramiko.SSHClient:
-    print_identity(load_identity())
-    print(f"Connecting to {USER}@{HOST}")
+    identity = load_identity()
+    print_identity(identity)
+    user, host = connection_from_identity(identity)
+    print(f"Connecting to {user}@{host}")
     password = getpass.getpass("Password+OTP: ")
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-    sock = socket.create_connection((HOST, 22), timeout=30)
+    sock = socket.create_connection((host, 22), timeout=30)
     transport = paramiko.Transport(sock)
     opts = transport.get_security_options()
     if hasattr(opts, "digests") and "hmac-sha2-256" in opts.digests:
         opts.digests = ["hmac-sha2-256"] + [d for d in opts.digests if d != "hmac-sha2-256"]
-    transport.connect(username=USER, password=password)
+    transport.connect(username=user, password=password)
     client._transport = transport  # Paramiko exposes no public setter for this path.
     print("Connected. Watching JSON command files.")
     return client

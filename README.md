@@ -18,7 +18,7 @@ by capability family rather than by the older broad project-stage folders.
 - `memory-control/`: project-memory workflow skills, currently
   `brain-dumping` and `brain-refreshing`.
 - `workspace-bridging/`: skills that bridge local workspaces to Kestrel,
-  Constance, and PNNL cloud VM execution environments, including Codex and
+  Constance, and configured cloud VM execution environments, including Codex and
   Copilot-facing variants where staged.
 - `visual-analysis/`: active structured-grid POM, staggered-grid ROMS, and
   sparse curvilinear EFDC map and movie post-processing, plus staged future
@@ -150,8 +150,8 @@ usable skill families at different maturity levels:
   access, and model-safe NCEI long-term fallback for supported historical
   records when operational AWS coverage is incomplete.
 - `workspace-bridging/kestrel-hpc` is a robust operational bridge skill, not
-  merely a copied placeholder. It records Bear's Kestrel account context,
-  required SSH MAC option, Password+OTP handling rules, Slurm job inspection and
+  merely a copied placeholder. It uses runtime-supplied account and host context,
+  preserves the required SSH MAC option, protects interactive credentials, and supports Slurm inspection and
   monitoring patterns, upload/download guidance, and a reusable local Paramiko
   bridge workflow for multi-command sessions. It should be treated as the
   primary Kestrel access skill for controlled compile, transfer, job-monitoring,
