@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parent
 SKILL_ROOT = ROOT.parent if ROOT.name in {"hpc_bridge", "scripts"} else ROOT
 DEFAULT_SESSIONS_ROOT = SKILL_ROOT / "bridge_sessions"
 DEFAULT_INSTALLED_SKILLS_ROOT = Path.home() / ".codex" / "skills"
-KNOWN_BRIDGE_SKILLS = ("kestrel-hpc", "cloudvm-bridge", "constance-hpc")
+KNOWN_BRIDGE_SKILLS = ("kestrel-hpc", "cloudvm-bridge", "constance-hpc", "expanse-hpc")
 EXCLUDED_NAMES = {
     ".venv",
     "__pycache__",

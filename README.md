@@ -18,8 +18,8 @@ by capability family rather than by the older broad project-stage folders.
 - `memory-control/`: project-memory workflow skills, currently
   `brain-dumping` and `brain-refreshing`.
 - `workspace-bridging/`: skills that bridge local workspaces to Kestrel,
-  Constance, and configured cloud VM execution environments, including Codex and
-  Copilot-facing variants where staged.
+  Expanse, Constance, and configured cloud VM execution environments, including
+  Codex and Copilot-facing variants where staged.
 - `visual-analysis/`: active structured-grid POM, staggered-grid ROMS, and
   sparse curvilinear EFDC map and movie post-processing, plus staged future
   scientific-analysis work.
@@ -156,6 +156,11 @@ usable skill families at different maturity levels:
   bridge workflow for multi-command sessions. It should be treated as the
   primary Kestrel access skill for controlled compile, transfer, job-monitoring,
   and compact-output retrieval tasks.
+- `workspace-bridging/expanse-hpc` mirrors the named-session JSON bridge
+  architecture for SDSC Expanse, supports password-or-agent authentication
+  followed by TOTP, and documents Expanse-specific Slurm, Lmod, project,
+  Lustre, node-local storage, and resource-selection rules. Its Copilot sibling
+  reuses the same helper package.
 - `workspace-bridging/constance-hpc` and `workspace-bridging/cloudvm-bridge`
   are also staged as execution/connectivity skills, with Copilot sibling folders
   retained where migration work has been performed.

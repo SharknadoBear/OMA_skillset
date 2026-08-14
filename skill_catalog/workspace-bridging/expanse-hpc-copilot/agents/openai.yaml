@@ -1,0 +1,4 @@
+interface:
+  display_name: "Expanse HPC Copilot"
+  short_description: "Copilot bridge workflow for Expanse HPC"
+  default_prompt: "Use $expanse-hpc-copilot to run an authorized Expanse bridge workflow."

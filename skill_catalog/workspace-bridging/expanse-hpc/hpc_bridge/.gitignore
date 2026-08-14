@@ -1,0 +1,9 @@
+.venv/
+commands/
+results/
+__pycache__/
+bridge_sessions/
+bridge_status.txt
+*.py[cod]
+*.tmp
+*.log

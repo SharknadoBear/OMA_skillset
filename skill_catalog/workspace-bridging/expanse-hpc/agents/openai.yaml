@@ -1,0 +1,4 @@
+interface:
+  display_name: "Expanse HPC"
+  short_description: "Secure bridge for SDSC Expanse HPC"
+  default_prompt: "Use $expanse-hpc to run an authorized Expanse HPC workflow."
