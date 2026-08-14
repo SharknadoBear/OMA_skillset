@@ -1,5 +1,5 @@
 name: fvcom-region-bpoly
-description: Create map-guided, feature-first FVCOM four-sided RegionBPoly envelopes with topo/road background maps, QA scoring, adjustment tools, and offshore-boundary artifacts.
+description: Create feature-first FVCOM RegionBPoly envelopes and apply geometry-only post-arc clipping feedback while preserving mission scope.
 instructions: |
   Use scripts/run_region_bpoly.py by default. Use --mode execute unless the user
   explicitly requests retained test/debug/benchmark artifacts. Execute mode
@@ -55,3 +55,7 @@ instructions: |
   Use scripts/adjust_region_bpoly.py for final-stage rotate, scale, or reshape
   edits from map review. The adjustment map must show the old polygon dashed and
   the adjusted polygon solid.
+
+  Use scripts/apply_arc_feedback.py only with a hash-matched
+  region_bpoly_arc_feedback_v1 artifact. Preserve target_region_features exactly,
+  rerun feature/guard/offshore QA, and reject stale or semantic-changing feedback.

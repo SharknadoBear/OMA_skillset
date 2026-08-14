@@ -8,6 +8,7 @@ from .boundary_resolution import (
     boundary_resolution_config,
     build_boundary_resolution,
 )
+from .feedback import build_region_bpoly_arc_feedback
 from .workflow import BdryArcConfig, run_bdry_arc
 
 __all__ = [
@@ -18,5 +19,6 @@ __all__ = [
     "boundary_resolution_config",
     "build_boundary_resolution",
     "build_model_boundary_loops",
+    "build_region_bpoly_arc_feedback",
     "run_bdry_arc",
 ]
