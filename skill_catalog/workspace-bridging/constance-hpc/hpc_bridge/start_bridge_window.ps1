@@ -13,7 +13,8 @@ Write-Host "Ensuring bridge Python dependencies are installed..."
 & $venvPython -m pip install --disable-pip-version-check --quiet -r $requirements
 
 Write-Host ""
-Write-Host "Starting Constance bridge. Enter credentials only in this window when prompted."
+Write-Host "Starting read-only HPC bridge for the runtime target in bridge_identity.json."
+Write-Host "Enter credentials only in this window when prompted."
 Write-Host ""
 Set-Location $bridgeDir
 & $venvPython .\bridge_server.py

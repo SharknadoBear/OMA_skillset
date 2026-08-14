@@ -1,4 +1,4 @@
 interface:
   display_name: "Cloud VM Bridge"
-  short_description: "SSH bridge for automodeldev01 VM."
-  default_prompt: "Use $cloudvm-bridge to connect to the cloud VM, run commands, transfer files, and collect results through the local bridge."
+  short_description: "Private runtime SSH bridge for a cloud VM"
+  default_prompt: "Use $cloudvm-bridge with a privately supplied SSH target to run commands or transfer approved files."

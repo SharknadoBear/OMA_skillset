@@ -22,9 +22,6 @@ IDENTITY = ROOT / "bridge_identity.json"
 COMMANDS = ROOT / "commands"
 PROCESSED = COMMANDS / "processed"
 RESULTS = ROOT / "results"
-HOST = "constance.pnl.gov"
-USER = "huan111"
-EXPECTED_ED25519_SHA256 = "SHA256:tb23nJucub3vtSE3254A7U1AVajet/ITL3eiTE6zUtE"
 MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024
 
 
@@ -57,15 +54,32 @@ def print_identity(identity: dict) -> None:
     print("")
 
 
+def connection_from_identity(identity: dict) -> tuple[str, str, str]:
+    target = str(identity.get("remote_target", "")).strip()
+    if target.count("@") != 1:
+        raise ValueError("bridge_identity.json remote_target must be username@hostname")
+    user, host = target.split("@", 1)
+    fingerprint = str(identity.get("expected_host_key_sha256", "")).strip()
+    if not user or not host:
+        raise ValueError("bridge_identity.json remote_target must be username@hostname")
+    if not fingerprint.startswith("SHA256:"):
+        raise ValueError("bridge_identity.json must contain an approved SHA256 host-key fingerprint")
+    return user, host, fingerprint
+
+
 def sha256_fingerprint(key: paramiko.PKey) -> str:
     digest = hashlib.sha256(key.asbytes()).digest()
     return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
 
 
-class StrictConstanceHostKeyPolicy(paramiko.MissingHostKeyPolicy):
+class StrictHostKeyPolicy(paramiko.MissingHostKeyPolicy):
+    def __init__(self, expected_host: str, expected_fingerprint: str) -> None:
+        self.expected_host = expected_host
+        self.expected_fingerprint = expected_fingerprint
+
     def missing_host_key(self, client: paramiko.SSHClient, hostname: str, key: paramiko.PKey) -> None:
         fingerprint = sha256_fingerprint(key)
-        if hostname == HOST and key.get_name() == "ssh-ed25519" and fingerprint == EXPECTED_ED25519_SHA256:
+        if hostname == self.expected_host and fingerprint == self.expected_fingerprint:
             client.get_host_keys().add(hostname, key.get_name(), key)
             return
         raise paramiko.SSHException(
@@ -74,18 +88,19 @@ class StrictConstanceHostKeyPolicy(paramiko.MissingHostKeyPolicy):
 
 
 def connect() -> paramiko.SSHClient:
-    print_identity(load_identity())
-    print(f"Connecting to {USER}@{HOST}")
-    print("Enter Constance password/MFA only in this window.")
-    password = getpass.getpass("Constance password/MFA: ")
+    identity = load_identity()
+    print_identity(identity)
+    user, host, expected_fingerprint = connection_from_identity(identity)
+    print(f"Connecting to {user}@{host}")
+    print("Enter the remote password/MFA only in this window.")
+    password = getpass.getpass("Remote password/MFA: ")
     client = paramiko.SSHClient()
-    client.load_system_host_keys()
-    client.set_missing_host_key_policy(StrictConstanceHostKeyPolicy())
-    sock = socket.create_connection((HOST, 22), timeout=30)
+    client.set_missing_host_key_policy(StrictHostKeyPolicy(host, expected_fingerprint))
+    sock = socket.create_connection((host, 22), timeout=30)
     try:
         client.connect(
-            hostname=HOST,
-            username=USER,
+            hostname=host,
+            username=user,
             password=password,
             sock=sock,
             look_for_keys=True,

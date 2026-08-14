@@ -22,8 +22,6 @@ COMMANDS = ROOT / "commands"
 PROCESSED = COMMANDS / "processed"
 RESULTS = ROOT / "results"
 STATUS = ROOT / "bridge_status.txt"
-HOST = "automodeldev01.pnl.gov"
-USER = "huan111"
 
 
 def ensure_dirs() -> None:
@@ -60,17 +58,29 @@ def print_identity(identity: dict) -> None:
     print("")
 
 
+def connection_from_identity(identity: dict) -> tuple[str, str]:
+    target = str(identity.get("remote_target", "")).strip()
+    if target.count("@") != 1:
+        raise ValueError("bridge_identity.json remote_target must be username@hostname")
+    user, host = target.split("@", 1)
+    if not user or not host:
+        raise ValueError("bridge_identity.json remote_target must be username@hostname")
+    return user, host
+
+
 def connect() -> paramiko.SSHClient:
-    print_identity(load_identity())
-    print(f"Connecting to {USER}@{HOST}")
+    identity = load_identity()
+    print_identity(identity)
+    user, host = connection_from_identity(identity)
+    print(f"Connecting to {user}@{host}")
     write_status("waiting_for_password")
     password = getpass.getpass("Password: ")
     write_status("connecting")
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(
-        hostname=HOST,
-        username=USER,
+        hostname=host,
+        username=user,
         password=password,
         timeout=30,
         banner_timeout=30,
