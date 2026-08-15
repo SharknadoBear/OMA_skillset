@@ -10,7 +10,9 @@ by capability family rather than by the older broad project-stage folders.
 - `external-data-connectors/`: source-specific data acquisition and conversion
   capabilities, such as HYCOM, NOAA CO-OPS, USGS, CBOFS, DBOFS, SSCOFS, NYOFS,
   SJROFS, CFSv2, GloFAS, GSHHS, CUDEM, CUSP, NHD/NHM river products, and
-  usSEABED.
+  usSEABED, including model-neutral TPXO9v5 harmonic extraction.
+- `external-tool-connectors/`: instructions for third-party scientific tools
+  that are installed separately, currently UTide.
 - `forcing-builders/`: tools that assemble FVCOM-ready forcing products from
   source data or local inputs.
 - `grid-generation/`: regional-domain, boundary-arc, coastline-topology, and
@@ -47,14 +49,13 @@ Install all cataloged skills from the repository root on Windows PowerShell:
 $dest = Join-Path $env:USERPROFILE ".codex\skills"
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 Get-ChildItem .\skill_catalog -Directory | ForEach-Object {
-  Get-ChildItem $_.FullName -Directory | Where-Object {
-    Test-Path (Join-Path $_.FullName "SKILL.md")
-  } | ForEach-Object {
-    $target = Join-Path $dest $_.Name
+  Get-ChildItem $_.FullName -Filter "SKILL.md" -File -Recurse | ForEach-Object {
+    $skill = $_.Directory
+    $target = Join-Path $dest $skill.Name
     if (Test-Path $target) {
       Remove-Item -LiteralPath $target -Recurse -Force
     }
-    Copy-Item -LiteralPath $_.FullName -Destination $target -Recurse
+    Copy-Item -LiteralPath $skill.FullName -Destination $target -Recurse
   }
 }
 ```
@@ -64,11 +65,11 @@ Install all cataloged skills from macOS/Linux shell:
 ```bash
 dest="${CODEX_HOME:-$HOME/.codex}/skills"
 mkdir -p "$dest"
-for skill in skill_catalog/*/*; do
-  if [ -f "$skill/SKILL.md" ]; then
-    rm -rf "$dest/$(basename "$skill")"
-    cp -R "$skill" "$dest/$(basename "$skill")"
-  fi
+find skill_catalog -type f -name SKILL.md -print0 |
+while IFS= read -r -d '' skill_file; do
+  skill="$(dirname "$skill_file")"
+  rm -rf "$dest/$(basename "$skill")"
+  cp -R "$skill" "$dest/$(basename "$skill")"
 done
 ```
 
@@ -109,10 +110,10 @@ Use this prompt when asking a Codex-like agent to install the whole skillset:
 
 ```text
 Install all Codex-compatible skills from this repository. Treat every folder
-matching skill_catalog/<family>/<skill-name>/SKILL.md as one skill package. Copy
-each package into the local Codex skill directory as <skill-name>, preserving
-all subfolders and files. Validate that each copied package has SKILL.md at the
-package root, then list the installed skill names.
+containing a SKILL.md anywhere beneath skill_catalog/ as one skill package. Copy
+each package into the local Codex skill directory using its folder name,
+preserving all subfolders and files. Validate that each copied package has
+SKILL.md at the package root, then list the installed skill names.
 ```
 
 Use this prompt when asking an agent to install one skill:
@@ -146,9 +147,10 @@ usable skill families at different maturity levels:
   HYCOM, NOAA CO-OPS, CFSv2, CUDEM, CUSP, GSHHS, NHD/NHM river tools, USGS
   rivers, usSEABED, `glofas-data-fetcher`, and the AWS-primary
   `cbofs-fetcher`, `dbofs-fetcher`, `sscofs-fetcher`, `nyofs-fetcher`, and
-  `sjrofs-fetcher` connectors. The five OFS connectors use reviewed v2 plans, anonymous NOAA
-  access, and model-safe NCEI long-term fallback for supported historical
-  records when operational AWS coverage is incomplete.
+  `sjrofs-fetcher` connectors, plus `tpxo9v5-data-fetcher` for registered
+  model-neutral harmonic subsets and interpolation. The five OFS connectors use
+  reviewed v2 plans, anonymous NOAA access, and model-safe NCEI long-term fallback
+  for supported historical records when operational AWS coverage is incomplete.
 - `workspace-bridging/kestrel-hpc` is a robust operational bridge skill, not
   merely a copied placeholder. It uses runtime-supplied account and host context,
   preserves the required SSH MAC option, protects interactive credentials, and supports Slurm inspection and
@@ -182,8 +184,12 @@ usable skill families at different maturity levels:
   `efdc-map-postprocessing` and `efdc-movie-postprocessing` for sparse
   curvilinear EFDC grids. Script-only FVCOM folders without `SKILL.md` remain
   reference material rather than installable skills.
-- `common-core/` and `forcing-builders/` remain less mature catalog families and
-  should be expanded only through explicit skill development work.
+- `external-tool-connectors/u-tide-tool-instruction` documents
+  public UTide harmonic-analysis and reconstruction workflows without vendoring
+  the external package.
+- `common-core/` and the remaining `forcing-builders/` entries remain less mature
+  catalog families and should be expanded only through explicit skill development
+  work.
 
 See `../Memory/memo_v003.html` for the planning rationale and the script mapping
 from the original staging folders into the catalog.
