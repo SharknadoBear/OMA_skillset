@@ -14,7 +14,8 @@ by capability family rather than by the older broad project-stage folders.
 - `external-tool-connectors/`: instructions for third-party scientific tools
   that are installed separately, currently UTide.
 - `forcing-builders/`: tools that assemble FVCOM-ready forcing products from
-  source data or local inputs.
+  source data or local inputs, including validated boundary water-level time
+  series.
 - `grid-generation/`: regional-domain, boundary-arc, coastline-topology, and
   future mesh/refinement skills for FVCOM preprocessing.
 - `memory-control/`: project-memory workflow skills, currently
@@ -187,6 +188,10 @@ usable skill families at different maturity levels:
 - `external-tool-connectors/u-tide-tool-instruction` documents
   public UTide harmonic-analysis and reconstruction workflows without vendoring
   the external package.
+- `forcing-builders/fvcom-boundary-waterlevel-forcing` maps an existing combined
+  NetCDF or CSV water-level record onto FVCOM OBC nodes, writes exact redundant
+  FVCOM time representations, and produces mandatory spectral, sample-series,
+  and complete-boundary Hovmöller validation.
 - `common-core/` and the remaining `forcing-builders/` entries remain less mature
   catalog families and should be expanded only through explicit skill development
   work.

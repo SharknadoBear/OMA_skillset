@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM Boundary Water-Level Forcing"
+  short_description: "Build and validate FVCOM water-level OBC files"
+  default_prompt: "Use $fvcom-boundary-waterlevel-forcing to map an existing combined water-level series onto FVCOM open-boundary nodes and validate the forcing."
