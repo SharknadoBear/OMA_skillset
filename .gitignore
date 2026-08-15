@@ -11,6 +11,10 @@ __pycache__/
 *.tmp
 *.bak
 bridge_sessions/
+skill_catalog/external-data-connectors/tpxo9v5-data-fetcher/runs/
+skill_catalog/external-data-connectors/tpxo9v5-data-fetcher/**/*.nc
+skill_catalog/external-data-connectors/tpxo9v5-data-fetcher/**/rclone.conf
+skill_catalog/external-data-connectors/tpxo9v5-data-fetcher/**/.rclone/
 
 .DS_Store
 Thumbs.db
