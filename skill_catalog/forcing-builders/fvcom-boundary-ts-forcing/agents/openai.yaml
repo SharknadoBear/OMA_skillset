@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM Boundary T/S Forcing"
+  short_description: "Build and validate FVCOM boundary T/S files"
+  default_prompt: "Use $fvcom-boundary-ts-forcing to build and scientifically validate an FVCOM open-boundary temperature and salinity forcing file."
