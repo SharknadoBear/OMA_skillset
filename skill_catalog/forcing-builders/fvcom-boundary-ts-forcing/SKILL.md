@@ -95,4 +95,4 @@ Retain evidence when needed:
 python scripts/selftest_boundary_ts.py --work-dir WORK
 ```
 
-Use a source connector such as `hycom-obc-codex` only to prepare an external sigma-ready test input. Do not copy that acquisition or remapping logic into this package.
+Use a source connector such as `$hycom-fetcher-codex` only to prepare an external native-grid test input; perform horizontal and sigma remapping outside this forcing writer. Do not copy acquisition logic into this package.

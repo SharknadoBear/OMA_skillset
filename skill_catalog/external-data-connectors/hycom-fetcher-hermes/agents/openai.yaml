@@ -1,0 +1,4 @@
+interface:
+  display_name: "HYCOM Fetcher for Hermes"
+  short_description: "Run unattended HYCOM manifest downloads"
+  default_prompt: "Use $hycom-fetcher-hermes to execute a manifest-driven HYCOM download with persistent status evidence."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "HYCOM Fetcher for Codex"
+  short_description: "Run interactive HYCOM subset workflows"
+  default_prompt: "Use $hycom-fetcher-codex to review and run a bounded HYCOM request with timed download monitoring."

@@ -1,4 +1,0 @@
-interface:
-  display_name: "HYCOM OBC Core"
-  short_description: "Use shared HYCOM data helpers."
-  default_prompt: "Use $hycom-obc-core to estimate, fetch, and health-check a small external-data request."

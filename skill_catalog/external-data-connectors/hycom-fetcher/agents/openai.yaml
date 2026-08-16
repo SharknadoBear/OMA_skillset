@@ -1,0 +1,4 @@
+interface:
+  display_name: "HYCOM Fetcher"
+  short_description: "Fetch bounded native HYCOM variables safely"
+  default_prompt: "Use $hycom-fetcher to inventory, estimate, fetch, and validate a bounded native HYCOM subset."

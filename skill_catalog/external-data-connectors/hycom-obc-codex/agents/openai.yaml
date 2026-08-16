@@ -1,4 +1,0 @@
-interface:
-  display_name: "HYCOM OBC Codex"
-  short_description: "Plan and test HYCOM data pulls."
-  default_prompt: "Use $hycom-obc-codex to estimate, fetch, and health-check a small external-data request."
