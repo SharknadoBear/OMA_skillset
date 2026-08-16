@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Estimate requested data volume and choose local or Kestrel routing.
 
-This script is intentionally generic. It reads a request/manifest JSON and
-looks for explicit size fields first. If no reliable size is present, it blocks
-download execution by returning review_required instead of guessing.
+The estimator prefers explicit sizes and otherwise estimates a bounded CFSv2
+window from its time range, geographic extent, products, and native grid
+spacing. Unknown requests remain blocked rather than receiving a silent guess.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +20,19 @@ from typing import Any
 SIZE_KEYS_BYTES = ("estimated_bytes", "requested_bytes", "download_bytes", "size_bytes", "bytes")
 SIZE_KEYS_MB = ("estimated_mb", "requested_mb", "download_mb", "size_mb")
 SIZE_KEYS_GB = ("estimated_gb", "requested_gb", "download_gb", "size_gb")
-SCRATCH_TEMPLATE = "/scratch/yhuang168/oma_external_data_connectors/{skill_name}/{run_id}"
+SCRATCH_TEMPLATE = "/scratch/<username>/oma_external_data_connectors/{skill_name}/{run_id}"
+
+PRODUCT_VARIABLE_COUNTS = {
+    "uv-10m": 2,
+    "sfcprs": 1,
+    "dlwsfc": 1,
+    "dlwflx": 1,
+    "dswsfc": 1,
+    "strblk": 2,
+    "TaqaQrQp": 4,
+    "precip": 1,
+    "surtmp": 1,
+}
 
 
 def _read_json(path: str | Path | None) -> dict[str, Any]:
@@ -77,6 +91,59 @@ def _explicit_size_bytes(obj: Any) -> float | None:
     return None
 
 
+def _utc(text: Any) -> datetime | None:
+    if not text:
+        return None
+    value = str(text).strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _bounded_cfsv2_estimate(request: dict[str, Any]) -> tuple[float | None, dict[str, Any] | None]:
+    start = _utc(request.get("start") or request.get("start_utc"))
+    end = _utc(request.get("end") or request.get("end_utc"))
+    bbox = request.get("bbox") or request.get("bbox_0_360")
+    products = request.get("subdatasets") or request.get("products") or request.get("subdataset")
+    if isinstance(products, str):
+        products = [products]
+    if start is None or end is None or end < start or not isinstance(bbox, list) or len(bbox) != 4:
+        return None, None
+    if not products or any(str(value) not in PRODUCT_VARIABLE_COUNTS for value in products):
+        return None, None
+    try:
+        west, south, east, north = (float(value) for value in bbox)
+    except (TypeError, ValueError):
+        return None, None
+    if east < west or north < south:
+        return None, None
+    spacing = float(request.get("grid_spacing_degrees", 0.205))
+    cadence_hours = float(request.get("cadence_hours", 1.0))
+    if spacing <= 0 or cadence_hours <= 0:
+        return None, None
+    nlon = max(2, math.ceil((east - west) / spacing) + 3)
+    nlat = max(2, math.ceil((north - south) / spacing) + 3)
+    ntime = math.floor((end - start).total_seconds() / (cadence_hours * 3600.0)) + 1
+    nvars = sum(PRODUCT_VARIABLE_COUNTS[str(value)] for value in products)
+    values = ntime * nlat * nlon * nvars
+    estimated = values * 4.0 * 1.35 + (ntime + nlat + nlon) * 8.0
+    return estimated, {
+        "method": "bounded_cfsv2_native_grid",
+        "ntime": ntime,
+        "nlat": nlat,
+        "nlon": nlon,
+        "variable_count": nvars,
+        "float_bytes": 4,
+        "overhead_factor": 1.35,
+    }
+
+
 def _local_free_bytes(path: Path) -> int:
     target = path if path.exists() else path.parent
     target.mkdir(parents=True, exist_ok=True)
@@ -97,6 +164,11 @@ def main() -> None:
     skill_name = args.skill_name or Path(__file__).resolve().parents[1].name
     run_id = args.run_id or request.get("name") or request.get("run_id") or "default"
     estimated_bytes = _explicit_size_bytes(request)
+    estimate_details: dict[str, Any] | None = None
+    if estimated_bytes is not None:
+        estimate_details = {"method": "explicit_manifest_size"}
+    else:
+        estimated_bytes, estimate_details = _bounded_cfsv2_estimate(request)
     local_free = _local_free_bytes(run_dir)
 
     if estimated_bytes is None:
@@ -116,6 +188,7 @@ def main() -> None:
         "run_dir": str(run_dir),
         "estimated_requested_bytes": int(estimated_bytes) if estimated_bytes is not None else None,
         "estimated_requested_mb": round(estimated_bytes / 1024**2, 3) if estimated_bytes is not None else None,
+        "estimate_details": estimate_details,
         "local_free_bytes": local_free,
         "local_free_gb": round(local_free / 1024**3, 3),
         "routing_recommendation": recommendation,
