@@ -88,4 +88,4 @@ Retain synthetic artifacts when needed:
 python scripts/selftest_surface_fluxes.py --work-dir WORK
 ```
 
-Use an external connector such as `$cfsv2-atmosphere` only to prepare a separate validation input. Clearly label any synthetic validation-only field; never present it as observed or model-derived forcing.
+Use an external connector such as `$cfsv2-fetcher` only to prepare a separate validation input. Clearly label any synthetic validation-only field; never present it as observed or model-derived forcing.

@@ -1,0 +1,4 @@
+interface:
+  display_name: "CFSv2 Fetcher"
+  short_description: "Fetch bounded CFSv2 atmospheric fields"
+  default_prompt: "Use $cfsv2-fetcher to inventory, estimate, fetch, and validate a bounded CFSv2 atmospheric subset."

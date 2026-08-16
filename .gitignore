@@ -15,6 +15,24 @@ skill_catalog/external-data-connectors/tpxo9v5-data-fetcher/runs/
 skill_catalog/external-data-connectors/tpxo9v5-data-fetcher/**/*.nc
 skill_catalog/external-data-connectors/tpxo9v5-data-fetcher/**/rclone.conf
 skill_catalog/external-data-connectors/tpxo9v5-data-fetcher/**/.rclone/
+skill_catalog/external-data-connectors/hycom-fetcher/runs/
+skill_catalog/external-data-connectors/hycom-fetcher/**/*.nc
+skill_catalog/external-data-connectors/cfsv2-fetcher/runs/
+skill_catalog/external-data-connectors/cfsv2-fetcher/**/*.nc
+skill_catalog/external-data-connectors/hycom-fetcher/**/download_status.json
+skill_catalog/external-data-connectors/hycom-fetcher/**/download_monitor.html
+skill_catalog/external-data-connectors/hycom-fetcher/**/download_plan*.json
+skill_catalog/external-data-connectors/hycom-fetcher/**/download_checkpoint*.json
+skill_catalog/external-data-connectors/hycom-fetcher/**/chunks/
+skill_catalog/external-data-connectors/hycom-fetcher/**/*.part
+skill_catalog/external-data-connectors/hycom-fetcher/**/*.tmp
+skill_catalog/external-data-connectors/cfsv2-fetcher/**/download_status.json
+skill_catalog/external-data-connectors/cfsv2-fetcher/**/download_monitor.html
+skill_catalog/external-data-connectors/cfsv2-fetcher/**/download_plan*.json
+skill_catalog/external-data-connectors/cfsv2-fetcher/**/download_checkpoint*.json
+skill_catalog/external-data-connectors/cfsv2-fetcher/**/chunks/
+skill_catalog/external-data-connectors/cfsv2-fetcher/**/*.part
+skill_catalog/external-data-connectors/cfsv2-fetcher/**/*.tmp
 
 .DS_Store
 Thumbs.db
