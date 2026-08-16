@@ -14,8 +14,8 @@ by capability family rather than by the older broad project-stage folders.
 - `external-tool-connectors/`: instructions for third-party scientific tools
   that are installed separately, currently UTide.
 - `forcing-builders/`: tools that assemble FVCOM-ready forcing products from
-  source data or local inputs, including validated boundary water-level and
-  temperature/salinity time series.
+  source data or local inputs, including validated boundary water-level,
+  temperature/salinity, and modular surface-flux forcing.
 - `grid-generation/`: regional-domain, boundary-arc, coastline-topology, and
   future mesh/refinement skills for FVCOM preprocessing.
 - `memory-control/`: project-memory workflow skills, currently
@@ -196,6 +196,11 @@ usable skill families at different maturity levels:
   per-node temperature/salinity NetCDF as an FVCOM T/S OBC file, performs
   auditable within-axis missing-value repair, enforces a zero-NaN gate, and
   produces time-series, time-depth, Hovmöller, and vertical-transect QA.
+- `forcing-builders/fvcom-surface-fluxes-forcing` packages any selected subset
+  of prepared wind, direct or bulk heat, freshwater, and atmospheric-pressure
+  matrices on structured or FVCOM-native grids, applies source-aware sign and
+  unit gates, writes safe combined or split files, and produces mandatory
+  scientific QA plus a namelist fragment.
 - `common-core/` and the remaining `forcing-builders/` entries remain less mature
   catalog families and should be expanded only through explicit skill development
   work.

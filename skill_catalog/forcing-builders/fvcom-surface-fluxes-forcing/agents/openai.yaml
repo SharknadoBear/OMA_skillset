@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM Surface Fluxes Forcing"
+  short_description: "Build modular FVCOM surface forcing files"
+  default_prompt: "Use $fvcom-surface-fluxes-forcing to package and scientifically validate selected FVCOM wind, heat, freshwater, and pressure forcing."
