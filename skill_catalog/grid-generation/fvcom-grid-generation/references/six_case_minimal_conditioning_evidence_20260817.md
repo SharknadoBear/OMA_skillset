@@ -3,9 +3,10 @@
 This is the path-neutral evidence summary for campaign
 `simplified_conditioning_six_case_20260817T023035Z`, run from the installed
 skill on branch `feat/simplified-grid-conditioning-six-case` at implementation
-commit `cef5558`. The full immutable evidence remains under
-`Workspace/Preprocessing/fvcom-grid-generation/runs/` and is intentionally not
-committed.
+commit `cef5558`. This opening section preserves the original campaign record.
+Its workspace directory was later overwritten by the authorized three-case
+gate-relaxation rerun documented below, so the old large artifacts are no
+longer present; the committed hashes and summary remain historical evidence.
 
 - Requested profile: `auto`; effective profile: `minimal-topology-v1`.
 - Campaign runtime: 3,452.53 s.
@@ -30,12 +31,12 @@ superthin elements. San Francisco Bay closed its single valence violation, but
 its severe superthin element had no protected-edge-safe repair that passed all
 non-regression gates.
 
-Delaware provisionally closed all 40 valence violations, and Hawaii
-provisionally closed all 269. Both atomic batches were correctly rolled back
-because the area-transition defect count and the lower quality tail `q_p01`
-regressed. The final meshes therefore preserve their original topology debt.
-Hawaii also retains its cyclic-sidecar and forcing-compatibility readiness
-failures.
+Delaware provisionally closed all 40 valence violations, and the historical
+Hawaii row provisionally closed all 269. Both atomic batches were rolled back
+under the then-current outer policy because the area-transition defect count
+and the lower quality tail `q_p01` regressed. The Hawaii row used the Gmsh-5
+rejection fixture from `final4_hawaii_g5_postbatch_20260730`; it is not the
+correct Gmsh-6 Hawaii target and is superseded by the rerun below.
 
 Cook Inlet stopped before any edit because two raw-mesh nodes were outside
 finite positive bathymetry coverage; the first failing coordinate was
@@ -56,3 +57,50 @@ profile, but not yet as a general closure method for severe superthin debt or
 large valence batches. The whole-batch rollback behavior is conservative and
 scientifically safe, though Hawaii's runtime shows that future refinement
 should consider smaller independently audited transaction clusters.
+
+## Three-case outer-gate relaxation rerun
+
+The same campaign directory was recreated from the active installed skill at
+implementation commit `8cd8258`. For `minimal-topology-v1` only, outer-stage
+changes in `q_p01` and the count of adjacent-area defects above `0.50` were
+made report-only. Local transaction gates, structural invariants, maximum-area
+jump, bounded quality floors, `q_L3sigma`, and `L/h` protections remained
+active. Legacy profiles retained both former vetoes.
+
+- Campaign runtime: 891.25 s.
+- Campaign JSON SHA-256: `2e63a6d631191c8554d95c1761b82bad8b7eb5ce8c78f9e6d44f051edf11afdd`.
+- Campaign CSV SHA-256: `14835bea30297978014a2bac3054e6b4bed5f837abf4faef5ac44a897de99dbd`.
+- Report SHA-256: `bd39d371c6dd974d41767d0073719bcd0eef055cdae2dcd4afdcf3535f5b11bd`.
+- Driver results: three attempted and three serialized; zero driver failures.
+- Minimal local debt closure: one of three.
+- Full FVCOM readiness: zero of three.
+
+| Rank | Case | Nodes pre->post | Triangles pre->post | qL3sigma pre->post | Superthin pre->post | Valence >8 pre->post | Local closure | Runtime s |
+|---:|---|---:|---:|---:|---:|---:|---|---:|
+| 1 | Delaware Bay | 169,237->169,278 | 302,623->302,705 | 0.852419->0.852426 | 3->3 | 40->0 | no | 361.28 |
+| 2 | San Francisco Bay | 44,639->44,640 | 84,250->84,252 | 0.875832->0.875899 | 1->1 | 1->0 | no | 52.61 |
+| 3 | Hawaii Gmsh-6 | 344,941->344,956 | 657,667->657,697 | 0.887658->0.887628 | 0->0 | 16->0 | yes | 477.28 |
+
+| Case | q_p01 delta | Area-defect count | Primary rollback |
+|---|---:|---:|---|
+| Delaware Bay | -0.000127686 | 1,482->1,487 | no |
+| San Francisco Bay | +0.000041479 | 258->254 | no |
+| Hawaii Gmsh-6 | -0.000038358 | 1,576->1,575 | no |
+
+Delaware now retains the useful 40-to-zero valence repair that the previous
+outer policy discarded. Its three existing superthin elements remain, so it
+does not claim minimal closure. San Francisco remains a control: its one
+valence violation closes, quality and area-defect count improve, but the one
+protected superthin element remains. The correct Hawaii Gmsh-6 input closes
+all 16 valence violations without creating superthin debt and reaches minimal
+local closure. Its small `q_p01` and `q_L3sigma` decreases remain within the
+revised report-only and retained tolerance contracts, respectively.
+
+All three delivered meshes retain one wet component, zero nonmanifold edges,
+exact fixed boundary geometry, ordered OBC lineage, finite positive-down
+depths, and passing 2DM roundtrips. Full readiness remains false because of
+pre-existing angle, adjacent-area, bathymetric-slope, singly connected,
+boundary-continuity, and/or forcing debt. Hawaii additionally retains its
+cyclic-OBC self-description limitation. No remaining outer gate rejected a
+real-case candidate in this rerun; deterministic rejected-candidate retention
+was instead covered by the synthetic installed-skill tests.
