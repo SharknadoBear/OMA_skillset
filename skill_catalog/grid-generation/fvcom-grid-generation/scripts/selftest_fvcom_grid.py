@@ -659,13 +659,27 @@ def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
         assert np.all(mesh.depths > 0)
         assert manifest["mesh"]["constraint_recovery"]["boundary_constraint_recovered"] is True
         assert manifest["mesh"]["conditioning"]["stage_order"] == [
-            "spring-relax-v1",
-            "thin-repair-v1",
-            "aggressive-local-disabled",
-            "area-transition-relax-v1",
-            "systematic-thin-terminal-disabled",
+            "spring-relaxation-disabled",
+            "broad-thin-repair-disabled",
+            "valence-first-local-transactions",
+            "immediate-post-valence-superthin-cleanup",
+            "residual-superthin-component-repair",
+            "terminal-valence-and-superthin-scan",
+            "area-transition-relaxation-disabled",
             "terminal-constraint-audit",
         ]
+        assert manifest["mesh"]["conditioning"]["profile"] == (
+            "minimal-topology-v1"
+        )
+        assert manifest["mesh"]["conditioning"]["requested_profile"] == (
+            "auto"
+        )
+        assert manifest["mesh"]["conditioning"][
+            "spring_relaxation"
+        ]["reason"] == "disabled"
+        assert manifest["mesh"]["conditioning"][
+            "area_transition_relaxation"
+        ]["reason"] == "disabled"
         assert manifest["mesh"]["conditioning"]["area_transition_relaxation"]["profile"] == "area-transition-relax-v1"
         assert manifest["postprocess"]["enabled"] is False
         assert manifest["settings"]["postprocess_profile"] == "none"

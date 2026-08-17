@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Any, Callable
 
 import numpy as np
@@ -80,6 +81,7 @@ class MeshConfig:
     area_transition_area_change_threshold: float = 0.50
     area_transition_target_gradient_threshold: float = 0.10
     conditioning_profile: str = "auto"
+    minimal_conditioning_wall_time_s: float = 3_600.0
     aggressive_conditioning_rounds: int = 4
     aggressive_boundary_edit_policy: str = "kind-aware-envelope"
     aggressive_max_prunes_per_round: int = 500
@@ -357,8 +359,22 @@ def generate_mesh(
             values = np.asarray(values, dtype=float).copy()
             values[fixed_mask] = np.asarray(conditioning_targets, dtype=float)[fixed_mask]
         return values
+    effective_conditioning_profile = str(config.conditioning_profile)
+    if effective_conditioning_profile == "auto":
+        effective_conditioning_profile = "minimal-topology-v1"
+    if effective_conditioning_profile not in {
+        "minimal-topology-v1",
+        "guarded-v1",
+        "aggressive-local-v2",
+        "none",
+    }:
+        raise ValueError(
+            "conditioning_profile must be auto, minimal-topology-v1, "
+            "guarded-v1, aggressive-local-v2, or none"
+        )
+    minimal_profile = effective_conditioning_profile == "minimal-topology-v1"
     spring_config = SpringRelaxConfig(
-        enabled=bool(config.regional_spring_relaxation),
+        enabled=bool(config.regional_spring_relaxation) and not minimal_profile,
         quality_threshold=float(config.spring_relax_quality_threshold),
         min_angle_deg=float(config.spring_relax_min_angle_deg),
         ring_layers=int(config.spring_relax_ring_layers),
@@ -378,14 +394,14 @@ def generate_mesh(
     points_arr = spring_result.nodes_xy
 
     thin_config = ThinTriangleRepairConfig(
-        enabled=bool(config.thin_triangle_repair),
+        enabled=bool(config.thin_triangle_repair) and not minimal_profile,
         quality_threshold=float(config.thin_triangle_quality_threshold),
         min_angle_deg=float(config.thin_triangle_min_angle_deg),
         max_passes=int(config.thin_triangle_max_passes),
         max_flips=int(config.thin_triangle_max_flips),
         max_insertions=int(config.thin_triangle_max_insertions),
         relaxation_config=SpringRelaxConfig(
-            enabled=bool(config.regional_spring_relaxation),
+            enabled=bool(config.regional_spring_relaxation) and not minimal_profile,
             quality_threshold=float(config.spring_relax_quality_threshold),
             min_angle_deg=float(config.spring_relax_min_angle_deg),
             ring_layers=int(config.spring_relax_ring_layers),
@@ -415,15 +431,13 @@ def generate_mesh(
         hard_anchors.extend([False] * (len(points_arr) - len(hard_anchors)))
     point_targets = conditioning_targets.tolist()
 
-    effective_conditioning_profile = str(config.conditioning_profile)
-    if effective_conditioning_profile == "auto":
-        effective_conditioning_profile = "aggressive-local-v2" if boundary.adaptive_resolution else "guarded-v1"
-    if effective_conditioning_profile not in {"guarded-v1", "aggressive-local-v2", "none"}:
-        raise ValueError("conditioning_profile must be auto, guarded-v1, aggressive-local-v2, or none")
     aggressive_result = None
     node_lineage = np.arange(len(points_arr), dtype=int)
     restricted_edges_current: set[tuple[int, int]] = set()
-    if effective_conditioning_profile == "aggressive-local-v2":
+    if effective_conditioning_profile in {
+        "aggressive-local-v2",
+        "minimal-topology-v1",
+    }:
         _progress(progress_callback, "aggressive_local_topology", 0.965, {"profile": effective_conditioning_profile})
         aggressive_result = condition_mesh_aggressive(
             points_arr,
@@ -437,10 +451,21 @@ def generate_mesh(
             target_spacing_sampler=_sample_conditioning_targets,
             config=AggressiveConditioningConfig(
                 enabled=True,
-                enable_thin_repair=str(config.thin_repair_profile) != "none",
+                profile_name=effective_conditioning_profile,
+                stage_order=(
+                    "valence-before-thin"
+                    if minimal_profile
+                    else "thin-before-valence"
+                ),
+                enable_pruning=not minimal_profile,
+                enable_thin_repair=(
+                    True
+                    if minimal_profile
+                    else str(config.thin_repair_profile) != "none"
+                ),
                 thin_repair_profile=(
                     "guarded-v1"
-                    if str(config.thin_repair_profile) == "none"
+                    if minimal_profile or str(config.thin_repair_profile) == "none"
                     else (
                         "systematic-v5"
                         if str(config.thin_repair_profile) == "systematic-v6"
@@ -455,9 +480,27 @@ def generate_mesh(
                     config.systematic_v5_max_connectivity_transactions
                 ),
                 max_rounds=int(config.aggressive_conditioning_rounds),
-                boundary_edit_policy=str(config.aggressive_boundary_edit_policy),
-                max_prunes_per_round=int(config.aggressive_max_prunes_per_round),
+                boundary_edit_policy=(
+                    "none"
+                    if minimal_profile
+                    else str(config.aggressive_boundary_edit_policy)
+                ),
+                max_boundary_edits_per_round=(0 if minimal_profile else 25),
+                max_boundary_welds_per_round=(0 if minimal_profile else 25),
+                max_boundary_ear_removals_per_round=(0 if minimal_profile else 25),
+                max_prunes_per_round=(
+                    0
+                    if minimal_profile
+                    else int(config.aggressive_max_prunes_per_round)
+                ),
                 max_valence_removals_per_round=int(config.aggressive_max_valence_repairs_per_round),
+                micro_relax_cycles=(0 if minimal_profile else 3),
+                deadline_monotonic_s=(
+                    time.perf_counter()
+                    + float(config.minimal_conditioning_wall_time_s)
+                    if minimal_profile
+                    else None
+                ),
             ),
         )
         points_arr = aggressive_result.nodes_xy
@@ -476,7 +519,7 @@ def generate_mesh(
         )
 
     area_transition_config = AreaTransitionRelaxConfig(
-        enabled=bool(config.area_transition_relaxation),
+        enabled=bool(config.area_transition_relaxation) and not minimal_profile,
         max_patches=int(config.area_transition_max_patches),
         raw_area_change_threshold=float(config.area_transition_area_change_threshold),
         target_gradient_threshold=float(config.area_transition_target_gradient_threshold),
@@ -501,12 +544,16 @@ def generate_mesh(
     point_targets = conditioning_targets.tolist()
 
     terminal_thin_result = None
-    if aggressive_result is not None and str(config.thin_repair_profile) in {
+    if (
+        not minimal_profile
+        and aggressive_result is not None
+        and str(config.thin_repair_profile) in {
         "systematic-v2",
         "systematic-v3",
         "systematic-v5",
         "systematic-v6",
-    }:
+        }
+    ):
         terminal_profile = str(config.thin_repair_profile)
         _progress(progress_callback, "terminal_systematic_thin_repair", 0.975, {"profile": terminal_profile})
         previous_lineage = np.asarray(node_lineage, dtype=int).copy()
@@ -682,17 +729,46 @@ def generate_mesh(
         if terminal_thin_result is not None
         else "systematic-thin-terminal-disabled"
     )
+    minimal_local_debt_closed = bool(
+        minimal_profile
+        and aggressive_result is not None
+        and aggressive_result.report.get(
+            "minimal_local_debt_closed",
+            False,
+        )
+        and terminal_audit["passed"]
+        and not terminal_rollback
+    )
     conditioning_report = {
-        "schema_version": "fvcom_generation_conditioning_v4",
+        "schema_version": "fvcom_generation_conditioning_v5",
         "profile": effective_conditioning_profile,
-        "stage_order": [
-            "spring-relax-v1",
-            "thin-repair-v1",
-            "aggressive-local-v2" if aggressive_result is not None else "aggressive-local-disabled",
-            "area-transition-relax-v1",
-            terminal_stage_name,
-            "terminal-constraint-audit",
-        ],
+        "requested_profile": str(config.conditioning_profile),
+        "minimal_local_debt_closed": minimal_local_debt_closed,
+        "stage_order": (
+            [
+                "spring-relaxation-disabled",
+                "broad-thin-repair-disabled",
+                "valence-first-local-transactions",
+                "immediate-post-valence-superthin-cleanup",
+                "residual-superthin-component-repair",
+                "terminal-valence-and-superthin-scan",
+                "area-transition-relaxation-disabled",
+                "terminal-constraint-audit",
+            ]
+            if minimal_profile
+            else [
+                "spring-relax-v1",
+                "thin-repair-v1",
+                (
+                    "aggressive-local-v2"
+                    if aggressive_result is not None
+                    else "aggressive-local-disabled"
+                ),
+                "area-transition-relax-v1",
+                terminal_stage_name,
+                "terminal-constraint-audit",
+            ]
+        ),
         "spring_relaxation": spring_result.report,
         "thin_triangle_repair": thin_result.report,
         "aggressive_local_topology": aggressive_result.report if aggressive_result is not None else {"enabled": False},
@@ -1277,7 +1353,9 @@ def _orient_ccw(points: np.ndarray, triangles: np.ndarray) -> np.ndarray:
     out = triangles.copy()
     for i, tri in enumerate(out):
         coords = points[tri]
-        area2 = np.cross(coords[1] - coords[0], coords[2] - coords[0])
+        first = coords[1] - coords[0]
+        second = coords[2] - coords[0]
+        area2 = first[0] * second[1] - first[1] * second[0]
         if area2 < 0:
             out[i] = [tri[0], tri[2], tri[1]]
     return out

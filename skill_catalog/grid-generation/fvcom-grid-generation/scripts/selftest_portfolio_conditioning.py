@@ -119,6 +119,15 @@ def test_closed_lake_common_conditioning() -> None:
             ),
         )
         assert report["status"] == "pass", json.dumps(report, indent=2)
+        assert report["policy"]["requested_profile"] == "auto"
+        assert report["policy"]["effective_profile"] == "minimal-topology-v1"
+        assert report["minimal_local_debt_closed"]
+        assert report["fvcom_ready"]
+        assert report["area_transition"]["enabled"] is False
+        assert (
+            report["area_transition"]["reason"]
+            == "disabled_by_minimal_topology_v1"
+        )
         assert report["inputs"]["canonical_size_field"][
             "sampling_interface_schema_version"
         ] == "legacy_unspecified"
@@ -145,6 +154,23 @@ def test_closed_lake_common_conditioning() -> None:
         assert (output / "delivered_boundary_nodes.geojson").is_file()
         assert (output / "obc_remap_manifest.json").is_file()
         assert (output / "mesh_quality.json").is_file()
+        replay = root / "conditioned_replay"
+        replay_report = condition_portfolio_mesh(
+            mesh,
+            size_field,
+            bathymetry,
+            replay,
+            name="closed_lake_conditioned",
+            config=PortfolioConditioningConfig(
+                primary_rounds=2,
+                terminal_rounds=1,
+                area_transition_max_patches=2,
+            ),
+        )
+        assert replay_report["minimal_local_debt_closed"]
+        assert (output / "conditioned.2dm").read_bytes() == (
+            replay / "conditioned.2dm"
+        ).read_bytes()
         try:
             condition_portfolio_mesh(
                 mesh,
@@ -180,6 +206,11 @@ def test_two_obc_ids_order_and_boundary_are_preserved() -> None:
                 terminal_rounds=1,
                 area_transition_max_patches=2,
             ),
+            boundary_contract={
+                "open_boundary_count": 2,
+                "open_boundary_ids": source_ids,
+                "open_boundary_cyclic": [False, False],
+            },
         )
         assert report["status"] == "pass", json.dumps(report, indent=2)
         delivered = read_2dm(output / "conditioned.2dm")
@@ -207,16 +238,85 @@ def test_two_obc_ids_order_and_boundary_are_preserved() -> None:
         )
         assert (
             remap["cyclicity_contract"]["policy"]
-            == "ordered_noncyclic_arcs_only"
+            == "external_cyclicity_sidecar"
         )
         assert report["final_global_audit"]["open_boundary_chain_count"] == 2
         assert report["roundtrip"]["open_boundary_chain_order_match"]
         assert report["roundtrip"]["open_boundary_id_match"]
 
 
+def test_cyclic_obc_and_source_forcing_remain_readiness_failures() -> None:
+    with tempfile.TemporaryDirectory(prefix="portfolio_cyclic_obc_") as temp:
+        root = Path(temp)
+        source_chains = [[2, 3, 4, 5, 6, 7]]
+        source_ids = [41]
+        mesh, size_field, bathymetry, _raw_lonlat = _write_inputs(
+            root,
+            open_boundary_chains=source_chains,
+            open_boundary_ids=source_ids,
+        )
+        output = root / "conditioned"
+        report = condition_portfolio_mesh(
+            mesh,
+            size_field,
+            bathymetry,
+            output,
+            name="cyclic_obc_conditioned",
+            boundary_contract={
+                "open_boundary_count": 1,
+                "open_boundary_ids": ["cyclic_exchange"],
+                "open_boundary_cyclic": [True],
+            },
+            source_boundary_metadata={"forcing_compatible": False},
+        )
+        assert report["minimal_local_debt_closed"]
+        assert not report["fvcom_ready"]
+        assert report["status"] == "needs_review"
+        failures = set(report["fvcom_readiness_failure_taxonomy"])
+        assert "cyclic_obc_not_self_describing_in_sms_2dm" in failures
+        assert "open_boundary_forcing_incompatible" in failures
+        assert (
+            report["open_boundary_cyclicity_contract"]["chains"][0]["cyclic"]
+            is True
+        )
+        remap = json.loads(
+            (output / "obc_remap_manifest.json").read_text(encoding="utf-8")
+        )
+        assert remap["chains"][0]["cyclic"]
+        assert not remap["forcing_compatible"]
+
+
+def test_scientific_input_failure_is_separate_from_local_closure() -> None:
+    with tempfile.TemporaryDirectory(prefix="portfolio_science_gate_") as temp:
+        root = Path(temp)
+        mesh, size_field, bathymetry, _raw_lonlat = _write_inputs(
+            root,
+            open_boundary_chains=[],
+            open_boundary_ids=[],
+        )
+        report = condition_portfolio_mesh(
+            mesh,
+            size_field,
+            bathymetry,
+            root / "conditioned",
+            scientific_input_valid=False,
+            scientific_input_note="synthetic rejected boundary placement",
+        )
+        assert report["minimal_local_debt_closed"]
+        assert not report["fvcom_ready"]
+        assert "scientific_input_invalid" in report[
+            "fvcom_readiness_failure_taxonomy"
+        ]
+        assert report["scientific_input"]["note"] == (
+            "synthetic rejected boundary placement"
+        )
+
+
 TESTS: tuple[Callable[[], None], ...] = (
     test_closed_lake_common_conditioning,
     test_two_obc_ids_order_and_boundary_are_preserved,
+    test_cyclic_obc_and_source_forcing_remain_readiness_failures,
+    test_scientific_input_failure_is_separate_from_local_closure,
 )
 
 

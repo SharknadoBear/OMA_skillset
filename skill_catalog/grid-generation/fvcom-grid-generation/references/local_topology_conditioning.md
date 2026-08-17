@@ -1,6 +1,16 @@
-# Aggressive Local Topology Conditioning
+# Local Topology Conditioning
 
-Use this note for `aggressive-local-v2`, `condition_mesh_local.py`, `repair_high_valence.py`, and `prune_redundant_vertices.py`.
+Use this note for `minimal-topology-v1`, `aggressive-local-v2`, `run_portfolio_conditioning.py`, `condition_mesh_local.py`, `repair_high_valence.py`, and `prune_redundant_vertices.py`.
+
+## Minimal topology v1
+
+`auto` resolves to `minimal-topology-v1` in both integrated generation and standalone portfolio conditioning. This profile fixes every topological boundary coordinate and membership, disables pruning, spring and micro-relaxation, area-transition relaxation, boundary edits, passage deletion, and global retriangulation, and permits only atomic local retriangulation.
+
+Each of at most four rounds applies valence repair first, immediately scans and repairs any superthin debt created by an accepted valence transaction, repairs residual connected superthin debt with protected-edge-safe flips, collapses, or bounded local cavities, and finishes with another valence scan plus immediate thin cleanup. Stop on zero selected debt, no accepted improvement, or the per-case wall-clock deadline. Never delete one triangle as an isolated operation and never remove a wet passage.
+
+Hash the raw mesh, canonical size field, immutable bathymetry, boundary/OBC contract, and source boundary metadata. A transaction commits only when its targeted debt improves and positive areas, protected/restricted edges, wet components, boundary/OBC lineage, singly connected counts, quality tails, adjacent-area debt, and `L/h` stay within the established non-regression tolerances. Resample final positive-down depths and repeat the full 2DM roundtrip and quality audit.
+
+Report `minimal_local_debt_closed` separately from `fvcom_ready`. The first requires valence at most eight, zero unique superthin triangles, no restricted-edge violation, and no structural regression. The second retains every scientific and numerical readiness gate, including angles, area transition, bathymetric slope, size/continuity, topology, forcing, depth, node budget, and serialization. External plural/cyclic OBC metadata preserves lineage and scientific context; a cyclic chain remains non-self-describing in SMS 2DM and therefore cannot pass full readiness on that file alone.
 
 ## Geometry and hard limits
 
