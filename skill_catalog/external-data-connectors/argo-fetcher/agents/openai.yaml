@@ -1,0 +1,4 @@
+interface:
+  display_name: "Argo Fetcher"
+  short_description: "Fetch bounded Argo core and BGC profiles"
+  default_prompt: "Use $argo-fetcher to estimate, download, and health-check Argo profiles for a bounded time and region."

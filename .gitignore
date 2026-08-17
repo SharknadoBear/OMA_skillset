@@ -33,6 +33,20 @@ skill_catalog/external-data-connectors/cfsv2-fetcher/**/download_checkpoint*.jso
 skill_catalog/external-data-connectors/cfsv2-fetcher/**/chunks/
 skill_catalog/external-data-connectors/cfsv2-fetcher/**/*.part
 skill_catalog/external-data-connectors/cfsv2-fetcher/**/*.tmp
+skill_catalog/external-data-connectors/argo-fetcher/runs/
+skill_catalog/external-data-connectors/argo-fetcher/**/*.nc
+skill_catalog/external-data-connectors/argo-fetcher/**/download_plan*.json
+skill_catalog/external-data-connectors/argo-fetcher/**/selection.json
+skill_catalog/external-data-connectors/argo-fetcher/**/selection.csv
+skill_catalog/external-data-connectors/argo-fetcher/**/download_manifest.csv
+skill_catalog/external-data-connectors/argo-fetcher/**/download_status.json
+skill_catalog/external-data-connectors/argo-fetcher/**/download_monitor.html
+skill_catalog/external-data-connectors/argo-fetcher/**/health_check.json
+skill_catalog/external-data-connectors/argo-fetcher/**/profile_inventory.csv
+skill_catalog/external-data-connectors/argo-fetcher/**/health_plots/
+skill_catalog/external-data-connectors/argo-fetcher/**/cache/
+skill_catalog/external-data-connectors/argo-fetcher/**/*.part
+skill_catalog/external-data-connectors/argo-fetcher/**/*.tmp
 
 .DS_Store
 Thumbs.db
