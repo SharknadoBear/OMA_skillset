@@ -21,7 +21,7 @@ fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> fvcom-grid-generation
 - For open domains, propagate the delivered OBC target and distance through connected wet cells, hold offshore authority near the OBC, then transfer smoothly in log space to the nearshore target. Treat the configured transfer distance as a minimum and extend it automatically when the declared gradation requires more wet distance. For closed domains, omit this transfer.
 - Apply all distance propagation and final gradation over the wet model domain so land and island holes cannot create shortcuts.
 - Treat boundary, bathymetry, `fvcom_size_field_v4`, node budget, and QA policy as generator-neutral mesh intent. Lock their hashes before a multi-mesher test, choose adapters by topology capability, and never flatten OBC chains to make an unsupported generator run.
-- Resolve `--conditioning-profile auto` to `minimal-topology-v1`. Run only fixed-boundary valence repair, immediate superthin cleanup, residual protected-edge-safe superthin repair, and a terminal valence/thin scan. Do not run spring relaxation, area-transition relaxation, pruning, boundary edits, global retriangulation, or the broad legacy postprocessor implicitly.
+- Resolve `--conditioning-profile auto` to `minimal-topology-v1`. Run only fixed-boundary valence repair, immediate superthin cleanup, residual protected-edge-safe superthin repair, and a terminal valence/thin scan. At the outer whole-stage decision, report changes in `q_p01` and the count of adjacent-area defects above `0.50` without using either as a rollback veto; retain every local transaction gate, the maximum adjacent-area-change gate, and all FVCOM readiness gates. Do not run spring relaxation, area-transition relaxation, pruning, boundary edits, global retriangulation, or the broad legacy postprocessor implicitly.
 - Keep depths finite and positive down and treat OceanMesh2D GPL material as a method reference only.
 
 ## Primary Workflow
@@ -184,7 +184,7 @@ The default `minimal-topology-v1` order after constrained seeding/refinement is:
 1. Hash/audit the mesh, canonical size field, bathymetry, boundary/OBC contract, and optional source metadata.
 2. Repair valence above eight with every boundary coordinate and membership fixed. After each accepted valence transaction, immediately scan and repair any created or exposed superthin debt.
 3. Repair residual connected superthin debt with protected-edge-safe flips, collapses, or bounded local cavity reconstruction. Never delete a triangle in isolation or remove a wet passage.
-4. Repeat the terminal valence/thin scan for at most four rounds and accept only audited non-regressing atomic retriangulations. Resample depth from the immutable bathymetry and repeat the complete serialization/quality audit.
+4. Repeat the terminal valence/thin scan for at most four rounds and accept only audited atomic retriangulations. Keep `q_p01` and the adjacent-area defect-count delta as outer-stage diagnostics, not vetoes; retain the remaining structural, quality-floor, maximum-area-jump, and size-continuity protections. If another outer gate rejects the batch, serialize the rejected candidate, boundary lineage, quality audit, edit ledger, and rollback manifest. Resample depth from the immutable bathymetry and repeat the complete serialization/quality audit.
 
 The following is the explicit legacy conditioning order used only when a legacy profile is selected:
 

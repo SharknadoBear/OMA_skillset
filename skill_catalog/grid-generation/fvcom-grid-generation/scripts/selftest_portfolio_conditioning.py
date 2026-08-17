@@ -14,6 +14,7 @@ import xarray as xr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from fvcom_grid_generation import portfolio_conditioning as conditioning_module  # noqa: E402
 from fvcom_grid_generation.portfolio_conditioning import (  # noqa: E402
     PortfolioConditioningConfig,
     condition_portfolio_mesh,
@@ -312,11 +313,86 @@ def test_scientific_input_failure_is_separate_from_local_closure() -> None:
         )
 
 
+def test_rejected_primary_candidate_is_retained_deterministically() -> None:
+    with tempfile.TemporaryDirectory(prefix="portfolio_rejected_candidate_") as temp:
+        root = Path(temp)
+        mesh, size_field, bathymetry, _raw_lonlat = _write_inputs(
+            root,
+            open_boundary_chains=[],
+            open_boundary_ids=[],
+        )
+        original = conditioning_module._stage_regressions
+
+        def force_remaining_gate(
+            before: dict[str, object],
+            after: dict[str, object],
+            *,
+            minimal_policy: bool = False,
+        ) -> list[str]:
+            failures = original(
+                before,
+                after,
+                minimal_policy=minimal_policy,
+            )
+            if minimal_policy:
+                failures.append("synthetic_remaining_hard_gate")
+            return sorted(set(failures))
+
+        conditioning_module._stage_regressions = force_remaining_gate
+        try:
+            reports = [
+                condition_portfolio_mesh(
+                    mesh,
+                    size_field,
+                    bathymetry,
+                    root / output_name,
+                    name="rejected_candidate_fixture",
+                )
+                for output_name in ("first", "second")
+            ]
+        finally:
+            conditioning_module._stage_regressions = original
+
+        for report in reports:
+            primary = report["primary_topology"]
+            assert primary["rollback_applied"]
+            assert "synthetic_remaining_hard_gate" in primary["rollback_reasons"]
+            evidence = primary["rejected_candidate_evidence"]
+            assert evidence["status"] == "rejected"
+            for key in (
+                "candidate_2dm",
+                "mesh_quality_json",
+                "boundary_nodes_geojson",
+                "edit_ledger_json",
+                "rollback_manifest_json",
+            ):
+                assert Path(evidence[key]["path"]).is_file()
+            quality = json.loads(
+                Path(evidence["mesh_quality_json"]["path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            assert quality["artifact_role"] == "rejected_primary_candidate"
+            assert not quality["accepted_for_delivery"]
+            assert quality["serialized_roundtrip"]["passed"]
+
+        first = reports[0]["primary_topology"]["rejected_candidate_evidence"]
+        second = reports[1]["primary_topology"]["rejected_candidate_evidence"]
+        for key in (
+            "candidate_2dm",
+            "mesh_quality_json",
+            "boundary_nodes_geojson",
+            "edit_ledger_json",
+        ):
+            assert first[key]["sha256"] == second[key]["sha256"]
+
+
 TESTS: tuple[Callable[[], None], ...] = (
     test_closed_lake_common_conditioning,
     test_two_obc_ids_order_and_boundary_are_preserved,
     test_cyclic_obc_and_source_forcing_remain_readiness_failures,
     test_scientific_input_failure_is_separate_from_local_closure,
+    test_rejected_primary_candidate_is_retained_deterministically,
 )
 
 

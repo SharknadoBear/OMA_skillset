@@ -392,6 +392,11 @@ def condition_portfolio_mesh(
         primary_audit,
         minimal_policy=(effective_profile == "minimal-topology-v1"),
     )
+    primary_report_only_deltas = (
+        _minimal_report_only_deltas(raw_audit, primary_audit)
+        if effective_profile == "minimal-topology-v1"
+        else {}
+    )
     primary_rollback = bool(primary_regressions)
     state = raw_state.clone() if primary_rollback else primary_candidate
     accepted_primary_audit = raw_audit if primary_rollback else primary_audit
@@ -525,6 +530,22 @@ def condition_portfolio_mesh(
         if name is not None and str(name).strip()
         else f"{raw_mesh.mesh_name}_portfolio_conditioned"
     )
+    rejected_primary_evidence = None
+    if primary_rollback:
+        rejected_primary_evidence = _write_rejected_primary_candidate(
+            output / "rejected_primary_candidate",
+            state=primary_candidate,
+            audit=primary_audit,
+            projection=projection,
+            bathymetry=bathymetry,
+            target_sampler_xy=target_sampler_xy,
+            raw_obc_ids=raw_obc_ids,
+            open_boundary_cyclic=open_boundary_cyclic,
+            rollback_reasons=primary_regressions,
+            report_only_deltas=primary_report_only_deltas,
+            edit_ledger=primary_result.edit_ledger,
+            mesh_name=f"{output_name}_rejected_primary_candidate",
+        )
     write_2dm(
         mesh_output,
         final_lonlat,
@@ -711,6 +732,14 @@ def condition_portfolio_mesh(
             "plural_obc_policy": (
                 "independent lineage mapping and terminal boundary-edge audit"
             ),
+            "outer_stage_acceptance": {
+                "report_only_for_minimal_topology_v1": [
+                    "q_p01_regressed",
+                    "area_transition_defect_count_regressed",
+                ],
+                "legacy_profiles_unchanged": True,
+                "full_fvcom_readiness_gates_unchanged": True,
+            },
         },
         "inputs": {
             "mesh": {"path": str(mesh_path), "sha256": _sha256(mesh_path)},
@@ -771,6 +800,8 @@ def condition_portfolio_mesh(
             "candidate_global_audit": _public_audit(primary_audit),
             "rollback_applied": primary_rollback,
             "rollback_reasons": primary_regressions,
+            "report_only_deltas": primary_report_only_deltas,
+            "rejected_candidate_evidence": rejected_primary_evidence,
         },
         "area_transition": area_report,
         "terminal_topology": {
@@ -799,6 +830,7 @@ def condition_portfolio_mesh(
             "obc_remap_manifest": _artifact(obc_output),
             "mesh_quality_json": _artifact(quality_output),
             "conditioning_report_json": str(report_output),
+            "rejected_primary_candidate": rejected_primary_evidence,
         },
         "limitations": [
             (
@@ -820,6 +852,162 @@ def condition_portfolio_mesh(
     }
     _write_json(report_output, report)
     return _json_safe(report)
+
+
+def _write_rejected_primary_candidate(
+    output: Path,
+    *,
+    state: _ConditioningState,
+    audit: dict[str, Any],
+    projection: LocalProjection,
+    bathymetry: _RegularGrid,
+    target_sampler_xy: Callable[[np.ndarray], np.ndarray],
+    raw_obc_ids: list[int],
+    open_boundary_cyclic: list[bool],
+    rollback_reasons: list[str],
+    report_only_deltas: dict[str, Any],
+    edit_ledger: list[dict[str, Any]],
+    mesh_name: str,
+) -> dict[str, Any]:
+    """Serialize a rejected whole-stage candidate as immutable evidence."""
+
+    output.mkdir(parents=False, exist_ok=False)
+    mesh_output = output / "candidate.2dm"
+    quality_output = output / "mesh_quality.json"
+    boundary_output = output / "boundary_nodes.geojson"
+    ledger_output = output / "edit_ledger.json"
+    manifest_output = output / "rollback_manifest.json"
+
+    boundary_chains = [
+        list(map(int, chain))
+        for chain in audit.get("_mapped_boundary_chains", [])
+    ]
+    obc_chains = [
+        list(map(int, chain))
+        for chain in audit.get("_mapped_obc_chains", [])
+    ]
+    obc_ids = (
+        list(map(int, raw_obc_ids))
+        if len(obc_chains) == len(raw_obc_ids)
+        else []
+    )
+    if not obc_ids:
+        obc_chains = []
+
+    lonlat = unproject_points(state.points, projection)
+    depths = bathymetry.sample(lonlat)
+    if np.any(~np.isfinite(depths)) or np.any(depths <= 0.0):
+        raise ValueError(
+            "Rejected primary candidate cannot be serialized with finite "
+            "positive-down depths"
+        )
+    write_2dm(
+        mesh_output,
+        lonlat,
+        depths,
+        state.triangles + 1,
+        np.empty(0, dtype=int),
+        mesh_name=mesh_name,
+        open_boundary_chains=[
+            np.asarray(chain, dtype=int) + 1 for chain in obc_chains
+        ],
+        open_boundary_ids=obc_ids,
+    )
+    roundtrip = _roundtrip_audit(
+        mesh_output,
+        state,
+        projection,
+        obc_chains,
+        obc_ids,
+    )
+    serialized = read_2dm(mesh_output)
+    serialized_points = project_points(serialized.nodes_lonlat, projection)
+    serialized_triangles = np.asarray(serialized.triangles, dtype=int) - 1
+    triangle_targets = _triangle_targets(
+        serialized_points,
+        serialized_triangles,
+        target_sampler_xy,
+    )
+    quality = evaluate_mesh_quality(
+        serialized_points,
+        serialized.depths,
+        serialized.triangles,
+        serialized.open_boundary_nodes,
+        {
+            "boundary_constraint_recovered": bool(
+                audit["boundary_edge_set_exact"]
+            ),
+            "source": "rejected_primary_candidate_evidence",
+        },
+        constraint_chains=boundary_chains,
+        open_boundary_chains=[
+            np.asarray(chain, dtype=int).tolist()
+            for chain in serialized.open_boundary_chains
+        ],
+        open_boundary_cyclic=(
+            list(map(bool, open_boundary_cyclic))
+            if len(obc_chains) == len(open_boundary_cyclic)
+            else [False] * len(obc_chains)
+        ),
+        require_open_boundary=bool(obc_chains),
+        expected_open_boundary_count=len(obc_chains),
+        enforce_size_error=True,
+        enforce_no_unused_nodes=True,
+        target_size_by_triangle=triangle_targets,
+    )
+    quality["artifact_role"] = "rejected_primary_candidate"
+    quality["accepted_for_delivery"] = False
+    quality["rollback_reasons"] = list(map(str, rollback_reasons))
+    quality["candidate_global_audit"] = _public_audit(audit)
+    quality["report_only_deltas"] = report_only_deltas
+    quality["serialized_roundtrip"] = roundtrip
+    _write_json(quality_output, quality)
+
+    boundary_document = _boundary_geojson(
+        lonlat,
+        boundary_chains,
+        obc_chains,
+        obc_ids,
+        state.raw_lineage,
+        target_sampler_xy(state.points),
+        (
+            list(map(bool, open_boundary_cyclic))
+            if len(obc_chains) == len(open_boundary_cyclic)
+            else [False] * len(obc_chains)
+        ),
+    )
+    _write_json(boundary_output, boundary_document)
+    _write_json(
+        ledger_output,
+        {
+            "schema_version": "fvcom_rejected_topology_edit_ledger_v1",
+            "artifact_role": "rejected_primary_candidate",
+            "accepted_for_delivery": False,
+            "rollback_reasons": list(map(str, rollback_reasons)),
+            "edit_ledger": edit_ledger,
+        },
+    )
+    manifest = {
+        "schema_version": "fvcom_rejected_primary_candidate_v1",
+        "status": "rejected",
+        "accepted_for_delivery": False,
+        "rollback_reasons": list(map(str, rollback_reasons)),
+        "report_only_deltas": report_only_deltas,
+        "candidate_global_audit": _public_audit(audit),
+        "roundtrip": roundtrip,
+        "artifacts": {
+            "candidate_2dm": _artifact(mesh_output),
+            "mesh_quality_json": _artifact(quality_output),
+            "boundary_nodes_geojson": _artifact(boundary_output),
+            "edit_ledger_json": _artifact(ledger_output),
+        },
+    }
+    _write_json(manifest_output, manifest)
+    return {
+        "status": "rejected",
+        **manifest["artifacts"],
+        "rollback_manifest_json": _artifact(manifest_output),
+    }
 
 
 def _primary_topology_config(
@@ -1138,14 +1326,15 @@ def _stage_regressions(
         failures.extend(
             f"terminal_core:{value}" for value in after["core_failures"]
         )
-    nonincrease = (
+    nonincrease = [
         "singly_connected_triangle_count",
         "superthin_triangle_count",
         "count_valence_above_8",
         "valence_excess_above_8",
-        "area_transition_defect_count",
         "l_over_h_count_above_1_55",
-    )
+    ]
+    if not minimal_policy:
+        nonincrease.append("area_transition_defect_count")
     for key in nonincrease:
         if int(after[key]) > int(before[key]):
             failures.append(f"{key}_regressed")
@@ -1160,8 +1349,6 @@ def _stage_regressions(
             20.0,
         ):
             failures.append("minimum_angle_deg_regressed")
-        if float(after["q_p01"]) + 1.0e-9 < float(before["q_p01"]):
-            failures.append("q_p01_regressed")
         if float(after["q_l3_sigma"]) + 1.0e-4 < float(
             before["q_l3_sigma"]
         ):
@@ -1187,6 +1374,34 @@ def _stage_regressions(
         if float(after[key]) > baseline + tolerance:
             failures.append(f"{key}_regressed")
     return sorted(set(failures))
+
+
+def _minimal_report_only_deltas(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose the two relaxed whole-stage metrics without vetoing a repair."""
+
+    q_before = float(before["q_p01"])
+    q_after = float(after["q_p01"])
+    area_before = int(before["area_transition_defect_count"])
+    area_after = int(after["area_transition_defect_count"])
+    return {
+        "policy": "report_only_not_outer_stage_veto",
+        "full_fvcom_readiness_gates_unchanged": True,
+        "q_p01": {
+            "before": q_before,
+            "after": q_after,
+            "delta": q_after - q_before,
+            "regressed_under_previous_gate": bool(q_after + 1.0e-9 < q_before),
+        },
+        "area_transition_defect_count_above_0_50": {
+            "before": area_before,
+            "after": area_after,
+            "delta": area_after - area_before,
+            "regressed_under_previous_gate": bool(area_after > area_before),
+        },
+    }
 
 
 def _mapped_source_chains(
