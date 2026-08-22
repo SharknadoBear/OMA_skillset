@@ -80,7 +80,7 @@ def build_model_boundary_loops(
     open_overlap_fraction = _line_fraction_near(open_xy, exterior_xy, tolerance_m)
     class_lengths = _class_lengths(segments_xy)
     unclassified_threshold_m = max(2.0 * target_resolution_m, 0.001 * max(exterior_xy.length, 1.0))
-    frame_clip_policy = str(source_manifest.get("settings", {}).get("frame_clip_policy", "report-only"))
+    frame_clip_policy = str(source_manifest.get("settings", {}).get("frame_clip_policy", "reject-unintended"))
     coastline_source = str(source_manifest.get("inputs", {}).get("coastline_source", ""))
     configured_frame_tolerance = source_manifest.get("settings", {}).get("frame_clip_tolerance_m")
     frame_clip_tolerance_m = float(
@@ -112,6 +112,8 @@ def build_model_boundary_loops(
     if class_lengths.get("unclassified_outer_boundary", 0.0) > unclassified_threshold_m:
         failures.append("unclassified_outer_boundary_length_nontrivial")
     frame_gate_enabled = frame_clip_policy == "reject-unintended" and coastline_source == "gshhs"
+    if frame_clip_policy == "report-only":
+        failures.append("diagnostic_only_report_only_policy")
     if frame_gate_enabled and gate_frame_clip_length_m > frame_clip_tolerance_m:
         failures.append("unintended_frame_clip_nontrivial")
     if frame_gate_enabled and (

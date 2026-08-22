@@ -63,6 +63,7 @@ class BdryArcConfig:
     frame_clip_policy: str = "reject-unintended"
     frame_clip_tolerance_m: float | None = None
     feedback_candidate_max_km: float = 100.0
+    obc_placement_policy: str = "offshore-first"
 
 
 def _resolve_heuristic_mode(cli_mode: str, run_mode: str) -> tuple[str, bool]:
@@ -99,6 +100,8 @@ def run_bdry_arc(
         raise ValueError("--boundary-resolution-profile must be legacy, adaptive-coastal-v1, or adaptive-coastal-v2")
     if config.frame_clip_policy not in {"reject-unintended", "report-only"}:
         raise ValueError("--frame-clip-policy must be reject-unintended or report-only")
+    if config.obc_placement_policy not in {"offshore-first", "mouth-first"}:
+        raise ValueError("--obc-placement-policy must be offshore-first or mouth-first")
     if config.frame_clip_tolerance_m is not None and config.frame_clip_tolerance_m < 0.0:
         raise ValueError("--frame-clip-tolerance-m must be nonnegative")
     if config.feedback_candidate_max_km <= 0.0:
@@ -122,6 +125,7 @@ def run_bdry_arc(
             "resolution_policy": "use requested GSHHS resolution only; do not downshift unless explicitly requested",
             "boundary_resolution_profile": config.boundary_resolution_profile,
             "frame_clip_policy": config.frame_clip_policy,
+            "obc_placement_policy": config.obc_placement_policy,
         },
     )
     visual_dir = run_dir / "intermediate" / "visual_review"
@@ -298,6 +302,7 @@ def run_bdry_arc(
             anchors,
             run_dir=run_dir,
             topology_time_budget_s=config.topology_time_budget_s,
+            obc_placement_policy=config.obc_placement_policy,
         )
         scored = topology_selection["scored"]
         wet_result = topology_selection["wet_result"]
@@ -344,6 +349,15 @@ def run_bdry_arc(
             land_boundary_xy,
             config.target_resolution_m,
         )
+    if not lake_closed_branch and not island_loop_branch:
+        trimmed = bool(wet_result.get("metadata", {}).get("open_arc_trimmed_to_wet_exterior"))
+        if config.obc_placement_policy == "offshore-first":
+            family = "compact-mouth-fallback" if trimmed else "complete-offshore"
+        else:
+            family = "compact-mouth" if trimmed else "complete-offshore-fallback"
+        wet_result.setdefault("metadata", {})["obc_placement_policy"] = config.obc_placement_policy
+        wet_result["metadata"]["obc_placement_family"] = family
+        wet_result["metadata"]["offshore_family_attempted_first"] = config.obc_placement_policy == "offshore-first"
     final_status, failure_taxonomy = _final_status(scored, wet_result, anchors, forbidden_regions_xy)
     advisory_taxonomy: list[str] = []
     if wet_result.get("metadata", {}).get("open_arc_trimmed_to_wet_exterior"):
@@ -432,6 +446,7 @@ def run_bdry_arc(
             "topology_time_budget_s": float(config.topology_time_budget_s),
             "boundary_resolution_profile": config.boundary_resolution_profile,
             "frame_clip_policy": config.frame_clip_policy,
+            "obc_placement_policy": config.obc_placement_policy,
             "frame_clip_tolerance_m": (
                 float(config.frame_clip_tolerance_m)
                 if config.frame_clip_tolerance_m is not None
@@ -603,16 +618,12 @@ def run_bdry_arc(
         feedback["outputs"]["feedback_json"] = str(feedback_path)
     manifest["region_bpoly_arc_feedback"] = feedback
     manifest["outputs"].update(feedback.get("outputs", {}))
-    frame_gate_blocked = bool(
-        feedback.get("policy", {}).get("gate_enabled")
-        and feedback.get("diagnostic_status") != "pass"
-    )
+    open_contract = dict(feedback.get("open_exterior_contract", {}))
+    manifest["open_exterior_contract"] = open_contract
+    frame_gate_blocked = bool(not open_contract.get("downstream_eligible", False))
     if frame_gate_blocked:
         manifest["final_status"] = "needs_review"
-        for failure in (
-            "unintended_frame_clip_nontrivial",
-            "gshhs_coastline_incomplete_on_landward_boundary",
-        ):
+        for failure in open_contract.get("failure_taxonomy", ["open_exterior_contract_not_downstream_eligible"]):
             if failure not in manifest["failure_taxonomy"]:
                 manifest["failure_taxonomy"].append(failure)
     if feedback_failed:
@@ -1102,6 +1113,7 @@ def select_gshhs_open_side_topology(
     anchors: dict[str, Any] | None = None,
     run_dir: Path | None = None,
     topology_time_budget_s: float | None = None,
+    obc_placement_policy: str = "offshore-first",
 ) -> dict[str, Any]:
     """Select the coastline-anchor seaward-chain deformation that creates the best domain."""
     evaluated: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -1129,6 +1141,7 @@ def select_gshhs_open_side_topology(
             target_resolution_m,
             anchors=anchors,
             land_union_xy=land_union_xy,
+            obc_placement_policy=obc_placement_policy,
         )
         metadata = result["metadata"]
         metrics = dict(candidate.get("metrics", {}))
@@ -1387,6 +1400,7 @@ def extract_gshhs_vector_wet_domain(
     target_resolution_m: float,
     anchors: dict[str, Any] | None = None,
     land_union_xy=None,
+    obc_placement_policy: str = "offshore-first",
 ) -> dict[str, Any]:
     """Build a GSHHS-first wet domain from a coastline-anchor deformed frame."""
     land_union = land_union_xy if land_union_xy is not None else (unary_union(land_polygons_xy).buffer(0) if land_polygons_xy else GeometryCollection())
@@ -1423,12 +1437,38 @@ def extract_gshhs_vector_wet_domain(
         domain = selected if selected is not None else deformed_frame.buffer(0)
 
     source_open_arc_xy = offshore_arc_xy
-    delivered_open_arc_xy, trim_report = _normalize_open_arc_to_wet_exterior(
-        source_open_arc_xy,
-        domain,
-        land_boundary,
-        target_resolution_m,
+    source_exterior_overlap = _line_fraction_near_boundary(
+        source_open_arc_xy, domain.boundary, max(2.0, 0.02 * target_resolution_m)
     )
+    use_complete_offshore = bool(
+        obc_placement_policy == "offshore-first"
+        and source_open_arc_xy.is_simple
+        and source_exterior_overlap >= 0.999
+    )
+    if use_complete_offshore:
+        delivered_open_arc_xy = source_open_arc_xy
+        trim_report = {
+            "open_arc_trimmed_to_wet_exterior": False,
+            "open_arc_trim_reason": "complete_offshore_arc_owns_model_exterior",
+            "source_open_arc_length_m": float(source_open_arc_xy.length),
+            "delivered_open_arc_length_m": float(source_open_arc_xy.length),
+            "discarded_source_open_arc_length_m": 0.0,
+            "delivered_source_start_position_m": 0.0,
+            "delivered_source_end_position_m": float(source_open_arc_xy.length),
+        }
+    else:
+        delivered_open_arc_xy, trim_report = _normalize_open_arc_to_wet_exterior(
+            source_open_arc_xy,
+            domain,
+            land_boundary,
+            target_resolution_m,
+        )
+    trim_report["obc_placement_policy"] = obc_placement_policy
+    trim_report["obc_placement_family"] = (
+        "complete-offshore" if use_complete_offshore else "compact-mouth-fallback"
+        if obc_placement_policy == "offshore-first" else "compact-mouth"
+    )
+    trim_report["source_open_arc_exterior_overlap_fraction"] = float(source_exterior_overlap)
 
     tolerance = max(2.0, 0.02 * target_resolution_m)
     source_arc_land = source_open_arc_xy.difference(

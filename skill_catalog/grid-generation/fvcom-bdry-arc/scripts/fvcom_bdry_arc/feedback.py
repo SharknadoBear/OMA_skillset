@@ -24,6 +24,28 @@ CLIP_FAILURES = {
 }
 
 
+def evaluate_open_exterior_metrics(
+    unintended_length_m: float,
+    landward_length_m: float,
+    outer_length_m: float,
+    tolerance_m: float,
+) -> dict[str, Any]:
+    """Evaluate the three independent open-exterior hard gates."""
+    fraction = float(unintended_length_m / max(landward_length_m, 1.0))
+    coverage = float(max(0.0, min(1.0, 1.0 - unintended_length_m / max(outer_length_m, 1.0))))
+    absolute_pass = bool(unintended_length_m <= tolerance_m)
+    fraction_pass = bool(fraction <= 0.001)
+    coverage_pass = bool(coverage >= 0.999)
+    return {
+        "unintended_fraction": fraction,
+        "intended_coverage": coverage,
+        "length_gate": absolute_pass,
+        "fraction_gate": fraction_pass,
+        "coverage_gate": coverage_pass,
+        "passed": bool(absolute_pass and fraction_pass and coverage_pass),
+    }
+
+
 def file_sha256(path: str | Path | None) -> str | None:
     if not path:
         return None
@@ -122,12 +144,15 @@ def build_region_bpoly_arc_feedback(
     outer_length_m = float(wet_polygon_xy.exterior.length) if wet_polygon_xy is not None else 0.0
     open_length_m = float(getattr(open_union, "length", 0.0))
     landward_length_m = max(outer_length_m - open_length_m, 1.0)
-    unintended_fraction = float(unintended_length_m / landward_length_m)
-    intended_coverage = float(max(0.0, min(1.0, 1.0 - unintended_length_m / max(outer_length_m, 1.0))))
-    length_gate = unintended_length_m <= tolerance_m
-    fraction_gate = unintended_fraction <= 0.001 or length_gate
-    coverage_gate = intended_coverage >= 0.999 or length_gate
-    diagnostic_pass = bool(length_gate and fraction_gate and coverage_gate)
+    metric_result = evaluate_open_exterior_metrics(
+        unintended_length_m, landward_length_m, outer_length_m, tolerance_m
+    )
+    unintended_fraction = metric_result["unintended_fraction"]
+    intended_coverage = metric_result["intended_coverage"]
+    length_gate = metric_result["length_gate"]
+    fraction_gate = metric_result["fraction_gate"]
+    coverage_gate = metric_result["coverage_gate"]
+    diagnostic_pass = metric_result["passed"]
     gate_enabled = frame_clip_policy == "reject-unintended" and str(
         source_manifest.get("inputs", {}).get("coastline_source", "")
     ) == "gshhs"
@@ -147,6 +172,27 @@ def build_region_bpoly_arc_feedback(
         structural_failures.append("unexpected_open_boundary_count")
     if arc_land_length_m > tolerance_m:
         structural_failures.append("open_boundary_intersects_land")
+    domain_type = str(region.get("domain_type", "")).lower()
+    coastal_single_obc = bool(
+        expected_obc_count == 1
+        and domain_type not in {"lake", "island", "archipelago"}
+        and "obc_placement_policy" in source_manifest.get("settings", {})
+    )
+    if coastal_single_obc:
+        if delivered_obc_count != 1 or len(open_xy) != 1:
+            structural_failures.append("open_boundary_not_one_simple_arc")
+        elif not bool(getattr(open_xy[0], "is_simple", False)):
+            structural_failures.append("open_boundary_self_intersects_or_branches")
+        land_union_for_contract = _load_land_union(coastline_gpkg, projection)
+        land_boundary_for_contract = getattr(land_union_for_contract, "boundary", GeometryCollection())
+        if len(open_xy) == 1 and not land_boundary_for_contract.is_empty:
+            landfall_tolerance_m = max(250.0, 0.25 * target_resolution_m)
+            endpoint_hits = sum(
+                Point(coord).distance(land_boundary_for_contract) <= landfall_tolerance_m
+                for coord in (open_xy[0].coords[0], open_xy[0].coords[-1])
+            )
+            if endpoint_hits != 2:
+                structural_failures.append("open_boundary_requires_exactly_two_coastline_landfalls")
     structural_failures.extend(nonclip_loop_failures)
 
     recommendations = _candidate_recommendations(
@@ -157,7 +203,9 @@ def build_region_bpoly_arc_feedback(
         tolerance_m=tolerance_m,
         candidate_max_km=float(candidate_max_km),
     )
-    if gate_enabled and not diagnostic_pass:
+    if frame_clip_policy == "report-only":
+        status = "input_needs_review"
+    elif not diagnostic_pass:
         status = "adjust_bpoly" if recommendations and not structural_failures else "input_needs_review"
     elif structural_failures:
         status = "input_needs_review"
@@ -257,6 +305,76 @@ def build_region_bpoly_arc_feedback(
     feedback_path = output_dir / "region_bpoly_arc_feedback_v1.json"
     feedback_path.write_text(json.dumps(feedback, indent=2), encoding="utf-8")
     feedback["outputs"]["feedback_json"] = str(feedback_path)
+    feedback_path.write_text(json.dumps(feedback, indent=2), encoding="utf-8")
+
+    placement_family = str(
+        source_manifest.get("wet_domain", {}).get("obc_placement_family")
+        or source_manifest.get("settings", {}).get("obc_placement_policy")
+        or "legacy-unspecified"
+    )
+    contract_path = output_dir / "open_exterior_contract.json"
+    decision_path = output_dir / "open_exterior_agent_decision.json"
+    report_only = frame_clip_policy == "report-only"
+    metric_gate_pass = bool(diagnostic_pass and not structural_failures)
+    contract = {
+        "schema_version": "fvcom_open_exterior_contract_v1",
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "final_status": "needs_review",
+        "downstream_eligible": False,
+        "obc_placement_policy": str(source_manifest.get("settings", {}).get("obc_placement_policy", "offshore-first")),
+        "obc_placement_family": placement_family,
+        "report_only": report_only,
+        "hard_metrics": {
+            "absolute_residual_length_m": unintended_length_m,
+            "absolute_limit_m": tolerance_m,
+            "absolute_gate_pass": length_gate,
+            "residual_fraction": unintended_fraction,
+            "fraction_limit": 0.001,
+            "fraction_gate_pass": fraction_gate,
+            "coastline_plus_obc_exterior_coverage": intended_coverage,
+            "coverage_minimum": 0.999,
+            "coverage_gate_pass": coverage_gate,
+            "all_independent_metric_gates_pass": metric_gate_pass,
+        },
+        "obc_geometry": {
+            "expected_count": int(expected_obc_count),
+            "delivered_count": int(delivered_obc_count),
+            "simple_nonbranching": bool(all(getattr(geom, "is_simple", False) for geom in open_xy)),
+            "nonendpoint_land_crossing_m": arc_land_length_m,
+            "exterior_overlap_fraction": float(loop_manifest.get("qa", {}).get("open_boundary_exterior_overlap_fraction", 0.0) or 0.0),
+        },
+        "residual_components": records,
+        "per_side": side_summaries,
+        "source_hashes": dict(feedback["input_sha256"]),
+        "map": {"path": str(map_path), "sha256": file_sha256(map_path)},
+        "agent_decision": {
+            "required": True,
+            "status": "pending",
+            "path": str(decision_path),
+        },
+        "failure_taxonomy": list(dict.fromkeys(
+            feedback["failure_taxonomy"]
+            + (["diagnostic_only_report_only_policy"] if report_only else [])
+            + (["open_exterior_agent_decision_required"] if metric_gate_pass and not report_only else [])
+        )),
+    }
+    contract_path.write_text(json.dumps(contract, indent=2), encoding="utf-8")
+    pending_decision = {
+        "schema_version": "open_exterior_agent_decision_v1",
+        "status": "pending",
+        "decision_actor": {"kind": "codex_agent"},
+        "assessed_contract_sha256": file_sha256(contract_path),
+        "inspected_map_sha256": file_sha256(map_path),
+        "bound_source_hashes": contract["source_hashes"],
+        "rationale": None,
+    }
+    decision_path.write_text(json.dumps(pending_decision, indent=2), encoding="utf-8")
+    feedback["open_exterior_contract"] = contract
+    feedback["outputs"].update({
+        "open_exterior_contract": str(contract_path),
+        "open_exterior_agent_decision": str(decision_path),
+        "open_exterior_review_map": str(map_path),
+    })
     feedback_path.write_text(json.dumps(feedback, indent=2), encoding="utf-8")
     return feedback
 

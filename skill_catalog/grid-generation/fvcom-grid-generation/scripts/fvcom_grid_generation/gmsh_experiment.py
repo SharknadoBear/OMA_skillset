@@ -1484,6 +1484,24 @@ def check_case_readiness(
     geometry_report: dict[str, Any] | None = None
     bathy_report: dict[str, Any] | None = None
     paths: dict[str, Path] = {"case_manifest": manifest_path}
+    from .open_exterior import validate_open_exterior_contract
+    boundary_doc = manifest.get("boundary") or {}
+    lineage_source = (
+        boundary_doc.get("open_exterior_contract")
+        or boundary_doc.get("resolution_manifest")
+        or boundary_doc.get("model_boundary_loop_manifest")
+    )
+    coastal_required = bool(boundary_doc.get("open_exterior_contract_required", False))
+    if lineage_source:
+        lineage_path = resolve_input_path(lineage_source, workspace)
+        if lineage_path and lineage_path.is_file():
+            open_audit = validate_open_exterior_contract(lineage_path, required=coastal_required)
+            if not open_audit["passed"]:
+                blockers.extend(open_audit["failure_taxonomy"])
+        elif coastal_required:
+            blockers.append("open_exterior_contract_missing")
+    elif coastal_required:
+        blockers.append("open_exterior_contract_missing")
     try:
         _reject_negative_fixture_selection(manifest, workspace)
         if manifest["boundary"]["input_kind"] == "adaptive_v2":

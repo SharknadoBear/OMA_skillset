@@ -21,6 +21,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fvcom_grid_generation.autonomous_thin import sha256_file  # noqa: E402
+from fvcom_grid_generation.open_exterior import validate_open_exterior_contract  # noqa: E402
 
 
 def _utc_now() -> str:
@@ -75,6 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    open_exterior_audit = validate_open_exterior_contract(
+        args.source_boundary_resolution_manifest.resolve(), required=False
+    )
+    if not open_exterior_audit["passed"]:
+        raise ValueError(
+            "autonomous-thin-v1 rejected the upstream open-exterior package: "
+            + ", ".join(open_exterior_audit["failure_taxonomy"])
+        )
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     initial_dir = output / "01_minimal_conditioning"

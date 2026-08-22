@@ -1043,7 +1043,7 @@ def test_region_bpoly_feedback_classifies_landward_clip_and_obc() -> None:
         assert Path(feedback["outputs"]["segments_geojson"]).exists()
 
 
-def test_region_bpoly_feedback_numerical_sliver_passes() -> None:
+def test_region_bpoly_feedback_absolute_sliver_does_not_waive_other_gates() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         region_path = root / "region.json"
@@ -1071,8 +1071,11 @@ def test_region_bpoly_feedback_numerical_sliver_passes() -> None:
             frame_clip_tolerance_m=250.0,
             adaptive_status="pass",
         )
-        assert feedback["diagnostic_status"] == "pass"
-        assert feedback["status"] == "pass"
+        assert feedback["metrics"]["length_gate_pass"] is True
+        assert feedback["metrics"]["fraction_gate_pass"] is False
+        assert feedback["metrics"]["coverage_gate_pass"] is False
+        assert feedback["diagnostic_status"] == "fail"
+        assert feedback["status"] in {"adjust_bpoly", "input_needs_review"}
 
 
 def test_feedback_reader_drops_empty_geometry_placeholders() -> None:
@@ -1150,7 +1153,7 @@ def main() -> int:
     test_v2_feature_anchors_and_junction_spacing()
     test_v2_passage_inventory_harmonizes_or_gates_without_closure()
     test_region_bpoly_feedback_classifies_landward_clip_and_obc()
-    test_region_bpoly_feedback_numerical_sliver_passes()
+    test_region_bpoly_feedback_absolute_sliver_does_not_waive_other_gates()
     test_feedback_reader_drops_empty_geometry_placeholders()
     test_adaptive_failure_after_clip_closure_stops_bbox_adjustment()
     print("fvcom-bdry-arc selftests passed")

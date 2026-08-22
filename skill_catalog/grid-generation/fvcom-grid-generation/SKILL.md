@@ -15,6 +15,7 @@ fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> fvcom-grid-generation
 
 - Reuse upstream domain and boundary artifacts; do not redesign the region here.
 - Prefer an adaptive boundary-resolution manifest when supplied. Otherwise preserve the legacy loop workflow.
+- Revalidate `fvcom_open_exterior_contract_v1` at every coastal entry point. Reject report-only packages, failed independent residual gates, stale/missing Codex map decisions, and `downstream_eligible=false` even when an upstream manifest says `pass`.
 - Keep full bathymetry for final node sampling and bound only the in-memory size-field grid.
 - Build nearshore sizing from the solid-boundary background, bathymetric gradient, and a geometry-derived paired-bank hydraulic skeleton. Detect the skeleton from land and island segments only; never use an open-boundary segment as a bank.
 - Do not consume or generate an external drainage/flow-network package. Infer hydraulic corridors directly from the wet model polygon, solid boundary geometry, and the supplied bathymetry.
@@ -26,6 +27,16 @@ fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> fvcom-grid-generation
 - Keep depths finite and positive down and treat OceanMesh2D GPL material as a method reference only.
 
 ## Primary Workflow
+
+For every new complete grid, initialize the standardized portable project first. Keep attempts under each stage's `_work/`, promote one hash-bound selection to its canonical stage name, and publish any terminal mesh at the stable path `final/fvcom_grid.2dm`. The filename does not imply readiness; future submission must pass `validate --require-submission-ready`.
+
+```powershell
+python scripts/manage_fvcom_grid_project.py init --project runs/my_project --name my_project
+python scripts/manage_fvcom_grid_project.py promote --project runs/my_project --stage 06_raw_mesh --source runs/my_project/06_raw_mesh/_work/gmsh6/raw.2dm --artifact-name raw_mesh.2dm
+python scripts/manage_fvcom_grid_project.py validate --project runs/my_project
+```
+
+See `references/grid_project_contract.md` for the fixed layout, canonical artifacts, publication inputs, and submission gate. Existing lower-level `--run-dir` commands remain supported for historical evidence.
 
 Adaptive package:
 
@@ -209,6 +220,7 @@ Hard anchors and all boundary nodes not explicitly handled by the kind-aware edi
 ## Standalone Tools
 
 - `scripts/run_autonomous_thin_workflow.py`: run or resume the opt-in autonomous workflow. It performs minimal conditioning, produces the hash-bound diagnostic/decision stage, and resumes one selected component through local topology repair or boundary rebuild, Gmsh-6 remeshing, reconditioning, and the three independent closure/readiness decisions. A shoreline decision must bind its request-bounded CUSP extract; the command never pauses for human review.
+- `scripts/manage_fvcom_grid_project.py`: initialize the fixed project tree, promote immutable stage selections, atomically publish terminal delivery artifacts, and validate submission readiness by exact hash.
 - `scripts/diagnose_autonomous_thin.py`: create the whole-domain locator, local mesh/boundary and lineage diagrams, CUSP/GSHHS overlay, scale evidence, and one pending Codex decision per connected superthin component.
 - `scripts/run_autonomous_thin_closure.py`: validate and execute one completed Codex decision. It preflights at most three boundary candidates, retains rejections, preserves protected and OBC lineage, and requires a complete Gmsh-6 remesh after any boundary transaction.
 - `scripts/run_mesher_portfolio_case.py`: build one immutable regional `fvcom_size_field_v4` bundle and generate the clean-room plus Gmsh 1/5/6 `RAW` candidates under one node budget. It writes a metric-by-metric comparison and never claims common conditioning.
@@ -300,6 +312,7 @@ python scripts/selftest_connectivity_restriction.py
 python scripts/selftest_local_topology_v5_extensions.py
 python scripts/selftest_systematic_v6.py
 python scripts/selftest_visual_superthin.py
+python scripts/selftest_grid_project.py
 python -m compileall scripts
 python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .
 ```
