@@ -42,10 +42,16 @@ rechecked its contract, decision, map, lineage, and selected-stage hashes.
 
 The standardized delivery is complete at `final/fvcom_grid.2dm`, even though
 the mesh is intentionally classified `needs_review`, `fvcom_ready=false`, and
-`submission_eligible=false`. Ordinary project validation passes; validation
-with `--require-submission-ready` fails only with
-`project_not_submission_ready`. This demonstrates that the stable filename is
-portable and predictable without implying scientific readiness.
+`submission_eligible=false`. The initial project-layout validator passed and
+submission validation failed with `project_not_submission_ready`.
+
+Post-test diagnosis found that the forward agent had executed the integrated
+clean-room SciPy-Delaunay backend rather than Gmsh Frontal-Delaunay algorithm
+6. The revised operational project contract therefore reclassifies this run
+with `default_mesher_policy_missing_or_invalid` and
+`raw_mesh_provenance_missing`. The artifact remains useful evidence for the
+boundary policy and stable filename, but it is a rejected mesher-routing
+control rather than a valid default-workflow result.
 
 Compact evidence is in `08_audit/final_audit.json` and
 `final/fvcom_grid_status.json`. Remaining failure taxonomy is superthin debt,

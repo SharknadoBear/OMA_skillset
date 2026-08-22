@@ -158,7 +158,7 @@ def test_candidate_normalization_and_capability_routing() -> None:
         "gmsh_delaunay_5": 5,
         "gmsh_frontal_delaunay_6": 6,
     }
-    assert normalize_candidate_ids(None)[0] == DEFAULT_PRIMARY_CANDIDATE
+    assert normalize_candidate_ids(None) == (DEFAULT_PRIMARY_CANDIDATE,)
     _expect_raises(
         ValueError,
         lambda: normalize_candidate_ids(["unknown"]),
@@ -168,7 +168,7 @@ def test_candidate_normalization_and_capability_routing() -> None:
     assert closed["default_raw_candidate"] == DEFAULT_PRIMARY_CANDIDATE
     assert (
         closed["candidates"][DEFAULT_PRIMARY_CANDIDATE]["policy_role"]
-        == "research_default_raw"
+        == "operational_default_raw"
     )
     assert closed["candidates"]["clean_room_raw"]["supported"]
     plural = capability_routing(
@@ -1420,6 +1420,10 @@ def test_real_small_gmsh_candidate_samples_immutable_bathymetry() -> None:
         assert (root / "raw_mesh.msh").is_file()
         assert mesh.generator_report["algorithm"] == 6
         assert mesh.generator_report["algorithm_name"] == "Frontal-Delaunay"
+        assert mesh.generator_report["thread_count"] == 1
+        assert mesh.generator_report["random_seed"] == 1
+        assert mesh.generator_report["native_smoothing_steps"] == 8
+        assert not mesh.generator_report["algorithm_fallback_enabled"]
         assert mesh.generator_report["boundary_node_count_1d"] == 4
         assert mesh.generator_report["boundary_discretization_mode"] == (
             "preserve_source_segments_two_endpoints"

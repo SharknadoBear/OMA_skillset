@@ -106,10 +106,10 @@ DEFAULT_FALLBACK_CANDIDATES = (
     "clean_room_raw",
     "gmsh_meshadapt_1",
 )
-DEFAULT_CANDIDATES = (
-    DEFAULT_PRIMARY_CANDIDATE,
-    *DEFAULT_FALLBACK_CANDIDATES,
-)
+# New operational runs execute one deterministic candidate by default.  The
+# challenger/control candidates remain available only when a caller names
+# them explicitly; a Gmsh-6 failure must not silently change the generator.
+DEFAULT_CANDIDATES = (DEFAULT_PRIMARY_CANDIDATE,)
 GMSH_CANDIDATE_ALGORITHMS: Mapping[str, int] = {
     "gmsh_meshadapt_1": 1,
     "gmsh_delaunay_5": 5,
@@ -1030,17 +1030,16 @@ def capability_routing(prepared: PreparedCase) -> dict[str, Any]:
         "case_open_boundary_count": int(open_count),
         "case_has_cyclic_open_boundary": bool(cyclic),
         "default_raw_candidate": DEFAULT_PRIMARY_CANDIDATE,
-        "fallback_order": list(DEFAULT_FALLBACK_CANDIDATES),
-        "promotion_status": (
-            "research_only_pending_six_case_hard_gate_pass"
-        ),
+        "fallback_order": [],
+        "explicit_research_candidates": list(DEFAULT_FALLBACK_CANDIDATES),
+        "promotion_status": "gmsh_frontal_delaunay_6_operational_default",
         "selection_basis": (
             "topology_complete_primary_then_metric_by_metric_challengers"
         ),
         "candidates": {
             "clean_room_raw": {
                 "supported": clean_supported,
-                "policy_role": "production_reference_when_supported",
+                "policy_role": "explicit_research_control_when_supported",
                 "supports_zero_obc": True,
                 "supports_plural_obc": False,
                 "supports_cyclic_obc": False,
@@ -1050,7 +1049,7 @@ def capability_routing(prepared: PreparedCase) -> dict[str, Any]:
                 candidate: {
                     "supported": True,
                     "policy_role": (
-                        "research_default_raw"
+                        "operational_default_raw"
                         if candidate == DEFAULT_PRIMARY_CANDIDATE
                         else (
                             "delaunay_challenger"
@@ -2566,6 +2565,9 @@ def _run_gmsh_candidate(
             "raw_stage": True,
             "common_conditioning_applied": False,
             "native_smoothing_steps": 8,
+            "thread_count": 1,
+            "random_seed": 1,
+            "algorithm_fallback_enabled": False,
         },
         extra_quality={
             "gmsh_native_quality": _native_quality_report(result),

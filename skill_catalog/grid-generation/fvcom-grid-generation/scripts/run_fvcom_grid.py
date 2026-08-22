@@ -34,6 +34,16 @@ def main() -> int:
     parser.add_argument("--name", required=True)
     parser.add_argument("--mode", choices=("execute", "test"), default="execute")
     parser.add_argument("--coarse-smoke", action="store_true")
+    parser.add_argument(
+        "--allow-clean-room-execute",
+        action="store_true",
+        help=(
+            "Explicit research/control override for a full clean-room "
+            "SciPy-Delaunay execution. New operational grids must use "
+            "run_mesher_portfolio_case.py, whose default is Gmsh "
+            "Frontal-Delaunay algorithm 6."
+        ),
+    )
     parser.add_argument("--land-spacing-m", type=float, default=50.0)
     parser.add_argument("--open-spacing-m", type=float, default=3000.0)
     parser.add_argument("--gradation", type=float, default=0.20)
@@ -215,6 +225,17 @@ def main() -> int:
     parser.add_argument("--postprocess-max-passes", type=int, default=8)
     parser.add_argument("--postprocess-connectivity-limit", default="auto")
     args = parser.parse_args()
+    if (
+        args.mode == "execute"
+        and not args.coarse_smoke
+        and not args.allow_clean_room_execute
+    ):
+        parser.error(
+            "run_fvcom_grid.py is the explicit clean-room control backend. "
+            "For a new operational grid use run_mesher_portfolio_case.py "
+            "without --candidates (Gmsh Frontal-Delaunay algorithm 6 only), "
+            "or pass --allow-clean-room-execute for a documented research control."
+        )
     if args.postprocess_profile != "none":
         parser.error("Integrated cleanup is disabled; run scripts/postprocess_fvcom_mesh.py on the completed .2dm")
     connectivity_limit = (

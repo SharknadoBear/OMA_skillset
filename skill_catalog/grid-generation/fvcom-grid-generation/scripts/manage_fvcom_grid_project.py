@@ -31,6 +31,14 @@ def parser() -> argparse.ArgumentParser:
     promote_p.add_argument("--stage", required=True)
     promote_p.add_argument("--source", required=True, type=Path)
     promote_p.add_argument("--artifact-name", required=True)
+    promote_p.add_argument(
+        "--generator-manifest",
+        type=Path,
+        help=(
+            "Required when promoting raw_mesh.2dm; must be the project-local "
+            "Gmsh Frontal-Delaunay-6 candidate_manifest.json."
+        ),
+    )
     publication = sub.add_parser("publish")
     publication.add_argument("--project", required=True, type=Path)
     publication.add_argument("--mesh", type=Path)
@@ -53,7 +61,13 @@ def main() -> int:
     if args.command == "init":
         result = init_project(args.project, args.name)
     elif args.command == "promote":
-        result = promote(args.project, args.stage, args.source, args.artifact_name)
+        result = promote(
+            args.project,
+            args.stage,
+            args.source,
+            args.artifact_name,
+            generator_manifest=args.generator_manifest,
+        )
     elif args.command == "publish":
         companions = {
             "mesh_quality": args.mesh_quality,

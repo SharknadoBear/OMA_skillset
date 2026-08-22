@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM Grid Generation"
-  short_description: "Generate, condition, and autonomously repair FVCOM grids"
-  default_prompt: "Use $fvcom-grid-generation to generate, minimally condition, autonomously repair residual thin-boundary defects, and fully audit an FVCOM grid."
+  short_description: "Generate and audit Gmsh-6 FVCOM grids"
+  default_prompt: "Use $fvcom-grid-generation to generate a deterministic Gmsh-6 FVCOM grid, minimally condition it, and publish a fully audited project."
