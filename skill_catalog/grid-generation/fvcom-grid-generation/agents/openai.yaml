@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM Grid Generation"
-  short_description: "Compare, generate, and condition adaptive FVCOM meshes"
-  default_prompt: "Use $fvcom-grid-generation to lock one boundary, bathymetry, size-field, and QA contract; make the delivered boundary follow the sampled 2-D size field with a continuous gradated trace while preserving source vertices and lineage; audit boundary/first-ring target continuity; use Gmsh Frontal-Delaunay 6 as the research raw primary with Delaunay 5 and the clean-room reference as routed challengers; generate FVCOM 2DM candidates; and apply only the requested common conditioning."
+  short_description: "Generate, condition, and autonomously repair FVCOM grids"
+  default_prompt: "Use $fvcom-grid-generation to generate, minimally condition, autonomously repair residual thin-boundary defects, and fully audit an FVCOM grid."
