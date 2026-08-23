@@ -43,7 +43,16 @@ def atomic_write_json(path: str | Path, payload: dict[str, Any]) -> None:
         with os.fdopen(handle, "w", encoding="utf-8", newline="\n") as stream:
             json.dump(payload, stream, indent=2, sort_keys=True)
             stream.write("\n")
-        os.replace(temporary, destination)
+        # OneDrive and antivirus indexers can briefly hold the destination open
+        # on Windows. Retry publication without weakening atomicity.
+        for attempt in range(20):
+            try:
+                os.replace(temporary, destination)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == 19:
+                    raise
+                time.sleep(min(0.05 * (attempt + 1), 0.5))
     except Exception:
         try:
             os.unlink(temporary)
@@ -71,13 +80,14 @@ class DownloadStatus:
         self,
         path: str | Path,
         *,
-        connector: str,
-        request_hash: str,
-        total_chunks: int,
-        expected_bytes: int,
-        estimate_seconds: float,
+        connector: str = "cfs-fetcher",
+        request_hash: str = "",
+        total_chunks: int = 0,
+        expected_bytes: int = 0,
+        estimate_seconds: float = 0.0,
         artifacts: dict[str, str] | None = None,
         heartbeat_seconds: float = 15.0,
+        **initial: Any,
     ) -> None:
         self.path = Path(path)
         self._lock = threading.RLock()
@@ -107,6 +117,7 @@ class DownloadStatus:
             "retries": 0,
             "recent_messages": [],
             "artifacts": dict(artifacts or {}),
+            **initial,
         }
         self._write()
         self._thread = threading.Thread(target=self._heartbeat, daemon=True)
@@ -133,9 +144,13 @@ class DownloadStatus:
                     return
                 self._write()
 
-    def start(self) -> None:
+    def start(self, message: str | None = None) -> None:
         with self._lock:
             self.data.update({"state": "running", "started_utc": utc_now()})
+            if message:
+                recent = list(self.data.get("recent_messages", []))
+                recent.append({"utc": utc_now(), "message": safe_message(message)})
+                self.data["recent_messages"] = recent[-12:]
             self._write()
 
     def update(self, **values: Any) -> None:

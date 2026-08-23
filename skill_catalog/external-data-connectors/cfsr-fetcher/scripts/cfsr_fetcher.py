@@ -26,6 +26,31 @@ try:
 except ImportError:
     from download_monitor import DownloadStatus, atomic_write_json, launch_monitor, write_monitor_html
 
+try:
+    from .cfs_grib_core import (
+        SCHEMA_PLAN as ATMOSPHERIC_PLAN_SCHEMA,
+        build_plan as build_atmospheric_plan,
+        execute_request as execute_atmospheric_request,
+        fetch_plan as fetch_atmospheric_plan,
+        health as health_atmospheric,
+        hycom_eligibility,
+        ncei_inventory as inventory_ncei_atmospheric,
+        normalize_request as normalize_atmospheric_request,
+        runtime_preflight,
+    )
+except ImportError:
+    from cfs_grib_core import (
+        SCHEMA_PLAN as ATMOSPHERIC_PLAN_SCHEMA,
+        build_plan as build_atmospheric_plan,
+        execute_request as execute_atmospheric_request,
+        fetch_plan as fetch_atmospheric_plan,
+        health as health_atmospheric,
+        hycom_eligibility,
+        ncei_inventory as inventory_ncei_atmospheric,
+        normalize_request as normalize_atmospheric_request,
+        runtime_preflight,
+    )
+
 
 NCEI_CATALOG = "https://www.ncei.noaa.gov/thredds/catalog/model-cfs_reanl_ts/{yyyymm}/catalog.xml"
 NCEI_FILE = "https://www.ncei.noaa.gov/thredds/fileServer/model-cfs_reanl_ts/{yyyymm}/pressfc.gdas.{yyyymm}.grb2"
@@ -836,14 +861,27 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("--input", type=Path, required=True)
     check.add_argument("--request", type=Path)
     check.add_argument("--output", type=Path)
+    snapshot = sub.add_parser("snapshot")
+    snapshot.add_argument("--request", type=Path, required=True)
+    snapshot.add_argument("--run-dir", type=Path, required=True)
+    snapshot.add_argument("--no-route", action="store_true")
+    snapshot.add_argument("--no-open-monitor", action="store_true")
+    run = sub.add_parser("run")
+    run.add_argument("--request", type=Path, required=True)
+    run.add_argument("--run-dir", type=Path, required=True)
+    run.add_argument("--snapshot", action="store_true")
+    run.add_argument("--no-route", action="store_true")
+    run.add_argument("--no-open-monitor", action="store_true")
+    runtime = sub.add_parser("runtime")
+    runtime.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     if args.command == "inventory":
-        request = normalize_request(json.loads(args.request.read_text(encoding="utf-8-sig")))
+        request = normalize_atmospheric_request(json.loads(args.request.read_text(encoding="utf-8-sig")), "cfsr")
         attempts: list[dict[str, Any]] = []
         result = None
         for provider in request["provider_order"]:
             try:
-                result = ncei_inventory(request) if provider == "ncei" else {"schema_version":"cfsr_inventory_v1","provider":"hycom","note":"HYCOM inventory is established during estimate"}
+                result = inventory_ncei_atmospheric("cfsr", request) if provider == "ncei" else {"schema_version":"cfs_hycom_inventory_v2","model":"cfsr", **hycom_eligibility("cfsr", request["products"])}
                 break
             except Exception as exc:
                 attempts.append({"provider":provider,"error":f"{type(exc).__name__}: {exc}"})
@@ -855,23 +893,43 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2))
     elif args.command == "estimate":
         request_payload = json.loads(args.request.read_text(encoding="utf-8-sig"))
-        plan = build_plan(request_payload, args.run_dir)
+        plan = build_atmospheric_plan("cfsr", request_payload, args.run_dir)
         output = args.output or args.run_dir / "download_plan.json"
         atomic_write_json(output, plan)
-        atomic_write_json(args.run_dir / "request.json", normalize_request(request_payload))
+        atomic_write_json(args.run_dir / "request.json", normalize_atmospheric_request(request_payload, "cfsr"))
         print(json.dumps(plan, indent=2))
     elif args.command == "fetch":
         plan = json.loads(args.plan.read_text(encoding="utf-8-sig"))
-        print(json.dumps(fetch_plan(plan, args.run_dir, output=args.output, open_monitor=not args.no_open_monitor, cleanup_raw=args.cleanup_raw), indent=2))
+        if plan.get("schema_version") == ATMOSPHERIC_PLAN_SCHEMA:
+            result = fetch_atmospheric_plan("cfsr", plan, args.run_dir, output=args.output, open_monitor=not args.no_open_monitor, cleanup_raw=args.cleanup_raw)
+        else:
+            result = fetch_plan(plan, args.run_dir, output=args.output, open_monitor=not args.no_open_monitor, cleanup_raw=args.cleanup_raw)
+        print(json.dumps(result, indent=2))
     elif args.command == "status":
         path = args.run_dir / "download_status.json"
         print(path.read_text(encoding="utf-8-sig") if path.exists() else json.dumps({"state":"not_started"}, indent=2))
     elif args.command == "health":
         request = json.loads(args.request.read_text(encoding="utf-8-sig")) if args.request else None
-        report = health(args.input, request)
+        report = health_atmospheric(args.input, request)
+        if not report.get("checks", {}).get("schema"):
+            report = health(args.input, request)
         if args.output:
             atomic_write_json(args.output, report)
         print(json.dumps(report, indent=2))
+    elif args.command in {"snapshot", "run"}:
+        request_payload = json.loads(args.request.read_text(encoding="utf-8-sig"))
+        result = execute_atmospheric_request(
+            "cfsr", request_payload, args.run_dir, __file__,
+            snapshot=(args.command == "snapshot" or bool(getattr(args, "snapshot", False))),
+            no_route=bool(args.no_route), open_monitor=not args.no_open_monitor,
+        )
+        print(json.dumps(result, indent=2))
+    elif args.command == "runtime":
+        report = runtime_preflight()
+        if args.output:
+            atomic_write_json(args.output, report)
+        print(json.dumps(report, indent=2))
+        return 0 if report["passed"] else 2
     return 0
 
 

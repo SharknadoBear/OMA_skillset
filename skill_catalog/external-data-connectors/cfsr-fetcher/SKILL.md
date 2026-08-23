@@ -1,43 +1,43 @@
 ---
 name: cfsr-fetcher
-description: Inventory, estimate, download, resume, decode, and health-check bounded NCEP Climate Forecast System Reanalysis (CFSR) atmospheric fields from NCEI with a whole-run HYCOM fallback. Use when Codex needs hourly historical CFSR surface pressure, an estimate-first storage gate, resumable monthly GRIB2 acquisition, provider-neutral NetCDF subsets, or an automatic HTML download waitbar.
+description: Inventory, estimate, snapshot, download, resume, decode, route, and health-check bounded NCEP Climate Forecast System Reanalysis atmospheric fields with NCEI full-resolution GRIB2 as the primary source and a whole-request HYCOM fallback. Use when Codex needs hourly CFSR wind, pressure, temperature, humidity, precipitation, heat-flux, stress, or surface-temperature fields from 1979-01-01 through 2011-03-31, including automatic CFSv2 era handoff and cross-era manifests.
 ---
 
 # CFSR Fetcher
 
-Acquire native CFSR fields. Keep FVCOM packaging and model-specific interpolation downstream.
+Acquire native reanalysis fields. Keep interpolation and forcing-file packaging downstream.
 
 ## Required workflow
 
-1. Require `numpy`, `netCDF4`, `requests`, `eccodes`, and a JPEG2000-capable `rasterio/GDAL` build. Use `xarray` only for HYCOM fallback.
-2. Read [references/request_contract.md](references/request_contract.md), then inventory and estimate the bounded request:
+1. Run `python scripts/check_grib_runtime.py --output runtime.json`. If it fails, use an isolated environment with the pinned packages described in [request_contract.md](references/request_contract.md).
+2. Write a bounded `cfs_atmospheric_request_v2`. Use exact UTC hours, 0-360 longitude, and only required products.
+3. Inventory and estimate before transfer:
 
 ```powershell
 python scripts/cfsr_fetcher.py inventory --request request.json --output inventory.json
 python scripts/cfsr_fetcher.py estimate --request request.json --run-dir runs/case --output runs/case/download_plan.json
 ```
 
-3. Do not fetch a blocked plan. Require local free space greater than four times the planned transfer.
-4. Fetch with resume. Runs estimated at ten minutes or longer automatically create and launch a loopback HTML waitbar:
+4. Do not execute a blocked plan. Require free space greater than four times the planned raw transfer.
+5. Use `snapshot` for one exact hour or `run` for routed acquisition. Inspect `health_check.json` before downstream use:
 
 ```powershell
-python scripts/cfsr_fetcher.py fetch --plan runs/case/download_plan.json --run-dir runs/case --resume
+python scripts/cfsr_fetcher.py snapshot --request request.json --run-dir runs/snapshot
+python scripts/cfsr_fetcher.py run --request request.json --run-dir runs/case
 ```
 
-5. Inspect `health_check.json` before using the output.
+## Source and routing rules
 
-## Source rules
+- Prefer full-resolution NCEI CFS Reanalysis time-series GRIB2. Reject `.l.` products and verify requested months against the live catalog.
+- Route dates from 2011-04-01 onward to the adjacent `$cfsv2-fetcher`. Split a crossing request into two native-grid files plus `cfs_family_routing_manifest_v1`; never concatenate different grids.
+- Lock one provider across all products in an era segment. Use HYCOM only when every product has a scientifically exact mapping; never mix providers.
+- Preserve GRIB level, units, interval/PDT, forecast lead, source filename, and checksums. Do not silently change flux signs.
+- Preserve the historical surface-pressure Python functions and v1 plan reader. NCEI pressure is absolute Pa; HYCOM `airprs` is explicitly converted from its 1000 hPa departure.
+- Never store credentials, URL queries, or personal paths in portable requests or examples.
 
-- Prefer NCEI `pressfc.gdas.YYYYMM.grb2` from the CFS Reanalysis Time Series archive. Do not substitute `prmsl` or low-resolution `.l` products.
-- Treat NCEI surface pressure as absolute pressure and validate its GRIB parameter, surface level, units, and plausible range before writing.
-- Use HYCOM `cfsr-sec_{year}_01hr_sfcprs.nc/airprs` only as a whole-run fallback. Convert its 1000 hPa departure with `(airprs + 1000) * 100` Pa.
-- Never mix providers in one output. Record the chosen provider in `source_provider_lock.json`.
-- Preserve native time and spatial coordinates. Crop with the requested native-cell halo; do not interpolate, smooth, or resample.
-- Retain raw downloads and checkpoints unless `--cleanup-raw` is explicitly requested after successful health validation.
+## Packaged resources
 
-## Packaged tools
-
-- `scripts/cfsr_fetcher.py`: inventory, estimate, fetch, status, and health commands.
-- `scripts/download_monitor.py`: atomic status and loopback waitbar support.
-- `scripts/selftest_cfsr_fetcher.py`: offline gate, resume, normalization, and health tests.
-- `references/request_contract.md`: request, output, provider, and monitoring schemas.
+- `scripts/cfs_grib_core.py`: shared NCEI/HYCOM v2 acquisition, routing, canonical writing, and health logic.
+- `scripts/cfsr_fetcher.py`: CFSR entry point and legacy compatibility API.
+- `scripts/download_monitor.py`: atomic status and loopback waitbar, including Windows/OneDrive retry.
+- [references/request_contract.md](references/request_contract.md): schemas, products, era behavior, and acceptance rules.

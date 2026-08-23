@@ -24,6 +24,35 @@ try:
 except ImportError:
     from download_monitor import DownloadStatus, atomic_write_json, launch_monitor, safe_message, write_monitor_html
 
+try:
+    from .cfs_grib_core import (
+        SCHEMA_PLAN as ATMOSPHERIC_PLAN_SCHEMA,
+        ERA_SPLIT,
+        build_plan as build_atmospheric_plan,
+        execute_request as execute_atmospheric_request,
+        fetch_plan as fetch_atmospheric_plan,
+        health as health_atmospheric,
+        hycom_eligibility,
+        ncei_inventory as inventory_ncei_atmospheric,
+        normalize_request as normalize_atmospheric_request,
+        runtime_preflight,
+        legacy_cross_era_warning,
+    )
+except ImportError:
+    from cfs_grib_core import (
+        SCHEMA_PLAN as ATMOSPHERIC_PLAN_SCHEMA,
+        ERA_SPLIT,
+        build_plan as build_atmospheric_plan,
+        execute_request as execute_atmospheric_request,
+        fetch_plan as fetch_atmospheric_plan,
+        health as health_atmospheric,
+        hycom_eligibility,
+        ncei_inventory as inventory_ncei_atmospheric,
+        normalize_request as normalize_atmospheric_request,
+        runtime_preflight,
+        legacy_cross_era_warning,
+    )
+
 
 HYCOM_CFSV2_BASE = "https://tds.hycom.org/thredds/dodsC/datasets/force/ncep_cfsv2/netcdf/"
 URL_PREFIXES = ("cfsv2-sec2", "cfsv2-sec", "cfsv2-sea")
@@ -44,6 +73,15 @@ SUBDATASET_VARIABLES: dict[str, list[str]] = {
 }
 SUBDATASET_ALIASES = {"dlwflx": "dlwsfc"}
 CFSV2_PRESSURE_BASE_HPA = 1000.0
+LEGACY_SUBDATASET_PRODUCTS = {
+    "uv-10m": "wind_10m",
+    "sfcprs": "surface_pressure",
+    "dlwsfc": "downward_longwave_surface_flux",
+    "dswsfc": "downward_shortwave_surface_flux",
+    "strblk": "surface_wind_stress",
+    "precip": "precipitation_rate",
+    "surtmp": "surface_temperature",
+}
 
 
 class Cfsv2FetcherError(RuntimeError):
@@ -783,6 +821,26 @@ def fetch_cfsv2_window(
     destination = Path(output).resolve()
     if destination.exists() and not overwrite:
         return destination
+    start_value, end_value = _parse_utc(start), _parse_utc(end)
+    if start_value < np.datetime64(ERA_SPLIT.replace(tzinfo=None), "ms"):
+        subdataset = normalize_subdataset(subdataset_name)
+        product = LEGACY_SUBDATASET_PRODUCTS.get(subdataset)
+        if product is None:
+            raise Cfsv2FetcherError(f"Legacy {subdataset!r} has no scientifically exact cross-era NCEI mapping; use an explicit v2 product request")
+        routed_run = Path(run_dir).resolve() if run_dir else destination.parent
+        routed = execute_atmospheric_request(
+            "cfsv2",
+            {
+                "start": _request_time_text(start), "end": _request_time_text(end),
+                "products": [product], "bbox": [lon_range[0], lat_range[0], lon_range[1], lat_range[1]],
+                "max_retries": max_retries, "output": destination.name,
+            },
+            routed_run, __file__, snapshot=start_value == end_value, open_monitor=open_monitor,
+        )
+        routed_path = Path(routed["output"])
+        if routed.get("model") == "cfs-family":
+            legacy_cross_era_warning()
+        return routed_path
     request = {
         "start": _request_time_text(start),
         "end": _request_time_text(end),
@@ -859,9 +917,10 @@ def _read_json(path: str | Path) -> dict[str, Any]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    inventory = subparsers.add_parser("inventory", help="Inspect a yearly CFSv2 subdataset")
-    inventory.add_argument("--year", type=int, required=True)
-    inventory.add_argument("--subdataset", required=True, choices=sorted(set(SUBDATASET_VARIABLES) | set(SUBDATASET_ALIASES)))
+    inventory = subparsers.add_parser("inventory", help="Inspect an NCEI v2 request or a legacy HYCOM subdataset")
+    inventory.add_argument("--request")
+    inventory.add_argument("--year", type=int)
+    inventory.add_argument("--subdataset", choices=sorted(set(SUBDATASET_VARIABLES) | set(SUBDATASET_ALIASES)))
     inventory.add_argument("--source-url")
     inventory.add_argument("--output")
     estimate = subparsers.add_parser("estimate", help="Build a timed, hash-bound download plan")
@@ -875,6 +934,7 @@ def build_parser() -> argparse.ArgumentParser:
     fetch.add_argument("--output")
     fetch.add_argument("--no-open-monitor", action="store_true")
     fetch.add_argument("--cleanup-chunks", action="store_true")
+    fetch.add_argument("--cleanup-raw", action="store_true")
     window = subparsers.add_parser("window", help="Deprecated alias: estimate and fetch a bounded window")
     window.add_argument("--start", required=True)
     window.add_argument("--end", required=True)
@@ -899,27 +959,54 @@ def build_parser() -> argparse.ArgumentParser:
     pressure = subparsers.add_parser("pressure-to-pa", help="Convert CFSv2 pressure departure to absolute Pa")
     pressure.add_argument("--value", type=float, required=True)
     pressure.add_argument("--units", default="hPa", choices=("hPa", "Pa"))
+    snapshot = subparsers.add_parser("snapshot", help="Fetch one exact UTC NCEI/HYCOM snapshot through the v2 contract")
+    snapshot.add_argument("--request", required=True)
+    snapshot.add_argument("--run-dir", required=True)
+    snapshot.add_argument("--no-route", action="store_true")
+    snapshot.add_argument("--no-open-monitor", action="store_true")
+    run = subparsers.add_parser("run", help="Route, estimate, fetch, and validate a v2 request")
+    run.add_argument("--request", required=True)
+    run.add_argument("--run-dir", required=True)
+    run.add_argument("--snapshot", action="store_true")
+    run.add_argument("--no-route", action="store_true")
+    run.add_argument("--no-open-monitor", action="store_true")
+    runtime = subparsers.add_parser("runtime", help="Emit a machine-readable GRIB runtime preflight")
+    runtime.add_argument("--output")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "inventory":
-        payload = inventory_cfsv2(args.year, args.subdataset, source_url=args.source_url)
+        if args.request:
+            request = normalize_atmospheric_request(_read_json(args.request), "cfsv2")
+            if request["provider"] == "hycom":
+                payload = {"schema_version": "cfs_hycom_inventory_v2", "model": "cfsv2", **hycom_eligibility("cfsv2", request["products"])}
+            else:
+                payload = inventory_ncei_atmospheric("cfsv2", request)
+        else:
+            if args.year is None or args.subdataset is None:
+                raise ValueError("inventory requires --request, or both --year and --subdataset")
+            payload = inventory_cfsv2(args.year, args.subdataset, source_url=args.source_url)
         if args.output:
             atomic_write_json(args.output, payload)
         print(json.dumps(payload, indent=2))
         return 0
     if args.command == "estimate":
-        payload = build_cfsv2_plan(_read_json(args.request), run_dir=args.run_dir, probe_repeats=args.probe_repeats)
+        request_payload = _read_json(args.request)
+        if request_payload.get("schema_version") == "cfs_atmospheric_request_v2" or "products" in request_payload or "product" in request_payload:
+            payload = build_atmospheric_plan("cfsv2", request_payload, args.run_dir)
+        else:
+            payload = build_cfsv2_plan(request_payload, run_dir=args.run_dir, probe_repeats=args.probe_repeats)
         atomic_write_json(args.output, payload)
         print(json.dumps(payload, indent=2))
         return 0
     if args.command == "fetch":
-        payload = fetch_cfsv2_plan(
-            _read_json(args.plan), run_dir=args.run_dir, output=args.output,
-            open_monitor=not args.no_open_monitor, cleanup_chunks=args.cleanup_chunks,
-        )
+        plan = _read_json(args.plan)
+        if plan.get("schema_version") == ATMOSPHERIC_PLAN_SCHEMA:
+            payload = fetch_atmospheric_plan("cfsv2", plan, args.run_dir, output=args.output, open_monitor=not args.no_open_monitor, cleanup_raw=args.cleanup_raw)
+        else:
+            payload = fetch_cfsv2_plan(plan, run_dir=args.run_dir, output=args.output, open_monitor=not args.no_open_monitor, cleanup_chunks=args.cleanup_chunks)
         print(json.dumps(payload, indent=2))
         return 0
     if args.command == "window":
@@ -937,10 +1024,24 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "health":
         request = _read_json(args.request) if args.request else None
-        payload = health_cfsv2(args.input, request)
+        payload = health_atmospheric(args.input, request) if request and ("products" in request or request.get("schema_version") == "cfs_atmospheric_request_v2") else health_cfsv2(args.input, request)
         atomic_write_json(args.output, payload)
         print(json.dumps(payload, indent=2))
         return 0
+    if args.command in {"snapshot", "run"}:
+        payload = execute_atmospheric_request(
+            "cfsv2", _read_json(args.request), args.run_dir, __file__,
+            snapshot=(args.command == "snapshot" or bool(getattr(args, "snapshot", False))),
+            no_route=bool(args.no_route), open_monitor=not args.no_open_monitor,
+        )
+        print(json.dumps(payload, indent=2))
+        return 0
+    if args.command == "runtime":
+        payload = runtime_preflight()
+        if args.output:
+            atomic_write_json(args.output, payload)
+        print(json.dumps(payload, indent=2))
+        return 0 if payload["passed"] else 2
     value = float(cfsv2_airprs_to_absolute_pa([args.value], source_units=args.units)[0])
     print(json.dumps({"airprs_departure": args.value, "source_units": args.units, "absolute_pressure_pa": value}, indent=2))
     return 0

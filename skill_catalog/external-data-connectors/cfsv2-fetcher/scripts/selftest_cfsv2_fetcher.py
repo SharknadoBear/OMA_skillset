@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import xarray as xr
@@ -125,6 +126,18 @@ class Cfsv2FetcherTests(unittest.TestCase):
         )
         with xr.open_dataset(annual, decode_times=False) as dataset:
             self.assertEqual(dataset.sizes["MT"], 8784)
+
+    def test_legacy_wrong_era_delegates_to_v2_router(self) -> None:
+        routed_output = self.root / "cfsr.nc"
+        routed_output.touch()
+        with patch("cfsv2_fetcher.execute_atmospheric_request", return_value={"model": "cfsr", "output": str(routed_output)} ) as execute:
+            result = fetch_cfsv2_window(
+                "2008-01-01T00:00:00Z", "2008-01-01T00:00:00Z", "sfcprs",
+                lon_range=(283.0, 283.3), lat_range=(38.0, 38.3),
+                output=self.root / "legacy.nc", run_dir=self.root / "routed", open_monitor=False,
+            )
+        self.assertEqual(result, routed_output)
+        self.assertEqual(execute.call_args.args[1]["products"], ["surface_pressure"])
 
     def test_gate_stale_plan_and_coverage(self) -> None:
         self.assertEqual(_plan_gate(1, 100, 599)["state"], "ready")

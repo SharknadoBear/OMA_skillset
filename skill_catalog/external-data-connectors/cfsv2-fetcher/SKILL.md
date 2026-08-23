@@ -1,48 +1,43 @@
 ---
 name: cfsv2-fetcher
-description: Inventory, estimate, download, resume, and health-check bounded NCEP CFSv2 atmospheric fields from HYCOM THREDDS/OPeNDAP. Use when Codex needs native CFSv2 wind, pressure, heat-flux, freshwater, or surface-temperature subsets with mandatory timed/storage planning and automatic HTML waitbar monitoring for downloads potentially lasting ten minutes or longer.
+description: Inventory, estimate, snapshot, download, resume, decode, route, and health-check bounded NCEP CFSv2 atmospheric fields with NCEI full-resolution GRIB2 as the primary source and a whole-request HYCOM fallback. Use when Codex needs hourly CFSv2 wind, pressure, temperature, humidity, precipitation, heat-flux, stress, or surface-temperature fields from 2011-04-01 onward, including automatic CFSR era handoff and cross-era manifests.
 ---
 
 # CFSv2 Fetcher
 
-Use this skill to acquire native atmospheric fields. Keep interpolation, derived fluxes, and FVCOM packaging downstream.
+Acquire native atmospheric fields. Keep interpolation and forcing-file packaging downstream.
 
 ## Required workflow
 
-1. Verify `numpy`, `xarray`, and `netCDF4` are importable. If not, notify Bear with environment-specific installation guidance.
-2. Inventory the requested year and subdataset:
+1. Run `python scripts/check_grib_runtime.py --output runtime.json`. If it fails, use an isolated environment with the pinned packages described in [request_contract.md](references/request_contract.md).
+2. Write a bounded `cfs_atmospheric_request_v2`. Use exact UTC hours, 0-360 longitude, and only required products.
+3. Inventory and estimate before transfer:
 
 ```powershell
-python scripts/cfsv2_fetcher.py inventory --year 2019 --subdataset uv-10m --output runs/case/inventory.json
-```
-
-3. Read [references/request_contract.md](references/request_contract.md), write a bounded request, and run the mandatory estimate gate:
-
-```powershell
+python scripts/cfsv2_fetcher.py inventory --request request.json --output inventory.json
 python scripts/cfsv2_fetcher.py estimate --request request.json --run-dir runs/case --output runs/case/download_plan.json
 ```
 
-4. Do not fetch a blocked plan. Use Kestrel when local free space is not greater than four times the selected data size.
-5. Execute the plan. Runs conservatively estimated at 600 seconds or longer automatically open the loopback waitbar:
+4. Do not execute a blocked plan. Require free space greater than four times the planned raw transfer.
+5. Use `snapshot` for one exact hour or `run` for routed acquisition. Inspect `health_check.json` before downstream use:
 
 ```powershell
-python scripts/cfsv2_fetcher.py fetch --plan runs/case/download_plan.json --run-dir runs/case --output runs/case/wind.nc
+python scripts/cfsv2_fetcher.py snapshot --request request.json --run-dir runs/snapshot
+python scripts/cfsv2_fetcher.py run --request request.json --run-dir runs/case
 ```
 
-6. Inspect `health_check.json` before downstream transformation.
+## Source and routing rules
 
-## Source and compatibility rules
+- Prefer full-resolution NCEI CFSv2 analysis time-series GRIB2. Reject `.l.` products and discover live month coverage instead of hardcoding an upper date.
+- Route dates before 2011-04-01 to the adjacent `$cfsr-fetcher`. Split a crossing request into two native-grid files plus `cfs_family_routing_manifest_v1`; never concatenate different grids.
+- Lock one provider across all products in an era segment. Use HYCOM only when every product has a scientifically exact mapping; never mix providers.
+- Preserve GRIB level, units, interval/PDT, forecast lead, source filename, and checksums. Do not silently change flux signs.
+- Keep `fetch_cfsv2_window`, `fetch_cfsv2_year`, `fetch_wind_year`, `fetch_pressure_year`, legacy subdatasets, and `window`. Treat `wndspd` and `TaqaQrQp` as deprecated HYCOM-only compatibility paths.
+- Never store credentials, URL queries, or personal paths in portable requests or examples.
 
-- Use official HYCOM CFSv2 yearly sources. Keep downloads bounded by UTC time, native bbox, subdataset, and variables.
-- Use canonical subdataset `dlwsfc`; accept `dlwflx` only as its compatibility alias.
-- Treat `airprs` as a departure from 1000 hPa. Use `cfsv2_airprs_to_absolute_pa` for explicit absolute-pressure conversion.
-- Preserve `fetch_cfsv2_window`, `fetch_cfsv2_year`, `fetch_wind_year`, and `fetch_pressure_year`; they invoke the estimate gate automatically.
-- Retain `window` as a deprecated CLI alias. Do not add model-specific regridding or forcing-file creation.
-- Never place credentials, URL queries, personal paths, or field values in plans, monitor artifacts, or examples.
+## Packaged resources
 
-## Packaged tools
-
-- `scripts/cfsv2_fetcher.py`: inventory, estimate, fetch, window, health, and pressure conversion.
-- `scripts/download_monitor.py`: atomic status and localhost waitbar protocol.
-- `scripts/estimate_data_request.py` and `scripts/check_download_health.py`: standard connector hooks.
-- `scripts/selftest_cfsv2_fetcher.py`: offline compatibility and gate tests.
+- `scripts/cfs_grib_core.py`: shared NCEI/HYCOM v2 acquisition, routing, canonical writing, and health logic.
+- `scripts/cfsv2_fetcher.py`: CFSv2 entry point and legacy compatibility API.
+- `scripts/download_monitor.py`: atomic status and loopback waitbar, including Windows/OneDrive retry.
+- [references/request_contract.md](references/request_contract.md): schemas, products, era behavior, and acceptance rules.
