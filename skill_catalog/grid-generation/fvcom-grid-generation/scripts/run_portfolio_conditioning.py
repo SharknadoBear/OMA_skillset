@@ -23,6 +23,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bathymetry-nc", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--name")
+    parser.add_argument(
+        "--conditioning-profile",
+        choices=(
+            "auto",
+            "minimal-topology-v1",
+            "guarded-v1",
+            "aggressive-local-v2",
+            "none",
+        ),
+        default="auto",
+    )
+    parser.add_argument("--boundary-contract-json", type=Path)
+    parser.add_argument("--source-boundary-metadata-json", type=Path)
+    parser.add_argument(
+        "--scientific-input-status",
+        choices=("valid", "invalid"),
+        default="valid",
+    )
+    parser.add_argument("--scientific-input-note")
+    parser.add_argument("--wall-time-s", type=float, default=3_600.0)
     parser.add_argument("--primary-rounds", type=int, default=4)
     parser.add_argument("--terminal-rounds", type=int, default=1)
     parser.add_argument("--max-prunes-per-round", type=int, default=500)
@@ -63,7 +83,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    boundary_contract = (
+        json.loads(args.boundary_contract_json.read_text(encoding="utf-8"))
+        if args.boundary_contract_json is not None
+        else None
+    )
+    source_boundary_metadata = (
+        json.loads(
+            args.source_boundary_metadata_json.read_text(encoding="utf-8")
+        )
+        if args.source_boundary_metadata_json is not None
+        else None
+    )
     config = PortfolioConditioningConfig(
+        conditioning_profile=str(args.conditioning_profile),
         primary_rounds=int(args.primary_rounds),
         terminal_rounds=int(args.terminal_rounds),
         max_prunes_per_round=int(args.max_prunes_per_round),
@@ -87,6 +120,7 @@ def main() -> int:
         area_transition_target_gradient_threshold=float(
             args.area_transition_target_gradient_threshold
         ),
+        wall_time_s=float(args.wall_time_s),
     )
     try:
         report = condition_portfolio_mesh(
@@ -96,6 +130,12 @@ def main() -> int:
             args.output_dir,
             name=args.name,
             config=config,
+            boundary_contract=boundary_contract,
+            source_boundary_metadata=source_boundary_metadata,
+            scientific_input_valid=(
+                str(args.scientific_input_status) == "valid"
+            ),
+            scientific_input_note=args.scientific_input_note,
         )
     except Exception as exc:
         print(
@@ -120,6 +160,10 @@ def main() -> int:
                     "conditioning_report_json"
                 ],
                 "quality_accepted": report["quality_accepted"],
+                "minimal_local_debt_closed": report[
+                    "minimal_local_debt_closed"
+                ],
+                "fvcom_ready": report["fvcom_ready"],
                 "quality_failure_taxonomy": report[
                     "quality_failure_taxonomy"
                 ],

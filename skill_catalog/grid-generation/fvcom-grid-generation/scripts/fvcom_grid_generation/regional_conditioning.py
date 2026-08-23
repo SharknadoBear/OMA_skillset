@@ -1052,7 +1052,11 @@ def _spring_shape_force(
         for tri in tris[np.where(affected)[0]]:
             ids = np.asarray(tri, dtype=int)
             coords = points[ids]
-            area2 = float(np.cross(coords[1] - coords[0], coords[2] - coords[0]))
+            first = coords[1] - coords[0]
+            second = coords[2] - coords[0]
+            area2 = float(
+                first[0] * second[1] - first[1] * second[0]
+            )
             area = 0.5 * area2
             if area <= 0.0:
                 continue

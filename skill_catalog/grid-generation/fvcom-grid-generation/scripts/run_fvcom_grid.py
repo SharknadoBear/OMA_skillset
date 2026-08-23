@@ -176,9 +176,23 @@ def main() -> int:
     parser.add_argument("--area-transition-target-gradient-threshold", type=float, default=0.10)
     parser.add_argument(
         "--conditioning-profile",
-        choices=("auto", "guarded-v1", "aggressive-local-v2", "none"),
+        choices=(
+            "auto",
+            "minimal-topology-v1",
+            "guarded-v1",
+            "aggressive-local-v2",
+            "none",
+        ),
         default="auto",
-        help="Auto selects aggressive-local-v2 for adaptive boundary packages and guarded-v1 for legacy grids.",
+        help=(
+            "Auto selects minimal-topology-v1. Explicit legacy profiles "
+            "retain their existing spring/thin/area behavior."
+        ),
+    )
+    parser.add_argument(
+        "--minimal-conditioning-wall-time-s",
+        type=float,
+        default=3_600.0,
     )
     parser.add_argument("--aggressive-conditioning-rounds", type=int, default=4)
     parser.add_argument(
@@ -286,6 +300,9 @@ def main() -> int:
             area_transition_area_change_threshold=args.area_transition_area_change_threshold,
             area_transition_target_gradient_threshold=args.area_transition_target_gradient_threshold,
             conditioning_profile=args.conditioning_profile,
+            minimal_conditioning_wall_time_s=(
+                args.minimal_conditioning_wall_time_s
+            ),
             aggressive_conditioning_rounds=args.aggressive_conditioning_rounds,
             aggressive_boundary_edit_policy=args.aggressive_boundary_edit_policy,
             aggressive_max_prunes_per_round=args.aggressive_max_prunes_per_round,

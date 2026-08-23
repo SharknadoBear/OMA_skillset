@@ -25,6 +25,8 @@ from .regional_conditioning import SpringRelaxConfig, _edge_flip_candidate, rela
 @dataclass(frozen=True)
 class AggressiveConditioningConfig:
     enabled: bool = True
+    profile_name: str = "aggressive-local-v2"
+    stage_order: str = "thin-before-valence"
     enable_pruning: bool = True
     enable_thin_repair: bool = True
     enable_valence_repair: bool = True
@@ -190,6 +192,13 @@ def condition_mesh_aggressive(
 ) -> LocalTopologyResult:
     """Apply target-aware pruning, aggressive thin repair, and hard valence repair."""
     config = config or AggressiveConditioningConfig()
+    if str(config.stage_order) not in {
+        "thin-before-valence",
+        "valence-before-thin",
+    }:
+        raise ValueError(
+            "stage_order must be thin-before-valence or valence-before-thin"
+        )
     if str(config.thin_repair_profile) not in {
         "guarded-v1",
         "systematic-v2",
@@ -257,28 +266,75 @@ def condition_mesh_aggressive(
     rounds: list[dict[str, Any]] = []
     if config.enabled:
         for round_index in range(max(0, int(config.max_rounds))):
+            if _deadline_reached(config):
+                break
             before_round = _summary(state, config)
             prune = (
                 _prune_redundant_vertices(state, config, initial_components)
                 if config.enable_pruning and int(config.max_prunes_per_round) > 0
                 else _disabled_stage(state, config, "pruning_disabled")
             )
-            thin = (
-                _repair_superthin(state, config, initial_components)
-                if config.enable_thin_repair and _thin_budget(config) > 0
-                else _disabled_stage(state, config, "thin_repair_disabled")
-            )
-            valence, post_valence_thin, compound = _repair_valence_thin_atomic(
-                state,
-                config,
-                initial_components,
-            )
+            if str(config.stage_order) == "valence-before-thin":
+                valence, post_valence_thin, compound = (
+                    _repair_valence_thin_atomic(
+                        state,
+                        config,
+                        initial_components,
+                    )
+                )
+                thin = (
+                    _repair_superthin(state, config, initial_components)
+                    if config.enable_thin_repair and _thin_budget(config) > 0
+                    else _disabled_stage(state, config, "thin_repair_disabled")
+                )
+                (
+                    terminal_valence,
+                    terminal_post_valence_thin,
+                    terminal_compound,
+                ) = _repair_valence_thin_atomic(
+                    state,
+                    config,
+                    initial_components,
+                )
+            else:
+                thin = (
+                    _repair_superthin(state, config, initial_components)
+                    if config.enable_thin_repair and _thin_budget(config) > 0
+                    else _disabled_stage(state, config, "thin_repair_disabled")
+                )
+                valence, post_valence_thin, compound = (
+                    _repair_valence_thin_atomic(
+                        state,
+                        config,
+                        initial_components,
+                    )
+                )
+                terminal_valence = _disabled_stage(
+                    state,
+                    config,
+                    "terminal_valence_scan_not_selected",
+                )
+                terminal_post_valence_thin = _disabled_stage(
+                    state,
+                    config,
+                    "terminal_valence_scan_not_selected",
+                )
+                terminal_compound = {
+                    "attempted": False,
+                    "accepted": True,
+                    "rolled_back": False,
+                    "rejected_gates": [],
+                    "before": _summary(state, config),
+                    "after": _summary(state, config),
+                }
             after_round = _summary(state, config)
             operations = int(
                 prune["accepted"]
                 + thin["accepted"]
                 + valence["accepted"]
                 + post_valence_thin["accepted"]
+                + terminal_valence["accepted"]
+                + terminal_post_valence_thin["accepted"]
             )
             rounds.append(
                 {
@@ -289,6 +345,13 @@ def condition_mesh_aggressive(
                     "high_valence_repair": valence,
                     "post_valence_thin_repair": post_valence_thin,
                     "valence_thin_atomic_transaction": compound,
+                    "terminal_high_valence_repair": terminal_valence,
+                    "terminal_post_valence_thin_repair": (
+                        terminal_post_valence_thin
+                    ),
+                    "terminal_valence_thin_atomic_transaction": (
+                        terminal_compound
+                    ),
                     "after": after_round,
                     "accepted_operation_count": operations,
                 }
@@ -305,14 +368,22 @@ def condition_mesh_aggressive(
     )
     hard_gate = bool(final["count_valence_above_limit"] == 0)
     superthin_gate = bool(final["superthin_triangle_count"] == 0)
+    minimal_local_debt_closed = bool(
+        final_invariants_ok
+        and hard_gate
+        and superthin_gate
+        and int(final["restricted_edge_violation_count"]) == 0
+    )
     report = {
         "schema_version": "fvcom_aggressive_local_conditioning_v2",
-        "profile": "aggressive-local-v2",
+        "profile": str(config.profile_name),
         "settings": asdict(config),
         "accepted": bool(final_invariants_ok),
         "fvcom_valence_gate_passed": hard_gate,
         "superthin_gate_passed": superthin_gate,
-        "terminal_topology_gate_passed": bool(hard_gate and superthin_gate),
+        "minimal_local_debt_closed": minimal_local_debt_closed,
+        "terminal_topology_gate_passed": minimal_local_debt_closed,
+        "deadline_reached": bool(_deadline_reached(config)),
         "before": initial,
         "after": final,
         "rounds": rounds,
@@ -4429,7 +4500,9 @@ def _delaunay_edge_is_illegal(
     pb = np.asarray(points[int(b)], dtype=float)
     pc = np.asarray(points[int(c)], dtype=float)
     pd = np.asarray(points[int(d)], dtype=float)
-    orient = float(np.cross(pb - pa, pc - pa))
+    ab = pb - pa
+    ac = pc - pa
+    orient = float(ab[0] * ac[1] - ab[1] * ac[0])
     if abs(orient) <= 1.0e-20:
         return False
     shifted = np.vstack([pa - pd, pb - pd, pc - pd])
@@ -6418,7 +6491,16 @@ def _remove_boundary_vertex(state: _State, node: int, config: AggressiveConditio
     replacement = _triangulate_ring_greedy(state.points, fan, None, int(config.max_valence))
     if replacement is None:
         return False
-    area_change = 0.5 * abs(float(np.cross(state.points[node] - state.points[previous], state.points[following] - state.points[previous])))
+    previous_to_node = state.points[node] - state.points[previous]
+    previous_to_following = (
+        state.points[following] - state.points[previous]
+    )
+    area_change = 0.5 * abs(
+        float(
+            previous_to_node[0] * previous_to_following[1]
+            - previous_to_node[1] * previous_to_following[0]
+        )
+    )
     if (
         state.cumulative_boundary_area_change_m2 + area_change
         > float(config.maximum_domain_area_change_fraction) * max(_mesh_area(state.points, state.triangles), 1.0e-30)

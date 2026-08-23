@@ -7,9 +7,9 @@ same policy can be applied to meshes produced by unrelated generators without
 requiring generator-specific boundary-node metadata.
 
 SMS 2DM ``NS`` records preserve ordered nodestrings and integer identifiers but
-do not encode whether a nodestring is cyclic.  This module therefore supports
-ordered, non-cyclic open-boundary arcs only.  It records cyclicity as unknown
-and rejects an explicitly repeated first/last OBC node instead of guessing.
+do not encode whether a nodestring is cyclic.  Accept an optional external
+boundary contract to retain that fact as a sidecar, and never infer cyclicity
+from the 2DM alone.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 from pathlib import Path
+import time
 from typing import Any, Callable, Iterable
 
 import numpy as np
@@ -25,6 +26,7 @@ from scipy.interpolate import RegularGridInterpolator
 import xarray as xr
 
 from .bathymetry import load_bathymetry
+from .edge_size_audit import audit_edge_target_sizes
 from .local_topology import (
     AggressiveConditioningConfig,
     LocalTopologyResult,
@@ -61,6 +63,7 @@ class UnsupportedCyclicOpenBoundaryError(ValueError):
 class PortfolioConditioningConfig:
     """One fixed, bounded policy shared by every generator candidate."""
 
+    conditioning_profile: str = "auto"
     primary_rounds: int = 4
     terminal_rounds: int = 1
     max_prunes_per_round: int = 500
@@ -72,13 +75,24 @@ class PortfolioConditioningConfig:
     area_transition_max_patches: int = 12
     area_transition_raw_threshold: float = 0.50
     area_transition_target_gradient_threshold: float = 0.10
+    wall_time_s: float = 3_600.0
 
     def validate(self) -> None:
+        if str(self.conditioning_profile) not in {
+            "auto",
+            "minimal-topology-v1",
+            "guarded-v1",
+            "aggressive-local-v2",
+            "none",
+        }:
+            raise ValueError(
+                "conditioning_profile must be auto, minimal-topology-v1, "
+                "guarded-v1, aggressive-local-v2, or none"
+            )
         integer_positive = {
             "primary_rounds": self.primary_rounds,
             "terminal_rounds": self.terminal_rounds,
             "max_valence_flip_batch": self.max_valence_flip_batch,
-            "micro_relax_cycles": self.micro_relax_cycles,
         }
         for name, value in integer_positive.items():
             if int(value) <= 0:
@@ -93,6 +107,7 @@ class PortfolioConditioningConfig:
                 self.max_valence_l_over_h_count_increase
             ),
             "area_transition_max_patches": self.area_transition_max_patches,
+            "micro_relax_cycles": self.micro_relax_cycles,
         }
         for name, value in integer_nonnegative.items():
             if int(value) < 0:
@@ -103,6 +118,8 @@ class PortfolioConditioningConfig:
             raise ValueError(
                 "area_transition_target_gradient_threshold must be nonnegative"
             )
+        if float(self.wall_time_s) <= 0.0:
+            raise ValueError("wall_time_s must be positive")
 
 
 @dataclass
@@ -209,6 +226,10 @@ def condition_portfolio_mesh(
     *,
     name: str | None = None,
     config: PortfolioConditioningConfig | None = None,
+    boundary_contract: dict[str, Any] | None = None,
+    source_boundary_metadata: dict[str, Any] | None = None,
+    scientific_input_valid: bool = True,
+    scientific_input_note: str | None = None,
 ) -> dict[str, Any]:
     """Condition one raw 2DM under the common portfolio policy.
 
@@ -219,6 +240,11 @@ def condition_portfolio_mesh(
 
     policy = config or PortfolioConditioningConfig()
     policy.validate()
+    effective_profile = (
+        "minimal-topology-v1"
+        if str(policy.conditioning_profile) == "auto"
+        else str(policy.conditioning_profile)
+    )
     mesh_path = Path(mesh_path).resolve()
     size_path = Path(size_field_nc).resolve()
     bathy_path = Path(bathymetry_nc).resolve()
@@ -234,7 +260,15 @@ def condition_portfolio_mesh(
     raw_mesh = read_2dm(mesh_path)
     _validate_mesh_arrays(raw_mesh)
     raw_obc_chains, raw_obc_ids = _input_open_boundaries(raw_mesh)
-    cyclicity = _cyclicity_contract(raw_obc_chains, raw_obc_ids)
+    cyclicity = _cyclicity_contract(
+        raw_obc_chains,
+        raw_obc_ids,
+        boundary_contract,
+    )
+    open_boundary_cyclic = [
+        bool(item["cyclic"])
+        for item in cyclicity["chains"]
+    ]
 
     projection = local_utm_projection(_bbox(raw_mesh.nodes_lonlat))
     raw_points = project_points(raw_mesh.nodes_lonlat, projection)
@@ -280,6 +314,7 @@ def condition_portfolio_mesh(
         raw_boundary_chains,
         raw_obc_chains,
         raw_obc_ids,
+        open_boundary_cyclic,
         target_sampler_xy,
     )
     if not raw_audit["core_passed"]:
@@ -288,6 +323,41 @@ def condition_portfolio_mesh(
             "conditioning: "
             + ", ".join(raw_audit["core_failures"])
         )
+    raw_depths = bathymetry.sample(raw_mesh.nodes_lonlat)
+    raw_triangle_targets = _triangle_targets(
+        raw_points,
+        raw_triangles,
+        target_sampler_xy,
+    )
+    raw_quality = evaluate_mesh_quality(
+        raw_points,
+        raw_depths,
+        raw_mesh.triangles,
+        raw_mesh.open_boundary_nodes,
+        {
+            "boundary_constraint_recovered": bool(
+                raw_audit["boundary_edge_set_exact"]
+            ),
+            "source": "raw_2dm_preconditioning_audit",
+        },
+        constraint_chains=raw_boundary_chains,
+        open_boundary_chains=[
+            np.asarray(chain, dtype=int).tolist()
+            for chain in raw_mesh.open_boundary_chains
+        ],
+        open_boundary_cyclic=open_boundary_cyclic,
+        require_open_boundary=bool(raw_obc_chains),
+        expected_open_boundary_count=len(raw_obc_chains),
+        enforce_size_error=True,
+        enforce_no_unused_nodes=True,
+        target_size_by_triangle=raw_triangle_targets,
+    )
+    raw_edge_size = _edge_size_continuity_audit(
+        raw_points,
+        raw_triangles,
+        raw_boundary_chains,
+        target_sampler_xy,
+    )
 
     primary_result = condition_mesh_aggressive(
         raw_state.points,
@@ -302,7 +372,10 @@ def condition_portfolio_mesh(
         boundary_kinds=raw_state.boundary_kinds,
         hard_anchor_mask=raw_state.hard,
         target_spacing_sampler=target_sampler_xy,
-        config=_primary_topology_config(policy),
+        config=_primary_topology_config(
+            policy,
+            effective_profile=effective_profile,
+        ),
     )
     primary_candidate = _state_from_result(primary_result)
     primary_audit = _global_structural_audit(
@@ -311,67 +384,123 @@ def condition_portfolio_mesh(
         raw_boundary_chains,
         raw_obc_chains,
         raw_obc_ids,
+        open_boundary_cyclic,
         target_sampler_xy,
     )
-    primary_regressions = _stage_regressions(raw_audit, primary_audit)
+    primary_regressions = _stage_regressions(
+        raw_audit,
+        primary_audit,
+        minimal_policy=(effective_profile == "minimal-topology-v1"),
+    )
+    primary_report_only_deltas = (
+        _minimal_report_only_deltas(raw_audit, primary_audit)
+        if effective_profile == "minimal-topology-v1"
+        else {}
+    )
     primary_rollback = bool(primary_regressions)
     state = raw_state.clone() if primary_rollback else primary_candidate
     accepted_primary_audit = raw_audit if primary_rollback else primary_audit
 
     pre_area_state = state.clone()
     pre_area_audit = accepted_primary_audit
-    area_result = relax_mesh_area_transitions(
-        state.points,
-        state.triangles,
-        state.fixed,
-        target_spacing_sampler=target_sampler_xy,
-        constraint_chains=state.constraint_chains,
-        open_boundary_nodes_zero_based=np.empty(0, dtype=int),
-        config=AreaTransitionRelaxConfig(
-            enabled=True,
-            max_patches=int(policy.area_transition_max_patches),
-            raw_area_change_threshold=float(
-                policy.area_transition_raw_threshold
+    if effective_profile == "minimal-topology-v1":
+        area_report: dict[str, Any] = {
+            "enabled": False,
+            "reason": "disabled_by_minimal_topology_v1",
+            "accepted_patch_count": 0,
+        }
+        terminal_report: dict[str, Any] = {
+            "enabled": False,
+            "reason": "terminal_valence_scan_is_internal_to_minimal_profile",
+        }
+        terminal_edit_ledger: list[dict[str, Any]] = []
+        terminal_audit = pre_area_audit
+        terminal_regressions: list[str] = []
+        terminal_rollback = False
+        final_state = pre_area_state
+        final_audit = pre_area_audit
+    elif effective_profile == "none":
+        area_report = {
+            "enabled": False,
+            "reason": "conditioning_profile_none",
+            "accepted_patch_count": 0,
+        }
+        terminal_report = {
+            "enabled": False,
+            "reason": "conditioning_profile_none",
+        }
+        terminal_edit_ledger = []
+        terminal_audit = pre_area_audit
+        terminal_regressions = []
+        terminal_rollback = False
+        final_state = pre_area_state
+        final_audit = pre_area_audit
+    else:
+        area_result = relax_mesh_area_transitions(
+            state.points,
+            state.triangles,
+            state.fixed,
+            target_spacing_sampler=target_sampler_xy,
+            constraint_chains=state.constraint_chains,
+            open_boundary_nodes_zero_based=np.empty(0, dtype=int),
+            config=AreaTransitionRelaxConfig(
+                enabled=True,
+                max_patches=int(policy.area_transition_max_patches),
+                raw_area_change_threshold=float(
+                    policy.area_transition_raw_threshold
+                ),
+                target_gradient_threshold=float(
+                    policy.area_transition_target_gradient_threshold
+                ),
             ),
-            target_gradient_threshold=float(
-                policy.area_transition_target_gradient_threshold
-            ),
-        ),
-    )
-    area_state = state.clone()
-    area_state.points = np.asarray(area_result.nodes_xy, dtype=float)
-    area_state.targets = np.asarray(area_result.target_spacing_m, dtype=float)
-
-    terminal_result = condition_mesh_aggressive(
-        area_state.points,
-        area_state.triangles,
-        area_state.fixed,
-        area_state.constraint_chains,
-        np.empty(0, dtype=int),
-        target_spacing_m=area_state.targets,
-        boundary_kinds=area_state.boundary_kinds,
-        hard_anchor_mask=area_state.hard,
-        target_spacing_sampler=target_sampler_xy,
-        config=_terminal_topology_config(policy),
-    )
-    terminal_candidate = _state_from_result(
-        terminal_result,
-        previous_raw_lineage=area_state.raw_lineage,
-    )
-    terminal_audit = _global_structural_audit(
-        terminal_candidate,
-        raw_points,
-        raw_boundary_chains,
-        raw_obc_chains,
-        raw_obc_ids,
-        target_sampler_xy,
-    )
-    terminal_regressions = _stage_regressions(pre_area_audit, terminal_audit)
-    terminal_rollback = bool(terminal_regressions)
-    final_state = (
-        pre_area_state.clone() if terminal_rollback else terminal_candidate
-    )
-    final_audit = pre_area_audit if terminal_rollback else terminal_audit
+        )
+        area_report = area_result.report
+        area_state = state.clone()
+        area_state.points = np.asarray(area_result.nodes_xy, dtype=float)
+        area_state.targets = np.asarray(
+            area_result.target_spacing_m,
+            dtype=float,
+        )
+        terminal_result = condition_mesh_aggressive(
+            area_state.points,
+            area_state.triangles,
+            area_state.fixed,
+            area_state.constraint_chains,
+            np.empty(0, dtype=int),
+            target_spacing_m=area_state.targets,
+            boundary_kinds=area_state.boundary_kinds,
+            hard_anchor_mask=area_state.hard,
+            target_spacing_sampler=target_sampler_xy,
+            config=_terminal_topology_config(policy),
+        )
+        terminal_report = terminal_result.report
+        terminal_edit_ledger = terminal_result.edit_ledger
+        terminal_candidate = _state_from_result(
+            terminal_result,
+            previous_raw_lineage=area_state.raw_lineage,
+        )
+        terminal_audit = _global_structural_audit(
+            terminal_candidate,
+            raw_points,
+            raw_boundary_chains,
+            raw_obc_chains,
+            raw_obc_ids,
+            open_boundary_cyclic,
+            target_sampler_xy,
+        )
+        terminal_regressions = _stage_regressions(
+            pre_area_audit,
+            terminal_audit,
+        )
+        terminal_rollback = bool(terminal_regressions)
+        final_state = (
+            pre_area_state.clone()
+            if terminal_rollback
+            else terminal_candidate
+        )
+        final_audit = (
+            pre_area_audit if terminal_rollback else terminal_audit
+        )
 
     final_boundary_chains = _mapped_source_chains(
         raw_boundary_chains,
@@ -401,6 +530,22 @@ def condition_portfolio_mesh(
         if name is not None and str(name).strip()
         else f"{raw_mesh.mesh_name}_portfolio_conditioned"
     )
+    rejected_primary_evidence = None
+    if primary_rollback:
+        rejected_primary_evidence = _write_rejected_primary_candidate(
+            output / "rejected_primary_candidate",
+            state=primary_candidate,
+            audit=primary_audit,
+            projection=projection,
+            bathymetry=bathymetry,
+            target_sampler_xy=target_sampler_xy,
+            raw_obc_ids=raw_obc_ids,
+            open_boundary_cyclic=open_boundary_cyclic,
+            rollback_reasons=primary_regressions,
+            report_only_deltas=primary_report_only_deltas,
+            edit_ledger=primary_result.edit_ledger,
+            mesh_name=f"{output_name}_rejected_primary_candidate",
+        )
     write_2dm(
         mesh_output,
         final_lonlat,
@@ -446,7 +591,7 @@ def condition_portfolio_mesh(
         },
         constraint_chains=final_boundary_chains,
         open_boundary_chains=serialized_obc_chains,
-        open_boundary_cyclic=[False] * len(serialized_obc_chains),
+        open_boundary_cyclic=open_boundary_cyclic,
         require_open_boundary=bool(raw_obc_chains),
         expected_open_boundary_count=len(raw_obc_chains),
         enforce_size_error=True,
@@ -469,6 +614,13 @@ def condition_portfolio_mesh(
     }
     quality["open_boundary_cyclicity_contract"] = cyclicity
     quality["serialized_roundtrip"] = roundtrip
+    edge_size = _edge_size_continuity_audit(
+        serialized_points,
+        serialized_triangles,
+        final_boundary_chains,
+        target_sampler_xy,
+    )
+    quality["edge_size_continuity"] = edge_size
 
     boundary_document = _boundary_geojson(
         final_lonlat,
@@ -477,6 +629,7 @@ def condition_portfolio_mesh(
         raw_obc_ids,
         final_state.raw_lineage,
         target_sampler_xy(final_state.points),
+        open_boundary_cyclic,
     )
     obc_manifest = _obc_remap_manifest(
         mesh_path,
@@ -487,42 +640,106 @@ def condition_portfolio_mesh(
         final_state.raw_lineage,
         cyclicity,
         roundtrip,
+        source_boundary_metadata,
     )
     _write_json(boundary_output, boundary_document)
     _write_json(obc_output, obc_manifest)
+
+    minimal_local_debt_closed = bool(
+        not primary_rollback
+        and primary_result.report.get("minimal_local_debt_closed", False)
+        and int(final_audit["superthin_triangle_count"]) == 0
+        and int(final_audit["count_valence_above_8"]) == 0
+        and roundtrip["passed"]
+        and final_audit["core_passed"]
+    )
+    readiness_failures = list(map(str, quality["failure_taxonomy"]))
+    if not bool(roundtrip["passed"]):
+        readiness_failures.append("sms_2dm_roundtrip_failed")
+    if not bool(final_audit["core_passed"]):
+        readiness_failures.extend(
+            f"terminal_core:{value}"
+            for value in final_audit["core_failures"]
+        )
+    if not bool(obc_manifest["forcing_compatible"]):
+        readiness_failures.append("open_boundary_forcing_incompatible")
+    if not bool(edge_size["passed"]):
+        readiness_failures.extend(
+            f"edge_size_continuity:{value}"
+            for value in edge_size["failure_taxonomy"]
+        )
+    if raw_obc_chains and not bool(cyclicity["supported"]):
+        readiness_failures.append("open_boundary_cyclicity_unknown")
+    if any(open_boundary_cyclic):
+        readiness_failures.append(
+            "cyclic_obc_not_self_describing_in_sms_2dm"
+        )
+    if not bool(scientific_input_valid):
+        readiness_failures.append("scientific_input_invalid")
+    readiness_failures = sorted(set(readiness_failures))
+    fvcom_ready = bool(not readiness_failures)
+    quality["raw_stage"] = False
+    quality["common_conditioning_applied"] = bool(
+        effective_profile != "none"
+    )
+    quality["conditioning_profile_requested"] = str(
+        policy.conditioning_profile
+    )
+    quality["conditioning_profile_effective"] = effective_profile
+    quality["minimal_local_debt_closed"] = minimal_local_debt_closed
+    quality["fvcom_ready"] = fvcom_ready
+    quality["accepted"] = fvcom_ready
+    quality["failure_taxonomy"] = readiness_failures
     _write_json(quality_output, quality)
 
-    status = (
-        "pass"
-        if bool(
-            quality["accepted"]
-            and roundtrip["passed"]
-            and final_audit["core_passed"]
-            and obc_manifest["forcing_compatible"]
-        )
-        else "needs_review"
-    )
+    status = "pass" if fvcom_ready else "needs_review"
     report = {
-        "schema_version": "fvcom_portfolio_conditioning_v1",
+        "schema_version": "fvcom_portfolio_conditioning_v2",
         "status": status,
+        "minimal_local_debt_closed": minimal_local_debt_closed,
+        "fvcom_ready": fvcom_ready,
+        "fvcom_readiness_failure_taxonomy": readiness_failures,
         "policy": {
-            "name": "generator-neutral-guarded-v1",
+            "name": effective_profile,
+            "requested_profile": str(policy.conditioning_profile),
+            "effective_profile": effective_profile,
             "settings": asdict(policy),
-            "stage_order": [
-                "raw-global-audit",
-                "aggressive-local-v2-guarded-primary",
-                "target-aware-area-transition-relax-v1",
-                "guarded-terminal-thin-valence",
-                "terminal-global-audit-or-rollback",
-                "immutable-bathymetry-resampling",
-                "serialized-quality-audit",
-            ],
+            "stage_order": (
+                [
+                    "raw-global-audit",
+                    "valence-first-local-transactions",
+                    "immediate-post-valence-superthin-cleanup",
+                    "residual-superthin-component-repair",
+                    "terminal-valence-and-superthin-scan",
+                    "terminal-global-audit-or-rollback",
+                    "immutable-bathymetry-resampling",
+                    "serialized-quality-audit",
+                ]
+                if effective_profile == "minimal-topology-v1"
+                else [
+                    "raw-global-audit",
+                    "aggressive-local-v2-guarded-primary",
+                    "target-aware-area-transition-relax-v1",
+                    "guarded-terminal-thin-valence",
+                    "terminal-global-audit-or-rollback",
+                    "immutable-bathymetry-resampling",
+                    "serialized-quality-audit",
+                ]
+            ),
             "boundary_edit_policy": "none",
             "all_topological_boundary_nodes_fixed": True,
             "internal_legacy_flat_obc_disabled": True,
             "plural_obc_policy": (
                 "independent lineage mapping and terminal boundary-edge audit"
             ),
+            "outer_stage_acceptance": {
+                "report_only_for_minimal_topology_v1": [
+                    "q_p01_regressed",
+                    "area_transition_defect_count_regressed",
+                ],
+                "legacy_profiles_unchanged": True,
+                "full_fvcom_readiness_gates_unchanged": True,
+            },
         },
         "inputs": {
             "mesh": {"path": str(mesh_path), "sha256": _sha256(mesh_path)},
@@ -538,27 +755,65 @@ def condition_portfolio_mesh(
                 "path": str(bathy_path),
                 "sha256": bathymetry.source_sha256,
             },
+            "boundary_contract": {
+                "supplied": bool(boundary_contract is not None),
+                "canonical_sha256": (
+                    hashlib.sha256(
+                        json.dumps(
+                            boundary_contract,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    if boundary_contract is not None
+                    else None
+                ),
+            },
+            "source_boundary_metadata": {
+                "supplied": bool(source_boundary_metadata is not None),
+                "canonical_sha256": (
+                    hashlib.sha256(
+                        json.dumps(
+                            source_boundary_metadata,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    if source_boundary_metadata is not None
+                    else None
+                ),
+            },
         },
         "projection_epsg": int(projection.epsg),
         "input_triangle_reorientation_count": int(reoriented_count),
         "open_boundary_cyclicity_contract": cyclicity,
+        "scientific_input": {
+            "valid": bool(scientific_input_valid),
+            "note": scientific_input_note,
+        },
         "raw_global_audit": _public_audit(raw_audit),
+        "raw_quality": raw_quality,
+        "raw_edge_size_continuity": raw_edge_size,
         "primary_topology": {
             "report": primary_result.report,
             "edit_ledger": primary_result.edit_ledger,
             "candidate_global_audit": _public_audit(primary_audit),
             "rollback_applied": primary_rollback,
             "rollback_reasons": primary_regressions,
+            "report_only_deltas": primary_report_only_deltas,
+            "rejected_candidate_evidence": rejected_primary_evidence,
         },
-        "area_transition": area_result.report,
+        "area_transition": area_report,
         "terminal_topology": {
-            "report": terminal_result.report,
-            "edit_ledger": terminal_result.edit_ledger,
+            "report": terminal_report,
+            "edit_ledger": terminal_edit_ledger,
             "candidate_global_audit": _public_audit(terminal_audit),
             "rollback_to_pre_area_applied": terminal_rollback,
             "rollback_reasons": terminal_regressions,
         },
         "final_global_audit": _public_audit(final_audit),
+        "final_quality": quality,
+        "final_edge_size_continuity": edge_size,
         "depth_sampling": {
             "source": str(bathy_path),
             "source_sha256": bathymetry.source_sha256,
@@ -567,19 +822,21 @@ def condition_portfolio_mesh(
             "maximum_delivered_depth_m": float(np.max(final_depths)),
         },
         "roundtrip": roundtrip,
-        "quality_accepted": bool(quality["accepted"]),
-        "quality_failure_taxonomy": list(quality["failure_taxonomy"]),
+        "quality_accepted": fvcom_ready,
+        "quality_failure_taxonomy": readiness_failures,
         "outputs": {
             "conditioned_2dm": _artifact(mesh_output),
             "delivered_boundary_nodes_geojson": _artifact(boundary_output),
             "obc_remap_manifest": _artifact(obc_output),
             "mesh_quality_json": _artifact(quality_output),
             "conditioning_report_json": str(report_output),
+            "rejected_primary_candidate": rejected_primary_evidence,
         },
         "limitations": [
             (
-                "SMS 2DM does not encode OBC cyclicity; only ordered non-cyclic "
-                "OBC arcs are supported and cyclicity is reported as unknown."
+                "SMS 2DM does not encode OBC cyclicity; an external contract "
+                "can preserve it as evidence but a cyclic result is not "
+                "self-describing or FVCOM-ready as a standalone 2DM."
             ),
             (
                 "The current aggressive and area-transition cores expose a "
@@ -597,21 +854,187 @@ def condition_portfolio_mesh(
     return _json_safe(report)
 
 
+def _write_rejected_primary_candidate(
+    output: Path,
+    *,
+    state: _ConditioningState,
+    audit: dict[str, Any],
+    projection: LocalProjection,
+    bathymetry: _RegularGrid,
+    target_sampler_xy: Callable[[np.ndarray], np.ndarray],
+    raw_obc_ids: list[int],
+    open_boundary_cyclic: list[bool],
+    rollback_reasons: list[str],
+    report_only_deltas: dict[str, Any],
+    edit_ledger: list[dict[str, Any]],
+    mesh_name: str,
+) -> dict[str, Any]:
+    """Serialize a rejected whole-stage candidate as immutable evidence."""
+
+    output.mkdir(parents=False, exist_ok=False)
+    mesh_output = output / "candidate.2dm"
+    quality_output = output / "mesh_quality.json"
+    boundary_output = output / "boundary_nodes.geojson"
+    ledger_output = output / "edit_ledger.json"
+    manifest_output = output / "rollback_manifest.json"
+
+    boundary_chains = [
+        list(map(int, chain))
+        for chain in audit.get("_mapped_boundary_chains", [])
+    ]
+    obc_chains = [
+        list(map(int, chain))
+        for chain in audit.get("_mapped_obc_chains", [])
+    ]
+    obc_ids = (
+        list(map(int, raw_obc_ids))
+        if len(obc_chains) == len(raw_obc_ids)
+        else []
+    )
+    if not obc_ids:
+        obc_chains = []
+
+    lonlat = unproject_points(state.points, projection)
+    depths = bathymetry.sample(lonlat)
+    if np.any(~np.isfinite(depths)) or np.any(depths <= 0.0):
+        raise ValueError(
+            "Rejected primary candidate cannot be serialized with finite "
+            "positive-down depths"
+        )
+    write_2dm(
+        mesh_output,
+        lonlat,
+        depths,
+        state.triangles + 1,
+        np.empty(0, dtype=int),
+        mesh_name=mesh_name,
+        open_boundary_chains=[
+            np.asarray(chain, dtype=int) + 1 for chain in obc_chains
+        ],
+        open_boundary_ids=obc_ids,
+    )
+    roundtrip = _roundtrip_audit(
+        mesh_output,
+        state,
+        projection,
+        obc_chains,
+        obc_ids,
+    )
+    serialized = read_2dm(mesh_output)
+    serialized_points = project_points(serialized.nodes_lonlat, projection)
+    serialized_triangles = np.asarray(serialized.triangles, dtype=int) - 1
+    triangle_targets = _triangle_targets(
+        serialized_points,
+        serialized_triangles,
+        target_sampler_xy,
+    )
+    quality = evaluate_mesh_quality(
+        serialized_points,
+        serialized.depths,
+        serialized.triangles,
+        serialized.open_boundary_nodes,
+        {
+            "boundary_constraint_recovered": bool(
+                audit["boundary_edge_set_exact"]
+            ),
+            "source": "rejected_primary_candidate_evidence",
+        },
+        constraint_chains=boundary_chains,
+        open_boundary_chains=[
+            np.asarray(chain, dtype=int).tolist()
+            for chain in serialized.open_boundary_chains
+        ],
+        open_boundary_cyclic=(
+            list(map(bool, open_boundary_cyclic))
+            if len(obc_chains) == len(open_boundary_cyclic)
+            else [False] * len(obc_chains)
+        ),
+        require_open_boundary=bool(obc_chains),
+        expected_open_boundary_count=len(obc_chains),
+        enforce_size_error=True,
+        enforce_no_unused_nodes=True,
+        target_size_by_triangle=triangle_targets,
+    )
+    quality["artifact_role"] = "rejected_primary_candidate"
+    quality["accepted_for_delivery"] = False
+    quality["rollback_reasons"] = list(map(str, rollback_reasons))
+    quality["candidate_global_audit"] = _public_audit(audit)
+    quality["report_only_deltas"] = report_only_deltas
+    quality["serialized_roundtrip"] = roundtrip
+    _write_json(quality_output, quality)
+
+    boundary_document = _boundary_geojson(
+        lonlat,
+        boundary_chains,
+        obc_chains,
+        obc_ids,
+        state.raw_lineage,
+        target_sampler_xy(state.points),
+        (
+            list(map(bool, open_boundary_cyclic))
+            if len(obc_chains) == len(open_boundary_cyclic)
+            else [False] * len(obc_chains)
+        ),
+    )
+    _write_json(boundary_output, boundary_document)
+    _write_json(
+        ledger_output,
+        {
+            "schema_version": "fvcom_rejected_topology_edit_ledger_v1",
+            "artifact_role": "rejected_primary_candidate",
+            "accepted_for_delivery": False,
+            "rollback_reasons": list(map(str, rollback_reasons)),
+            "edit_ledger": edit_ledger,
+        },
+    )
+    manifest = {
+        "schema_version": "fvcom_rejected_primary_candidate_v1",
+        "status": "rejected",
+        "accepted_for_delivery": False,
+        "rollback_reasons": list(map(str, rollback_reasons)),
+        "report_only_deltas": report_only_deltas,
+        "candidate_global_audit": _public_audit(audit),
+        "roundtrip": roundtrip,
+        "artifacts": {
+            "candidate_2dm": _artifact(mesh_output),
+            "mesh_quality_json": _artifact(quality_output),
+            "boundary_nodes_geojson": _artifact(boundary_output),
+            "edit_ledger_json": _artifact(ledger_output),
+        },
+    }
+    _write_json(manifest_output, manifest)
+    return {
+        "status": "rejected",
+        **manifest["artifacts"],
+        "rollback_manifest_json": _artifact(manifest_output),
+    }
+
+
 def _primary_topology_config(
     config: PortfolioConditioningConfig,
+    *,
+    effective_profile: str,
 ) -> AggressiveConditioningConfig:
+    minimal = effective_profile == "minimal-topology-v1"
+    disabled = effective_profile == "none"
     return AggressiveConditioningConfig(
-        enabled=True,
-        enable_pruning=True,
-        enable_thin_repair=True,
-        enable_valence_repair=True,
+        enabled=not disabled,
+        profile_name=effective_profile,
+        stage_order=(
+            "valence-before-thin" if minimal else "thin-before-valence"
+        ),
+        enable_pruning=not (minimal or disabled),
+        enable_thin_repair=not disabled,
+        enable_valence_repair=not disabled,
         thin_repair_profile="guarded-v1",
         max_rounds=int(config.primary_rounds),
         boundary_edit_policy="none",
         max_boundary_edits_per_round=0,
         max_boundary_welds_per_round=0,
         max_boundary_ear_removals_per_round=0,
-        max_prunes_per_round=int(config.max_prunes_per_round),
+        max_prunes_per_round=(
+            0 if minimal or disabled else int(config.max_prunes_per_round)
+        ),
         max_valence_removals_per_round=int(
             config.max_valence_repairs_per_round
         ),
@@ -622,7 +1045,12 @@ def _primary_topology_config(
         max_valence_l_over_h_count_increase=int(
             config.max_valence_l_over_h_count_increase
         ),
-        micro_relax_cycles=int(config.micro_relax_cycles),
+        micro_relax_cycles=(
+            0 if minimal or disabled else int(config.micro_relax_cycles)
+        ),
+        deadline_monotonic_s=(
+            time.perf_counter() + float(config.wall_time_s)
+        ),
     )
 
 
@@ -631,6 +1059,8 @@ def _terminal_topology_config(
 ) -> AggressiveConditioningConfig:
     return AggressiveConditioningConfig(
         enabled=True,
+        profile_name="guarded-v1-terminal",
+        stage_order="thin-before-valence",
         enable_pruning=False,
         enable_thin_repair=True,
         enable_valence_repair=True,
@@ -652,6 +1082,9 @@ def _terminal_topology_config(
             config.max_valence_l_over_h_count_increase
         ),
         micro_relax_cycles=int(config.micro_relax_cycles),
+        deadline_monotonic_s=(
+            time.perf_counter() + float(config.wall_time_s)
+        ),
     )
 
 
@@ -700,6 +1133,7 @@ def _global_structural_audit(
     raw_boundary_chains: list[list[int]],
     raw_obc_chains: list[list[int]],
     raw_obc_ids: list[int],
+    open_boundary_cyclic: list[bool],
     target_sampler_xy: Callable[[np.ndarray], np.ndarray],
 ) -> dict[str, Any]:
     points = np.asarray(state.points, dtype=float)
@@ -739,7 +1173,7 @@ def _global_structural_audit(
         mapped_boundary,
         None,
         mapped_obc,
-        [False] * len(mapped_obc),
+        open_boundary_cyclic,
     )
     reverse = _raw_to_delivered(state.raw_lineage)
     raw_boundary_nodes = sorted(
@@ -764,7 +1198,7 @@ def _global_structural_audit(
         triangles,
         constraint_chains=mapped_boundary,
         open_boundary_chains_zero_based=mapped_obc,
-        open_boundary_cyclic=[False] * len(mapped_obc),
+        open_boundary_cyclic=open_boundary_cyclic,
         target_size_by_triangle=targets_by_triangle,
     )
     areas = np.asarray(geometry["area"], dtype=float)
@@ -784,6 +1218,17 @@ def _global_structural_audit(
         dtype=int,
     )
     valence_excess = int(np.sum(np.maximum(valence - 8, 0)))
+    minimum_angles = (
+        np.min(np.asarray(geometry["angles_deg"], dtype=float), axis=1)
+        if len(triangles)
+        else np.empty(0, dtype=float)
+    )
+    unique_superthin_count = int(
+        np.count_nonzero(
+            (np.asarray(geometry["quality"], dtype=float) < 0.10)
+            | (minimum_angles < 5.0)
+        )
+    )
     boundary_edge_exact = bool(
         not mapping_failures
         and expected_boundary_edges == actual_boundary_edges
@@ -842,10 +1287,7 @@ def _global_structural_audit(
         "open_boundary_chain_count": int(len(mapped_obc)),
         "open_boundary_ids": list(map(int, raw_obc_ids)),
         "open_boundary_ordered": bool(integrity["open_boundary_ordered"]),
-        "superthin_triangle_count": int(
-            metrics["oceanmesh_quality"]["count_q_below_0_10"]
-        )
-        + int(metrics["angles"]["count_min_angle_below_5"]),
+        "superthin_triangle_count": unique_superthin_count,
         "count_valence_above_8": int(
             metrics["valence"]["count_valence_above_8"]
         ),
@@ -876,27 +1318,51 @@ def _global_structural_audit(
 def _stage_regressions(
     before: dict[str, Any],
     after: dict[str, Any],
+    *,
+    minimal_policy: bool = False,
 ) -> list[str]:
     failures: list[str] = []
     if not bool(after["core_passed"]):
         failures.extend(
             f"terminal_core:{value}" for value in after["core_failures"]
         )
-    nonincrease = (
+    nonincrease = [
         "singly_connected_triangle_count",
         "superthin_triangle_count",
         "count_valence_above_8",
         "valence_excess_above_8",
-        "area_transition_defect_count",
         "l_over_h_count_above_1_55",
-    )
+    ]
+    if not minimal_policy:
+        nonincrease.append("area_transition_defect_count")
     for key in nonincrease:
         if int(after[key]) > int(before[key]):
             failures.append(f"{key}_regressed")
-    nondecrease_float = ("q_min", "q_p01", "q_l3_sigma", "minimum_angle_deg")
-    for key in nondecrease_float:
-        if float(after[key]) + 1.0e-12 < float(before[key]):
-            failures.append(f"{key}_regressed")
+    if minimal_policy:
+        if float(after["q_min"]) + 1.0e-12 < min(
+            float(before["q_min"]),
+            0.25,
+        ):
+            failures.append("q_min_regressed")
+        if float(after["minimum_angle_deg"]) + 1.0e-8 < min(
+            float(before["minimum_angle_deg"]),
+            20.0,
+        ):
+            failures.append("minimum_angle_deg_regressed")
+        if float(after["q_l3_sigma"]) + 1.0e-4 < float(
+            before["q_l3_sigma"]
+        ):
+            failures.append("q_l3_sigma_regressed")
+    else:
+        nondecrease_float = (
+            "q_min",
+            "q_p01",
+            "q_l3_sigma",
+            "minimum_angle_deg",
+        )
+        for key in nondecrease_float:
+            if float(after[key]) + 1.0e-12 < float(before[key]):
+                failures.append(f"{key}_regressed")
     if (
         float(after["maximum_adjacent_area_change"])
         > float(before["maximum_adjacent_area_change"]) + 1.0e-12
@@ -908,6 +1374,34 @@ def _stage_regressions(
         if float(after[key]) > baseline + tolerance:
             failures.append(f"{key}_regressed")
     return sorted(set(failures))
+
+
+def _minimal_report_only_deltas(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose the two relaxed whole-stage metrics without vetoing a repair."""
+
+    q_before = float(before["q_p01"])
+    q_after = float(after["q_p01"])
+    area_before = int(before["area_transition_defect_count"])
+    area_after = int(after["area_transition_defect_count"])
+    return {
+        "policy": "report_only_not_outer_stage_veto",
+        "full_fvcom_readiness_gates_unchanged": True,
+        "q_p01": {
+            "before": q_before,
+            "after": q_after,
+            "delta": q_after - q_before,
+            "regressed_under_previous_gate": bool(q_after + 1.0e-9 < q_before),
+        },
+        "area_transition_defect_count_above_0_50": {
+            "before": area_before,
+            "after": area_after,
+            "delta": area_after - area_before,
+            "regressed_under_previous_gate": bool(area_after > area_before),
+        },
+    }
 
 
 def _mapped_source_chains(
@@ -954,6 +1448,35 @@ def _triangle_targets(
         return np.empty(0, dtype=float)
     centroids = np.asarray(points, dtype=float)[tris].mean(axis=1)
     return np.asarray(target_sampler_xy(centroids), dtype=float)
+
+
+def _edge_size_continuity_audit(
+    points: np.ndarray,
+    triangles: np.ndarray,
+    boundary_chains: list[list[int]],
+    target_sampler_xy: Callable[[np.ndarray], np.ndarray],
+) -> dict[str, Any]:
+    targets = np.asarray(target_sampler_xy(points), dtype=float)
+    return audit_edge_target_sizes(
+        points,
+        triangles,
+        [
+            {
+                "chain_id": f"constraint_{index:03d}",
+                "nodes": chain,
+                "cyclic": True,
+            }
+            for index, chain in enumerate(boundary_chains, start=1)
+        ],
+        target_sampler_xy,
+        boundary_target_by_node=targets,
+        transition_graph_rings=2,
+        thresholds=(1.55, 2.0),
+        boundary_gradation_limit=0.10,
+        boundary_field_ratio_limit=1.50,
+        boundary_first_ring_p95_limit=1.50,
+        boundary_first_ring_maximum_limit=2.0,
+    )
 
 
 def _load_canonical_size_field(path: Path) -> _RegularGrid:
@@ -1137,7 +1660,68 @@ def _input_open_boundaries(mesh: Mesh2DM) -> tuple[list[list[int]], list[int]]:
 def _cyclicity_contract(
     chains: list[list[int]],
     ids: list[int],
+    boundary_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if boundary_contract is not None:
+        declared_count = int(
+            boundary_contract.get(
+                "open_boundary_count",
+                len(boundary_contract.get("open_boundary_cyclic", [])),
+            )
+        )
+        cyclic = list(boundary_contract.get("open_boundary_cyclic", []))
+        if declared_count != len(chains) or len(cyclic) != len(chains):
+            raise ValueError(
+                "Boundary contract OBC count/cyclicity does not match the "
+                "input 2DM nodestring count"
+            )
+        declared_ids = list(
+            boundary_contract.get("open_boundary_ids", ids)
+        )
+        if len(declared_ids) != len(chains):
+            raise ValueError(
+                "Boundary contract open_boundary_ids count does not match "
+                "the input 2DM"
+            )
+        return {
+            "supported": True,
+            "input_format": "SMS_2DM_NS_plus_external_boundary_contract",
+            "boundary_contract_sha256": hashlib.sha256(
+                json.dumps(
+                    boundary_contract,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+            "reason": (
+                "cyclicity supplied by an external hash-bound sidecar; "
+                "SMS 2DM remains non-self-describing"
+            ),
+            "policy": "external_cyclicity_sidecar",
+            "explicit_repeated_first_last_node_rejected": True,
+            "chains": [
+                {
+                    "nodestring_id": int(nodestring_id),
+                    "declared_open_boundary_id": str(declared_id),
+                    "cyclic": bool(is_cyclic),
+                    "cyclicity": (
+                        "cyclic" if bool(is_cyclic) else "noncyclic"
+                    ),
+                    "processed_as": (
+                        "ordered_cyclic_sidecar_chain"
+                        if bool(is_cyclic)
+                        else "ordered_noncyclic_arc"
+                    ),
+                    "node_count": int(len(chain)),
+                }
+                for nodestring_id, declared_id, chain, is_cyclic in zip(
+                    ids,
+                    declared_ids,
+                    chains,
+                    cyclic,
+                )
+            ],
+        }
     return {
         "supported": False,
         "input_format": "SMS_2DM_NS",
@@ -1147,6 +1731,8 @@ def _cyclicity_contract(
         "chains": [
             {
                 "nodestring_id": int(nodestring_id),
+                "declared_open_boundary_id": str(nodestring_id),
+                "cyclic": False,
                 "cyclicity": "unknown_not_encoded",
                 "processed_as": "ordered_noncyclic_arc",
                 "node_count": int(len(chain)),
@@ -1240,13 +1826,15 @@ def _obc_remap_manifest(
     raw_lineage: np.ndarray,
     cyclicity: dict[str, Any],
     roundtrip: dict[str, Any],
+    source_boundary_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     records = []
     exact = True
-    for nodestring_id, source, delivered in zip(
+    for nodestring_id, source, delivered, cycle_record in zip(
         source_ids,
         source_chains,
         delivered_chains,
+        cyclicity["chains"],
     ):
         source_1based = (np.asarray(source, dtype=int) + 1).tolist()
         delivered_1based = (np.asarray(delivered, dtype=int) + 1).tolist()
@@ -1261,8 +1849,20 @@ def _obc_remap_manifest(
                 "delivered_node_count": int(len(delivered_1based)),
                 "source_sequence_retained_by_lineage": retained,
                 "orientation_preserved": retained,
-                "cyclicity": "unknown_not_encoded",
+                "cyclicity": str(cycle_record["cyclicity"]),
+                "cyclic": bool(cycle_record["cyclic"]),
             }
+        )
+    source_forcing_compatible = True
+    if source_boundary_metadata is not None and source_chains:
+        source_forcing_compatible = bool(
+            source_boundary_metadata.get(
+                "forcing_compatible",
+                source_boundary_metadata.get(
+                    "forcing_compatible_without_remap",
+                    True,
+                ),
+            )
         )
     return {
         "schema_version": "fvcom_portfolio_obc_remap_v1",
@@ -1279,11 +1879,18 @@ def _obc_remap_manifest(
             dtype=int,
         ).tolist(),
         "cyclicity_contract": cyclicity,
+        "source_boundary_metadata_supplied": bool(
+            source_boundary_metadata is not None
+        ),
+        "source_boundary_forcing_compatible": (
+            source_forcing_compatible
+        ),
         "forcing_interpolation_performed": False,
         "forcing_compatible": bool(
             exact
             and roundtrip["open_boundary_chain_order_match"]
             and roundtrip["open_boundary_id_match"]
+            and source_forcing_compatible
         ),
     }
 
@@ -1295,11 +1902,20 @@ def _boundary_geojson(
     obc_ids: list[int],
     raw_lineage: np.ndarray,
     targets: np.ndarray,
+    open_boundary_cyclic: list[bool],
 ) -> dict[str, Any]:
     memberships: dict[int, list[int]] = {}
-    for nodestring_id, chain in zip(obc_ids, obc_chains):
+    cyclic_memberships: dict[int, list[bool]] = {}
+    for nodestring_id, chain, is_cyclic in zip(
+        obc_ids,
+        obc_chains,
+        open_boundary_cyclic,
+    ):
         for node in chain:
             memberships.setdefault(int(node), []).append(int(nodestring_id))
+            cyclic_memberships.setdefault(int(node), []).append(
+                bool(is_cyclic)
+            )
     features: list[dict[str, Any]] = []
     for chain_index, chain in enumerate(boundary_chains):
         for position, node in enumerate(chain):
@@ -1323,6 +1939,10 @@ def _boundary_geojson(
                         ),
                         "is_open_boundary": bool(int(node) in memberships),
                         "open_boundary_nodestring_ids": memberships.get(
+                            int(node),
+                            [],
+                        ),
+                        "open_boundary_cyclic": cyclic_memberships.get(
                             int(node),
                             [],
                         ),

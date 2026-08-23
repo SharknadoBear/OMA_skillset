@@ -113,6 +113,7 @@ class GridConfig:
     area_transition_area_change_threshold: float = 0.50
     area_transition_target_gradient_threshold: float = 0.10
     conditioning_profile: str = "auto"
+    minimal_conditioning_wall_time_s: float = 3_600.0
     aggressive_conditioning_rounds: int = 4
     aggressive_boundary_edit_policy: str = "kind-aware-envelope"
     aggressive_max_prunes_per_round: int = 500
@@ -150,8 +151,19 @@ def run_fvcom_grid(
         or float(config.coastal_distance_m) < 0.0
     ):
         raise ValueError("coastal_distance_m must be nonnegative")
-    if config.conditioning_profile not in {"auto", "guarded-v1", "aggressive-local-v2", "none"}:
-        raise ValueError("conditioning_profile must be auto, guarded-v1, aggressive-local-v2, or none")
+    if config.conditioning_profile not in {
+        "auto",
+        "minimal-topology-v1",
+        "guarded-v1",
+        "aggressive-local-v2",
+        "none",
+    }:
+        raise ValueError(
+            "conditioning_profile must be auto, minimal-topology-v1, "
+            "guarded-v1, aggressive-local-v2, or none"
+        )
+    if float(config.minimal_conditioning_wall_time_s) <= 0.0:
+        raise ValueError("minimal_conditioning_wall_time_s must be positive")
     if config.thin_repair_profile not in {
         "guarded-v1",
         "systematic-v2",
@@ -411,6 +423,9 @@ def run_fvcom_grid(
         area_transition_area_change_threshold=float(config.area_transition_area_change_threshold),
         area_transition_target_gradient_threshold=float(config.area_transition_target_gradient_threshold),
         conditioning_profile=str(config.conditioning_profile),
+        minimal_conditioning_wall_time_s=float(
+            config.minimal_conditioning_wall_time_s
+        ),
         aggressive_conditioning_rounds=int(config.aggressive_conditioning_rounds),
         aggressive_boundary_edit_policy=str(config.aggressive_boundary_edit_policy),
         aggressive_max_prunes_per_round=int(config.aggressive_max_prunes_per_round),
@@ -566,6 +581,24 @@ def run_fvcom_grid(
         quality["failure_taxonomy"].append("2dm_roundtrip_failed")
         quality["accepted"] = False
 
+    quality["raw_stage"] = False
+    quality["common_conditioning_applied"] = bool(
+        mesh.report.get("conditioning", {}).get("profile") != "none"
+    )
+    quality["conditioning_profile_requested"] = str(
+        config.conditioning_profile
+    )
+    quality["conditioning_profile_effective"] = str(
+        mesh.report.get("conditioning", {}).get("profile", "unknown")
+    )
+    quality["minimal_local_debt_closed"] = bool(
+        mesh.report.get("conditioning", {}).get(
+            "minimal_local_debt_closed",
+            False,
+        )
+    )
+    quality["fvcom_ready"] = bool(quality["accepted"])
+
     quality_json = run_dir / "mesh_quality.json"
     quality_json.write_text(json.dumps(_json_safe(quality), indent=2), encoding="utf-8")
     mesh_gpkg = write_mesh_gpkg(run_dir / "mesh_nodes_elements.gpkg", mesh.nodes_lonlat, mesh.triangles, depths)
@@ -685,6 +718,15 @@ def run_fvcom_grid(
             "area_transition_target_gradient_threshold": float(config.area_transition_target_gradient_threshold),
             "conditioning_profile_requested": str(config.conditioning_profile),
             "conditioning_profile_effective": str(mesh.report.get("conditioning", {}).get("profile", "guarded-v1")),
+            "minimal_conditioning_wall_time_s": float(
+                config.minimal_conditioning_wall_time_s
+            ),
+            "minimal_local_debt_closed": bool(
+                mesh.report.get("conditioning", {}).get(
+                    "minimal_local_debt_closed",
+                    False,
+                )
+            ),
             "aggressive_conditioning_rounds": int(config.aggressive_conditioning_rounds),
             "aggressive_boundary_edit_policy": str(config.aggressive_boundary_edit_policy),
             "aggressive_max_prunes_per_round": int(config.aggressive_max_prunes_per_round),
