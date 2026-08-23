@@ -1,0 +1,73 @@
+{
+  "schema_version": "fvcom_grid_quality_policy_forward_test_v1",
+  "case_id": "delaware_river_estuary",
+  "test_date_utc": "2026-08-23",
+  "campaign_id": "grid_quality_policy_v1_delaware_20260823T212949Z",
+  "project_relative_path": "grid_quality_policy_v1_delaware_20260823T212949Z/01_delaware_river_estuary",
+  "execution_baseline": {
+    "repository_head_at_launch": "0c2921571d750a1eaf0c4cb7726182168a054b49",
+    "fvcom_implementation_commit": "7262cdeecc2fa2e98de774b16e9c55b07eed65ef",
+    "quality_policy_sha256": "e445f858e8c0a9e8056e807e91db428ac470c673b6280cc60e127a4c85dac4c4",
+    "python_version": "3.13.14",
+    "gmsh_version": "4.15.2",
+    "context_policy": "fresh_subagent_with_only_the_approved_case_prompt"
+  },
+  "source_provenance": {
+    "gshhs_version": "2.3.7",
+    "gshhs_resolution": "f",
+    "gshhs_levels": [
+      1
+    ],
+    "gshhs_manifest_sha256": "0a3da5f4e59004ace8cfdb0e14c6e62d353c1451a11fecc174ebcd021dbefd89",
+    "gshhs_health_sha256": "cb4895af70614945813f8477740e0a99dd35309e8c5d7b913274c0babf7760a7",
+    "region_bpoly_sha256": "4d3dc1843bfc131d6c4db7371c43c4887623650133fc708687c5990918e1b44f",
+    "promoted_coastline_sha256": "651ab093d639e16231ad86a0d33d8c7669a36f67a2dd016fad26f60227204479"
+  },
+  "terminal_result": {
+    "state": "failed_pre_mesh",
+    "benchmark_grid_baseline_ready": false,
+    "fvcom_ready": false,
+    "accepted": false,
+    "submission_eligible": false,
+    "class_1_blocker": "open_exterior_absolute_residual_exceeded",
+    "project_manifest_sha256": "ac8a8aac7f719c7bffd4c436755e19ba030d17029482072964220d2204a7f56b",
+    "delivery_status_sha256": "1e38844195e43c1aebf1d56d9fbe70b372c2f4d9cf137717dc70cde60ac859a8",
+    "mesh_file_count": 0,
+    "mesh_review_map_count": 0,
+    "bathymetry_started": false,
+    "gmsh_started": false,
+    "conditioning_started": false
+  },
+  "authoritative_boundary_evidence": {
+    "contract_relative_path": "03_boundary/_work/b11/fb/open_exterior_contract.json",
+    "contract_sha256": "252cb4a64dc8a58f93a8951733a0d8bf7267bcf1789ad1ee3d5f69aa57b24834",
+    "feedback_map_sha256": "060b30a97800c8031ffff555e15043d0f8eae6ca558a0cd45f66bb2147a1f796",
+    "agent_decision_sha256": "577274fdce106426556431a084273275a567c0c9e70eb37d8723699a170ebacf",
+    "obc_placement_family": "compact-mouth-fallback",
+    "expected_obc_count": 1,
+    "delivered_obc_count": 1,
+    "nonendpoint_land_crossing_m": 0.0,
+    "absolute_residual_length_m": 831.118305499265,
+    "absolute_limit_m": 250.0,
+    "absolute_gate_pass": false,
+    "residual_fraction": 0.0008145923655127601,
+    "fraction_limit": 0.001,
+    "fraction_gate_pass": true,
+    "coastline_plus_obc_exterior_coverage": 0.9992842626608991,
+    "coverage_minimum": 0.999,
+    "coverage_gate_pass": true,
+    "downstream_eligible": false
+  },
+  "independent_audit": {
+    "standard_project_validation_passed": true,
+    "require_benchmark_ready_passed": false,
+    "require_benchmark_ready_failures": [
+      "project_not_benchmark_ready",
+      "benchmark_mesh_missing"
+    ],
+    "non_authoritative_one_km_tolerance_override_rejected": true,
+    "strict_250_m_absolute_gate_preserved": true,
+    "terminal_mesh_or_map_fabricated": false,
+    "interpretation": "The forward test is valid package evidence and a scientific pre-mesh failure. It exercised the new policy binding and project validator, while the pre-existing strict open-exterior Class-1 gate correctly prevented bathymetry, meshing, conditioning, and review-map publication."
+  }
+}
