@@ -1,0 +1,4 @@
+interface:
+  display_name: "HRRR Fetcher"
+  short_description: "Fetch robust NOAA HRRR GRIB2 subsets"
+  default_prompt: "Use $hrrr-fetcher to inventory, estimate, fetch, subset, and validate NOAA HRRR atmospheric fields."

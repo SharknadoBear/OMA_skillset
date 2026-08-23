@@ -9,7 +9,8 @@ by capability family rather than by the older broad project-stage folders.
 - `common-core/`: shared FVCOM support utilities, currently `fvcom-common`.
 - `external-data-connectors/`: source-specific data acquisition and conversion
   capabilities, such as the model-neutral `hycom-fetcher`, `argo-fetcher`, and the
-  NCEI-first, era-routing `cfsv2-fetcher`/`cfsr-fetcher` pair,
+  NCEI-first, era-routing `cfsv2-fetcher`/`cfsr-fetcher` pair and resilient
+  multi-mirror `hrrr-fetcher`,
   NOAA CO-OPS, USGS, CBOFS, DBOFS, SSCOFS, NYOFS, SJROFS, GloFAS, GSHHS,
   CUDEM, CUSP, NHD/NHM river products, and
   usSEABED, including model-neutral TPXO9v5 harmonic extraction.
@@ -149,7 +150,9 @@ usable skill families at different maturity levels:
   appropriate, and downloaded-data health checks. The connector set now includes
   `argo-fetcher` for native core/B/S GDAC profiles, `hycom-fetcher` with thin
   Codex/Hermes variants, NOAA CO-OPS,
-  NCEI-first `cfsv2-fetcher`/`cfsr-fetcher` with automatic era routing, CUDEM, CUSP, GSHHS, NHD/NHM river tools, USGS
+  NCEI-first `cfsv2-fetcher`/`cfsr-fetcher` with automatic era routing,
+  `hrrr-fetcher` for AWS-first, message-ranged CONUS and Alaska analysis/forecast fields,
+  CUDEM, CUSP, GSHHS, NHD/NHM river tools, USGS
   rivers, usSEABED, `glofas-data-fetcher`, and the AWS-primary
   `cbofs-fetcher`, `dbofs-fetcher`, `sscofs-fetcher`, `nyofs-fetcher`, and
   `sjrofs-fetcher` connectors, plus `tpxo9v5-data-fetcher` for registered

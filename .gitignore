@@ -45,6 +45,14 @@ skill_catalog/external-data-connectors/cfsr-fetcher/**/raw/
 skill_catalog/external-data-connectors/cfsr-fetcher/**/raw_messages/
 skill_catalog/external-data-connectors/cfsr-fetcher/**/*.part
 skill_catalog/external-data-connectors/cfsr-fetcher/**/*.tmp
+skill_catalog/external-data-connectors/hrrr-fetcher/runs/
+skill_catalog/external-data-connectors/hrrr-fetcher/**/*.nc
+skill_catalog/external-data-connectors/hrrr-fetcher/**/download_status.json
+skill_catalog/external-data-connectors/hrrr-fetcher/**/download_plan*.json
+skill_catalog/external-data-connectors/hrrr-fetcher/**/raw_messages/
+skill_catalog/external-data-connectors/hrrr-fetcher/**/scratch/
+skill_catalog/external-data-connectors/hrrr-fetcher/**/*.part
+skill_catalog/external-data-connectors/hrrr-fetcher/**/*.partset
 skill_catalog/external-data-connectors/argo-fetcher/runs/
 skill_catalog/external-data-connectors/argo-fetcher/**/*.nc
 skill_catalog/external-data-connectors/argo-fetcher/**/download_plan*.json
