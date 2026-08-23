@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from .metrics import compute_mesh_metrics
+from .quality_policy import apply_quality_policy, load_quality_policy
 
 
 @dataclass(frozen=True)
@@ -39,8 +40,19 @@ def evaluate_mesh_quality(
     enforce_no_unused_nodes: bool = False,
     target_size_by_triangle: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Evaluate final FVCOM gates plus OceanMesh and topology diagnostics."""
-    thresholds = thresholds or QualityThresholds()
+    """Evaluate the benchmark baseline and nonblocking refinement debt."""
+    policy = load_quality_policy()
+    policy_thresholds = policy["thresholds"]
+    thresholds = thresholds or QualityThresholds(
+        min_q_l3_sigma=float(policy_thresholds["regional_q_l3_sigma_target_above"]),
+        min_angle_deg=float(policy_thresholds["regional_minimum_angle_target_deg"]),
+        max_angle_deg=float(policy_thresholds["regional_maximum_angle_target_deg"]),
+        max_bathy_slope=float(policy_thresholds["regional_maximum_bathymetric_slope"]),
+        max_area_change=float(policy_thresholds["regional_maximum_adjacent_area_change"]),
+        max_node_valence=int(policy_thresholds["maximum_node_valence"]),
+        max_size_error_p95=float(policy_thresholds["regional_target_size_l_over_h_p95"]),
+        max_size_error=float(policy_thresholds["regional_target_size_l_over_h_maximum"]),
+    )
     triangles = np.asarray(triangles_1based, dtype=int) - 1
     open_zero = (np.asarray(open_boundary_nodes, dtype=int) - 1).tolist()
     open_chains_zero = None
@@ -69,67 +81,67 @@ def evaluate_mesh_quality(
     integrity = metrics["constraint_integrity"]
     depth_report = metrics["depths"]
 
-    failures: list[str] = []
+    findings: list[str] = []
     if (
         int(metrics["oceanmesh_quality"].get("count_q_below_0_10", 0)) > 0
         or int(metrics["angles"].get("count_min_angle_below_5", 0)) > 0
     ):
-        failures.append("superthin_elements_present")
+        findings.append("superthin_elements_present")
     if not np.isfinite(q_l3_sigma) or q_l3_sigma <= float(thresholds.min_q_l3_sigma):
-        failures.append("q_l3_sigma_below_threshold")
+        findings.append("q_l3_sigma_below_threshold")
     if min_angle < thresholds.min_angle_deg:
-        failures.append("min_angle_below_threshold")
+        findings.append("min_angle_below_threshold")
     if max_angle > thresholds.max_angle_deg:
-        failures.append("max_angle_above_threshold")
+        findings.append("max_angle_above_threshold")
     if max_slope > thresholds.max_bathy_slope:
-        failures.append("bathymetric_slope_above_threshold")
+        findings.append("bathymetric_slope_above_threshold")
     if max_area_change > thresholds.max_area_change:
-        failures.append("adjacent_area_change_above_threshold")
+        findings.append("adjacent_area_change_above_threshold")
     if max_valence > thresholds.max_node_valence:
-        failures.append("node_valence_above_threshold")
+        findings.append("node_valence_above_threshold")
     if not depth_report["finite"] or not depth_report["positive"]:
-        failures.append("nonpositive_or_nan_depth")
+        findings.append("nonpositive_or_nan_depth")
     open_chain_count = int(integrity["open_boundary_chain_count"])
     open_node_count = int(integrity["open_boundary_node_count"])
     if expected_open_boundary_count is not None:
         if open_chain_count != int(expected_open_boundary_count):
-            failures.append("open_boundary_chain_count_mismatch")
+            findings.append("open_boundary_chain_count_mismatch")
     elif require_open_boundary and open_chain_count == 0:
-        failures.append("missing_open_boundary_nodestring")
+        findings.append("missing_open_boundary_nodestring")
     if open_chain_count and not integrity["open_boundary_ordered"]:
-        failures.append("open_boundary_nodestring_not_ordered_on_mesh")
+        findings.append("open_boundary_nodestring_not_ordered_on_mesh")
     if not constraint_report.get("boundary_constraint_recovered", False):
-        failures.append("boundary_constraint_not_recovered")
+        findings.append("boundary_constraint_not_recovered")
     if not integrity["all_protected_edges_present"]:
-        failures.append("protected_boundary_constraint_missing")
+        findings.append("protected_boundary_constraint_missing")
     if topology["connected_component_count"] != 1:
-        failures.append("multiple_mesh_components")
+        findings.append("multiple_mesh_components")
     if topology["nonmanifold_edge_count"]:
-        failures.append("nonmanifold_edges_present")
+        findings.append("nonmanifold_edges_present")
     if topology["boundary_degree_anomaly_count"]:
-        failures.append("boundary_not_traversable")
+        findings.append("boundary_not_traversable")
     if topology["singly_connected_triangle_count"]:
-        failures.append("singly_connected_elements_present")
+        findings.append("singly_connected_elements_present")
     if topology["nonpositive_signed_area_count"]:
-        failures.append("nonpositive_triangle_area")
+        findings.append("nonpositive_triangle_area")
     if enforce_no_unused_nodes and topology["unused_node_count"]:
-        failures.append("unused_mesh_nodes_present")
+        findings.append("unused_mesh_nodes_present")
     size_error = metrics.get("size_error_l_over_h")
     if enforce_size_error:
         if not size_error:
-            failures.append("missing_target_size_error_diagnostic")
+            findings.append("missing_target_size_error_diagnostic")
         elif not bool(size_error.get("valid", False)):
-            failures.append("target_size_by_triangle_invalid")
+            findings.append("target_size_by_triangle_invalid")
         else:
             p95 = float(size_error["quantiles"]["p95"])
             maximum = float(size_error["maximum"])
             if p95 > thresholds.max_size_error_p95:
-                failures.append("target_size_l_over_h_p95_above_threshold")
+                findings.append("target_size_l_over_h_p95_above_threshold")
             if maximum > thresholds.max_size_error:
-                failures.append("target_size_l_over_h_max_above_threshold")
+                findings.append("target_size_l_over_h_max_above_threshold")
 
-    return {
-        "schema_version": "fvcom_mesh_quality_v2",
+    result = {
+        "schema_version": "fvcom_mesh_quality_v3",
         "node_count": int(metrics["node_count"]),
         "triangle_count": int(metrics["triangle_count"]),
         "open_boundary_chain_count": open_chain_count,
@@ -154,6 +166,19 @@ def evaluate_mesh_quality(
         "constraint_integrity": integrity,
         "size_error_l_over_h": metrics.get("size_error_l_over_h"),
         "depths": depth_report,
-        "failure_taxonomy": failures,
-        "accepted": not failures,
+        "all_quality_findings": sorted(set(findings)),
     }
+    advisories = {
+        "oceanmesh_quality": metrics["oceanmesh_quality"],
+        "angle_statistics": metrics["angles"],
+        "valence_statistics": metrics["valence"],
+        "size_error_l_over_h": metrics.get("size_error_l_over_h"),
+        "node_count": int(metrics["node_count"]),
+        "triangle_count": int(metrics["triangle_count"]),
+    }
+    return apply_quality_policy(
+        result,
+        findings,
+        advisories=advisories,
+        policy=policy,
+    )

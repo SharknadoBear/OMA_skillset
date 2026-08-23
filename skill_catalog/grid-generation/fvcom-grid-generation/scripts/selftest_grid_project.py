@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fvcom_grid_generation.grid_project import (
@@ -19,6 +21,8 @@ from fvcom_grid_generation.grid_project import (
     validate,
 )
 from fvcom_grid_generation.open_exterior import sha256_file, validate_open_exterior_contract
+from fvcom_grid_generation.quality_policy import public_policy_binding
+from fvcom_grid_generation.sms_2dm import write_2dm
 
 
 def write(path: Path, value: str) -> Path:
@@ -68,14 +72,50 @@ def contract_fixture(root: Path, *, report_only: bool = False) -> Path:
     return path
 
 
-def companions(root: Path) -> dict[str, Path]:
+def mesh_fixture(path: Path, *, open_boundary: bool = True) -> Path:
+    chains = [[1, 2]] if open_boundary else []
+    return write_2dm(
+        path,
+        np.asarray(
+            [[-75.2, 39.0], [-75.0, 39.0], [-75.0, 39.2], [-75.2, 39.2]],
+            dtype=float,
+        ),
+        np.asarray([2.0, 4.0, 8.0, 6.0], dtype=float),
+        np.asarray([[1, 2, 3], [1, 3, 4]], dtype=int),
+        np.empty(0, dtype=int),
+        mesh_name="project fixture",
+        open_boundary_chains=chains,
+        open_boundary_ids=([1] if chains else []),
+    )
+
+
+def companions(
+    root: Path,
+    *,
+    benchmark_ready: bool = True,
+    findings: list[str] | None = None,
+) -> dict[str, Path]:
+    findings = list(findings or [])
+    quality = {
+        "schema_version": "fvcom_mesh_quality_v3",
+        "quality_policy": public_policy_binding(),
+        "oceanmesh_quality": {"q_l3_sigma": 0.812345},
+        "all_quality_findings": findings,
+        "benchmark_grid_baseline_ready": benchmark_ready,
+        "fvcom_ready": benchmark_ready,
+        "accepted": benchmark_ready,
+        "failure_taxonomy": findings if not benchmark_ready else [],
+        "regional_refinement_debt": [],
+    }
     values = {
-        "mesh_quality": write(root / "08_audit" / "_work" / "quality.json", "{}"),
+        "mesh_quality": write(
+            root / "08_audit" / "_work" / "quality.json",
+            json.dumps(quality),
+        ),
         "mesh_conditioning": write(root / "08_audit" / "_work" / "conditioning.json", "{}"),
         "boundary_nodes": write(root / "08_audit" / "_work" / "boundary.geojson", '{"type":"FeatureCollection","features":[]}'),
         "obc_remap_manifest": write(root / "08_audit" / "_work" / "obc.json", "{}"),
         "roundtrip_audit": write(root / "08_audit" / "_work" / "roundtrip.json", "{}"),
-        "mesh_review_map": write(root / "08_audit" / "_work" / "review.png", "png"),
     }
     return values
 
@@ -151,7 +191,9 @@ def main() -> None:
             failures=["boundary_failed"],
         )
         assert status["state"] == "failed_pre_mesh"
-        source = write(project / "06_raw_mesh" / "_work" / "attempt1" / "raw_mesh.2dm", "MESH2D\n")
+        source = mesh_fixture(
+            project / "06_raw_mesh" / "_work" / "attempt1" / "raw_mesh.2dm"
+        )
         candidate = gmsh6_candidate(source)
         try:
             promote(project, "06_raw_mesh", source, "raw_mesh.2dm")
@@ -177,8 +219,9 @@ def main() -> None:
             submission_eligible=False,
             obc_status="pass",
             forcing_status="incompatible",
-            failures=["forcing_incompatible"],
+            failures=["node_valence_above_threshold"],
             open_exterior_source=contract,
+            basemap_provider="offline",
         )
         assert (project / "final" / "fvcom_grid.2dm").is_file()
         assert not validate(project, require_submission_ready=True)["passed"]
@@ -195,7 +238,9 @@ def main() -> None:
             forcing_status="pending",
             failures=[],
         )
-        raw_source = write(ready / "06_raw_mesh" / "_work" / "gmsh6" / "raw_mesh.2dm", "MESH2D\n")
+        raw_source = mesh_fixture(
+            ready / "06_raw_mesh" / "_work" / "gmsh6" / "raw_mesh.2dm"
+        )
         raw_candidate = gmsh6_candidate(raw_source)
         promote(
             ready,
@@ -204,7 +249,9 @@ def main() -> None:
             "raw_mesh.2dm",
             generator_manifest=raw_candidate,
         )
-        conditioned = write(ready / "07_conditioning" / "_work" / "mesh.2dm", "MESH2D\n")
+        conditioned = mesh_fixture(
+            ready / "07_conditioning" / "_work" / "mesh.2dm"
+        )
         promote(ready, "07_conditioning", conditioned, "conditioned_mesh.2dm")
         publish(
             ready,
@@ -216,12 +263,18 @@ def main() -> None:
             forcing_status="compatible",
             failures=[],
             open_exterior_source=contract,
+            basemap_provider="offline",
         )
+        assert validate(ready, require_benchmark_ready=True)["passed"]
         assert validate(ready, require_submission_ready=True)["passed"]
+        assert (ready / "08_audit" / "mesh_review_map.png").is_file()
+        assert (ready / "final" / "mesh_review_map_manifest.json").is_file()
 
         rejected = base / "cleanroom"
         init_project(rejected, "cleanroom")
-        control_mesh = write(rejected / "06_raw_mesh" / "_work" / "control" / "raw_mesh.2dm", "MESH2D\n")
+        control_mesh = mesh_fixture(
+            rejected / "06_raw_mesh" / "_work" / "control" / "raw_mesh.2dm"
+        )
         control_candidate = gmsh6_candidate(control_mesh, candidate_id="clean_room_raw")
         try:
             promote(

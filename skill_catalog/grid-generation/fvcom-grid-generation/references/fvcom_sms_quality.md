@@ -2,6 +2,11 @@
 
 Use this note when changing `.2dm`, OBC nodestring, depth, constraint, or acceptance behavior.
 
+The sole normative policy is
+[`fvcom_grid_quality_policy_v1.json`](fvcom_grid_quality_policy_v1.json). Every
+quality document binds its SHA-256; this reference describes how its metrics are
+computed and represented.
+
 ## Output Invariants
 
 - Write `MESH2D`, `MESHNAME`, `E3T`, `ND`, and `NS` records.
@@ -15,17 +20,16 @@ Use this note when changing `.2dm`, OBC nodestring, depth, constraint, or accept
 - Write `delivered_boundary_nodes.geojson` from the terminal constraint chains so recovery nodes are represented explicitly.
 - Permit topology edits only on local cavities; never rebuild the full Delaunay triangulation during spring relaxation, thin repair, pruning, or valence repair.
 
-## Default Gates
+## Benchmark-first decision buckets
 
-- minimum triangle angle: `30 deg`;
-- maximum triangle angle: `130 deg`;
-- maximum bathymetric slope: `0.1`;
-- maximum adjacent element area-change metric: `0.5`;
-- maximum true vertex-neighbor valence: `8`;
-- one manifold, traversable component;
-- no missing protected constraints or nonpositive elements.
+- Class 1 blocks a first benchmark: invalid/nonfinite geometry, a structural topology break, missing protected constraints, invalid OBC/open exterior, incomplete positive-down bathymetry, node-cap or roundtrip failure, any true vertex-neighbor valence above `8`, or any superthin triangle with `q < 0.10` or minimum angle below `5 deg`.
+- Class 2 is regional-refinement debt: ordinary `30–130 deg` angle tails, `q_L3sigma <= 0.75`, non-superthin quality tails, bathymetric slope above `0.1`, adjacent-area change above `0.5`, size/continuity debt, and singly connected triangles that do not create a structural break.
+- Class 3 contains descriptive distributions, source/domain statistics, runtime, mesh size, and budget headroom.
 
-When any gate fails, retain all artifacts and set `final_status: needs_review`. Normal generation writes one quality document for the generation-time smoothed mesh. Cleanup comparisons belong to the standalone postprocessor.
+Class-1 failure retains all artifacts and sets `final_status: needs_review`.
+Class-2/3 findings remain visible but cannot veto topology repair or a first
+benchmark run. Normal generation writes one policy-bound quality document for
+the generation-time smoothed mesh.
 
 Adaptive boundary packages additionally require ordered explicit chains, per-node target spacing, and OBC size compatibility: 95th-percentile `L/h <= 1.55` and maximum `L/h <= 2.0`.
 
@@ -85,7 +89,7 @@ and transition audit in `size_field.nc` and `size_field_components.png`.
 - `thin-repair-v1` may flip an unprotected interior edge or split a long unprotected interior edge, then invoke regional spring relaxation.
 - `aggressive-local-v2` runs target-redundant degree-3/4 pruning, superthin-pair midpoint collapse or kind-aware boundary repair, hard valence repair, and two-ring micro-relaxation before area-transition conditioning. See `local_topology_conditioning.md`.
 - `area-transition-relax-v1` re-samples the Eulerian target field and processes excessive adjacent-area pairs sequentially after thin repair. Use raw area change `|A1-A2|/max(A1,A2) > 0.50`, or require target gradient, raw change, and normalized `log(A/A*)` mismatch together for a preemptive trigger.
-- Reject and restore a stage if any signed area becomes nonpositive, a protected/OBC edge is lost, a new nonmanifold edge/component appears, an unedited original boundary coordinate or hard anchor moves, or controlled global quality tails regress.
+- In the default minimal/autonomous path, reject and restore only if a signed area becomes nonpositive, a protected/OBC edge is lost, a new nonmanifold edge/component appears, an unedited original boundary coordinate or hard anchor moves, or the ordered valence/superthin tuple regresses. Legacy profiles may retain their documented quality-tail experiments.
 - Compare every area-transition patch to the whole-stage baseline for `L/h` maximum, p95, and count above 1.55, permitting at most the explicit 0.1% numerical tolerance on maximum/p95; cap total movement at `0.25h` and retain target-normalized area-jump diagnostics.
-- Record unresolved boundary-imposed defects and retain the mesh as `needs_review`; never alter the boundary to manufacture acceptance.
+- Record unresolved boundary-imposed defects under their policy bucket and never alter the boundary to manufacture acceptance.
 - Treat any remaining unique-neighbor valence above eight as a hard FVCOM readiness failure, even when the mesh remains serializable and all other structural invariants pass.

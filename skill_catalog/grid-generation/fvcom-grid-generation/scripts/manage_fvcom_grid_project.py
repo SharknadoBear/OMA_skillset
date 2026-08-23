@@ -44,15 +44,21 @@ def parser() -> argparse.ArgumentParser:
     publication.add_argument("--mesh", type=Path)
     for key in ("mesh-quality", "mesh-conditioning", "boundary-nodes", "obc-remap-manifest", "roundtrip-audit", "mesh-review-map"):
         publication.add_argument("--" + key, type=Path)
-    publication.add_argument("--fvcom-ready", type=_bool, default=False)
-    publication.add_argument("--submission-eligible", type=_bool, default=False)
+    publication.add_argument("--fvcom-ready", type=_bool)
+    publication.add_argument("--submission-eligible", type=_bool)
     publication.add_argument("--obc-status", default="unknown")
     publication.add_argument("--forcing-status", default="unknown")
     publication.add_argument("--failure", action="append", default=[])
     publication.add_argument("--open-exterior-source", type=Path)
+    publication.add_argument(
+        "--basemap-provider",
+        default="topo",
+        choices=("topo", "offline"),
+    )
     validation = sub.add_parser("validate")
     validation.add_argument("--project", required=True, type=Path)
     validation.add_argument("--require-submission-ready", action="store_true")
+    validation.add_argument("--require-benchmark-ready", action="store_true")
     return root
 
 
@@ -88,9 +94,14 @@ def main() -> int:
             forcing_status=args.forcing_status,
             failures=args.failure,
             open_exterior_source=args.open_exterior_source,
+            basemap_provider=args.basemap_provider,
         )
     else:
-        result = validate(args.project, require_submission_ready=args.require_submission_ready)
+        result = validate(
+            args.project,
+            require_benchmark_ready=args.require_benchmark_ready,
+            require_submission_ready=args.require_submission_ready,
+        )
     print(json.dumps(result, indent=2))
     return 0 if result.get("passed", True) else 2
 

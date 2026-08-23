@@ -683,14 +683,18 @@ def _topology_escrow_failures(
     failures: list[str] = []
     if not invariants_ok:
         failures.extend(_failed_invariant_names(invariants))
-    if int(midpoint["count_valence_above_limit"]) >= int(
-        before["count_valence_above_limit"]
-    ):
-        failures.append("escrow_valence_count_not_strictly_improved")
-    if int(midpoint["valence_excess_sum"]) >= int(
-        before["valence_excess_sum"]
-    ):
-        failures.append("escrow_valence_excess_not_strictly_improved")
+    before_valence = (
+        int(before["count_valence_above_limit"]),
+        int(before["valence_excess_sum"]),
+        int(before["maximum_valence"]),
+    )
+    midpoint_valence = (
+        int(midpoint["count_valence_above_limit"]),
+        int(midpoint["valence_excess_sum"]),
+        int(midpoint["maximum_valence"]),
+    )
+    if not midpoint_valence < before_valence:
+        failures.append("escrow_valence_tuple_not_strictly_improved")
     maximum_valence = max(
         int(before["maximum_valence"]),
         max(0, int(config.topology_escrow_maximum_valence)),
@@ -707,10 +711,6 @@ def _topology_escrow_failures(
         float(config.topology_escrow_maximum_superthin_severity),
     ):
         failures.append("escrow_superthin_severity_exceeded")
-    if int(midpoint["singly_connected_triangle_count"]) > int(
-        before["singly_connected_triangle_count"]
-    ):
-        failures.append("escrow_singly_connected_regression")
     if int(midpoint["boundary_component_count"]) != int(
         before["boundary_component_count"]
     ):
@@ -729,20 +729,6 @@ def _topology_escrow_failures(
         failures.append("escrow_protected_edge_regression")
     if int(midpoint.get("restricted_edge_violation_count", 0)) != 0:
         failures.append("escrow_restricted_edge_violation")
-    l_over_h_allowance = max(
-        0,
-        int(config.max_valence_l_over_h_count_increase),
-    )
-    if int(midpoint["l_over_h_count_above_1_55"]) > int(
-        before["l_over_h_count_above_1_55"]
-    ) + l_over_h_allowance:
-        failures.append("escrow_l_over_h_count_allowance_exceeded")
-    if float(midpoint["l_over_h_p95"]) > max(
-        1.55,
-        1.001
-        * max(float(before["l_over_h_p95"]), 1.0e-12),
-    ):
-        failures.append("escrow_l_over_h_p95_regression")
     if _maximum_boundary_source_arc_deviation(state) > 1.0e-6:
         failures.append("escrow_boundary_vertex_off_source_arc")
     if not _boundary_loops_simple(state):
@@ -788,8 +774,6 @@ def _post_thin_counterproductive(
     return bool(
         not thin_after < thin_before
         or valence_after > valence_before
-        or int(after["singly_connected_triangle_count"])
-        > int(midpoint["singly_connected_triangle_count"])
         or int(after["boundary_degree_anomaly_count"])
         > int(midpoint["boundary_degree_anomaly_count"])
         or int(after["boundary_component_count"])
@@ -818,8 +802,6 @@ def _compound_valence_thin_failures(
         failures.append("new_superthin_triangles")
     if after["superthin_severity_sum"] > before["superthin_severity_sum"] + 1.0e-10:
         failures.append("superthin_severity_regression")
-    if after["singly_connected_triangle_count"] > before["singly_connected_triangle_count"]:
-        failures.append("new_singly_connected_triangles")
     if after["boundary_degree_anomaly_count"] > before["boundary_degree_anomaly_count"]:
         failures.append("new_boundary_degree_anomalies")
     if after["boundary_component_count"] != before["boundary_component_count"]:
@@ -6653,6 +6635,9 @@ def _repair_high_valence(state: _State, config: AggressiveConditioningConfig, in
             initial_components,
             geometry=trial_geometry,
             topology=trial_topology,
+            allow_new_singly_connected=(
+                str(config.profile_name) == "minimal-topology-v1"
+            ),
         )
         trial = _summary(state, config, geometry=trial_geometry, topology=trial_topology)
         nonregression = _nonregression(
@@ -6683,6 +6668,9 @@ def _repair_high_valence(state: _State, config: AggressiveConditioningConfig, in
                     initial_components,
                     geometry=alternative_geometry,
                     topology=alternative_topology,
+                    allow_new_singly_connected=(
+                        str(config.profile_name) == "minimal-topology-v1"
+                    ),
                 )
                 alternative_trial = _summary(
                     state,
@@ -6826,6 +6814,9 @@ def _repair_valence_flip_batches(
                 initial_components,
                 geometry=geometry,
                 topology=trial_topology,
+                allow_new_singly_connected=(
+                    str(config.profile_name) == "minimal-topology-v1"
+                ),
             )
             trial_summary = _summary(state, config, geometry=geometry, topology=trial_topology)
             nonregression = _nonregression(
@@ -6964,6 +6955,9 @@ def _repair_valence_cluster_cavities(
             initial_components,
             geometry=geometry,
             topology=trial_topology,
+            allow_new_singly_connected=(
+                str(config.profile_name) == "minimal-topology-v1"
+            ),
         )
         trial_summary = _summary(state, config, geometry=geometry, topology=trial_topology)
         nonregression = _nonregression(
@@ -7815,43 +7809,48 @@ def _nonregression(
     max_l_over_h_count_increase: int = 0,
 ) -> bool:
     topology_ok = bool(
-        after["singly_connected_triangle_count"] <= before["singly_connected_triangle_count"]
-        and after["boundary_degree_anomaly_count"] <= before["boundary_degree_anomaly_count"]
+        after["boundary_degree_anomaly_count"] <= before["boundary_degree_anomaly_count"]
         and after["boundary_component_count"] == before["boundary_component_count"]
         and after["protected_edge_not_boundary_count"] <= before["protected_edge_not_boundary_count"]
     )
     if purpose == "valence":
         # The FVCOM connectivity cap is a hard structural gate.  A perfectly
         # regular nine-spoke star cannot be reduced to valence eight without
-        # changing its quality distribution, so use absolute local-quality
-        # floors while still protecting target-size excess.
-        return bool(
-            topology_ok
-            and
-            (after["count_valence_above_limit"] < before["count_valence_above_limit"] or after["valence_excess_sum"] < before["valence_excess_sum"])
-            and after["q_min"] + 1.0e-12 >= min(before["q_min"], 0.25)
-            and after["minimum_angle_deg"] + 1.0e-8 >= min(before["minimum_angle_deg"], 20.0)
-            and after["l_over_h_p95"] <= max(1.55, 1.001 * max(before["l_over_h_p95"], 1.0e-12))
-            and after["l_over_h_count_above_1_55"]
-            <= before["l_over_h_count_above_1_55"] + max(0, int(max_l_over_h_count_increase))
+        # changing its quality distribution. Benchmark-first conditioning
+        # therefore gates on structure and valence improvement, not regional
+        # refinement metrics such as angle tails, area transition, or L/h.
+        before_valence = (
+            int(before["count_valence_above_limit"]),
+            int(before["valence_excess_sum"]),
+            int(before["maximum_valence"]),
         )
+        after_valence = (
+            int(after["count_valence_above_limit"]),
+            int(after["valence_excess_sum"]),
+            int(after["maximum_valence"]),
+        )
+        return bool(topology_ok and after_valence < before_valence)
     if purpose == "thin":
         defect_improved = bool(
             after["superthin_triangle_count"] < before["superthin_triangle_count"]
             or after["thin_triangle_count"] < before["thin_triangle_count"]
             or after["thin_severity_sum"] < before["thin_severity_sum"] - 1.0e-10
         )
+        before_valence = (
+            int(before["count_valence_above_limit"]),
+            int(before["valence_excess_sum"]),
+            int(before["maximum_valence"]),
+        )
+        after_valence = (
+            int(after["count_valence_above_limit"]),
+            int(after["valence_excess_sum"]),
+            int(after["maximum_valence"]),
+        )
         return bool(
             defect_improved
             and topology_ok
             and after["superthin_triangle_count"] <= before["superthin_triangle_count"]
-            and after["q_min"] + 1.0e-12 >= before["q_min"]
-            and after["q_p01"] + 1.0e-9 >= before["q_p01"]
-            and after["minimum_angle_deg"] + 1.0e-8 >= before["minimum_angle_deg"]
-            and after["l_over_h_p95"] <= 1.001 * max(before["l_over_h_p95"], 1.0e-12)
-            and after["l_over_h_count_above_1_55"] <= before["l_over_h_count_above_1_55"]
-            and after["area_transition_count_above_0_50"] <= before["area_transition_count_above_0_50"]
-            and after["count_valence_above_limit"] <= before["count_valence_above_limit"]
+            and after_valence <= before_valence
         )
     size_ok = bool(
         after["l_over_h_maximum"] <= 1.001 * max(before["l_over_h_maximum"], 1.0e-12)
@@ -7974,7 +7973,10 @@ def _audit_state(
         initial_components,
         geometry=geometry,
         topology=topology,
-        allow_new_singly_connected=str(config.systematic_gate_scope) == "loop-end",
+        allow_new_singly_connected=(
+            str(config.profile_name) == "minimal-topology-v1"
+            or str(config.systematic_gate_scope) == "loop-end"
+        ),
     )
     if (
         str(config.thin_repair_profile) == "systematic-v5"

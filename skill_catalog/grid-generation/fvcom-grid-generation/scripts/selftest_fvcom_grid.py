@@ -859,7 +859,7 @@ def test_manifest_output_resolution_is_cwd_independent() -> None:
         assert resolved == artifact.resolve()
 
 
-def test_final_quality_requires_q_l3_sigma_above_075() -> None:
+def test_q_l3_sigma_target_is_regional_refinement_debt() -> None:
     nodes = np.asarray([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]], dtype=float)
     triangles = np.asarray([[1, 2, 3], [1, 3, 4]], dtype=int)
     common = {
@@ -871,13 +871,17 @@ def test_final_quality_requires_q_l3_sigma_above_075() -> None:
     }
     regular = evaluate_mesh_quality(nodes, **common)
     assert regular["oceanmesh_quality"]["q_l3_sigma"] > 0.75
-    assert "q_l3_sigma_below_threshold" not in regular["failure_taxonomy"]
+    assert "q_l3_sigma_below_threshold" not in {
+        item["code"] for item in regular["regional_refinement_debt"]
+    }
 
     degraded = nodes.copy()
     degraded[2] = [1.0, 0.01]
     poor = evaluate_mesh_quality(degraded, **common)
     assert poor["oceanmesh_quality"]["q_l3_sigma"] <= 0.75
-    assert "q_l3_sigma_below_threshold" in poor["failure_taxonomy"]
+    assert "q_l3_sigma_below_threshold" in {
+        item["code"] for item in poor["regional_refinement_debt"]
+    }
 
 
 def main() -> int:
@@ -906,7 +910,7 @@ def main() -> int:
     test_full_synthetic_workflow_and_2dm_roundtrip()
     test_full_synthetic_systematic_v6_workflow()
     test_adaptive_resolution_workflow_and_quadtree_seed()
-    test_final_quality_requires_q_l3_sigma_above_075()
+    test_q_l3_sigma_target_is_regional_refinement_debt()
     print("fvcom-grid-generation selftests passed")
     return 0
 

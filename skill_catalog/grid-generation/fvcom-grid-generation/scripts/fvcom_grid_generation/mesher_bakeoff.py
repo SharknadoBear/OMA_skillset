@@ -454,6 +454,24 @@ def _validate_stage_template(stage: Mapping[str, Any], label: str) -> None:
 
 
 def _validate_qa_policy(policy: Mapping[str, Any]) -> None:
+    if policy.get("schema_version") == "fvcom_grid_quality_policy_v1":
+        adapter = policy.get("mesher_bakeoff_adapter")
+        if not isinstance(adapter, Mapping):
+            raise BakeoffContractError(
+                "CONTRACT_VIOLATION",
+                "benchmark-first QA policy requires mesher_bakeoff_adapter",
+            )
+        _validate_qa_policy(
+            {
+                "policy_id": policy.get("policy_id"),
+                "accepted_path": adapter.get("accepted_path"),
+                "failure_taxonomy_path": adapter.get("failure_taxonomy_path"),
+                "metric_paths": adapter.get("metric_paths"),
+                "metric_directions": adapter.get("metric_directions", {}),
+                "hard_gates": adapter.get("hard_gate_ids"),
+            }
+        )
+        return
     if not isinstance(policy.get("policy_id"), str) or not policy["policy_id"]:
         raise BakeoffContractError(
             "CONTRACT_VIOLATION", "qa_policy.policy_id is required"
@@ -866,10 +884,23 @@ def _nested_value(value: Any, path: str) -> Any:
     return current
 
 
+def _runtime_qa_policy(policy: Mapping[str, Any]) -> Mapping[str, Any]:
+    if policy.get("schema_version") != "fvcom_grid_quality_policy_v1":
+        return policy
+    adapter = policy.get("mesher_bakeoff_adapter")
+    if not isinstance(adapter, Mapping):
+        raise BakeoffContractError(
+            "CONTRACT_VIOLATION",
+            "benchmark-first QA policy requires mesher_bakeoff_adapter",
+        )
+    return adapter
+
+
 def _read_qa_result(
     qa_path: Path, policy: Mapping[str, Any]
 ) -> tuple[bool, list[str], dict[str, Any]]:
     report = _read_json(qa_path)
+    policy = _runtime_qa_policy(policy)
     try:
         accepted = _nested_value(report, str(policy["accepted_path"]))
         failure_taxonomy = _nested_value(
@@ -1112,6 +1143,7 @@ def _metric_ordering(
     if not eligible:
         return {}
     output: dict[str, list[dict[str, Any]]] = {}
+    policy = _runtime_qa_policy(policy)
     directions = policy.get("metric_directions", {})
     for metric in sorted(policy["metric_paths"]):
         direction = directions.get(metric, "report_only")

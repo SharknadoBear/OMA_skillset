@@ -18,6 +18,13 @@ import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import substring
 
+from .quality_policy import (
+    apply_quality_policy,
+    classify_failure_codes,
+    load_quality_policy,
+    public_policy_binding,
+)
+
 
 DIAGNOSTIC_SCHEMA = "fvcom_thin_component_diagnostic_v2"
 DECISION_SCHEMA = "fvcom_agent_thin_decision_v1"
@@ -280,6 +287,12 @@ def no_op_closure_report(diagnostic: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("no-op closure requires a zero-component diagnostic")
     if int(diagnostic.get("superthin_triangle_count", -1)) != 0:
         raise ValueError("no-op closure requires zero superthin triangles")
+    benchmark_ready = bool(
+        diagnostic.get(
+            "benchmark_grid_baseline_ready",
+            diagnostic.get("fvcom_ready", False),
+        )
+    )
     return {
         "schema_version": CLOSURE_SCHEMA,
         "profile": "autonomous-thin-v1",
@@ -287,7 +300,17 @@ def no_op_closure_report(diagnostic: dict[str, Any]) -> dict[str, Any]:
         "route": "no_op",
         "autonomous_thin_closed": True,
         "minimal_local_debt_closed": True,
-        "fvcom_ready": bool(diagnostic.get("fvcom_ready", False)),
+        "benchmark_grid_baseline_ready": benchmark_ready,
+        "fvcom_ready": benchmark_ready,
+        "accepted": benchmark_ready,
+        "submission_eligible": bool(diagnostic.get("submission_eligible", False)),
+        "regional_refinement_debt": list(
+            diagnostic.get("regional_refinement_debt") or []
+        ),
+        "quality_advisories": dict(diagnostic.get("quality_advisories") or {}),
+        "quality_policy": dict(
+            diagnostic.get("quality_policy") or public_policy_binding()
+        ),
         "failure_taxonomy": list(diagnostic.get("fvcom_readiness_failure_taxonomy") or []),
         "input_hashes": dict(diagnostic.get("input_hashes") or {}),
     }
@@ -607,36 +630,52 @@ def closure_acceptance(
     roundtrip_passed: bool,
 ) -> dict[str, Any]:
     """Apply the non-negotiable post-remesh autonomous closure gates."""
-    failures: list[str] = []
+    findings: list[str] = []
     before_thin = int(before.get("superthin_triangle_count", 0))
     after_thin = int(after.get("superthin_triangle_count", before_thin))
     if before_thin and after_thin >= before_thin:
-        failures.append("superthin_debt_not_strictly_reduced")
+        findings.append("superthin_repair_not_monotonic")
     if int(after.get("connected_component_count", 1)) != 1:
-        failures.append("wet_component_count_not_one")
+        findings.append("multiple_mesh_components")
     if int(after.get("singly_connected_triangle_count", 0)) != 0:
-        failures.append("singly_connected_elements_present")
+        findings.append("singly_connected_elements_present")
     if int(after.get("nonmanifold_edge_count", 0)) != 0:
-        failures.append("nonmanifold_edges_present")
+        findings.append("nonmanifold_edges_present")
     if int(after.get("nonpositive_area_count", 0)) != 0:
-        failures.append("nonpositive_elements_present")
+        findings.append("nonpositive_triangle_area")
     if int(after.get("open_boundary_chain_count", expected_open_boundary_count)) != int(
         expected_open_boundary_count
     ):
-        failures.append("open_boundary_count_changed")
+        findings.append("open_boundary_chain_count_mismatch")
     if not bool(after.get("open_boundary_ordered", True)):
-        failures.append("open_boundary_order_changed")
+        findings.append("open_boundary_nodestring_not_ordered_on_mesh")
     if not bool(after.get("forcing_compatible", True)):
-        failures.append("forcing_incompatible")
+        findings.append("open_boundary_forcing_incompatible")
     if not roundtrip_passed:
-        failures.append("serialization_roundtrip_failed")
-    return {
-        "passed": not failures,
-        "failure_taxonomy": failures,
+        findings.append("2dm_roundtrip_failed")
+    if int(after.get("count_valence_above_8", 0)) > 0:
+        findings.append("node_valence_above_threshold")
+    if after_thin > 0:
+        findings.append("superthin_elements_present")
+    policy = load_quality_policy()
+    result = apply_quality_policy(
+        {}, findings, advisories={"closure_after": dict(after)}, policy=policy
+    )
+    classified = classify_failure_codes(findings, policy)
+    submission_failures = list(classified["submission_preconditions"])
+    result.update({
+        "passed": bool(result["benchmark_grid_baseline_ready"]),
+        "submission_eligible": bool(
+            result["benchmark_grid_baseline_ready"] and not submission_failures
+        ),
+        "submission_failure_taxonomy": submission_failures,
         "superthin_before": before_thin,
         "superthin_after": after_thin,
-        "autonomous_thin_closed": bool(not failures and after_thin == 0),
-    }
+        "autonomous_thin_closed": bool(
+            result["benchmark_grid_baseline_ready"] and after_thin == 0
+        ),
+    })
+    return result
 
 
 def json_safe(value: Any) -> Any:

@@ -2,17 +2,21 @@
 
 Use this note for `minimal-topology-v1`, `aggressive-local-v2`, `run_portfolio_conditioning.py`, `condition_mesh_local.py`, `repair_high_valence.py`, and `prune_redundant_vertices.py`.
 
+The authoritative decision buckets and thresholds are defined only in
+[`fvcom_grid_quality_policy_v1.json`](fvcom_grid_quality_policy_v1.json). This
+note explains the algorithms; it does not define a competing readiness policy.
+
 ## Minimal topology v1
 
 `auto` resolves to `minimal-topology-v1` in both integrated generation and standalone portfolio conditioning. This profile fixes every topological boundary coordinate and membership, disables pruning, spring and micro-relaxation, area-transition relaxation, boundary edits, passage deletion, and global retriangulation, and permits only atomic local retriangulation.
 
 Each of at most four rounds applies valence repair first, immediately scans and repairs any superthin debt created by an accepted valence transaction, repairs residual connected superthin debt with protected-edge-safe flips, collapses, or bounded local cavities, and finishes with another valence scan plus immediate thin cleanup. Stop on zero selected debt, no accepted improvement, or the per-case wall-clock deadline. Never delete one triangle as an isolated operation and never remove a wet passage.
 
-Hash the raw mesh, canonical size field, immutable bathymetry, boundary/OBC contract, and source boundary metadata. Each local transaction still commits only when its targeted debt improves and positive areas, protected/restricted edges, wet components, boundary/OBC lineage, singly connected counts, quality tails, adjacent-area debt, and `L/h` stay within the established local tolerances. At the outer whole-stage decision only, a lower mesh-wide `q_p01` or a larger count of adjacent-triangle area changes above `0.50` is report-only for `minimal-topology-v1`; neither rolls back an otherwise safe topology repair. Preserve the maximum adjacent-area-change gate, bounded `q_min`, minimum-angle and `q_{L3\sigma}` gates, `L/h` gates, and every structural gate. Legacy profiles retain both former vetoes.
+Hash the raw mesh, canonical size field, immutable bathymetry, boundary/OBC contract, and source boundary metadata. For the default minimal and autonomous paths, accept transactions lexicographically: preserve absolute structural invariants first, reduce the valence tuple second, and reduce the superthin tuple third. A valence improvement may be escrowed while immediate superthin cleanup runs. A superthin repair may not worsen the retained valence tuple. Ordinary angle tails, `q_min`, `q_p01`, `q_{L3\sigma}`, adjacent-area transition, bathymetric slope, singly-connected count without a structural break, and `L/h` are Class-2 debt and never roll back a useful Class-1 repair. Explicit legacy and research profiles retain their documented experimental guards.
 
-When any remaining outer gate rejects the primary candidate, retain `candidate.2dm`, its quality JSON, boundary-node lineage, edit ledger, and a hash-bound rollback manifest under `rejected_primary_candidate/`. The delivered `conditioned.2dm` remains the restored pre-stage state. Resample final positive-down depths and repeat the full 2DM roundtrip and quality audit.
+When a structural or ordered debt gate rejects the primary candidate, retain `candidate.2dm`, its quality JSON, boundary-node lineage, edit ledger, and a hash-bound rollback manifest under `rejected_primary_candidate/`. Deliver the best structurally valid lexicographic champion, not the mesh with the smoothest Class-2 statistics. Resample final positive-down depths and repeat the full 2DM roundtrip and quality audit.
 
-Report `minimal_local_debt_closed` separately from `fvcom_ready`. The first requires valence at most eight, zero unique superthin triangles, no restricted-edge violation, and no structural regression. The second retains every scientific and numerical readiness gate, including angles, area transition, bathymetric slope, size/continuity, topology, forcing, depth, node budget, and serialization. External plural/cyclic OBC metadata preserves lineage and scientific context; a cyclic chain remains non-self-describing in SMS 2DM and therefore cannot pass full readiness on that file alone.
+Report `minimal_local_debt_closed` separately from `benchmark_grid_baseline_ready`. Both require valence at most eight and zero unique superthin triangles; the benchmark decision additionally requires the complete structural, boundary/OBC, bathymetry, node-cap, and serialization baseline. `fvcom_ready` and `accepted` are compatibility aliases of the benchmark decision. `submission_eligible` additionally requires forcing/OBC remap compatibility, project provenance, and exact final hashes. External plural/cyclic OBC metadata may preserve benchmark validity while leaving submission ineligible when the SMS 2DM alone is not self-describing.
 
 ## Geometry and hard limits
 
@@ -72,7 +76,7 @@ Write one `fvcom_visual_superthin_repair_plan_v1` per transaction. Bind it to th
 
 Use the visual route implied by the observed mechanism: connectivity restriction and constrained patch reconstruction for an artificial shortcut; inward-front support and optional source-arc insertion for a fixed fan; free or reviewed-spoke paired-bank/centerline support for an under-resolved passage; and legal constrained or protected-chord min-max cavity retriangulation/support for an interior transition. Existing boundary coordinates and hard anchors do not move. A new OBC node lies on the source arc, preserves the original ordered OBC nodes as a subsequence, and marks existing forcing incompatible.
 
-The visual experiment may ignore valence non-regression while it tests whether all superthin debt can be removed, but it must report the valence delta and cannot claim FVCOM readiness. Positive area, manifold wet topology, protected constraints, passage identity, source-arc membership, restricted-edge absence, quality-tail non-regression, size/area-transition non-regression, and 12-decimal serialization remain mandatory.
+The autonomous visual path must retain the best valence tuple while removing superthin debt. Positive area, manifold wet topology, protected constraints, passage identity, source-arc membership, restricted-edge absence, and exact serialization remain mandatory. Quality tails, size/area transition, slope, and nonstructural singly-connected changes are recorded as regional debt and do not reject a structurally valid valence/superthin improvement.
 
 ## Human-approved whole-passage deletion
 
@@ -131,6 +135,10 @@ E(x)=\frac12\sum_{(i,j)\in E}
 with the same target-aware rest-length construction used by `spring-relax-v1`.
 
 ## Transaction gates
+
+The following detailed tolerances describe legacy/research edit ladders unless a
+paragraph explicitly names `minimal-topology-v1` or `autonomous-thin-v1`. The
+default paths always use the benchmark-first ordering above.
 
 Snapshot before every edit. Restore it unless all of the following hold:
 

@@ -110,6 +110,7 @@ def test_auto_resolver_is_minimal_and_disables_broad_edits() -> None:
     assert resolved.max_boundary_welds_per_round == 0
     assert resolved.max_boundary_ear_removals_per_round == 0
     assert resolved.micro_relax_cycles == 0
+    assert resolved.topology_escrow_enabled
 
 
 def _stage_audit() -> dict[str, object]:
@@ -120,6 +121,7 @@ def _stage_audit() -> dict[str, object]:
         "superthin_triangle_count": 0,
         "count_valence_above_8": 1,
         "valence_excess_above_8": 1,
+        "maximum_valence": 9,
         "area_transition_defect_count": 10,
         "l_over_h_count_above_1_55": 0,
         "q_min": 0.50,
@@ -166,7 +168,7 @@ def test_legacy_outer_gate_preserves_q_p01_and_area_count_vetoes() -> None:
     }
 
 
-def test_minimal_outer_gate_keeps_remaining_safety_vetoes() -> None:
+def test_minimal_outer_gate_keeps_priority_vetoes_only() -> None:
     before = _stage_audit()
     after = dict(before)
     after.update(
@@ -180,16 +182,7 @@ def test_minimal_outer_gate_keeps_remaining_safety_vetoes() -> None:
         }
     )
     failures = set(_stage_regressions(before, after, minimal_policy=True))
-    assert {
-        "superthin_triangle_count_regressed",
-        "q_min_regressed",
-        "minimum_angle_deg_regressed",
-        "q_l3_sigma_regressed",
-        "maximum_adjacent_area_change_regressed",
-        "l_over_h_p95_regressed",
-    }.issubset(failures)
-    assert "q_p01_regressed" not in failures
-    assert "area_transition_defect_count_regressed" not in failures
+    assert failures == {"superthin_triangle_count_regressed"}
 
 
 def test_valence_only_repair_closes_without_boundary_movement() -> None:
@@ -302,7 +295,7 @@ TESTS: tuple[Callable[[], None], ...] = (
     test_auto_resolver_is_minimal_and_disables_broad_edits,
     test_minimal_outer_gate_reports_q_p01_and_area_count_only,
     test_legacy_outer_gate_preserves_q_p01_and_area_count_vetoes,
-    test_minimal_outer_gate_keeps_remaining_safety_vetoes,
+    test_minimal_outer_gate_keeps_priority_vetoes_only,
     test_valence_only_repair_closes_without_boundary_movement,
     test_superthin_only_repair_is_an_atomic_flip,
     test_protected_superthin_boundary_is_reported_not_deleted,

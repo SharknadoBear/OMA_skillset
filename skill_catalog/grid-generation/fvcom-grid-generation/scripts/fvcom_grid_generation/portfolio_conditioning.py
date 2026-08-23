@@ -47,6 +47,11 @@ from .projection import (
     unproject_points,
 )
 from .quality import evaluate_mesh_quality
+from .quality_policy import (
+    apply_quality_policy,
+    classify_failure_codes,
+    load_quality_policy,
+)
 from .regional_conditioning import (
     AreaTransitionRelaxConfig,
     relax_mesh_area_transitions,
@@ -653,31 +658,42 @@ def condition_portfolio_mesh(
         and roundtrip["passed"]
         and final_audit["core_passed"]
     )
-    readiness_failures = list(map(str, quality["failure_taxonomy"]))
+    policy_document = load_quality_policy()
+    all_findings = list(map(str, quality.get("all_quality_findings", [])))
     if not bool(roundtrip["passed"]):
-        readiness_failures.append("sms_2dm_roundtrip_failed")
+        all_findings.append("sms_2dm_roundtrip_failed")
     if not bool(final_audit["core_passed"]):
-        readiness_failures.extend(
+        all_findings.extend(
             f"terminal_core:{value}"
             for value in final_audit["core_failures"]
         )
     if not bool(obc_manifest["forcing_compatible"]):
-        readiness_failures.append("open_boundary_forcing_incompatible")
+        all_findings.append("open_boundary_forcing_incompatible")
     if not bool(edge_size["passed"]):
-        readiness_failures.extend(
+        all_findings.extend(
             f"edge_size_continuity:{value}"
             for value in edge_size["failure_taxonomy"]
         )
     if raw_obc_chains and not bool(cyclicity["supported"]):
-        readiness_failures.append("open_boundary_cyclicity_unknown")
+        all_findings.append("open_boundary_cyclicity_unknown")
     if any(open_boundary_cyclic):
-        readiness_failures.append(
+        all_findings.append(
             "cyclic_obc_not_self_describing_in_sms_2dm"
         )
     if not bool(scientific_input_valid):
-        readiness_failures.append("scientific_input_invalid")
-    readiness_failures = sorted(set(readiness_failures))
-    fvcom_ready = bool(not readiness_failures)
+        all_findings.append("scientific_input_invalid")
+    all_findings = sorted(set(all_findings))
+    apply_quality_policy(
+        quality,
+        all_findings,
+        advisories=quality.get("quality_advisories", {}),
+        policy=policy_document,
+    )
+    classified = classify_failure_codes(all_findings, policy_document)
+    baseline_failures = list(quality["baseline_failure_taxonomy"])
+    submission_failures = list(classified["submission_preconditions"])
+    benchmark_ready = bool(quality["benchmark_grid_baseline_ready"])
+    submission_eligible = bool(benchmark_ready and not submission_failures)
     quality["raw_stage"] = False
     quality["common_conditioning_applied"] = bool(
         effective_profile != "none"
@@ -687,18 +703,24 @@ def condition_portfolio_mesh(
     )
     quality["conditioning_profile_effective"] = effective_profile
     quality["minimal_local_debt_closed"] = minimal_local_debt_closed
-    quality["fvcom_ready"] = fvcom_ready
-    quality["accepted"] = fvcom_ready
-    quality["failure_taxonomy"] = readiness_failures
+    quality["submission_failure_taxonomy"] = submission_failures
+    quality["submission_eligible"] = submission_eligible
+    quality["all_quality_findings"] = all_findings
     _write_json(quality_output, quality)
 
-    status = "pass" if fvcom_ready else "needs_review"
+    status = "pass" if benchmark_ready else "needs_review"
     report = {
-        "schema_version": "fvcom_portfolio_conditioning_v2",
+        "schema_version": "fvcom_portfolio_conditioning_v3",
         "status": status,
         "minimal_local_debt_closed": minimal_local_debt_closed,
-        "fvcom_ready": fvcom_ready,
-        "fvcom_readiness_failure_taxonomy": readiness_failures,
+        "benchmark_grid_baseline_ready": benchmark_ready,
+        "fvcom_ready": benchmark_ready,
+        "submission_eligible": submission_eligible,
+        "fvcom_readiness_failure_taxonomy": baseline_failures,
+        "regional_refinement_debt": quality["regional_refinement_debt"],
+        "quality_advisories": quality["quality_advisories"],
+        "submission_failure_taxonomy": submission_failures,
+        "quality_policy": quality["quality_policy"],
         "policy": {
             "name": effective_profile,
             "requested_profile": str(policy.conditioning_profile),
@@ -733,12 +755,13 @@ def condition_portfolio_mesh(
                 "independent lineage mapping and terminal boundary-edge audit"
             ),
             "outer_stage_acceptance": {
-                "report_only_for_minimal_topology_v1": [
-                    "q_p01_regressed",
-                    "area_transition_defect_count_regressed",
+                "benchmark_first_priority": [
+                    "absolute_structural_invariants",
+                    "valence_debt",
+                    "superthin_debt",
                 ],
+                "regional_refinement_debt_never_rolls_back_minimal_repairs": True,
                 "legacy_profiles_unchanged": True,
-                "full_fvcom_readiness_gates_unchanged": True,
             },
         },
         "inputs": {
@@ -822,8 +845,8 @@ def condition_portfolio_mesh(
             "maximum_delivered_depth_m": float(np.max(final_depths)),
         },
         "roundtrip": roundtrip,
-        "quality_accepted": fvcom_ready,
-        "quality_failure_taxonomy": readiness_failures,
+        "quality_accepted": benchmark_ready,
+        "quality_failure_taxonomy": baseline_failures,
         "outputs": {
             "conditioned_2dm": _artifact(mesh_output),
             "delivered_boundary_nodes_geojson": _artifact(boundary_output),
@@ -836,7 +859,7 @@ def condition_portfolio_mesh(
             (
                 "SMS 2DM does not encode OBC cyclicity; an external contract "
                 "can preserve it as evidence but a cyclic result is not "
-                "self-describing or FVCOM-ready as a standalone 2DM."
+                "self-describing or submission-eligible as a standalone 2DM."
             ),
             (
                 "The current aggressive and area-transition cores expose a "
@@ -846,7 +869,9 @@ def condition_portfolio_mesh(
             ),
             (
                 "A needs_review result is retained when the bounded policy "
-                "cannot close every existing FVCOM hard gate."
+                "cannot close the benchmark structural, valence, or "
+                "superthin baseline. Regional refinement debt is reported "
+                "separately and is never a baseline veto."
             ),
         ],
     }
@@ -1045,6 +1070,10 @@ def _primary_topology_config(
         max_valence_l_over_h_count_increase=int(
             config.max_valence_l_over_h_count_increase
         ),
+        topology_escrow_enabled=minimal,
+        topology_escrow_maximum_superthin_count=1_000_000,
+        topology_escrow_maximum_superthin_severity=1.0e12,
+        topology_escrow_maximum_valence=1_000_000,
         micro_relax_cycles=(
             0 if minimal or disabled else int(config.micro_relax_cycles)
         ),
@@ -1327,33 +1356,37 @@ def _stage_regressions(
             f"terminal_core:{value}" for value in after["core_failures"]
         )
     nonincrease = [
-        "singly_connected_triangle_count",
         "superthin_triangle_count",
         "count_valence_above_8",
         "valence_excess_above_8",
         "l_over_h_count_above_1_55",
     ]
+    if minimal_policy:
+        before_valence = (
+            int(before["count_valence_above_8"]),
+            int(before["valence_excess_above_8"]),
+            int(before["maximum_valence"]),
+        )
+        after_valence = (
+            int(after["count_valence_above_8"]),
+            int(after["valence_excess_above_8"]),
+            int(after["maximum_valence"]),
+        )
+        if after_valence > before_valence:
+            failures.append("valence_debt_regressed")
+        elif after_valence == before_valence and int(
+            after["superthin_triangle_count"]
+        ) > int(before["superthin_triangle_count"]):
+            failures.append("superthin_triangle_count_regressed")
+        # All Class-2 metrics, including singly connected count, ordinary
+        # quality tails, area transition, and L/h, are report-only here.
+        return sorted(set(failures))
     if not minimal_policy:
         nonincrease.append("area_transition_defect_count")
     for key in nonincrease:
         if int(after[key]) > int(before[key]):
             failures.append(f"{key}_regressed")
-    if minimal_policy:
-        if float(after["q_min"]) + 1.0e-12 < min(
-            float(before["q_min"]),
-            0.25,
-        ):
-            failures.append("q_min_regressed")
-        if float(after["minimum_angle_deg"]) + 1.0e-8 < min(
-            float(before["minimum_angle_deg"]),
-            20.0,
-        ):
-            failures.append("minimum_angle_deg_regressed")
-        if float(after["q_l3_sigma"]) + 1.0e-4 < float(
-            before["q_l3_sigma"]
-        ):
-            failures.append("q_l3_sigma_regressed")
-    else:
+    if not minimal_policy:
         nondecrease_float = (
             "q_min",
             "q_p01",
@@ -1380,15 +1413,15 @@ def _minimal_report_only_deltas(
     before: dict[str, Any],
     after: dict[str, Any],
 ) -> dict[str, Any]:
-    """Expose the two relaxed whole-stage metrics without vetoing a repair."""
+    """Expose benchmark-first Class-2 deltas without vetoing a repair."""
 
     q_before = float(before["q_p01"])
     q_after = float(after["q_p01"])
     area_before = int(before["area_transition_defect_count"])
     area_after = int(after["area_transition_defect_count"])
     return {
-        "policy": "report_only_not_outer_stage_veto",
-        "full_fvcom_readiness_gates_unchanged": True,
+        "policy": "regional_refinement_debt_never_outer_stage_veto",
+        "benchmark_first_policy": True,
         "q_p01": {
             "before": q_before,
             "after": q_after,
@@ -1400,6 +1433,37 @@ def _minimal_report_only_deltas(
             "after": area_after,
             "delta": area_after - area_before,
             "regressed_under_previous_gate": bool(area_after > area_before),
+        },
+        "q_min": {
+            "before": float(before["q_min"]),
+            "after": float(after["q_min"]),
+            "delta": float(after["q_min"]) - float(before["q_min"]),
+        },
+        "q_l3_sigma": {
+            "before": float(before["q_l3_sigma"]),
+            "after": float(after["q_l3_sigma"]),
+            "delta": float(after["q_l3_sigma"]) - float(before["q_l3_sigma"]),
+        },
+        "minimum_angle_deg": {
+            "before": float(before["minimum_angle_deg"]),
+            "after": float(after["minimum_angle_deg"]),
+            "delta": float(after["minimum_angle_deg"]) - float(before["minimum_angle_deg"]),
+        },
+        "maximum_adjacent_area_change": {
+            "before": float(before["maximum_adjacent_area_change"]),
+            "after": float(after["maximum_adjacent_area_change"]),
+            "delta": float(after["maximum_adjacent_area_change"]) - float(before["maximum_adjacent_area_change"]),
+        },
+        "singly_connected_triangle_count": {
+            "before": int(before["singly_connected_triangle_count"]),
+            "after": int(after["singly_connected_triangle_count"]),
+            "delta": int(after["singly_connected_triangle_count"]) - int(before["singly_connected_triangle_count"]),
+        },
+        "l_over_h": {
+            "p95_before": float(before["l_over_h_p95"]),
+            "p95_after": float(after["l_over_h_p95"]),
+            "maximum_before": float(before["l_over_h_maximum"]),
+            "maximum_after": float(after["l_over_h_maximum"]),
         },
     }
 

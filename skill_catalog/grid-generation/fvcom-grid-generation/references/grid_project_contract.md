@@ -21,6 +21,8 @@ publication verifies SHA-256 before atomic replacement.
   06_raw_mesh/raw_mesh_manifest.json
   07_conditioning/conditioned_mesh.2dm
   08_audit/final_audit.json
+  08_audit/mesh_review_map.png
+  08_audit/mesh_review_map_manifest.json
   final/
   logs/
 ```
@@ -40,13 +42,20 @@ Clean-room and Gmsh 1/5 candidates remain explicit research controls and cannot
 be promoted or published through this operational project contract.
 
 When a raw or conditioned terminal mesh exists, `publish` requires the mesh
-quality, conditioning, boundary-node, OBC-remap, roundtrip, and review-map
-companions. It writes `final/fvcom_grid.2dm` even for a non-ready terminal mesh,
-plus `final/fvcom_grid_status.json`; the status uses schema
-`fvcom_grid_delivery_v1` and records readiness, submission eligibility, OBC and
-forcing status, selected-stage hashes, and failure taxonomy. A pre-mesh failure
-writes the status but never fabricates a 2DM.
+quality, conditioning, boundary-node, OBC-remap, and roundtrip companions. It
+automatically writes the standard positive-down bathymetry/triangle review map,
+with the delivered OBC in red, a bounded Esri topographic background or
+project-local coastline fallback, and the grid name plus four-decimal
+`q_L3sigma` in the title. The PNG and hash-bound manifest are stable under
+`08_audit/` and copied to `final/`. Publication writes `final/fvcom_grid.2dm`
+even for a non-ready terminal mesh, plus `final/fvcom_grid_status.json`; the
+status uses schema `fvcom_grid_delivery_v1` and records the bound quality-policy
+hash, benchmark readiness, regional debt, submission eligibility, OBC/forcing
+status, selected-stage hashes, and Class-1 failure taxonomy. A pre-mesh failure
+writes the status but never fabricates a 2DM or map.
 
-Run `validate --require-submission-ready` immediately before future job
-submission. It requires `submission_eligible=true`, `fvcom_ready=true`, and an
-exact final-mesh hash. A stable filename alone is never sufficient.
+Run `validate --require-benchmark-ready` before a first benchmark run. Run
+`validate --require-submission-ready` immediately before future job submission;
+it additionally requires forcing/remap compatibility, complete provenance, and
+an exact final-mesh hash. Class-2/3 debt does not independently block either
+decision. A stable filename alone is never sufficient.

@@ -36,6 +36,7 @@ from .progress import ProgressTracker
 from .open_exterior import validate_open_exterior_contract
 from .projection import project_points, unproject_points
 from .quality import evaluate_mesh_quality
+from .quality_policy import apply_quality_policy, load_quality_policy
 from .size_field import (
     SizeFieldConfig,
     boundary_front_seed_points,
@@ -508,9 +509,9 @@ def run_fvcom_grid(
     _apply_delivered_node_budget_gate(quality, delivered_node_budget)
     quality["open_boundary_size_error"] = _open_boundary_size_error(mesh.nodes_xy, mesh.open_boundary_nodes, mesh.target_spacing_m)
     if quality["open_boundary_size_error"]["p95_l_over_h"] > 1.55 or quality["open_boundary_size_error"]["maximum_l_over_h"] > 2.0:
-        if "open_boundary_size_mismatch" not in quality["failure_taxonomy"]:
-            quality["failure_taxonomy"].append("open_boundary_size_mismatch")
-        quality["accepted"] = False
+        quality.setdefault("all_quality_findings", []).append(
+            "open_boundary_size_mismatch"
+        )
 
     progress.update("write_outputs", 90.0, message="Writing the generation-time smoothed FVCOM mesh and QA artifacts.")
     output_2dm = write_2dm(
@@ -587,10 +588,20 @@ def run_fvcom_grid(
         ),
     }
     if not roundtrip_positive_signed_areas:
-        quality["failure_taxonomy"].append("2dm_roundtrip_nonpositive_area")
+        quality.setdefault("all_quality_findings", []).append(
+            "2dm_roundtrip_nonpositive_area"
+        )
     if not quality["roundtrip"]["ok"]:
-        quality["failure_taxonomy"].append("2dm_roundtrip_failed")
-        quality["accepted"] = False
+        quality.setdefault("all_quality_findings", []).append(
+            "2dm_roundtrip_failed"
+        )
+
+    apply_quality_policy(
+        quality,
+        sorted(set(quality.get("all_quality_findings", []))),
+        advisories=quality.get("quality_advisories", {}),
+        policy=load_quality_policy(),
+    )
 
     quality["raw_stage"] = False
     quality["common_conditioning_applied"] = bool(
@@ -608,7 +619,10 @@ def run_fvcom_grid(
             False,
         )
     )
-    quality["fvcom_ready"] = bool(quality["accepted"])
+    quality["submission_eligible"] = False
+    quality["submission_failure_taxonomy"] = [
+        "project_provenance_incomplete"
+    ]
 
     quality_json = run_dir / "mesh_quality.json"
     quality_json.write_text(json.dumps(_json_safe(quality), indent=2), encoding="utf-8")
@@ -627,7 +641,10 @@ def run_fvcom_grid(
         depths,
         mesh.open_boundary_nodes,
         boundary_package.domain_polygon_lonlat,
-        f"{name} FVCOM grid ({'pass' if quality.get('accepted') else 'needs review'})",
+        (
+            f"{name} | q_L3σ = "
+            f"{float(quality['oceanmesh_quality']['q_l3_sigma']):.4f}"
+        ),
     )
     final_status = "pass" if quality.get("accepted") else "needs_review"
     manifest = {
@@ -1173,10 +1190,14 @@ def _apply_delivered_node_budget_gate(
     quality["node_budget"] = dict(delivered_report)
     if bool(delivered_report.get("passed")):
         return
-    failures = quality.setdefault("failure_taxonomy", [])
-    if "hard_node_cap_exceeded" not in failures:
-        failures.append("hard_node_cap_exceeded")
-    quality["accepted"] = False
+    findings = quality.setdefault("all_quality_findings", [])
+    if "hard_node_cap_exceeded" not in findings:
+        findings.append("hard_node_cap_exceeded")
+    apply_quality_policy(
+        quality,
+        findings,
+        advisories=quality.get("quality_advisories", {}),
+    )
 
 
 def _open_boundary_size_error(nodes_xy: np.ndarray, open_nodes_one_based: np.ndarray, node_targets: np.ndarray) -> dict[str, Any]:

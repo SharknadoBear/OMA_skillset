@@ -11,6 +11,16 @@ from pathlib import Path
 from typing import Any
 
 from .open_exterior import validate_open_exterior_contract
+from .plotting import (
+    validate_standard_mesh_review_map,
+    write_standard_mesh_review_map,
+)
+from .quality_policy import (
+    classify_failure_codes,
+    load_quality_policy,
+    public_policy_binding,
+)
+from .sms_2dm import read_2dm
 
 
 STAGES = {
@@ -31,6 +41,7 @@ FINAL_COMPANIONS = {
     "obc_remap_manifest": "obc_remap_manifest.json",
     "roundtrip_audit": "roundtrip_audit.json",
     "mesh_review_map": "mesh_review_map.png",
+    "mesh_review_map_manifest": "mesh_review_map_manifest.json",
 }
 DEFAULT_MESHER_POLICY = {
     "candidate_id": "gmsh_frontal_delaunay_6",
@@ -108,6 +119,7 @@ def _append_command(root: Path, operation: str, details: dict[str, Any]) -> None
 
 def init_project(project: str | Path, name: str) -> dict[str, Any]:
     root = _root(project)
+    quality_policy = public_policy_binding()
     if root.exists() and any(root.iterdir()):
         manifest_path = root / "project_manifest.json"
         if not manifest_path.is_file():
@@ -117,6 +129,7 @@ def init_project(project: str | Path, name: str) -> dict[str, Any]:
             manifest.get("schema_version") != "fvcom_grid_project_v1"
             or manifest.get("name") != name
             or manifest.get("mesher_policy") != DEFAULT_MESHER_POLICY
+            or manifest.get("quality_policy") != quality_policy
         ):
             raise ValueError("incompatible project resume")
         return manifest
@@ -132,6 +145,7 @@ def init_project(project: str | Path, name: str) -> dict[str, Any]:
         "created_utc": utc_now(),
         "layout": {"stages": list(STAGES), "final": "final", "logs": "logs"},
         "mesher_policy": dict(DEFAULT_MESHER_POLICY),
+        "quality_policy": quality_policy,
         "selected_artifacts": {},
     }
     _atomic_json(root / "project_manifest.json", manifest)
@@ -139,7 +153,9 @@ def init_project(project: str | Path, name: str) -> dict[str, Any]:
         "schema_version": "fvcom_grid_delivery_v1",
         "state": "initialized",
         "fvcom_ready": False,
+        "benchmark_grid_baseline_ready": False,
         "submission_eligible": False,
+        "quality_policy": quality_policy,
         "failure_taxonomy": [],
     })
     _append_command(root, "init", {"name": name})
@@ -357,12 +373,13 @@ def publish(
     *,
     mesh: str | Path | None,
     companions: dict[str, str | Path],
-    fvcom_ready: bool,
-    submission_eligible: bool,
+    fvcom_ready: bool | None,
+    submission_eligible: bool | None,
     obc_status: str,
     forcing_status: str,
     failures: list[str],
     open_exterior_source: str | Path | None = None,
+    basemap_provider: str = "topo",
 ) -> dict[str, Any]:
     root = _root(project)
     manifest = _read(root / "project_manifest.json")
@@ -378,13 +395,16 @@ def publish(
             "terminal publication requires deterministic Gmsh-6 provenance: "
             + ", ".join(mesher_failures)
         )
+    policy = load_quality_policy()
+    policy_binding = public_policy_binding(policy)
+    if manifest.get("quality_policy") != policy_binding:
+        raise ValueError("project is not bound to the installed grid-quality policy")
+    all_findings = list(map(str, failures))
     open_audit = None
     if open_exterior_source:
         open_audit = validate_open_exterior_contract(open_exterior_source, required=True)
         if not open_audit["passed"]:
-            failures = list(dict.fromkeys(failures + open_audit["failure_taxonomy"]))
-            submission_eligible = False
-            fvcom_ready = False
+            all_findings.extend(open_audit["failure_taxonomy"])
         # Delivery manifests remain portable: retain the evidence hash and
         # decision, never an absolute workstation path.
         open_audit = {
@@ -393,44 +413,138 @@ def publish(
             if key != "contract_path"
         }
     final_dir = root / "final"
+    publication_companions = dict(companions)
+    quality_document: dict[str, Any] | None = None
+    benchmark_ready = False
+    regional_debt: list[dict[str, Any]] = []
+    quality_advisories: dict[str, Any] = {}
+    submission_failures: list[str] = []
     if selected_mesh is not None:
         if selected_mesh.is_symlink() or not selected_mesh.is_file():
             raise ValueError("terminal mesh is not a regular file")
-        missing = sorted(set(FINAL_COMPANIONS) - set(companions))
+        caller_required = set(FINAL_COMPANIONS) - {
+            "mesh_review_map",
+            "mesh_review_map_manifest",
+        }
+        missing = sorted(caller_required - set(publication_companions))
         if missing:
             raise ValueError("terminal mesh publication requires companions: " + ", ".join(missing))
+        quality_source = Path(publication_companions["mesh_quality"]).resolve()
+        boundary_source = Path(publication_companions["boundary_nodes"]).resolve()
+        terminal_mesh_document = read_2dm(selected_mesh)
+        if terminal_mesh_document.open_boundary_chains and open_exterior_source is None:
+            all_findings.append("open_exterior_contract_missing_or_stale")
+        quality_document = _read(quality_source)
+        if quality_document.get("quality_policy") != policy_binding:
+            raise ValueError("mesh quality is missing or stale against the project quality policy")
+        quality_findings = list(
+            map(str, quality_document.get("all_quality_findings", []))
+        )
+        quality_classified = classify_failure_codes(quality_findings, policy)
+        quality_ready = not quality_classified["benchmark_baseline"]
+        if bool(quality_document.get("benchmark_grid_baseline_ready")) != quality_ready:
+            raise ValueError("mesh quality benchmark decision contradicts its findings")
+        all_findings.extend(quality_findings)
+        if obc_status not in {"pass", "not_required"}:
+            all_findings.append("open_boundary_scientific_placement_invalid")
+        if forcing_status not in {"compatible", "not_required"}:
+            all_findings.append(
+                "open_boundary_forcing_missing"
+                if forcing_status in {"unknown", "missing", "pending"}
+                else "open_boundary_forcing_incompatible"
+            )
+        classified = classify_failure_codes(all_findings, policy)
+        benchmark_failures = list(classified["benchmark_baseline"])
+        benchmark_ready = not benchmark_failures
+        if fvcom_ready is not None and bool(fvcom_ready) != benchmark_ready:
+            raise ValueError("caller fvcom_ready contradicts the derived benchmark decision")
+        regional_debt = list(quality_document.get("regional_refinement_debt", []))
+        quality_advisories = dict(quality_document.get("quality_advisories") or {})
+        submission_failures = list(classified["submission_preconditions"])
+        submission_failures = sorted(set(submission_failures))
+        derived_submission_eligible = bool(
+            benchmark_ready and not submission_failures
+        )
+        if (
+            submission_eligible is not None
+            and bool(submission_eligible) != derived_submission_eligible
+        ):
+            raise ValueError(
+                "caller submission_eligible contradicts policy-derived project status"
+            )
+
+        stable_map = root / "08_audit" / "mesh_review_map.png"
+        stable_map_manifest = root / "08_audit" / "mesh_review_map_manifest.json"
+        if stable_map.exists() or stable_map_manifest.exists():
+            map_validation = validate_standard_mesh_review_map(
+                stable_map,
+                stable_map_manifest,
+                mesh_path=selected_mesh,
+                quality_path=quality_source,
+                boundary_nodes_path=boundary_source,
+            )
+            if not map_validation["passed"]:
+                raise ValueError(
+                    "refusing to overwrite a stale standard review map: "
+                    + ", ".join(map_validation["failure_taxonomy"])
+                )
+        else:
+            write_standard_mesh_review_map(
+                stable_map,
+                stable_map_manifest,
+                mesh_path=selected_mesh,
+                quality_path=quality_source,
+                boundary_nodes_path=boundary_source,
+                grid_name=str(manifest["name"]),
+                coastline_path=root / "02_coastline" / "coastline.gpkg",
+                basemap_provider=basemap_provider,
+            )
+        publication_companions["mesh_review_map"] = stable_map
+        publication_companions["mesh_review_map_manifest"] = stable_map_manifest
         mesh_hash = _verified_copy(selected_mesh, final_dir / "fvcom_grid.2dm")
         for key, final_name in FINAL_COMPANIONS.items():
-            source = Path(companions[key]).resolve()
+            source = Path(publication_companions[key]).resolve()
             if not source.is_file() or not _inside(source, root):
                 raise ValueError(f"{key} must be a project-local regular file")
             _verified_copy(source, final_dir / final_name)
     else:
         mesh_hash = None
-        submission_eligible = False
-        fvcom_ready = False
-    if submission_eligible and (not fvcom_ready or selected_mesh is None or failures):
-        raise ValueError("submission eligibility requires a ready, failure-free terminal mesh")
+        benchmark_failures = sorted(set(all_findings))
+        derived_submission_eligible = False
+        benchmark_ready = False
+    if derived_submission_eligible and (not benchmark_ready or selected_mesh is None):
+        raise ValueError("submission eligibility requires a benchmark-ready terminal mesh")
     status = {
         "schema_version": "fvcom_grid_delivery_v1",
         "created_utc": utc_now(),
         "state": "mesh_published" if selected_mesh is not None else "failed_pre_mesh",
         "mesh": ({"path": "final/fvcom_grid.2dm", "sha256": mesh_hash} if mesh_hash else None),
-        "fvcom_ready": bool(fvcom_ready),
-        "submission_eligible": bool(submission_eligible),
+        "quality_policy": policy_binding,
+        "benchmark_grid_baseline_ready": bool(benchmark_ready),
+        "fvcom_ready": bool(benchmark_ready),
+        "accepted": bool(benchmark_ready),
+        "submission_eligible": bool(derived_submission_eligible),
         "obc_status": obc_status,
         "forcing_status": forcing_status,
         "selected_stage_hashes": manifest.get("selected_artifacts", {}),
         "open_exterior_audit": open_audit,
-        "failure_taxonomy": list(dict.fromkeys(failures)),
+        "failure_taxonomy": list(dict.fromkeys(benchmark_failures)),
+        "regional_refinement_debt": regional_debt,
+        "quality_advisories": quality_advisories,
+        "submission_failure_taxonomy": submission_failures,
     }
     _atomic_json(final_dir / "fvcom_grid_status.json", status)
     _atomic_json(root / "project_status.json", status)
-    _append_command(root, "publish", {"mesh_sha256": mesh_hash, "submission_eligible": submission_eligible})
+    _append_command(root, "publish", {"mesh_sha256": mesh_hash, "submission_eligible": derived_submission_eligible})
     return status
 
 
-def validate(project: str | Path, *, require_submission_ready: bool = False) -> dict[str, Any]:
+def validate(
+    project: str | Path,
+    *,
+    require_benchmark_ready: bool = False,
+    require_submission_ready: bool = False,
+) -> dict[str, Any]:
     root = _root(project)
     failures: list[str] = []
     manifest_path = root / "project_manifest.json"
@@ -443,6 +557,17 @@ def validate(project: str | Path, *, require_submission_ready: bool = False) -> 
         failures.append("project_schema_invalid")
     if status.get("schema_version") != "fvcom_grid_delivery_v1":
         failures.append("delivery_schema_invalid")
+    policy_binding = public_policy_binding()
+    if manifest.get("quality_policy") != policy_binding:
+        failures.append("project_quality_policy_missing_or_stale")
+    if status.get("quality_policy") != policy_binding:
+        failures.append("delivery_quality_policy_missing_or_stale")
+    benchmark_value = status.get("benchmark_grid_baseline_ready")
+    if (
+        status.get("fvcom_ready") is not benchmark_value
+        or status.get("accepted") is not benchmark_value
+    ):
+        failures.append("delivery_compatibility_alias_mismatch")
     failures.extend(_default_mesher_failures(root, manifest))
     for record in manifest.get("selected_artifacts", {}).values():
         path = root / record["path"]
@@ -457,8 +582,27 @@ def validate(project: str | Path, *, require_submission_ready: bool = False) -> 
         path = root / mesh["path"]
         if not path.is_file() or sha256_file(path) != mesh.get("sha256"):
             failures.append("final_mesh_hash_stale")
+        quality_path = root / "final" / FINAL_COMPANIONS["mesh_quality"]
+        boundary_path = root / "final" / FINAL_COMPANIONS["boundary_nodes"]
+        map_audit = validate_standard_mesh_review_map(
+            root / "final" / FINAL_COMPANIONS["mesh_review_map"],
+            root / "final" / FINAL_COMPANIONS["mesh_review_map_manifest"],
+            mesh_path=path,
+            quality_path=quality_path,
+            boundary_nodes_path=boundary_path,
+        )
+        failures.extend(map_audit["failure_taxonomy"])
+    if require_benchmark_ready:
+        if status.get("benchmark_grid_baseline_ready") is not True:
+            failures.append("project_not_benchmark_ready")
+        if not mesh:
+            failures.append("benchmark_mesh_missing")
     if require_submission_ready:
-        if status.get("submission_eligible") is not True or status.get("fvcom_ready") is not True:
+        if (
+            status.get("submission_eligible") is not True
+            or status.get("benchmark_grid_baseline_ready") is not True
+            or status.get("fvcom_ready") is not True
+        ):
             failures.append("project_not_submission_ready")
         if not mesh:
             failures.append("submission_mesh_missing")

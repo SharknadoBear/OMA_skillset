@@ -389,6 +389,15 @@ def main() -> int:
             dpi=args.dpi,
         )
 
+    conditioning_report = (
+        _json(args.conditioning_report) if args.conditioning_report else {}
+    )
+    benchmark_ready = bool(
+        conditioning_report.get(
+            "benchmark_grid_baseline_ready",
+            conditioning_report.get("fvcom_ready", False),
+        )
+    )
     document = {
         "schema_version": DIAGNOSTIC_SCHEMA,
         "profile": "autonomous-thin-v1",
@@ -423,6 +432,25 @@ def main() -> int:
         "whole_domain_map": str(whole_map),
         "component_count": len(components),
         "superthin_triangle_count": int(sum(value["triangle_count"] for value in components)),
+        "minimal_local_debt_closed": bool(
+            conditioning_report.get("minimal_local_debt_closed", not components)
+        ),
+        "benchmark_grid_baseline_ready": benchmark_ready,
+        "fvcom_ready": benchmark_ready,
+        "accepted": benchmark_ready,
+        "submission_eligible": bool(
+            conditioning_report.get("submission_eligible", False)
+        ),
+        "fvcom_readiness_failure_taxonomy": list(
+            conditioning_report.get("fvcom_readiness_failure_taxonomy") or []
+        ),
+        "regional_refinement_debt": list(
+            conditioning_report.get("regional_refinement_debt") or []
+        ),
+        "quality_advisories": dict(
+            conditioning_report.get("quality_advisories") or {}
+        ),
+        "quality_policy": dict(conditioning_report.get("quality_policy") or {}),
         "components": components,
         "policy": {
             "minimum_elements_across": 3,

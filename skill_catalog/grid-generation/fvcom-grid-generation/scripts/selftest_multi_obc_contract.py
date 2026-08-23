@@ -309,20 +309,27 @@ def test_interior_edge_cannot_be_an_open_boundary() -> None:
 
 
 def test_target_size_p95_and_maximum_gates() -> None:
+    def debt_codes(report: dict) -> set[str]:
+        return {
+            str(value["code"])
+            for value in report.get("regional_refinement_debt", [])
+        }
+
     passing = _quality(np.ones(2, dtype=float))
-    assert "target_size_l_over_h_p95_above_threshold" not in passing["failure_taxonomy"]
-    assert "target_size_l_over_h_max_above_threshold" not in passing["failure_taxonomy"]
+    assert "target_size_l_over_h_p95_above_threshold" not in debt_codes(passing)
+    assert "target_size_l_over_h_max_above_threshold" not in debt_codes(passing)
 
     p95_failure = _quality(np.full(2, 0.8, dtype=float))
-    assert "target_size_l_over_h_p95_above_threshold" in p95_failure["failure_taxonomy"]
-    assert "target_size_l_over_h_max_above_threshold" not in p95_failure["failure_taxonomy"]
+    assert p95_failure["benchmark_grid_baseline_ready"]
+    assert "target_size_l_over_h_p95_above_threshold" in debt_codes(p95_failure)
+    assert "target_size_l_over_h_max_above_threshold" not in debt_codes(p95_failure)
 
     maximum_failure = _quality(np.full(2, 0.6, dtype=float))
-    assert "target_size_l_over_h_p95_above_threshold" in maximum_failure["failure_taxonomy"]
-    assert "target_size_l_over_h_max_above_threshold" in maximum_failure["failure_taxonomy"]
+    assert "target_size_l_over_h_p95_above_threshold" in debt_codes(maximum_failure)
+    assert "target_size_l_over_h_max_above_threshold" in debt_codes(maximum_failure)
 
     missing = _quality(None)
-    assert "missing_target_size_error_diagnostic" in missing["failure_taxonomy"]
+    assert "missing_target_size_error_diagnostic" in debt_codes(missing)
 
 
 def test_boundary_contract_exact_counts_and_cyclic_policy() -> None:

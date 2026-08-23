@@ -762,7 +762,25 @@ def _apply_conditioning_decision(
     report["minimal_local_debt_closed"] = bool(
         conditioning_report.get("minimal_local_debt_closed")
     )
-    report["fvcom_ready"] = bool(conditioning_report.get("fvcom_ready"))
+    benchmark_ready = bool(
+        conditioning_report.get(
+            "benchmark_grid_baseline_ready",
+            conditioning_report.get("fvcom_ready"),
+        )
+    )
+    report["benchmark_grid_baseline_ready"] = benchmark_ready
+    report["fvcom_ready"] = benchmark_ready
+    report["accepted"] = benchmark_ready
+    report["submission_eligible"] = bool(
+        conditioning_report.get("submission_eligible", False)
+    )
+    report["regional_refinement_debt"] = list(
+        conditioning_report.get("regional_refinement_debt") or []
+    )
+    report["quality_advisories"] = dict(
+        conditioning_report.get("quality_advisories") or {}
+    )
+    report["quality_policy"] = dict(conditioning_report.get("quality_policy") or {})
     audit = conditioning_report.get("final_global_audit") or {}
     superthin = audit.get("superthin_triangle_count")
     report["autonomous_thin_closed"] = bool(superthin == 0)
@@ -803,7 +821,11 @@ def main() -> int:
             "report": str(report_path),
             "autonomous_thin_closed": True,
             "minimal_local_debt_closed": True,
+            "benchmark_grid_baseline_ready": report[
+                "benchmark_grid_baseline_ready"
+            ],
             "fvcom_ready": report["fvcom_ready"],
+            "submission_eligible": report["submission_eligible"],
             "failure_taxonomy": report["failure_taxonomy"],
         }, indent=2))
         return 0
@@ -836,7 +858,13 @@ def main() -> int:
         "route": route,
         "autonomous_thin_closed": False,
         "minimal_local_debt_closed": False,
+        "benchmark_grid_baseline_ready": False,
         "fvcom_ready": False,
+        "accepted": False,
+        "submission_eligible": False,
+        "regional_refinement_debt": [],
+        "quality_advisories": {},
+        "quality_policy": {},
         "failure_taxonomy": [],
     }
     if route == "protected_or_source_conflict":
@@ -890,7 +918,11 @@ def main() -> int:
         "report": str(report_path),
         "autonomous_thin_closed": report["autonomous_thin_closed"],
         "minimal_local_debt_closed": report["minimal_local_debt_closed"],
+        "benchmark_grid_baseline_ready": report[
+            "benchmark_grid_baseline_ready"
+        ],
         "fvcom_ready": report["fvcom_ready"],
+        "submission_eligible": report["submission_eligible"],
         "failure_taxonomy": report["failure_taxonomy"],
     }, indent=2))
     return 0 if report["status"] in {

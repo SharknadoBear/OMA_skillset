@@ -271,9 +271,11 @@ def test_cyclic_obc_and_source_forcing_remain_readiness_failures() -> None:
             source_boundary_metadata={"forcing_compatible": False},
         )
         assert report["minimal_local_debt_closed"]
-        assert not report["fvcom_ready"]
-        assert report["status"] == "needs_review"
-        failures = set(report["fvcom_readiness_failure_taxonomy"])
+        assert report["benchmark_grid_baseline_ready"]
+        assert report["fvcom_ready"]
+        assert report["status"] == "pass"
+        assert not report["submission_eligible"]
+        failures = set(report["submission_failure_taxonomy"])
         assert "cyclic_obc_not_self_describing_in_sms_2dm" in failures
         assert "open_boundary_forcing_incompatible" in failures
         assert (

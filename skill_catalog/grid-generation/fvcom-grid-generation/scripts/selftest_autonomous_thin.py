@@ -325,8 +325,12 @@ def main() -> int:
         roundtrip_passed=True,
     )
     assert not delaware_rejection["passed"]
-    assert "wet_component_count_not_one" in delaware_rejection["failure_taxonomy"]
-    assert "singly_connected_elements_present" in delaware_rejection["failure_taxonomy"]
+    assert "multiple_mesh_components" in delaware_rejection["failure_taxonomy"]
+    assert "singly_connected_elements_present" not in delaware_rejection["failure_taxonomy"]
+    assert any(
+        value["code"] == "singly_connected_elements_present"
+        for value in delaware_rejection["regional_refinement_debt"]
+    )
 
     first = canonical_sha256({"b": 2, "a": 1})
     second = canonical_sha256({"a": 1, "b": 2})

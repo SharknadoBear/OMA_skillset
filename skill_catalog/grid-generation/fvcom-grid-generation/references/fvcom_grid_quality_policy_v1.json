@@ -1,0 +1,206 @@
+{
+  "schema_version": "fvcom_grid_quality_policy_v1",
+  "policy_id": "benchmark-first-2026-08-23",
+  "description": "Ordered FVCOM benchmark-grid policy: absolute invariants, valence, superthin debt, regional refinement debt, then descriptive advisories.",
+  "priority_order": [
+    "absolute_structural_invariants",
+    "valence_debt",
+    "superthin_debt",
+    "regional_refinement_debt",
+    "quality_advisories"
+  ],
+  "thresholds": {
+    "maximum_node_valence": 8,
+    "superthin_quality_below": 0.1,
+    "superthin_minimum_angle_below_deg": 5.0,
+    "regional_q_l3_sigma_target_above": 0.75,
+    "regional_minimum_angle_target_deg": 30.0,
+    "regional_maximum_angle_target_deg": 130.0,
+    "regional_maximum_adjacent_area_change": 0.5,
+    "regional_maximum_bathymetric_slope": 0.1,
+    "regional_target_size_l_over_h_p95": 1.55,
+    "regional_target_size_l_over_h_maximum": 2.0,
+    "roundtrip_coordinate_tolerance_m": 0.01,
+    "planning_node_limit": 900000,
+    "hard_node_limit": 1000000
+  },
+  "buckets": {
+    "benchmark_baseline": {
+      "blocking": true,
+      "criteria": [
+        {
+          "id": "absolute_mesh_structure",
+          "failure_codes": [
+            "nonfinite_mesh_coordinates",
+            "nonpositive_triangle_area",
+            "multiple_mesh_components",
+            "nonmanifold_edges_present",
+            "boundary_not_traversable",
+            "boundary_constraint_not_recovered",
+            "protected_boundary_constraint_missing",
+            "unused_mesh_nodes_present",
+            "hard_node_cap_exceeded",
+            "scientific_input_invalid"
+          ],
+          "failure_prefixes": ["terminal_core:"]
+        },
+        {
+          "id": "valence_debt",
+          "priority": 1,
+          "failure_codes": ["node_valence_above_threshold"]
+        },
+        {
+          "id": "superthin_debt",
+          "priority": 2,
+          "failure_codes": [
+            "superthin_elements_present",
+            "superthin_repair_not_monotonic"
+          ]
+        },
+        {
+          "id": "boundary_and_open_exterior",
+          "failure_codes": [
+            "open_boundary_chain_count_mismatch",
+            "missing_open_boundary_nodestring",
+            "open_boundary_nodestring_not_ordered_on_mesh",
+            "open_boundary_scientific_placement_invalid",
+            "open_exterior_contract_failed",
+            "open_exterior_contract_missing_or_stale",
+            "open_exterior_not_downstream_eligible"
+          ],
+          "failure_prefixes": ["open_exterior:"]
+        },
+        {
+          "id": "bathymetry_and_serialization",
+          "failure_codes": [
+            "nonpositive_or_nan_depth",
+            "bathymetry_coverage_incomplete",
+            "2dm_roundtrip_nonpositive_area",
+            "2dm_roundtrip_failed",
+            "sms_2dm_roundtrip_failed"
+          ]
+        }
+      ]
+    },
+    "regional_refinement_debt": {
+      "blocking": false,
+      "criteria": [
+        {
+          "id": "ordinary_angle_tails",
+          "failure_codes": ["min_angle_below_threshold", "max_angle_above_threshold"]
+        },
+        {
+          "id": "quality_distribution",
+          "failure_codes": ["q_l3_sigma_below_threshold", "q_min_regional_debt", "q_p01_regional_debt"]
+        },
+        {
+          "id": "area_and_bathymetric_transition",
+          "failure_codes": ["adjacent_area_change_above_threshold", "bathymetric_slope_above_threshold"]
+        },
+        {
+          "id": "size_and_boundary_continuity",
+          "failure_codes": [
+            "target_size_l_over_h_p95_above_threshold",
+            "target_size_l_over_h_max_above_threshold",
+            "missing_target_size_error_diagnostic",
+            "target_size_by_triangle_invalid",
+            "open_boundary_size_mismatch"
+          ],
+          "failure_prefixes": ["edge_size_continuity:", "size_continuity:"]
+        },
+        {
+          "id": "nonstructural_topology_and_hydraulics",
+          "failure_codes": [
+            "singly_connected_elements_present",
+            "passage_resolution_debt",
+            "obc_apron_refinement_debt",
+            "wetting_drying_refinement_debt",
+            "cfl_refinement_debt",
+            "conservation_refinement_debt"
+          ]
+        }
+      ]
+    },
+    "quality_advisories": {
+      "blocking": false,
+      "metric_paths": [
+        "oceanmesh_quality.q_quantiles",
+        "angle_statistics",
+        "valence",
+        "size_error_l_over_h",
+        "node_count",
+        "triangle_count",
+        "node_budget",
+        "source_resolution",
+        "source_age",
+        "domain_complexity"
+      ]
+    }
+  },
+  "submission_preconditions": {
+    "failure_codes": [
+      "open_boundary_forcing_incompatible",
+      "open_boundary_forcing_missing",
+      "open_boundary_cyclicity_unknown",
+      "cyclic_obc_not_self_describing_in_sms_2dm",
+      "project_provenance_incomplete",
+      "final_mesh_hash_mismatch"
+    ],
+    "required_status": {
+      "benchmark_grid_baseline_ready": true,
+      "obc_status": ["pass", "not_required"],
+      "forcing_status": ["compatible", "not_required"]
+    }
+  },
+  "compatibility_aliases": {
+    "fvcom_ready": "benchmark_grid_baseline_ready",
+    "accepted": "benchmark_grid_baseline_ready"
+  },
+  "mesher_bakeoff_adapter": {
+    "accepted_path": "benchmark_grid_baseline_ready",
+    "failure_taxonomy_path": "failure_taxonomy",
+    "hard_gate_ids": [
+      "absolute_mesh_structure",
+      "valence_debt",
+      "superthin_debt",
+      "boundary_and_open_exterior",
+      "bathymetry_and_serialization"
+    ],
+    "metric_paths": {
+      "adjacent_area_change_max": "max_adjacent_area_change",
+      "bathymetric_slope_max": "max_bathymetric_slope",
+      "maximum_angle_deg": "max_angle_deg",
+      "minimum_angle_deg": "min_angle_deg",
+      "node_count": "node_count",
+      "q_below_0_10_count": "oceanmesh_quality.count_q_below_0_10",
+      "q_l3_sigma": "oceanmesh_quality.q_l3_sigma",
+      "singly_connected_triangle_count": "topology.singly_connected_triangle_count",
+      "target_size_l_over_h_max": "size_error_l_over_h.maximum",
+      "target_size_l_over_h_p95": "size_error_l_over_h.quantiles.p95",
+      "triangle_count": "triangle_count",
+      "true_neighbor_valence_max": "max_node_valence"
+    },
+    "metric_directions": {
+      "adjacent_area_change_max": "report_only",
+      "bathymetric_slope_max": "report_only",
+      "maximum_angle_deg": "report_only",
+      "minimum_angle_deg": "report_only",
+      "node_count": "report_only",
+      "q_below_0_10_count": "minimize",
+      "q_l3_sigma": "report_only",
+      "singly_connected_triangle_count": "report_only",
+      "target_size_l_over_h_max": "report_only",
+      "target_size_l_over_h_p95": "report_only",
+      "triangle_count": "report_only",
+      "true_neighbor_valence_max": "minimize"
+    }
+  },
+  "transaction_policy": {
+    "absolute_invariants_always_block": true,
+    "valence_tuple": ["count_valence_above_8", "valence_excess_above_8", "maximum_valence"],
+    "superthin_tuple": ["superthin_triangle_count", "superthin_severity_sum"],
+    "temporary_superthin_escrow_after_valence_improvement": true,
+    "class_2_or_3_regression_may_rollback": false,
+    "isolated_triangle_deletion_allowed": false
+  }
+}

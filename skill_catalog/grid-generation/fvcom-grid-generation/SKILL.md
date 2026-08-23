@@ -1,6 +1,6 @@
 ---
 name: fvcom-grid-generation
-description: Generate FVCOM-ready SMS 2DM meshes from legacy or adaptive fvcom-bdry-arc packages and CUDEM/NBS/CRM/ETOPO bathymetry using deterministic Gmsh Frontal-Delaunay algorithm 6 by operational default, a generator-neutral mesh-intent contract, geometry-derived hydraulic-skeleton and bathymetric-gradient sizing, wet-domain offshore-to-nearshore log transitions, local topology conditioning, and FVCOM QA. Use when Codex needs explicit boundary-chain ingestion, adaptive nearshore-to-offshore size fields, controlled mesher bakeoffs, variable-density seeding, initial no-conditioning mesh smoke tests, ordered OBC nodestrings, boundary-aware thin-triangle repair, or hard FVCOM valence and readiness checks.
+description: Generate benchmark-ready SMS 2DM meshes from legacy or adaptive fvcom-bdry-arc packages and CUDEM/NBS/CRM/ETOPO bathymetry using deterministic Gmsh Frontal-Delaunay algorithm 6 by operational default, a generator-neutral mesh-intent contract, geometry-derived sizing, topology-priority conditioning, standardized project delivery, and FVCOM QA. Use when Codex needs explicit boundary-chain ingestion, adaptive nearshore-to-offshore size fields, controlled mesher bakeoffs, variable-density seeding, initial no-conditioning mesh smoke tests, ordered OBC nodestrings, boundary-aware thin-triangle repair, hard valence/superthin closure, regional-refinement debt, or FVCOM grid-project publication.
 ---
 
 # fvcom-grid-generation
@@ -23,13 +23,14 @@ fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> fvcom-grid-generation
 - For open domains, propagate the delivered OBC target and distance through connected wet cells, hold offshore authority near the OBC, then transfer smoothly in log space to the nearshore target. Treat the configured transfer distance as a minimum and extend it automatically when the declared gradation requires more wet distance. For closed domains, omit this transfer.
 - Apply all distance propagation and final gradation over the wet model domain so land and island holes cannot create shortcuts.
 - Treat boundary, bathymetry, `fvcom_size_field_v4`, node budget, and QA policy as generator-neutral mesh intent. Lock their hashes before a multi-mesher test, choose adapters by topology capability, and never flatten OBC chains to make an unsupported generator run.
-- Resolve `--conditioning-profile auto` to `minimal-topology-v1`. Run only fixed-boundary valence repair, immediate superthin cleanup, residual protected-edge-safe superthin repair, and a terminal valence/thin scan. At the outer whole-stage decision, report changes in `q_p01` and the count of adjacent-area defects above `0.50` without using either as a rollback veto; retain every local transaction gate, the maximum adjacent-area-change gate, and all FVCOM readiness gates. Do not run spring relaxation, area-transition relaxation, pruning, boundary edits, global retriangulation, or the broad legacy postprocessor implicitly.
+- Load and obey [the benchmark-first quality policy](references/fvcom_grid_quality_policy_v1.json) for every evaluation, conditioning decision, portfolio result, and standardized publication. Fail closed when its hash is stale or a finding has no unique bucket.
+- Resolve `--conditioning-profile auto` to `minimal-topology-v1`. Run only fixed-boundary valence repair, immediate superthin cleanup, residual protected-edge-safe superthin repair, and a terminal valence/thin scan. Preserve absolute structural invariants; prioritize valence debt, then superthin debt; never roll either repair back because of Class-2 angle, quality, area-transition, slope, singly-connected-count, or size-continuity changes. Do not run spring relaxation, area-transition relaxation, pruning, boundary edits, global retriangulation, or the broad legacy postprocessor implicitly.
 - Keep `autonomous-thin-v1` opt-in. After minimal conditioning, have Codex inspect hash-bound whole-domain and component diagrams, classify the causal mechanism, and route it to bounded local repair, resolution refinement, localized CUSP/GSHHS boundary regularization, or complete subgrid-connection closure followed by full Gmsh-6 remeshing. Do not change `auto` until forward testing is reviewed, and never insert a routine human-review gate or delete one triangle in isolation. Read `references/autonomous_thin_boundary.md` before using this profile.
 - Keep depths finite and positive down and treat OceanMesh2D GPL material as a method reference only.
 
 ## Primary Workflow
 
-For every new complete grid, initialize the standardized portable project first. Keep attempts under each stage's `_work/`, promote one hash-bound selection to its canonical stage name, and publish any terminal mesh at the stable path `final/fvcom_grid.2dm`. The filename does not imply readiness; future submission must pass `validate --require-submission-ready`.
+For every new complete grid, initialize the standardized portable project first. Keep attempts under each stage's `_work/`, promote one hash-bound selection to its canonical stage name, and publish any terminal mesh at the stable path `final/fvcom_grid.2dm`. The filename does not imply readiness. Use `validate --require-benchmark-ready` before a first benchmark and `validate --require-submission-ready` before submission.
 
 ```powershell
 python scripts/manage_fvcom_grid_project.py init --project runs/my_project --name my_project
@@ -203,7 +204,7 @@ The default `minimal-topology-v1` order after constrained seeding/refinement is:
 1. Hash/audit the mesh, canonical size field, bathymetry, boundary/OBC contract, and optional source metadata.
 2. Repair valence above eight with every boundary coordinate and membership fixed. After each accepted valence transaction, immediately scan and repair any created or exposed superthin debt.
 3. Repair residual connected superthin debt with protected-edge-safe flips, collapses, or bounded local cavity reconstruction. Never delete a triangle in isolation or remove a wet passage.
-4. Repeat the terminal valence/thin scan for at most four rounds and accept only audited atomic retriangulations. Keep `q_p01` and the adjacent-area defect-count delta as outer-stage diagnostics, not vetoes; retain the remaining structural, quality-floor, maximum-area-jump, and size-continuity protections. If another outer gate rejects the batch, serialize the rejected candidate, boundary lineage, quality audit, edit ledger, and rollback manifest. Resample depth from the immutable bathymetry and repeat the complete serialization/quality audit.
+4. Repeat the terminal valence/thin scan for at most four rounds and accept only audited atomic retriangulations. Keep every regional-refinement metric as nonblocking debt. Roll back only structural failure or regression of the ordered valence/superthin debt; serialize every rejected candidate, boundary lineage, quality audit, edit ledger, and rollback manifest. Resample depth from the immutable bathymetry and repeat the complete serialization/quality audit.
 
 The following is the explicit legacy conditioning order used only when a legacy profile is selected:
 
@@ -227,7 +228,7 @@ Hard anchors and all boundary nodes not explicitly handled by the kind-aware edi
 ## Standalone Tools
 
 - `scripts/run_autonomous_thin_workflow.py`: run or resume the opt-in autonomous workflow. It performs minimal conditioning, produces the hash-bound diagnostic/decision stage, and resumes one selected component through local topology repair or boundary rebuild, Gmsh-6 remeshing, reconditioning, and the three independent closure/readiness decisions. A shoreline decision must bind its request-bounded CUSP extract; the command never pauses for human review.
-- `scripts/manage_fvcom_grid_project.py`: initialize the fixed project tree, promote immutable stage selections, atomically publish terminal delivery artifacts, and validate submission readiness by exact hash.
+- `scripts/manage_fvcom_grid_project.py`: initialize the fixed project tree, promote immutable stage selections, derive benchmark/submission decisions, automatically generate the standard review map, atomically publish terminal delivery artifacts, and validate readiness by exact hash.
 - `scripts/diagnose_autonomous_thin.py`: create the whole-domain locator, local mesh/boundary and lineage diagrams, CUSP/GSHHS overlay, scale evidence, and one pending Codex decision per connected superthin component.
 - `scripts/run_autonomous_thin_closure.py`: validate and execute one completed Codex decision. It preflights at most three boundary candidates, retains rejections, preserves protected and OBC lineage, and requires a complete Gmsh-6 remesh after any boundary transaction.
 - `scripts/run_mesher_portfolio_case.py`: build one immutable regional `fvcom_size_field_v4` bundle and generate deterministic Gmsh Frontal-Delaunay-6 `RAW` by default under one node budget. Clean-room and Gmsh 1/5 require explicit `--candidates` values. It writes a metric-by-metric comparison and never claims common conditioning.
@@ -279,6 +280,7 @@ Hard anchors and all boundary nodes not explicitly handled by the kind-aware edi
 - `mesh_nodes_elements.gpkg`
 - `mesh_quality_elements.gpkg`
 - `mesh_review_map.png`
+- `mesh_review_map_manifest.json`
 - progress JSON/JSONL artifacts
 
 A mesher-portfolio run additionally writes the immutable input-bundle
@@ -291,7 +293,7 @@ The v8 manifest records the size-field method and hydraulic-skeleton diagnostics
 
 ## Acceptance
 
-Emit two independent decisions. `minimal_local_debt_closed` requires valence `<=8`, zero unique superthin triangles (`q<0.10` or minimum angle below `5°`), zero restricted-edge violations, and no structural regression. `fvcom_ready` additionally requires a successful 2DM roundtrip with matching connectivity and valid OBC order, finite positive depths, positive-area elements, complete constraints, one manifold component, zero singly connected elements, exact hard anchors, sub-centimeter serialization shifts, valid exterior/island loops, forcing-compatible OBCs, `q_l3_sigma >0.75`, angles `30°–130°`, adjacent-area change `<=0.5`, and all canonical slope and size/continuity gates. A cyclic OBC remains non-ready because SMS 2DM is not self-describing; rejected scientific inputs remain hard readiness failures even when local topology closes. Retain artifacts with `needs_review` when either layer cannot close.
+Emit separate policy decisions. `minimal_local_debt_closed` requires valence `<=8`, zero unique superthin triangles (`q<0.10` or minimum angle below `5°`), zero restricted-edge violations, and no structural regression. `benchmark_grid_baseline_ready` additionally requires finite positive depths, positive areas, one intended connected manifold mesh, traversable preserved constraints and OBC/exterior lineage, node-cap compliance, and exact 2DM roundtrip. `fvcom_ready` and `accepted` are compatibility aliases of that benchmark decision. Record ordinary angle tails, `q_l3_sigma`, area transition, bathymetric slope, `L/h`, boundary continuity, and nonstructural singly connected elements under `regional_refinement_debt`; they never veto the baseline. `submission_eligible` additionally requires forcing compatibility, self-describing OBC metadata, project provenance, and exact final hashes. Retain every terminal mesh and status with `needs_review` when the baseline cannot close.
 
 For the visual superthin experiment, additionally require strict global superthin-count reduction, non-increasing superthin severity, no new residual component outside the reviewed lineage neighborhood, unchanged existing boundary coordinates, and refreshed visual evidence after every accepted component. Report `visual_zero_superthin_pass` separately from FVCOM readiness; use `visual_zero_superthin_pass_forcing_remap_required` when an OBC insertion occurred.
 
@@ -320,6 +322,8 @@ python scripts/selftest_local_topology_v5_extensions.py
 python scripts/selftest_systematic_v6.py
 python scripts/selftest_visual_superthin.py
 python scripts/selftest_grid_project.py
+python scripts/selftest_grid_quality_policy.py
+python scripts/selftest_mesh_review_map.py
 python -m compileall scripts
 python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .
 ```

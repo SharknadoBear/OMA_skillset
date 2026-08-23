@@ -148,7 +148,19 @@ def main() -> int:
                     "minimal_local_debt_closed": bool(
                         report["minimal_local_debt_closed"]
                     ),
+                    "benchmark_grid_baseline_ready": bool(
+                        report.get("benchmark_grid_baseline_ready", report["fvcom_ready"])
+                    ),
                     "fvcom_ready": bool(report["fvcom_ready"]),
+                    "submission_eligible": bool(
+                        report.get("submission_eligible", False)
+                    ),
+                    "regional_refinement_debt": list(
+                        report.get("regional_refinement_debt") or []
+                    ),
+                    "quality_advisories": dict(
+                        report.get("quality_advisories") or {}
+                    ),
                     "failure_taxonomy": list(
                         report["fvcom_readiness_failure_taxonomy"]
                     ),
@@ -189,7 +201,11 @@ def main() -> int:
                 {
                     "status": "failed",
                     "minimal_local_debt_closed": False,
+                    "benchmark_grid_baseline_ready": False,
                     "fvcom_ready": False,
+                    "submission_eligible": False,
+                    "regional_refinement_debt": [],
+                    "quality_advisories": {},
                     "failure_taxonomy": [
                         f"conditioning_exception:{type(exc).__name__}"
                     ],
@@ -223,6 +239,12 @@ def main() -> int:
         ),
         "fvcom_ready_count": int(
             sum(bool(item.get("fvcom_ready")) for item in results)
+        ),
+        "benchmark_grid_baseline_ready_count": int(
+            sum(bool(item.get("benchmark_grid_baseline_ready")) for item in results)
+        ),
+        "submission_eligible_count": int(
+            sum(bool(item.get("submission_eligible")) for item in results)
         ),
         "results": results,
     }
@@ -545,7 +567,9 @@ def _write_csv(path: Path, results: list[dict[str, Any]]) -> None:
         "status",
         "scientific_input_valid",
         "minimal_local_debt_closed",
+        "benchmark_grid_baseline_ready",
         "fvcom_ready",
+        "submission_eligible",
         "runtime_seconds",
         "nodes_before",
         "nodes_after",
@@ -616,7 +640,11 @@ def _write_csv(path: Path, results: list[dict[str, Any]]) -> None:
                     "minimal_local_debt_closed": value.get(
                         "minimal_local_debt_closed"
                     ),
+                    "benchmark_grid_baseline_ready": value.get(
+                        "benchmark_grid_baseline_ready"
+                    ),
                     "fvcom_ready": value.get("fvcom_ready"),
+                    "submission_eligible": value.get("submission_eligible"),
                     "runtime_seconds": value.get("runtime_seconds"),
                     "nodes_before": before.get(
                         "node_count",
