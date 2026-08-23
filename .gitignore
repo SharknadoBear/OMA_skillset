@@ -33,6 +33,8 @@ skill_catalog/external-data-connectors/cfsv2-fetcher/**/download_checkpoint*.jso
 skill_catalog/external-data-connectors/cfsv2-fetcher/**/chunks/
 skill_catalog/external-data-connectors/cfsv2-fetcher/**/*.part
 skill_catalog/external-data-connectors/cfsv2-fetcher/**/*.tmp
+skill_catalog/external-data-connectors/cfsr-fetcher/runs/
+skill_catalog/external-data-connectors/cfsr-fetcher/**/*.nc
 skill_catalog/external-data-connectors/argo-fetcher/runs/
 skill_catalog/external-data-connectors/argo-fetcher/**/*.nc
 skill_catalog/external-data-connectors/argo-fetcher/**/download_plan*.json

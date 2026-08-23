@@ -1,0 +1,4 @@
+interface:
+  display_name: "CFSR Fetcher"
+  short_description: "Fetch and validate bounded NCEP CFSR fields"
+  default_prompt: "Use $cfsr-fetcher to inventory, estimate, fetch, resume, and validate a bounded NCEP CFSR atmospheric field."

@@ -9,6 +9,7 @@ by capability family rather than by the older broad project-stage folders.
 - `common-core/`: shared FVCOM support utilities, currently `fvcom-common`.
 - `external-data-connectors/`: source-specific data acquisition and conversion
   capabilities, such as the model-neutral `hycom-fetcher`, `argo-fetcher`, `cfsv2-fetcher`,
+  and `cfsr-fetcher`,
   NOAA CO-OPS, USGS, CBOFS, DBOFS, SSCOFS, NYOFS, SJROFS, GloFAS, GSHHS,
   CUDEM, CUSP, NHD/NHM river products, and
   usSEABED, including model-neutral TPXO9v5 harmonic extraction.
@@ -148,14 +149,14 @@ usable skill families at different maturity levels:
   appropriate, and downloaded-data health checks. The connector set now includes
   `argo-fetcher` for native core/B/S GDAC profiles, `hycom-fetcher` with thin
   Codex/Hermes variants, NOAA CO-OPS,
-  `cfsv2-fetcher`, CUDEM, CUSP, GSHHS, NHD/NHM river tools, USGS
+  `cfsv2-fetcher`, `cfsr-fetcher`, CUDEM, CUSP, GSHHS, NHD/NHM river tools, USGS
   rivers, usSEABED, `glofas-data-fetcher`, and the AWS-primary
   `cbofs-fetcher`, `dbofs-fetcher`, `sscofs-fetcher`, `nyofs-fetcher`, and
   `sjrofs-fetcher` connectors, plus `tpxo9v5-data-fetcher` for registered
   model-neutral harmonic subsets and interpolation. The five OFS connectors use
   reviewed v2 plans, anonymous NOAA access, and model-safe NCEI long-term fallback
   for supported historical records when operational AWS coverage is incomplete.
-  HYCOM and CFSv2 requests use bounded transfer probes and persistent JSON
+  HYCOM, CFSv2, and CFSR requests use bounded transfer probes and persistent JSON
   progress; conservative estimates of ten minutes or longer open a localhost
   HTML waitbar automatically.
 - `workspace-bridging/kestrel-hpc` is a robust operational bridge skill, not
