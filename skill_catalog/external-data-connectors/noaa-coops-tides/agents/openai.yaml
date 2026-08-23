@@ -1,4 +1,4 @@
 interface:
   display_name: "NOAA CO-OPS Tides"
-  short_description: "Fetch and QA CO-OPS time series."
-  default_prompt: "Use $noaa-coops-tides to estimate, fetch, and health-check a small external-data request."
+  short_description: "Fetch, screen, and QA CO-OPS tides"
+  default_prompt: "Use $noaa-coops-tides to screen nearby tidal stations or estimate, fetch, and health-check a bounded CO-OPS request."

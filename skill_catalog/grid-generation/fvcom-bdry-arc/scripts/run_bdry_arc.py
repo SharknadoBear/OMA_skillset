@@ -59,6 +59,12 @@ def main() -> int:
         help="Reject residual GSHHS frame clips or retain historical report-only behavior.",
     )
     parser.add_argument(
+        "--residual-boundary-policy",
+        default="solid-default",
+        choices=("solid-default", "strict-reject"),
+        help="Classify residual frame-water segments as solid by default, or retain the historical strict length veto.",
+    )
+    parser.add_argument(
         "--frame-clip-tolerance-m",
         type=float,
         help="Absolute residual-frame tolerance; default max(250 m, 0.05 * target resolution).",
@@ -95,6 +101,7 @@ def main() -> int:
         topology_time_budget_s=args.topology_time_budget_s,
         boundary_resolution_profile=args.boundary_resolution_profile,
         frame_clip_policy=args.frame_clip_policy,
+        residual_boundary_policy=args.residual_boundary_policy,
         frame_clip_tolerance_m=args.frame_clip_tolerance_m,
         feedback_candidate_max_km=args.feedback_candidate_max_km,
         obc_placement_policy=args.obc_placement_policy,

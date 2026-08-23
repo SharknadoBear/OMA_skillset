@@ -72,6 +72,70 @@ def contract_fixture(root: Path, *, report_only: bool = False) -> Path:
     return path
 
 
+def role_contract_fixture(root: Path, *, stale_component_map: bool = False) -> Path:
+    map_path = write(root / "open_map.png", "whole map")
+    component_map = write(root / "residual_map.png", "component map")
+    source_hashes = {"region": "abc", "coastline": "def"}
+    decision_path = root / "decision_v2.json"
+    decision = {
+        "schema_version": "open_exterior_agent_decision_v2",
+        "status": "pass",
+        "decision_actor": {"kind": "codex_agent"},
+        "inspected_map_sha256": sha256_file(map_path),
+        "bound_source_hashes": source_hashes,
+        "residual_roles": [{
+            "segment_id": 0,
+            "role": "solid_lagoon_closure",
+            "component_map_sha256": sha256_file(component_map),
+            "no_artificial_bar": True,
+            "no_protected_feature_conflict": True,
+        }],
+    }
+    decision_path.write_text(json.dumps(decision), encoding="utf-8")
+    contract = {
+        "schema_version": "fvcom_open_exterior_contract_v2",
+        "report_only": False,
+        "downstream_eligible": True,
+        "hard_metrics": {
+            "absolute_gate_pass": True,
+            "fraction_gate_pass": True,
+            "coverage_gate_pass": True,
+            "all_independent_metric_gates_pass": True,
+            "absolute_limit_m": 250.0,
+            "absolute_residual_length_m": 0.0,
+            "metric_subject": "unassigned_residual",
+        },
+        "obc_geometry": {
+            "expected_count": 1,
+            "delivered_count": 1,
+            "simple_nonbranching": True,
+            "nonendpoint_land_crossing_m": 0.0,
+        },
+        "residual_role_summary": {
+            "pending_count": 0,
+            "unassigned_residual_length_m": 0.0,
+            "solid_lagoon_closure_count": 1,
+            "secondary_tidal_obc_count": 0,
+        },
+        "residual_components": [{
+            "segment_id": 0,
+            "classification": "unintended_frame_clip",
+            "assigned_role": "solid_lagoon_closure",
+            "role_status": "accepted",
+            "solid_role_geometry": {"eligible": True},
+            "agent_geometry_confirmation": {"no_artificial_bar": True, "no_protected_feature_conflict": True},
+            "forcing_eligibility": None,
+        }],
+        "component_maps": {"0": {"path": str(component_map), "sha256": ("0" * 64 if stale_component_map else sha256_file(component_map))}},
+        "source_hashes": source_hashes,
+        "map": {"path": str(map_path), "sha256": sha256_file(map_path)},
+        "agent_decision": {"status": "pass", "path": str(decision_path), "sha256": sha256_file(decision_path)},
+    }
+    path = root / "contract_v2.json"
+    path.write_text(json.dumps(contract), encoding="utf-8")
+    return path
+
+
 def mesh_fixture(path: Path, *, open_boundary: bool = True) -> Path:
     chains = [[1, 2]] if open_boundary else []
     return write_2dm(
@@ -173,6 +237,13 @@ def main() -> None:
         assert "Gmsh Frontal-Delaunay algorithm 6" in guarded.stderr
         contract = contract_fixture(base / "evidence")
         assert validate_open_exterior_contract(contract)["passed"]
+        role_contract = role_contract_fixture(base / "role_evidence")
+        role_audit = validate_open_exterior_contract(role_contract)
+        assert role_audit["passed"], role_audit
+        stale_role_contract = role_contract_fixture(base / "stale_role_evidence", stale_component_map=True)
+        stale_audit = validate_open_exterior_contract(stale_role_contract)
+        assert not stale_audit["passed"]
+        assert "residual_boundary_component_map_stale" in stale_audit["failure_taxonomy"]
         report_only = contract_fixture(base / "diagnostic", report_only=True)
         assert not validate_open_exterior_contract(report_only)["passed"]
 

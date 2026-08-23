@@ -21,6 +21,13 @@ CLIP_FAILURES = {
     "unintended_frame_clip_nontrivial",
     "gshhs_coastline_incomplete_on_landward_boundary",
     "model_boundary_loop_needs_review",
+    "residual_boundary_role_pending",
+}
+
+RESIDUAL_BOUNDARY_ROLES = {
+    "solid_lagoon_closure",
+    "secondary_tidal_obc",
+    "invalid_geometry",
 }
 
 
@@ -69,6 +76,7 @@ def build_region_bpoly_arc_feedback(
     source_manifest: dict[str, Any],
     *,
     frame_clip_policy: str,
+    residual_boundary_policy: str = "strict-reject",
     frame_clip_tolerance_m: float | None,
     candidate_max_km: float = 100.0,
     adaptive_status: str = "pending",
@@ -97,6 +105,7 @@ def build_region_bpoly_arc_feedback(
     frame_xy = _project_geometries(frame_gdf, projection)
     open_xy = _project_geometries(open_gdf, projection)
     open_union = unary_union(open_xy) if open_xy else GeometryCollection()
+    land_union_for_contract = _load_land_union(coastline_gpkg, projection)
     target_resolution_m = float(source_manifest.get("settings", {}).get("target_resolution_m", 250.0))
     tolerance_m = float(
         frame_clip_tolerance_m
@@ -124,6 +133,33 @@ def build_region_bpoly_arc_feedback(
                 open_overlap = 0.0
         intentional = bool(open_overlap >= 0.95)
         line_lonlat = unproject_geometry(line, projection)
+        landfall_tolerance_m = max(250.0, 0.25 * target_resolution_m)
+        endpoint_distances = (
+            [
+                float(Point(line.coords[0]).distance(land_union_for_contract.boundary)),
+                float(Point(line.coords[-1]).distance(land_union_for_contract.boundary)),
+            ]
+            if not land_union_for_contract.is_empty
+            else [None, None]
+        )
+        endpoint_buffers = Point(line.coords[0]).buffer(10.0).union(
+            Point(line.coords[-1]).buffer(10.0)
+        )
+        line_interior = line.difference(endpoint_buffers)
+        nonendpoint_land_crossing_m = float(
+            line_interior.intersection(land_union_for_contract).length
+            if not land_union_for_contract.is_empty
+            else math.inf
+        )
+        deterministic_solid_eligible = bool(
+            line.is_simple
+            and all(
+                value is not None and value <= landfall_tolerance_m
+                for value in endpoint_distances
+            )
+            and nonendpoint_land_crossing_m
+            <= max(1.0, 0.01 * target_resolution_m)
+        )
         record = {
             "segment_id": int(segment_id),
             "side_index": int(side_index),
@@ -133,10 +169,36 @@ def build_region_bpoly_arc_feedback(
             "distance_to_open_boundary_m": open_distance,
             "open_boundary_overlap_fraction": open_overlap,
             "classification": "intentional_open_boundary" if intentional else "unintended_frame_clip",
+            "role_status": "not_applicable" if intentional else "pending",
+            "assigned_role": "intentional_open_boundary" if intentional else None,
+            "solid_role_geometry": {
+                "simple_nonbranching": bool(line.is_simple),
+                "shoreline_bracketed_endpoints": bool(
+                    all(
+                        value is not None and value <= landfall_tolerance_m
+                        for value in endpoint_distances
+                    )
+                ),
+                "endpoint_distance_to_shoreline_m": endpoint_distances,
+                "landfall_tolerance_m": float(landfall_tolerance_m),
+                "nonendpoint_land_crossing_m": nonendpoint_land_crossing_m,
+                "nonendpoint_land_crossing_limit_m": float(
+                    max(1.0, 0.01 * target_resolution_m)
+                ),
+                "wet_component_preserved": None,
+                "eligible": deterministic_solid_eligible,
+            },
             "geometry_lonlat": [[float(x), float(y)] for x, y in line_lonlat.coords],
         }
         records.append(record)
-        geo_records.append({**{k: v for k, v in record.items() if k != "geometry_lonlat"}, "geometry": line_lonlat})
+        geo_records.append({
+            **{
+                key: value
+                for key, value in record.items()
+                if key not in {"geometry_lonlat", "solid_role_geometry"}
+            },
+            "geometry": line_lonlat,
+        })
 
     unintended = [item for item in records if item["classification"] == "unintended_frame_clip"]
     unintended_length_m = float(sum(item["length_m"] for item in unintended))
@@ -161,18 +223,31 @@ def build_region_bpoly_arc_feedback(
     nonclip_loop_failures = [failure for failure in loop_failures if failure not in CLIP_FAILURES]
     arc_land_length_m = float(source_manifest.get("wet_domain", {}).get("arc_land_intersection_length_m", 0.0) or 0.0)
     wet_component_count = _wet_component_count(wet_gdf)
+    for item in unintended:
+        geometry = item["solid_role_geometry"]
+        geometry["wet_component_preserved"] = wet_component_count == 1
+        geometry["eligible"] = bool(geometry["eligible"] and wet_component_count == 1)
     expected_obc_count = int(
         region.get("expected_obc_count", offshore.get("expected_obc_count", 0 if region.get("boundary_policy") == "no_open_boundary" else 1))
     )
     delivered_obc_count = sum(1 for geom in open_gdf.geometry if geom is not None and not geom.is_empty)
+    domain_type = str(region.get("domain_type", "")).lower()
+    role_contract_enabled = bool(
+        residual_boundary_policy == "solid-default"
+        and frame_clip_policy != "report-only"
+        and domain_type not in {"lake", "island", "archipelago"}
+    )
     structural_failures: list[str] = []
     if wet_component_count != 1:
         structural_failures.append("wet_component_count_not_one")
-    if delivered_obc_count != expected_obc_count:
+    if delivered_obc_count != expected_obc_count and not (
+        role_contract_enabled
+        and delivered_obc_count < expected_obc_count
+        and expected_obc_count - delivered_obc_count <= len(unintended)
+    ):
         structural_failures.append("unexpected_open_boundary_count")
     if arc_land_length_m > tolerance_m:
         structural_failures.append("open_boundary_intersects_land")
-    domain_type = str(region.get("domain_type", "")).lower()
     coastal_single_obc = bool(
         expected_obc_count == 1
         and domain_type not in {"lake", "island", "archipelago"}
@@ -183,7 +258,6 @@ def build_region_bpoly_arc_feedback(
             structural_failures.append("open_boundary_not_one_simple_arc")
         elif not bool(getattr(open_xy[0], "is_simple", False)):
             structural_failures.append("open_boundary_self_intersects_or_branches")
-        land_union_for_contract = _load_land_union(coastline_gpkg, projection)
         land_boundary_for_contract = getattr(land_union_for_contract, "boundary", GeometryCollection())
         if len(open_xy) == 1 and not land_boundary_for_contract.is_empty:
             landfall_tolerance_m = max(250.0, 0.25 * target_resolution_m)
@@ -199,12 +273,14 @@ def build_region_bpoly_arc_feedback(
         polygon_xy,
         region,
         unintended,
-        _load_land_union(coastline_gpkg, projection),
+        land_union_for_contract,
         tolerance_m=tolerance_m,
         candidate_max_km=float(candidate_max_km),
     )
     if frame_clip_policy == "report-only":
         status = "input_needs_review"
+    elif role_contract_enabled and unintended and not structural_failures:
+        status = "assign_boundary_roles"
     elif not diagnostic_pass:
         status = "adjust_bpoly" if recommendations and not structural_failures else "input_needs_review"
     elif structural_failures:
@@ -228,14 +304,29 @@ def build_region_bpoly_arc_feedback(
             }
         )
 
+    feedback_failures = (
+        list(dict.fromkeys(
+            structural_failures
+            + (["residual_boundary_role_decision_required"] if unintended else [])
+        ))
+        if role_contract_enabled
+        else _feedback_failures(
+            diagnostic_pass,
+            structural_failures,
+            adaptive_status,
+            adaptive_failures or [],
+        )
+    )
     feedback = {
         "schema_version": "region_bpoly_arc_feedback_v1",
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "status": status,
         "diagnostic_status": "pass" if diagnostic_pass else "fail",
-        "failure_taxonomy": _feedback_failures(diagnostic_pass, structural_failures, adaptive_status, adaptive_failures or []),
+        "failure_taxonomy": feedback_failures,
         "policy": {
             "frame_clip_policy": frame_clip_policy,
+            "residual_boundary_policy": residual_boundary_policy,
+            "role_contract_enabled": role_contract_enabled,
             "gate_enabled": gate_enabled,
             "frame_clip_tolerance_m": tolerance_m,
             "unintended_fraction_threshold": 0.001,
@@ -298,9 +389,18 @@ def build_region_bpoly_arc_feedback(
         segments_path.write_text('{"type":"FeatureCollection","features":[]}\n', encoding="utf-8")
     map_path = output_dir / "feedback_map.png"
     _plot_feedback(map_path, polygon_lonlat, wet_gdf, open_gdf, frame_gdf, status)
+    component_maps = _plot_residual_component_maps(
+        output_dir,
+        polygon_lonlat,
+        wet_gdf,
+        open_gdf,
+        records,
+        coastline_gpkg,
+    )
     feedback["outputs"] = {
         "segments_geojson": str(segments_path),
         "feedback_map": str(map_path),
+        "residual_component_maps": component_maps,
     }
     feedback_path = output_dir / "region_bpoly_arc_feedback_v1.json"
     feedback_path.write_text(json.dumps(feedback, indent=2), encoding="utf-8")
@@ -316,14 +416,45 @@ def build_region_bpoly_arc_feedback(
     decision_path = output_dir / "open_exterior_agent_decision.json"
     report_only = frame_clip_policy == "report-only"
     metric_gate_pass = bool(diagnostic_pass and not structural_failures)
+    contract_schema = (
+        "fvcom_open_exterior_contract_v2"
+        if role_contract_enabled
+        else "fvcom_open_exterior_contract_v1"
+    )
+    contract_failures = (
+        list(dict.fromkeys(
+            structural_failures
+            + (["residual_boundary_role_decision_required"] if unintended else [])
+            + ["open_exterior_agent_decision_required"]
+        ))
+        if role_contract_enabled
+        else list(feedback["failure_taxonomy"])
+    )
     contract = {
-        "schema_version": "fvcom_open_exterior_contract_v1",
+        "schema_version": contract_schema,
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "final_status": "needs_review",
         "downstream_eligible": False,
         "obc_placement_policy": str(source_manifest.get("settings", {}).get("obc_placement_policy", "offshore-first")),
         "obc_placement_family": placement_family,
         "report_only": report_only,
+        "residual_boundary_policy": {
+            "mode": residual_boundary_policy,
+            "default_role": "solid_lagoon_closure" if role_contract_enabled else None,
+            "station_is_eligibility_not_automatic_obc": True,
+            "requested_obc_count_controls_secondary_obc": True,
+            "allowed_roles": sorted(RESIDUAL_BOUNDARY_ROLES),
+        },
+        "raw_residual_metrics": {
+            "absolute_residual_length_m": unintended_length_m,
+            "residual_fraction": unintended_fraction,
+            "coastline_plus_obc_exterior_coverage": intended_coverage,
+        },
+        "boundary_lengths": {
+            "outer_boundary_length_m": outer_length_m,
+            "open_boundary_length_m": open_length_m,
+            "landward_boundary_length_m": landward_length_m,
+        },
         "hard_metrics": {
             "absolute_residual_length_m": unintended_length_m,
             "absolute_limit_m": tolerance_m,
@@ -335,6 +466,7 @@ def build_region_bpoly_arc_feedback(
             "coverage_minimum": 0.999,
             "coverage_gate_pass": coverage_gate,
             "all_independent_metric_gates_pass": metric_gate_pass,
+            "metric_subject": "unassigned_residual" if role_contract_enabled else "raw_residual",
         },
         "obc_geometry": {
             "expected_count": int(expected_obc_count),
@@ -344,29 +476,60 @@ def build_region_bpoly_arc_feedback(
             "exterior_overlap_fraction": float(loop_manifest.get("qa", {}).get("open_boundary_exterior_overlap_fraction", 0.0) or 0.0),
         },
         "residual_components": records,
+        "residual_role_summary": {
+            "pending_count": int(len(unintended)) if role_contract_enabled else 0,
+            "solid_lagoon_closure_count": 0,
+            "secondary_tidal_obc_count": 0,
+            "invalid_geometry_count": 0,
+            "unassigned_residual_length_m": unintended_length_m if role_contract_enabled else 0.0,
+            "assigned_solid_length_m": 0.0,
+            "assigned_secondary_obc_length_m": 0.0,
+        },
         "per_side": side_summaries,
         "source_hashes": dict(feedback["input_sha256"]),
         "map": {"path": str(map_path), "sha256": file_sha256(map_path)},
+        "component_maps": component_maps,
+        "station_screen": {
+            "required_for_secondary_tidal_obc": True,
+            "status": "not_run",
+            "path": None,
+            "sha256": None,
+        },
         "agent_decision": {
             "required": True,
             "status": "pending",
             "path": str(decision_path),
         },
         "failure_taxonomy": list(dict.fromkeys(
-            feedback["failure_taxonomy"]
+            contract_failures
             + (["diagnostic_only_report_only_policy"] if report_only else [])
-            + (["open_exterior_agent_decision_required"] if metric_gate_pass and not report_only else [])
+            + (["open_exterior_agent_decision_required"] if metric_gate_pass and not report_only and not role_contract_enabled else [])
         )),
     }
     contract_path.write_text(json.dumps(contract, indent=2), encoding="utf-8")
     pending_decision = {
-        "schema_version": "open_exterior_agent_decision_v1",
+        "schema_version": (
+            "open_exterior_agent_decision_v2"
+            if role_contract_enabled
+            else "open_exterior_agent_decision_v1"
+        ),
         "status": "pending",
         "decision_actor": {"kind": "codex_agent"},
         "assessed_contract_sha256": file_sha256(contract_path),
         "inspected_map_sha256": file_sha256(map_path),
         "bound_source_hashes": contract["source_hashes"],
         "rationale": None,
+        "residual_roles": [
+            {
+                "segment_id": int(item["segment_id"]),
+                "role": None,
+                "component_map_sha256": component_maps.get(str(item["segment_id"]), {}).get("sha256"),
+                "no_artificial_bar": None,
+                "no_protected_feature_conflict": None,
+                "rationale": None,
+            }
+            for item in unintended
+        ],
     }
     decision_path.write_text(json.dumps(pending_decision, indent=2), encoding="utf-8")
     feedback["open_exterior_contract"] = contract
@@ -647,3 +810,61 @@ def _plot_feedback(
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
+
+
+def _plot_residual_component_maps(
+    output_dir: Path,
+    region: Polygon,
+    wet_gdf: gpd.GeoDataFrame,
+    open_gdf: gpd.GeoDataFrame,
+    records: list[dict[str, Any]],
+    coastline_gpkg: str | Path | None,
+) -> dict[str, dict[str, Any]]:
+    """Write one geographic, hash-bound zoom map per raw frame-water component."""
+    land = _read_layer(Path(coastline_gpkg), "land_polygons") if coastline_gpkg else gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+    maps: dict[str, dict[str, Any]] = {}
+    for item in records:
+        if item.get("classification") != "unintended_frame_clip":
+            continue
+        segment_id = int(item["segment_id"])
+        line = LineString(item["geometry_lonlat"])
+        minx, miny, maxx, maxy = line.bounds
+        span = max(maxx - minx, maxy - miny, 0.005)
+        margin = max(0.02, 5.0 * span)
+        extent = (minx - margin, miny - margin, maxx + margin, maxy + margin)
+        fig, ax = plt.subplots(figsize=(9, 8))
+        if not land.empty:
+            clipped = land.cx[extent[0] : extent[2], extent[1] : extent[3]]
+            if not clipped.empty:
+                clipped.plot(ax=ax, facecolor="#d8d1bd", edgecolor="#31572c", linewidth=0.8, alpha=0.9, label="GSHHS land")
+        if not wet_gdf.empty:
+            wet_gdf.plot(ax=ax, facecolor="#8ecae6", edgecolor="#0b4f6c", linewidth=0.7, alpha=0.35, label="retained wet domain")
+        gpd.GeoSeries([region], crs="EPSG:4326").boundary.plot(ax=ax, color="#111111", linewidth=1.2, linestyle="--", label="RegionBPoly frame")
+        if not open_gdf.empty:
+            open_gdf.plot(ax=ax, color="#d00000", linewidth=2.2, label="delivered OBC")
+        gpd.GeoSeries([line], crs="EPSG:4326").plot(ax=ax, color="#ff8c00", linewidth=4.0, label="residual water segment")
+        endpoints = [Point(line.coords[0]), Point(line.coords[-1])]
+        gpd.GeoSeries(endpoints, crs="EPSG:4326").plot(ax=ax, color="#6a00f4", markersize=45, zorder=5, label="closure endpoints")
+        ax.set_xlim(extent[0], extent[2])
+        ax.set_ylim(extent[1], extent[3])
+        ax.set_title(
+            f"Residual component {segment_id} | {float(item['length_m']):.1f} m\n"
+            "Classify as solid closure, secondary tidal OBC, or invalid geometry"
+        )
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.set_aspect("equal", adjustable="box")
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            unique = dict(zip(labels, handles))
+            ax.legend(unique.values(), unique.keys(), loc="best", fontsize=8)
+        fig.tight_layout()
+        map_path = output_dir / f"residual_component_{segment_id:03d}_role_map.png"
+        fig.savefig(map_path, dpi=200)
+        plt.close(fig)
+        maps[str(segment_id)] = {
+            "path": str(map_path),
+            "sha256": file_sha256(map_path),
+            "extent_lonlat": [float(value) for value in extent],
+        }
+    return maps

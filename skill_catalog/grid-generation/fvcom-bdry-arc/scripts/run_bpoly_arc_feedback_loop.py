@@ -78,6 +78,8 @@ def _arc_command(args, region: Path, offshore: Path, output_dir: Path, name: str
         args.boundary_resolution_profile,
         "--frame-clip-policy",
         "reject-unintended",
+        "--residual-boundary-policy",
+        args.residual_boundary_policy,
         "--feedback-candidate-max-km",
         str(args.max_side_expansion_km),
     ]
@@ -279,6 +281,7 @@ def main() -> int:
     parser.add_argument("--gshhs-lookahead-km", type=float, default=100.0)
     parser.add_argument("--target-resolution-m", type=float, default=8000.0)
     parser.add_argument("--frame-clip-tolerance-m", type=float)
+    parser.add_argument("--residual-boundary-policy", default="solid-default", choices=("solid-default", "strict-reject"))
     parser.add_argument("--boundary-resolution-profile", default="adaptive-coastal-v2", choices=("legacy", "adaptive-coastal-v1", "adaptive-coastal-v2"))
     parser.add_argument("--topology-time-budget-s", type=float, default=900.0)
     parser.add_argument("--max-adjustments", type=int, default=4)
@@ -445,6 +448,7 @@ def main() -> int:
             "gshhs_resolution": args.gshhs_resolution,
             "gshhs_levels": args.gshhs_levels,
             "boundary_resolution_profile": args.boundary_resolution_profile,
+            "residual_boundary_policy": args.residual_boundary_policy,
         },
         "accepted_adjustments": accepted_adjustments,
         "cumulative_side_expansion_km": cumulative_by_side,

@@ -13,6 +13,7 @@ Use this skill as a self-contained Python toolbox for external data access. Keep
 - Toolbox focus: water level, temperature, salinity, station metadata, harmonic analysis, and time-series cache products.
 - Main packaged scripts:
 - `scripts/noaa_tides.py`
+- `scripts/screen_tidal_stations.py`: screen a residual-boundary contract against tidal CO-OPS stations within a bounded radius. A station is eligibility evidence only; it never creates an OBC automatically and never substitutes a river gauge.
 - Standard estimate hook: `scripts/estimate_data_request.py`.
 - Standard finishing gate: `scripts/check_download_health.py`.
 
@@ -39,6 +40,14 @@ python scripts/check_download_health.py --request request.json --run-dir runs/ca
 
 7. Surface the health report to Bear only when important caveats exist, such as missing requested coverage, empty variables, all-NaN fields, finite coverage below 95 percent, obvious gaps, or failed diagnostic plots.
 
+Metadata-only residual screening is bounded inventory work rather than an observation download. Run it directly against the hash-bound boundary contract and retained wet-domain package:
+
+```bash
+python scripts/screen_tidal_stations.py --open-exterior-contract open_exterior_contract.json --wet-domain-gpkg bdry_arc_package.gpkg --output-dir station_screen --radius-km 25
+```
+
+Require `tidal=true`, water-level or prediction products, datum evidence, and membership in the same retained wet component. Treat a qualifying station as permission for a later agent decision only. Respect the requested OBC count and keep a residual solid when another OBC is not authorized.
+
 ## Implementation Rules
 
 - Treat this as a generic data connector; do not make a downstream model file the default output.
@@ -53,3 +62,4 @@ python scripts/check_download_health.py --request request.json --run-dir runs/ca
 - Compile all Python scripts after edits.
 - Test `estimate_data_request.py` with local, Kestrel, and unknown-estimate cases.
 - Test `check_download_health.py` on a tiny cached or synthetic artifact and confirm JSON plus at least one plot for plottable data.
+- Run `python scripts/selftest_station_screen.py` and confirm tidal/product/datum/connectivity filtering and river-gauge rejection.

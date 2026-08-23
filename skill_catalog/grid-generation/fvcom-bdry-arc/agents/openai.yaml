@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM Boundary Arc"
   short_description: "Build and correct FVCOM boundary chains"
-  default_prompt: "Use $fvcom-bdry-arc to build FVCOM boundary loops, preserve exact delivered-OBC lineage, detect GSHHS frame clipping, derive passage spacing from protected passage geometry, and return bounded RegionBPoly feedback when needed."
+  default_prompt: "Use $fvcom-bdry-arc to build FVCOM boundary loops, preserve exact delivered-OBC lineage, classify real-water frame residuals as solid by default with hash-bound maps, and return bounded RegionBPoly feedback only for invalid geometry."

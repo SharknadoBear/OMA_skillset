@@ -81,6 +81,9 @@ def build_model_boundary_loops(
     class_lengths = _class_lengths(segments_xy)
     unclassified_threshold_m = max(2.0 * target_resolution_m, 0.001 * max(exterior_xy.length, 1.0))
     frame_clip_policy = str(source_manifest.get("settings", {}).get("frame_clip_policy", "reject-unintended"))
+    residual_boundary_policy = str(
+        source_manifest.get("settings", {}).get("residual_boundary_policy", "strict-reject")
+    )
     coastline_source = str(source_manifest.get("inputs", {}).get("coastline_source", ""))
     configured_frame_tolerance = source_manifest.get("settings", {}).get("frame_clip_tolerance_m")
     frame_clip_tolerance_m = float(
@@ -114,13 +117,16 @@ def build_model_boundary_loops(
     frame_gate_enabled = frame_clip_policy == "reject-unintended" and coastline_source == "gshhs"
     if frame_clip_policy == "report-only":
         failures.append("diagnostic_only_report_only_policy")
-    if frame_gate_enabled and gate_frame_clip_length_m > frame_clip_tolerance_m:
-        failures.append("unintended_frame_clip_nontrivial")
-    if frame_gate_enabled and (
-        unintended_frame_clip_fraction > 0.001
-        or intended_exterior_coverage_fraction < 0.999
-    ):
-        failures.append("gshhs_coastline_incomplete_on_landward_boundary")
+    if frame_gate_enabled and residual_boundary_policy == "solid-default" and gate_frame_clip_length_m > 0.0:
+        failures.append("residual_boundary_role_pending")
+    elif frame_gate_enabled:
+        if gate_frame_clip_length_m > frame_clip_tolerance_m:
+            failures.append("unintended_frame_clip_nontrivial")
+        if (
+            unintended_frame_clip_fraction > 0.001
+            or intended_exterior_coverage_fraction < 0.999
+        ):
+            failures.append("gshhs_coastline_incomplete_on_landward_boundary")
     final_status = "pass" if not failures else "needs_review"
 
     layers = _build_layers(
@@ -159,6 +165,7 @@ def build_model_boundary_loops(
             "open_boundary_overlap_threshold": float(open_overlap_threshold),
             "lake_no_open_boundary": bool(lake_no_open_boundary),
             "frame_clip_policy": frame_clip_policy,
+            "residual_boundary_policy": residual_boundary_policy,
             "frame_clip_tolerance_m": float(frame_clip_tolerance_m),
             "frame_clip_fraction_threshold": 0.001,
             "intended_exterior_coverage_threshold": 0.999,

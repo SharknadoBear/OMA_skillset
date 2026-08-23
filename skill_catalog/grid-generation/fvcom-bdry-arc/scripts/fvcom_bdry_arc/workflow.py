@@ -61,6 +61,7 @@ class BdryArcConfig:
     topology_time_budget_s: float = 900.0
     boundary_resolution_profile: str = "legacy"
     frame_clip_policy: str = "reject-unintended"
+    residual_boundary_policy: str = "solid-default"
     frame_clip_tolerance_m: float | None = None
     feedback_candidate_max_km: float = 100.0
     obc_placement_policy: str = "offshore-first"
@@ -100,6 +101,8 @@ def run_bdry_arc(
         raise ValueError("--boundary-resolution-profile must be legacy, adaptive-coastal-v1, or adaptive-coastal-v2")
     if config.frame_clip_policy not in {"reject-unintended", "report-only"}:
         raise ValueError("--frame-clip-policy must be reject-unintended or report-only")
+    if config.residual_boundary_policy not in {"solid-default", "strict-reject"}:
+        raise ValueError("--residual-boundary-policy must be solid-default or strict-reject")
     if config.obc_placement_policy not in {"offshore-first", "mouth-first"}:
         raise ValueError("--obc-placement-policy must be offshore-first or mouth-first")
     if config.frame_clip_tolerance_m is not None and config.frame_clip_tolerance_m < 0.0:
@@ -125,6 +128,7 @@ def run_bdry_arc(
             "resolution_policy": "use requested GSHHS resolution only; do not downshift unless explicitly requested",
             "boundary_resolution_profile": config.boundary_resolution_profile,
             "frame_clip_policy": config.frame_clip_policy,
+            "residual_boundary_policy": config.residual_boundary_policy,
             "obc_placement_policy": config.obc_placement_policy,
         },
     )
@@ -446,6 +450,7 @@ def run_bdry_arc(
             "topology_time_budget_s": float(config.topology_time_budget_s),
             "boundary_resolution_profile": config.boundary_resolution_profile,
             "frame_clip_policy": config.frame_clip_policy,
+            "residual_boundary_policy": config.residual_boundary_policy,
             "obc_placement_policy": config.obc_placement_policy,
             "frame_clip_tolerance_m": (
                 float(config.frame_clip_tolerance_m)
@@ -598,6 +603,7 @@ def run_bdry_arc(
             feedback_dir,
             manifest,
             frame_clip_policy=config.frame_clip_policy,
+            residual_boundary_policy=config.residual_boundary_policy,
             frame_clip_tolerance_m=config.frame_clip_tolerance_m,
             candidate_max_km=config.feedback_candidate_max_km,
             adaptive_status=("disabled" if config.boundary_resolution_profile == "legacy" else "pending"),
@@ -682,7 +688,11 @@ def run_bdry_arc(
             "enabled": False,
             "final_status": "needs_review",
             "failure_taxonomy": ["blocked_by_region_bpoly_feedback"],
-            "reason": "Residual GSHHS frame clipping must be resolved by RegionBPoly adjustment before adaptive boundary resolution.",
+            "reason": (
+                "Residual boundary roles and the hash-bound Codex map decision must be finalized before adaptive boundary resolution."
+                if config.residual_boundary_policy == "solid-default"
+                else "Residual GSHHS frame clipping must be resolved by RegionBPoly adjustment before adaptive boundary resolution."
+            ),
             "outputs": {},
         }
         if "blocked_by_region_bpoly_feedback" not in manifest["failure_taxonomy"]:
@@ -719,6 +729,7 @@ def run_bdry_arc(
             feedback_dir,
             manifest,
             frame_clip_policy=config.frame_clip_policy,
+            residual_boundary_policy=config.residual_boundary_policy,
             frame_clip_tolerance_m=config.frame_clip_tolerance_m,
             candidate_max_km=config.feedback_candidate_max_km,
             adaptive_status=adaptive_status,
@@ -2788,6 +2799,9 @@ def _write_unresolved_upstream_manifest(
             "heuristic_mode": resolved_heuristic_mode,
             "place_memory_enabled": bool(place_memory_enabled),
             "boundary_resolution_profile": config.boundary_resolution_profile,
+            "frame_clip_policy": config.frame_clip_policy,
+            "residual_boundary_policy": config.residual_boundary_policy,
+            "obc_placement_policy": config.obc_placement_policy,
         },
         "inputs": {
             "region_name": region.get("name"),
