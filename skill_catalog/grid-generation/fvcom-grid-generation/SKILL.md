@@ -1,6 +1,6 @@
 ---
 name: fvcom-grid-generation
-description: Generate FVCOM-ready SMS 2DM meshes from legacy or adaptive fvcom-bdry-arc packages and CUDEM/NBS/CRM/ETOPO bathymetry using a generator-neutral mesh-intent contract, clean-room constrained refinement or research Gmsh adapters, geometry-derived hydraulic-skeleton and bathymetric-gradient sizing, wet-domain offshore-to-nearshore log transitions, local topology conditioning, and FVCOM QA. Use when Codex needs explicit boundary-chain ingestion, adaptive nearshore-to-offshore size fields, controlled mesher bakeoffs, variable-density seeding, initial no-conditioning mesh smoke tests, ordered OBC nodestrings, boundary-aware thin-triangle repair, or hard FVCOM valence and readiness checks.
+description: Generate FVCOM-ready SMS 2DM meshes from legacy or adaptive fvcom-bdry-arc packages and CUDEM/NBS/CRM/ETOPO bathymetry using deterministic Gmsh Frontal-Delaunay algorithm 6 by operational default, a generator-neutral mesh-intent contract, geometry-derived hydraulic-skeleton and bathymetric-gradient sizing, wet-domain offshore-to-nearshore log transitions, local topology conditioning, and FVCOM QA. Use when Codex needs explicit boundary-chain ingestion, adaptive nearshore-to-offshore size fields, controlled mesher bakeoffs, variable-density seeding, initial no-conditioning mesh smoke tests, ordered OBC nodestrings, boundary-aware thin-triangle repair, or hard FVCOM valence and readiness checks.
 ---
 
 # fvcom-grid-generation
@@ -15,6 +15,8 @@ fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> fvcom-grid-generation
 
 - Reuse upstream domain and boundary artifacts; do not redesign the region here.
 - Prefer an adaptive boundary-resolution manifest when supplied. Otherwise preserve the legacy loop workflow.
+- Use deterministic Gmsh Frontal-Delaunay algorithm 6 for every new operational/full-project raw mesh: one thread, seed 1, first-order triangles, eight native smoothing steps, and no algorithm fallback. The default portfolio executes only this candidate. Keep Gmsh 1/5 and clean-room SciPy-Delaunay available only when explicitly requested as research controls; never silently substitute them after a Gmsh-6 failure.
+- Revalidate `fvcom_open_exterior_contract_v1` at every coastal entry point. Reject report-only packages, failed independent residual gates, stale/missing Codex map decisions, and `downstream_eligible=false` even when an upstream manifest says `pass`.
 - Keep full bathymetry for final node sampling and bound only the in-memory size-field grid.
 - Build nearshore sizing from the solid-boundary background, bathymetric gradient, and a geometry-derived paired-bank hydraulic skeleton. Detect the skeleton from land and island segments only; never use an open-boundary segment as a bank.
 - Do not consume or generate an external drainage/flow-network package. Infer hydraulic corridors directly from the wet model polygon, solid boundary geometry, and the supplied bathymetry.
@@ -22,9 +24,21 @@ fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> fvcom-grid-generation
 - Apply all distance propagation and final gradation over the wet model domain so land and island holes cannot create shortcuts.
 - Treat boundary, bathymetry, `fvcom_size_field_v4`, node budget, and QA policy as generator-neutral mesh intent. Lock their hashes before a multi-mesher test, choose adapters by topology capability, and never flatten OBC chains to make an unsupported generator run.
 - Resolve `--conditioning-profile auto` to `minimal-topology-v1`. Run only fixed-boundary valence repair, immediate superthin cleanup, residual protected-edge-safe superthin repair, and a terminal valence/thin scan. At the outer whole-stage decision, report changes in `q_p01` and the count of adjacent-area defects above `0.50` without using either as a rollback veto; retain every local transaction gate, the maximum adjacent-area-change gate, and all FVCOM readiness gates. Do not run spring relaxation, area-transition relaxation, pruning, boundary edits, global retriangulation, or the broad legacy postprocessor implicitly.
+- Keep `autonomous-thin-v1` opt-in. After minimal conditioning, have Codex inspect hash-bound whole-domain and component diagrams, classify the causal mechanism, and route it to bounded local repair, resolution refinement, localized CUSP/GSHHS boundary regularization, or complete subgrid-connection closure followed by full Gmsh-6 remeshing. Do not change `auto` until forward testing is reviewed, and never insert a routine human-review gate or delete one triangle in isolation. Read `references/autonomous_thin_boundary.md` before using this profile.
 - Keep depths finite and positive down and treat OceanMesh2D GPL material as a method reference only.
 
 ## Primary Workflow
+
+For every new complete grid, initialize the standardized portable project first. Keep attempts under each stage's `_work/`, promote one hash-bound selection to its canonical stage name, and publish any terminal mesh at the stable path `final/fvcom_grid.2dm`. The filename does not imply readiness; future submission must pass `validate --require-submission-ready`.
+
+```powershell
+python scripts/manage_fvcom_grid_project.py init --project runs/my_project --name my_project
+python scripts/run_mesher_portfolio_case.py --case-manifest runs/my_project/05_mesh_intent/case_manifest.json --output-dir runs/my_project/06_raw_mesh/_work/gmsh6
+python scripts/manage_fvcom_grid_project.py promote --project runs/my_project --stage 06_raw_mesh --source runs/my_project/06_raw_mesh/_work/gmsh6/candidates/gmsh_frontal_delaunay_6/raw_mesh.2dm --artifact-name raw_mesh.2dm --generator-manifest runs/my_project/06_raw_mesh/_work/gmsh6/candidates/gmsh_frontal_delaunay_6/candidate_manifest.json
+python scripts/manage_fvcom_grid_project.py validate --project runs/my_project
+```
+
+See `references/grid_project_contract.md` for the fixed layout, canonical artifacts, publication inputs, and submission gate. Existing lower-level `--run-dir` commands remain supported for historical evidence.
 
 Adaptive package:
 
@@ -32,12 +46,17 @@ Adaptive package:
 python scripts/run_fvcom_grid.py --bdry-arc-manifest bdry_arc_manifest.json --boundary-loops-gpkg model_boundary_loops.gpkg --boundary-resolution-manifest boundary_resolution_manifest.json --boundary-resolution-profile adaptive-coastal-v2 --bathy-nc bathy.nc --run-dir runs/case --name case --mode test --postprocess-profile none
 ```
 
-Legacy packages continue to use `--boundary-loops-gpkg` without a resolution manifest.
+Use this command only for test-mode mesh-intent/smoke evidence. Full clean-room
+execution requires the explicit `--allow-clean-room-execute` research override
+and is ineligible for standardized operational publication. Legacy packages
+continue to use `--boundary-loops-gpkg` without a resolution manifest.
 
 ## Research Mesher Portfolio
 
-Keep the clean-room constrained-Delaunay route as the production reference.
-Use the isolated Gmsh adapter only for controlled research candidates:
+Use Gmsh Frontal-Delaunay algorithm 6 as the operational raw generator. Keep
+the clean-room constrained-Delaunay route as an explicit source-lineage
+control and use the other isolated Gmsh adapters only for named research
+candidates:
 MeshAdapt algorithm 1, Delaunay algorithm 5, and Frontal-Delaunay algorithm 6.
 Feed every candidate the same immutable boundary, bathymetry,
 `fvcom_size_field_v4`, node budget, and QA policy. Separate the `RAW` generator
@@ -106,11 +125,11 @@ two-dimensional `L/h` audit target.
 
 Route by capability. The current clean-room adapter supports zero or one
 noncyclic OBC, while the Gmsh adapter also supports plural and cyclic OBCs.
-The research raw default is Gmsh Frontal-Delaunay algorithm 6, followed by
-Delaunay algorithm 5 as the first hard-gate challenger, the clean-room route as
-the production reference where supported, and MeshAdapt algorithm 1 as a
-diagnostic. Treat this as routing policy rather than a composite quality
-winner; production promotion remains withheld until the six-case matrix passes.
+The operational raw default is Gmsh Frontal-Delaunay algorithm 6 alone.
+Delaunay algorithm 5, the clean-room route, and MeshAdapt algorithm 1 run only
+when explicitly named for a research comparison. Treat this as routing policy
+rather than a composite quality winner; a failed Gmsh-6 run stops without
+generator fallback.
 The current continuity experiment is a no-conditioning `RAW` comparison:
 disable OMA conditioning and postprocessing, while recording native generator
 settings as raw provenance.
@@ -207,7 +226,11 @@ Hard anchors and all boundary nodes not explicitly handled by the kind-aware edi
 
 ## Standalone Tools
 
-- `scripts/run_mesher_portfolio_case.py`: build one immutable regional `fvcom_size_field_v4` bundle and generate the clean-room plus Gmsh 1/5/6 `RAW` candidates under one node budget. It writes a metric-by-metric comparison and never claims common conditioning.
+- `scripts/run_autonomous_thin_workflow.py`: run or resume the opt-in autonomous workflow. It performs minimal conditioning, produces the hash-bound diagnostic/decision stage, and resumes one selected component through local topology repair or boundary rebuild, Gmsh-6 remeshing, reconditioning, and the three independent closure/readiness decisions. A shoreline decision must bind its request-bounded CUSP extract; the command never pauses for human review.
+- `scripts/manage_fvcom_grid_project.py`: initialize the fixed project tree, promote immutable stage selections, atomically publish terminal delivery artifacts, and validate submission readiness by exact hash.
+- `scripts/diagnose_autonomous_thin.py`: create the whole-domain locator, local mesh/boundary and lineage diagrams, CUSP/GSHHS overlay, scale evidence, and one pending Codex decision per connected superthin component.
+- `scripts/run_autonomous_thin_closure.py`: validate and execute one completed Codex decision. It preflights at most three boundary candidates, retains rejections, preserves protected and OBC lineage, and requires a complete Gmsh-6 remesh after any boundary transaction.
+- `scripts/run_mesher_portfolio_case.py`: build one immutable regional `fvcom_size_field_v4` bundle and generate deterministic Gmsh Frontal-Delaunay-6 `RAW` by default under one node budget. Clean-room and Gmsh 1/5 require explicit `--candidates` values. It writes a metric-by-metric comparison and never claims common conditioning.
 - `scripts/research/gmsh/prepare_lake_superior_boundary.py`: estimate first, then build a fresh zero-OBC GSHHG L2/L3 Lake Superior boundary package with the deterministic St. Marys numerical land gate.
 - `scripts/research/gmsh/prepare_lake_superior_bathymetry.py`: convert a request-bounded ETOPO elevation mosaic to positive-down Lake Superior depth using the accepted wet-domain mask and the explicit 183.2 m IGLD 1985/EGM2008 caveat. Start estimate-first fetches from the committed `scripts/research/gmsh/continuity_cases/lake_superior_etopo_request.json`, and build a fresh ETOPO-only source index with the `cudem-bathy` connector instead of depending on a dated workspace index.
 - `scripts/research/gmsh/validate_lake_superior_preparation.py`: independently hash and validate the boundary, island inventory, numerical gate, wet mask, depth conversion, and readiness selected by `scripts/research/gmsh/continuity_cases/lake_superior.json`. The current selector is boundary preparation v5 plus bathymetry v2; earlier preparation versions are superseded evidence, not fallback inputs. See the research Gmsh README for the immutable end-to-end command sequence.
@@ -231,6 +254,8 @@ Hard anchors and all boundary nodes not explicitly handled by the kind-aware edi
 - `scripts/diagnose_high_valence.py`: inventory every valence violation in one topology scan, classify its likely repair route, write CSV/GeoJSON/JSON, and plot domain-wide plus graph-local diagnostic maps; supply a conditioning report to plot rejected cases first.
 - `scripts/diagnose_thinnest_triangles.py`: rank the lowest-quality delivered elements without editing the mesh, write per-edge flip/split blockers and gap-to-target evidence, and create a zoom panel plus individual figures for boundary, passage, junction, and interior-connectivity review.
 - `scripts/diagnose_superthin_components.py`: create the mandatory connected-component visual atlas, including 1/2/4-ring patches, protected and open boundaries, hard anchors, local valence, passage evidence, and bounded candidate-point overlays; it also writes pending reviewed-plan templates.
+- `scripts/diagnose_autonomous_thin.py`: extend the atlas with a complete-domain locator, boundary-lineage table, scale-derived CUSP request window, optional CUSP/GSHHS overlay, and pending hash-bound Codex decision documents.
+- `scripts/run_autonomous_thin_closure.py`: validate one Codex decision, create an audited adaptive-boundary patch, rebuild an immutable Gmsh-6 case, optionally remesh and run `minimal-topology-v1`, and emit the three independent closure/readiness statuses. Never reuse a decision after any input hash changes.
 - `scripts/apply_visual_superthin_plan.py`: validate and apply one SHA-bound, agent-reviewed component plan, write a checkpoint mesh/report/boundary/OBC remap, and reject stale, unreviewed, multi-component, structurally invalid, or non-improving transactions.
 - `scripts/plot_superthin_component_node_ids.py`: render one component's complete 1/2/4-ring neighborhood with plain one-based source 2DM node identifiers for human passage-core selection.
 - `scripts/apply_thin_passage_removal.py`: apply a SHA-bound sequence of human-approved or learned resolution-cluster whole-passage cuts, checkpoint every transaction, rebuild delivered boundary loops, and audit the explicitly intended topology deltas. This research-only tool is never called by `auto`.
@@ -294,6 +319,7 @@ python scripts/selftest_connectivity_restriction.py
 python scripts/selftest_local_topology_v5_extensions.py
 python scripts/selftest_systematic_v6.py
 python scripts/selftest_visual_superthin.py
+python scripts/selftest_grid_project.py
 python -m compileall scripts
 python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .
 ```

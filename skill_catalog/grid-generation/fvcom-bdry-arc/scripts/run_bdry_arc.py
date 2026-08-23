@@ -47,6 +47,12 @@ def main() -> int:
         choices=("legacy", "adaptive-coastal-v1", "adaptive-coastal-v2"),
     )
     parser.add_argument(
+        "--obc-placement-policy",
+        default="offshore-first",
+        choices=("offshore-first", "mouth-first"),
+        help="Prefer a complete offshore OBC, or try a compact mouth OBC first for coastal estuaries.",
+    )
+    parser.add_argument(
         "--frame-clip-policy",
         default="reject-unintended",
         choices=("reject-unintended", "report-only"),
@@ -91,6 +97,7 @@ def main() -> int:
         frame_clip_policy=args.frame_clip_policy,
         frame_clip_tolerance_m=args.frame_clip_tolerance_m,
         feedback_candidate_max_km=args.feedback_candidate_max_km,
+        obc_placement_policy=args.obc_placement_policy,
     )
     manifest = run_bdry_arc(
         region_bpoly_json=args.region_bpoly_json,

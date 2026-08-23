@@ -1,8 +1,9 @@
 # Generator-Neutral Mesher Portfolio
 
-Use this research contract when comparing triangulation engines. Keep the
-production route unchanged until a candidate passes the complete regional
-matrix.
+Use this contract for the operational Gmsh-6 raw route and for explicit
+triangulation-engine comparisons. Forward evidence has promoted deterministic
+Gmsh Frontal-Delaunay algorithm 6 to the default; other candidates never run
+unless named explicitly.
 
 ## Separate intent from implementation
 
@@ -47,8 +48,9 @@ Do not force every topology through every generator.
 
 | Adapter | Zero OBC | One noncyclic OBC | Multiple OBCs | Cyclic exterior | Research role |
 |---|---:|---:|---:|---:|---|
-| clean-room constrained Delaunay | yes | yes | no | no | production reference and source-lineage control |
-| Gmsh algorithms 1/5/6 | yes | yes | yes | yes | topology breadth and algorithm comparison |
+| clean-room constrained Delaunay | yes | yes | no | no | explicit source-lineage research control |
+| Gmsh algorithm 6 | yes | yes | yes | yes | operational default |
+| Gmsh algorithms 1/5 | yes | yes | yes | yes | explicit challengers and diagnostics |
 | external OceanMesh2D | not integrated | not integrated | not integrated | not integrated | GPL method reference unless an isolated adapter is explicitly added |
 
 Record an unsupported pairing as `capability_not_supported`; do not call it a
@@ -282,29 +284,19 @@ Use two explicit candidate strata:
 Compare algorithms only within a stratum. Compare locked versus native as a
 boundary-policy delta.
 
-## Current raw-mesher routing default
+## Operational raw-mesher default
 
-Use Gmsh Frontal-Delaunay algorithm 6 as the research raw primary. It supports
-zero, single, plural, and cyclic OBC contracts. Run Gmsh Delaunay algorithm 5
-as the first hard-gate challenger. This is a routing policy, not a regional
-result, a composite ranking, or a production-promotion claim. Keep the
-clean-room route as the production reference for supported zero/single
-noncyclic OBC topologies, and use MeshAdapt algorithm 1 as an explicit
-diagnostic rather than the default. Compare failed candidates metric by metric
-without a composite winner.
+Use Gmsh Frontal-Delaunay algorithm 6 as the operational raw generator. It
+supports zero, single, plural, and cyclic OBC contracts. Use first-order
+triangles, one thread, random seed 1, eight native smoothing steps, and disable
+algorithm switching on failure. A Gmsh-6 failure stops the operational run;
+it never activates a different generator.
 
-The executable default policy order is:
-
-1. `gmsh_frontal_delaunay_6` — research raw primary;
-2. `gmsh_delaunay_5` — first algorithm challenger;
-3. `clean_room_raw` — production reference where topology-compatible;
-4. `gmsh_meshadapt_1` — robustness diagnostic.
-
-Production promotion remains withheld until one routed workflow passes every
-hard gate across the complete six-case topology matrix. The current continuity
-experiment stops at `RAW`: disable all OMA conditioning and postprocessing.
-Native algorithm and smoothing settings remain generator provenance and do not
-make the candidate `COMMON_CONDITIONED`.
+The executable default candidate list contains only
+`gmsh_frontal_delaunay_6`. Name `gmsh_delaunay_5`, `clean_room_raw`, or
+`gmsh_meshadapt_1` explicitly for a research comparison. Native algorithm and
+smoothing settings remain raw-generator provenance and do not make the
+candidate `COMMON_CONDITIONED`.
 
 Audit target size per edge, not only from the longest triangle edge divided by
 one centroid sample:

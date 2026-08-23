@@ -10,7 +10,7 @@ Use this skill after `fvcom-region-bpoly` and before `fvcom-grid-generation`.
 ## Core Rules
 
 - Treat the bpoly offshore point as a side selector, not a final endpoint.
-- Build provisional coastal OBC anchors at coastline intersections on the two bpoly sides adjacent to the selected offshore side. If GSHHS wet-domain extraction shows that the source arc continues beyond the delivered exterior, trim only those source tails and promote the two delivered land/exterior intersections to the final OBC anchors.
+- Use `--obc-placement-policy offshore-first` for coastal estuaries. First seek one complete simple offshore arc with exactly two coastline landfalls and complete ownership of the open-water exterior; use a compact mouth fallback only when its wet domain removes the offshore apron and leaves no artificial frame-supported strip. `mouth-first` is an explicit alternative. Lake and island branches are unchanged.
 - Use GSHHS/GSHHG polygons as the topology base. Keep CUSP as an explicit legacy/debug input.
 - After model-loop construction, reject unintended GSHHS frame clipping by default. Keep GSHHS analysis in this skill and return geometry-only feedback to `fvcom-region-bpoly`; do not invent regional features here.
 - Carry the exact delivered OBC into the model-loop package as `delivered_open_boundary_arc`. Adaptive profiles must use that line and its landfall anchors directly; never reconstruct the adaptive OBC from resolution-scaled proximity classifications. Retain `source_open_boundary_arc` only as a compatibility alias.
@@ -46,7 +46,15 @@ Bounded RegionBPoly feedback loop:
 python scripts/run_bpoly_arc_feedback_loop.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --run-dir runs/case_feedback --name case --gshhs-resolution h --gshhs-levels 1 --gshhs-lookahead-km 100 --boundary-resolution-profile adaptive-coastal-v2
 ```
 
-The default `--frame-clip-policy reject-unintended` requires residual frame length no larger than `max(250 m, 0.05 * target resolution)`, residual fraction no larger than 0.001, and intended land/open exterior coverage of at least 0.999. Use `--frame-clip-policy report-only` only to reproduce historical diagnostics. When clipping fails, write `region_bpoly_arc_feedback_v1.json` and skip adaptive repair with `blocked_by_region_bpoly_feedback`.
+The default `--frame-clip-policy reject-unintended` requires residual frame length no larger than `max(250 m, 0.05 * target resolution)`, residual fraction no larger than 0.001, and intended land/open exterior coverage of at least 0.999. These are independent gates; a numerical sliver never waives the fraction or coverage checks. `report-only` is diagnostic-only, always `downstream_eligible=false`, and cannot feed gridding.
+
+Every coastal run writes `fvcom_open_exterior_contract_v1`, a whole-domain map distinguishing wet fill, coastline, delivered OBC, and residual frame segments, plus a pending `open_exterior_agent_decision_v1`. Codex must inspect the map, then finalize the decision and resume adaptive construction:
+
+```powershell
+python scripts/finalize_open_exterior_decision.py --bdry-arc-manifest runs/case/bdry_arc_manifest.json --decision pass --rationale "Complete offshore exterior is owned by one OBC; no frame-supported strip remains." --resume-adaptive
+```
+
+Do not mark `pass` from JSON alone. The finalizer verifies map/source hashes and refuses a pass when any hard metric or report-only policy fails.
 
 The loop retains immutable iterations, tests at most three geometry-only candidates per adjustment, accepts at most four monotonic adjustments, and caps cumulative outward movement at 100 km per implicated side. It never changes the feature plan. Stop as `input_needs_review` when geometry adjustment cannot satisfy both RegionBPoly QA and the complete boundary gate.
 
@@ -79,6 +87,7 @@ V2 never closes a channel automatically. Its default minimum passage spacing fol
 - `scripts/refine_boundary_resolution.py`: write an adaptive resolution package from existing loop, mission, and GSHHS artifacts.
 - `scripts/build_model_boundary_loops.py`: rebuild legacy loop classification for debugging.
 - `scripts/run_bpoly_arc_feedback_loop.py`: iterate RegionBPoly, GSHHS, model loops, and adaptive-v2 under bounded geometry-only adjustment.
+- `scripts/finalize_open_exterior_decision.py`: record the mandatory hash-bound Codex whole-map judgment and resume adaptive construction only for a strict passing contract.
 
 ## Outputs
 
@@ -96,6 +105,7 @@ Require final OBC anchors at the delivered land/exterior intersections, measured
 
 ```powershell
 python scripts/selftest_bdry_arc.py
+python scripts/selftest_open_exterior_contract.py
 python -m compileall scripts
 python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .
 ```

@@ -33,6 +33,7 @@ from .node_budget import (
 )
 from .plotting import write_mesh_gpkg, write_mesh_quality_gpkg, write_mesh_review_map
 from .progress import ProgressTracker
+from .open_exterior import validate_open_exterior_contract
 from .projection import project_points, unproject_points
 from .quality import evaluate_mesh_quality
 from .size_field import (
@@ -221,6 +222,16 @@ def run_fvcom_grid(
     boundary_resolution_manifest = upstream.get("boundary_resolution_manifest")
     bathy_nc = upstream["bathy_nc"]
     bdry_arc_manifest = upstream.get("bdry_arc_manifest")
+    if bdry_arc_manifest:
+        # Historical lower-level packages may predate the contract.  When the
+        # lineage contains one, every metric/decision is hard-revalidated;
+        # standardized new projects require it again at publication.
+        open_exterior_audit = validate_open_exterior_contract(bdry_arc_manifest, required=False)
+        if not open_exterior_audit["passed"]:
+            raise ValueError(
+                "strict open-exterior contract failed: "
+                + ", ".join(open_exterior_audit["failure_taxonomy"])
+            )
     if config.boundary_resolution_profile in {"adaptive-coastal-v1", "adaptive-coastal-v2"} and not boundary_resolution_manifest:
         raise ValueError(
             f"{config.boundary_resolution_profile} requires --boundary-resolution-manifest or an upstream adaptive boundary run"
