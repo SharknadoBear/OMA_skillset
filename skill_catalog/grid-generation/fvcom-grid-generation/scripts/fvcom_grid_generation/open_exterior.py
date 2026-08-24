@@ -60,7 +60,12 @@ def discover_open_exterior_contract(source: str | Path) -> tuple[dict[str, Any] 
     return None, None
 
 
-def validate_open_exterior_contract(source: str | Path, *, required: bool = True) -> dict[str, Any]:
+def validate_open_exterior_contract(
+    source: str | Path,
+    *,
+    required: bool = True,
+    require_topology_coverage: bool = True,
+) -> dict[str, Any]:
     contract, contract_path = discover_open_exterior_contract(source)
     failures: list[str] = []
     if contract is None:
@@ -82,7 +87,13 @@ def validate_open_exterior_contract(source: str | Path, *, required: bool = True
             failures.append(failure)
     if contract.get("downstream_eligible") is not True:
         failures.append("open_exterior_not_downstream_eligible")
+    coverage = contract.get("coastline_source_coverage") or {}
+    coverage_required = bool(
+        require_topology_coverage
+        and int((contract.get("obc_geometry") or {}).get("expected_count", 0) or 0) > 0
+    )
     decision = contract.get("agent_decision", {})
+    decision_doc: dict[str, Any] = {}
     if decision.get("status") != "pass":
         failures.append("open_exterior_agent_decision_missing_or_rejected")
     decision_path = _resolve(decision.get("path"), contract_path.parent if contract_path else Path.cwd())
@@ -108,6 +119,17 @@ def validate_open_exterior_contract(source: str | Path, *, required: bool = True
                 decision_doc,
                 failures,
             )
+    if coverage_required:
+        if contract.get("coastline_source_coverage_required") is not True or not coverage:
+            failures.append("coastline_source_coverage_missing")
+        else:
+            _validate_coastline_source_coverage(
+                coverage,
+                contract,
+                contract_path,
+                decision_doc,
+                failures,
+            )
     obc = contract.get("obc_geometry", {})
     expected = int(obc.get("expected_count", 0) or 0)
     if int(obc.get("delivered_count", 0) or 0) != expected:
@@ -125,6 +147,7 @@ def validate_open_exterior_contract(source: str | Path, *, required: bool = True
         "obc_placement_family": contract.get("obc_placement_family"),
         "contract_schema": schema,
         "residual_role_summary": contract.get("residual_role_summary"),
+        "coastline_source_coverage": coverage,
     }
 
 
@@ -185,6 +208,49 @@ def _validate_residual_roles(
             failures.append("residual_secondary_obc_station_screen_missing")
         elif screen.get("sha256") != sha256_file(screen_path):
             failures.append("residual_secondary_obc_station_screen_stale")
+
+
+def _validate_coastline_source_coverage(
+    coverage: dict[str, Any],
+    contract: dict[str, Any],
+    contract_path: Path,
+    decision_doc: dict[str, Any],
+    failures: list[str],
+) -> None:
+    if coverage.get("schema_version") != "fvcom_coastline_source_coverage_v1":
+        failures.append("coastline_source_coverage_schema_unsupported")
+    if coverage.get("downstream_eligible") is not True:
+        failures.append("coastline_source_footprint_incomplete")
+    if float(coverage.get("coverage_factor_x", 0.0) or 0.0) < 2.0 or float(
+        coverage.get("coverage_factor_y", 0.0) or 0.0
+    ) < 2.0:
+        failures.append("boundary_geometry_outside_coastline_coverage")
+    if coverage.get("model_bbox_centrally_contained") is not True or coverage.get("region_bpoly_covered") is not True:
+        failures.append("coastline_source_footprint_incomplete")
+    if float(coverage.get("source_frame_dependency_length_m", float("inf"))) > float(
+        coverage.get("source_frame_dependency_limit_m", 1.0)
+    ):
+        failures.append("coastline_source_frame_used_as_land_boundary")
+    if coverage.get("physical_coastline_only_landfalls") is not True:
+        failures.append("coastline_clip_edge_landfall")
+    coverage_path = _resolve(coverage.get("contract_path"), contract_path.parent)
+    expected_hash = (contract.get("source_hashes") or {}).get("coastline_source_coverage")
+    if not coverage_path or not coverage_path.is_file():
+        failures.append("coastline_source_coverage_file_missing")
+    elif expected_hash != sha256_file(coverage_path):
+        failures.append("coastline_source_coverage_hash_stale")
+    for key, decision_key in (
+        ("whole_domain", "inspected_coastline_coverage_map_sha256"),
+        ("source_edge_zoom", "inspected_coastline_coverage_zoom_sha256"),
+    ):
+        record = (coverage.get("maps") or {}).get(key) or {}
+        map_path = _resolve(record.get("path"), contract_path.parent)
+        if not map_path or not map_path.is_file():
+            failures.append("coastline_source_coverage_map_missing")
+        elif record.get("sha256") != sha256_file(map_path):
+            failures.append("coastline_source_coverage_map_stale")
+        elif decision_doc.get(decision_key) != record.get("sha256"):
+            failures.append("coastline_source_coverage_map_not_bound_to_decision")
 
 
 __all__ = ["discover_open_exterior_contract", "validate_open_exterior_contract"]

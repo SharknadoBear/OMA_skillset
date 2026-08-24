@@ -30,7 +30,7 @@ For `fvcom-bdry-arc`, translate that idea into a Python postprocessor:
 - project to a local CRS before distance, tangent, and area decisions;
 - bridge dangling endpoints only under strict geometric rules;
 - use the selected bpoly offshore side to identify the two adjacent bpoly sides;
-- find the open-boundary anchors where those adjacent bpoly sides intersect the GSHHS coastline/land boundary, choosing the crossing closest to each offshore-side corner;
+- find open-boundary anchors where those adjacent bpoly sides intersect the physical GSHHS `coastline_lines`, choosing the crossing closest to each offshore-side corner;
 - use the selected bpoly offshore-side endpoints as control corners, not final anchors;
 - create a smooth open-boundary arc by deforming the full seaward chain from one coastline/bpoly anchor through the offshore side to the other coastline/bpoly anchor;
 - combine the smooth arc with the non-seaward bpoly path between anchors to form a closed deformed frame;
@@ -39,6 +39,12 @@ For `fvcom-bdry-arc`, translate that idea into a Python postprocessor:
 - classify remaining non-open frame edges separately from GSHHS land-boundary arcs;
 - keep island holes if they are resolved at the target resolution;
 - mark `needs_review` when topology is ambiguous.
+
+Never rebuild physical shoreline from the boundary of bbox-clipped land polygons.
+That boundary includes artificial source-frame segments. Keep the land polygons
+for mask subtraction, but use only source-derived coastline lines for landfalls,
+arc trimming, and shoreline-bracketed residual roles. Require a centered source
+footprint before any of those decisions.
 
 ## Island / Archipelago Branch
 

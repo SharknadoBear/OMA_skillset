@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
 import urllib.request
 import zipfile
@@ -14,6 +15,8 @@ GSHHG_ZIP_NAME = f"gshhg-shp-{GSHHG_VERSION}.zip"
 GSHHG_ZIP_URL = f"https://ftp.soest.hawaii.edu/gshhg/{GSHHG_ZIP_NAME}"
 GSHHG_ZIP_ESTIMATED_BYTES = 142 * 1024 * 1024
 RESOLUTION_ORDER = ("c", "l", "i", "h", "f")
+MIN_TOPOLOGY_COVERAGE_FACTOR = 2.0
+DEFAULT_TOPOLOGY_COVERAGE_FACTOR = 3.0
 
 
 @dataclass(frozen=True)
@@ -204,6 +207,80 @@ def split_bbox_antimeridian(bbox: tuple[float, float, float, float]) -> tuple[li
     metadata["antimeridian_split"] = len(parts) > 1
     metadata["parts"] = [list(part) for part in parts]
     return parts, metadata
+
+
+def expand_centered_topology_bbox(
+    model_bbox: tuple[float, float, float, float],
+    *,
+    coverage_factor: float = DEFAULT_TOPOLOGY_COVERAGE_FACTOR,
+    lookahead_km: float = 0.0,
+) -> tuple[tuple[float, float, float, float], dict[str, object]]:
+    """Return a centered FVCOM topology footprint in an unwrapped longitude frame."""
+    west, south, east, north = map(float, model_bbox)
+    if south >= north or south < -90.0 or north > 90.0:
+        raise ValueError(f"Invalid model bbox latitude order/range: {model_bbox}")
+    if coverage_factor < MIN_TOPOLOGY_COVERAGE_FACTOR:
+        raise ValueError(
+            f"FVCOM topology coverage factor must be >= {MIN_TOPOLOGY_COVERAGE_FACTOR:.1f}"
+        )
+    if lookahead_km < 0.0:
+        raise ValueError("FVCOM topology look-ahead must be nonnegative")
+
+    east_unwrapped = east
+    while east_unwrapped <= west:
+        east_unwrapped += 360.0
+    lon_span = east_unwrapped - west
+    lat_span = north - south
+    if lon_span <= 0.0 or lon_span >= 360.0:
+        raise ValueError(f"FVCOM topology model longitude span must be within (0, 360): {model_bbox}")
+
+    center_lon = 0.5 * (west + east_unwrapped)
+    center_lat = 0.5 * (south + north)
+    lookahead_lat = float(lookahead_km) / 110.54
+    lookahead_lon = float(lookahead_km) / max(111.32 * math.cos(math.radians(center_lat)), 20.0)
+    half_lon = max(0.5 * float(coverage_factor) * lon_span, 0.5 * lon_span + lookahead_lon)
+    half_lat = max(0.5 * float(coverage_factor) * lat_span, 0.5 * lat_span + lookahead_lat)
+    request = (center_lon - half_lon, center_lat - half_lat, center_lon + half_lon, center_lat + half_lat)
+    if request[1] < -90.0 or request[3] > 90.0:
+        raise ValueError("Centered FVCOM topology footprint would cross a pole; reduce the regional extent")
+    if request[2] - request[0] >= 360.0:
+        raise ValueError("Centered FVCOM topology footprint would span the globe")
+
+    factor_lon = (request[2] - request[0]) / lon_span
+    factor_lat = (request[3] - request[1]) / lat_span
+    margin_lon = half_lon - 0.5 * lon_span
+    margin_lat = half_lat - 0.5 * lat_span
+    metadata: dict[str, object] = {
+        "schema_version": "gshhs_topology_coverage_v1",
+        "mode": "fvcom_topology",
+        "model_bbox_wsen_unwrapped": [west, south, east_unwrapped, north],
+        "source_bbox_wsen_unwrapped": list(request),
+        "coverage_factor_requested": float(coverage_factor),
+        "coverage_factor_lon": float(factor_lon),
+        "coverage_factor_lat": float(factor_lat),
+        "minimum_coverage_factor": MIN_TOPOLOGY_COVERAGE_FACTOR,
+        "lookahead_km": float(lookahead_km),
+        "margins_degrees": {
+            "west": float(margin_lon),
+            "east": float(margin_lon),
+            "south": float(margin_lat),
+            "north": float(margin_lat),
+        },
+        "margins_approx_km": {
+            "west": float(margin_lon * 111.32 * math.cos(math.radians(center_lat))),
+            "east": float(margin_lon * 111.32 * math.cos(math.radians(center_lat))),
+            "south": float(margin_lat * 110.54),
+            "north": float(margin_lat * 110.54),
+        },
+        "center_lonlat_unwrapped": [float(center_lon), float(center_lat)],
+        "source_center_offset_lonlat": [0.0, 0.0],
+        "model_bbox_centrally_contained": True,
+        "downstream_topology_eligible": bool(
+            factor_lon >= MIN_TOPOLOGY_COVERAGE_FACTOR
+            and factor_lat >= MIN_TOPOLOGY_COVERAGE_FACTOR
+        ),
+    }
+    return request, metadata
 
 
 def write_json(path: str | Path, data: dict[str, object]) -> None:

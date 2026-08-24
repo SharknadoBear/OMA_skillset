@@ -41,6 +41,13 @@ report, then writes the portable `fvcom_raw_mesh_provenance_v1` sidecar above.
 Clean-room and Gmsh 1/5 candidates remain explicit research controls and cannot
 be promoted or published through this operational project contract.
 
+For a coastal project, the promoted boundary must carry a passing
+`fvcom_coastline_source_coverage_v1` contract. It proves that the RegionBPoly
+was centered inside at least a 2x GSHHS source footprint, all landfalls came
+from physical coastline lines, the delivered exterior has zero source-frame
+dependency, and the whole/zoom coverage maps and hashes remain current.
+Historical exact-bbox packages are diagnostic-only for new projects.
+
 When a raw or conditioned terminal mesh exists, `publish` requires the mesh
 quality, conditioning, boundary-node, OBC-remap, and roundtrip companions. It
 automatically writes the standard positive-down bathymetry/triangle review map,

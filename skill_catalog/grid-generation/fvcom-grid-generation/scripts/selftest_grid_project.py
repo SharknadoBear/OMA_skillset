@@ -31,16 +31,43 @@ def write(path: Path, value: str) -> Path:
     return path
 
 
+def coverage_fixture(root: Path) -> tuple[dict, str]:
+    whole = write(root / "coverage_map.png", "coverage map")
+    zoom = write(root / "coverage_zoom.png", "coverage zoom")
+    path = root / "coastline_source_coverage.json"
+    coverage = {
+        "schema_version": "fvcom_coastline_source_coverage_v1",
+        "downstream_eligible": True,
+        "coverage_factor_x": 3.0,
+        "coverage_factor_y": 3.0,
+        "model_bbox_centrally_contained": True,
+        "region_bpoly_covered": True,
+        "source_frame_dependency_length_m": 0.0,
+        "source_frame_dependency_limit_m": 1.0,
+        "physical_coastline_only_landfalls": True,
+        "contract_path": str(path),
+        "maps": {
+            "whole_domain": {"path": str(whole), "sha256": sha256_file(whole)},
+            "source_edge_zoom": {"path": str(zoom), "sha256": sha256_file(zoom)},
+        },
+    }
+    path.write_text(json.dumps(coverage), encoding="utf-8")
+    return coverage, sha256_file(path)
+
+
 def contract_fixture(root: Path, *, report_only: bool = False) -> Path:
     map_path = write(root / "open_map.png", "map")
     decision_path = root / "decision.json"
-    source_hashes = {"region": "abc", "coastline": "def"}
+    coverage, coverage_hash = coverage_fixture(root)
+    source_hashes = {"region": "abc", "coastline": "def", "coastline_source_coverage": coverage_hash}
     decision = {
         "schema_version": "open_exterior_agent_decision_v1",
         "status": "pass",
         "decision_actor": {"kind": "codex_agent"},
         "inspected_map_sha256": sha256_file(map_path),
         "bound_source_hashes": source_hashes,
+        "inspected_coastline_coverage_map_sha256": coverage["maps"]["whole_domain"]["sha256"],
+        "inspected_coastline_coverage_zoom_sha256": coverage["maps"]["source_edge_zoom"]["sha256"],
     }
     decision_path.write_text(json.dumps(decision), encoding="utf-8")
     contract = {
@@ -59,6 +86,8 @@ def contract_fixture(root: Path, *, report_only: bool = False) -> Path:
             "simple_nonbranching": True,
             "nonendpoint_land_crossing_m": 0.0,
         },
+        "coastline_source_coverage_required": True,
+        "coastline_source_coverage": coverage,
         "source_hashes": source_hashes,
         "map": {"path": str(map_path), "sha256": sha256_file(map_path)},
         "agent_decision": {
@@ -75,7 +104,8 @@ def contract_fixture(root: Path, *, report_only: bool = False) -> Path:
 def role_contract_fixture(root: Path, *, stale_component_map: bool = False) -> Path:
     map_path = write(root / "open_map.png", "whole map")
     component_map = write(root / "residual_map.png", "component map")
-    source_hashes = {"region": "abc", "coastline": "def"}
+    coverage, coverage_hash = coverage_fixture(root)
+    source_hashes = {"region": "abc", "coastline": "def", "coastline_source_coverage": coverage_hash}
     decision_path = root / "decision_v2.json"
     decision = {
         "schema_version": "open_exterior_agent_decision_v2",
@@ -83,6 +113,8 @@ def role_contract_fixture(root: Path, *, stale_component_map: bool = False) -> P
         "decision_actor": {"kind": "codex_agent"},
         "inspected_map_sha256": sha256_file(map_path),
         "bound_source_hashes": source_hashes,
+        "inspected_coastline_coverage_map_sha256": coverage["maps"]["whole_domain"]["sha256"],
+        "inspected_coastline_coverage_zoom_sha256": coverage["maps"]["source_edge_zoom"]["sha256"],
         "residual_roles": [{
             "segment_id": 0,
             "role": "solid_lagoon_closure",
@@ -111,6 +143,8 @@ def role_contract_fixture(root: Path, *, stale_component_map: bool = False) -> P
             "simple_nonbranching": True,
             "nonendpoint_land_crossing_m": 0.0,
         },
+        "coastline_source_coverage_required": True,
+        "coastline_source_coverage": coverage,
         "residual_role_summary": {
             "pending_count": 0,
             "unassigned_residual_length_m": 0.0,
@@ -237,6 +271,18 @@ def main() -> None:
         assert "Gmsh Frontal-Delaunay algorithm 6" in guarded.stderr
         contract = contract_fixture(base / "evidence")
         assert validate_open_exterior_contract(contract)["passed"]
+        missing_coverage = contract_fixture(base / "missing_coverage")
+        missing_doc = json.loads(missing_coverage.read_text(encoding="utf-8"))
+        missing_doc.pop("coastline_source_coverage", None)
+        missing_doc.pop("coastline_source_coverage_required", None)
+        missing_coverage.write_text(json.dumps(missing_doc), encoding="utf-8")
+        missing_audit = validate_open_exterior_contract(missing_coverage)
+        assert "coastline_source_coverage_missing" in missing_audit["failure_taxonomy"]
+        stale_coverage = contract_fixture(base / "stale_coverage")
+        stale_doc = json.loads(stale_coverage.read_text(encoding="utf-8"))
+        Path(stale_doc["coastline_source_coverage"]["contract_path"]).write_text("stale", encoding="utf-8")
+        stale_coverage_audit = validate_open_exterior_contract(stale_coverage)
+        assert "coastline_source_coverage_hash_stale" in stale_coverage_audit["failure_taxonomy"]
         role_contract = role_contract_fixture(base / "role_evidence")
         role_audit = validate_open_exterior_contract(role_contract)
         assert role_audit["passed"], role_audit

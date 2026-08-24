@@ -32,6 +32,7 @@ def main() -> int:
     parser.add_argument("--gshhs-skill-dir")
     parser.add_argument("--gshhs-resolution", default="f", choices=("auto", "c", "l", "i", "h", "f"))
     parser.add_argument("--gshhs-levels", default="1")
+    parser.add_argument("--gshhs-coverage-factor", type=float, default=3.0, help="Centered topology source coverage factor; minimum 2.0.")
     parser.add_argument("--fallback-policy", default="auto", choices=("none", "osm-overpass", "auto"))
     parser.add_argument("--topology-mode", default="gshhs-vector", choices=("gshhs-vector", "island-loop", "iterative-raster", "vector-only"))
     parser.add_argument("--raster-resolution-m", type=float)
@@ -90,6 +91,7 @@ def main() -> int:
         gshhs_skill_dir=args.gshhs_skill_dir,
         gshhs_resolution=args.gshhs_resolution,
         gshhs_levels=args.gshhs_levels,
+        gshhs_coverage_factor=args.gshhs_coverage_factor,
         fallback_policy=args.fallback_policy,
         topology_mode=args.topology_mode,
         raster_resolution_m=args.raster_resolution_m,

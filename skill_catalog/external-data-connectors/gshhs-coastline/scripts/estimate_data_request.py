@@ -15,6 +15,7 @@ from gshhs_coastline.sources import (  # noqa: E402
     GSHHG_ZIP_ESTIMATED_BYTES,
     GSHHG_ZIP_URL,
     find_gshhs_cache,
+    expand_centered_topology_bbox,
     local_free_bytes,
     write_json,
 )
@@ -41,6 +42,14 @@ def main() -> int:
     args = parser.parse_args()
 
     request = _read_json(args.request)
+    topology_coverage = None
+    model_bbox = request.get("model_bbox") or request.get("model_bbox_wsen")
+    if model_bbox is not None:
+        _source_bbox, topology_coverage = expand_centered_topology_bbox(
+            tuple(float(value) for value in model_bbox),
+            coverage_factor=float(request.get("coverage_factor", 3.0)),
+            lookahead_km=float(request.get("lookahead_km", 0.0)),
+        )
     cache_dir = args.cache_dir or request.get("cache_dir")
     run_id = args.run_id or request.get("name") or request.get("run_id") or "default"
     cache = find_gshhs_cache(cache_dir)
@@ -84,6 +93,7 @@ def main() -> int:
             "rule": "download locally only when local_free_bytes > 4 * estimated_requested_bytes",
             "cache_policy": "local cache means estimated_requested_bytes is zero",
         },
+        "topology_coverage": topology_coverage,
     }
     write_json(args.output, result)
     print(json.dumps(result, indent=2))

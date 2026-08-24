@@ -30,7 +30,8 @@ from shapely.ops import linemerge, nearest_points, polygonize, substring, unary_
 
 from .boundary_loops import build_model_boundary_loops
 from .boundary_resolution import boundary_resolution_config, build_boundary_resolution
-from .feedback import build_region_bpoly_arc_feedback
+from .coastline_coverage import audit_coastline_source_coverage
+from .feedback import build_region_bpoly_arc_feedback, file_sha256
 from .projection import LocalProjection, local_utm_projection, project_geometry, unproject_geometry, unwrap_geometry_longitudes, unwrap_longitude
 
 
@@ -50,6 +51,7 @@ class BdryArcConfig:
     gshhs_skill_dir: str | None = None
     gshhs_resolution: str = "f"
     gshhs_levels: str = "1"
+    gshhs_coverage_factor: float = 3.0
     fallback_policy: str = "auto"
     topology_mode: str = "gshhs-vector"
     raster_resolution_m: float | None = None
@@ -109,6 +111,8 @@ def run_bdry_arc(
         raise ValueError("--frame-clip-tolerance-m must be nonnegative")
     if config.feedback_candidate_max_km <= 0.0:
         raise ValueError("--feedback-candidate-max-km must be positive")
+    if config.gshhs_coverage_factor < 2.0:
+        raise ValueError("--gshhs-coverage-factor must be at least 2.0")
     if config.topology_mode == "gshhs-vector" and config.coastline_source == "cusp-legacy":
         raise ValueError("--topology-mode gshhs-vector requires GSHHS/generic polygon-capable coastline input")
     resolved_heuristic_mode, place_memory_enabled = _resolve_heuristic_mode(config.heuristic_mode, config.mode)
@@ -169,12 +173,14 @@ def run_bdry_arc(
             fetch_metadata = {"fetched_with": "cusp-coastline", "coastline_source": "cusp-legacy"}
         else:
             coastline_gpkg, fetch_metadata = _fetch_gshhs_coastline(
-                buffered_bbox,
+                bbox_wsen,
                 run_dir / "coastline",
                 name,
                 gshhs_skill_dir=config.gshhs_skill_dir,
                 resolution=config.gshhs_resolution,
                 levels=config.gshhs_levels,
+                coverage_factor=config.gshhs_coverage_factor,
+                lookahead_km=config.coastline_buffer_km,
                 progress_interval_s=config.progress_interval_s,
             )
     if coastline_gpkg is None:
@@ -204,6 +210,7 @@ def run_bdry_arc(
         bpoly_xy,
         config.target_resolution_m,
     )
+    physical_coastline_boundary_xy = unary_union(repaired_lines_xy) if repaired_lines_xy else GeometryCollection()
     _write_progress(run_dir, "repair", "done", repair_meta)
 
     selected_side = unwrap_geometry_longitudes(_selected_side_line(offshore, region), longitude_origin)
@@ -220,9 +227,7 @@ def run_bdry_arc(
     elif island_loop_branch:
         anchors = _island_loop_reference_points(selected_side_xy, bpoly_xy, config.target_resolution_m)
     elif config.topology_mode == "gshhs-vector":
-        land_boundary_xy = unary_union(land_polygons_xy).boundary if land_polygons_xy else GeometryCollection()
-        if land_boundary_xy.is_empty and repaired_lines_xy:
-            land_boundary_xy = unary_union(repaired_lines_xy)
+        land_boundary_xy = physical_coastline_boundary_xy
         anchors = _coastline_bpoly_anchor_points(
             land_boundary_xy,
             selected_side_xy,
@@ -307,6 +312,7 @@ def run_bdry_arc(
             run_dir=run_dir,
             topology_time_budget_s=config.topology_time_budget_s,
             obc_placement_policy=config.obc_placement_policy,
+            physical_land_boundary_xy=physical_coastline_boundary_xy,
         )
         scored = topology_selection["scored"]
         wet_result = topology_selection["wet_result"]
@@ -362,7 +368,24 @@ def run_bdry_arc(
         wet_result.setdefault("metadata", {})["obc_placement_policy"] = config.obc_placement_policy
         wet_result["metadata"]["obc_placement_family"] = family
         wet_result["metadata"]["offshore_family_attempted_first"] = config.obc_placement_policy == "offshore-first"
+    coverage_contract: dict[str, Any] | None = None
+    if config.coastline_source == "gshhs":
+        coverage_contract = audit_coastline_source_coverage(
+            coastline_gpkg,
+            bpoly_lonlat,
+            projection,
+            physical_coastline_boundary_xy,
+            anchors_xy=[Point(anchors["start_xy"]), Point(anchors["end_xy"])] if not lake_closed_branch and not island_loop_branch else [],
+            delivered_boundary_xy=wet_result["wet_domain_xy"].boundary,
+            target_resolution_m=config.target_resolution_m,
+            output_dir=run_dir / "coastline_source_coverage",
+            name=name,
+        )
     final_status, failure_taxonomy = _final_status(scored, wet_result, anchors, forbidden_regions_xy)
+    if coverage_contract is not None and not coverage_contract.get("downstream_eligible", False):
+        final_status = "needs_review"
+        failure_taxonomy.extend(coverage_contract.get("failure_taxonomy", []))
+        failure_taxonomy = list(dict.fromkeys(failure_taxonomy))
     advisory_taxonomy: list[str] = []
     if wet_result.get("metadata", {}).get("open_arc_trimmed_to_wet_exterior"):
         advisory_taxonomy.append("source_open_arc_tail_trimmed_to_wet_exterior")
@@ -436,6 +459,7 @@ def run_bdry_arc(
             "coastline_source": config.coastline_source,
             "gshhs_resolution": config.gshhs_resolution,
             "gshhs_levels": config.gshhs_levels,
+            "gshhs_coverage_factor": float(config.gshhs_coverage_factor),
             "topology_mode": config.topology_mode,
             "topology_mode_used": topology_mode_used,
             "heuristic_mode": resolved_heuristic_mode,
@@ -482,6 +506,7 @@ def run_bdry_arc(
             "longitude_origin": projection.longitude_origin,
         },
         "coastline_audit": audit,
+        "coastline_source_coverage": coverage_contract,
         "repair": repair_meta,
         "seed": seed_meta,
         "anchors": {
@@ -528,6 +553,9 @@ def run_bdry_arc(
         "outputs": {
             **outputs,
             "bdry_arc_review_map": str(final_map),
+            "coastline_source_coverage": coverage_contract.get("contract_path") if coverage_contract else None,
+            "coastline_source_coverage_map": (coverage_contract or {}).get("maps", {}).get("whole_domain", {}).get("path"),
+            "coastline_source_coverage_zoom": (coverage_contract or {}).get("maps", {}).get("source_edge_zoom", {}).get("path"),
             "visual_review_dir": str(visual_dir) if config.mode == "test" else None,
         },
     }
@@ -1125,6 +1153,7 @@ def select_gshhs_open_side_topology(
     run_dir: Path | None = None,
     topology_time_budget_s: float | None = None,
     obc_placement_policy: str = "offshore-first",
+    physical_land_boundary_xy=None,
 ) -> dict[str, Any]:
     """Select the coastline-anchor seaward-chain deformation that creates the best domain."""
     evaluated: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -1153,6 +1182,7 @@ def select_gshhs_open_side_topology(
             anchors=anchors,
             land_union_xy=land_union_xy,
             obc_placement_policy=obc_placement_policy,
+            physical_land_boundary_xy=physical_land_boundary_xy,
         )
         metadata = result["metadata"]
         metrics = dict(candidate.get("metrics", {}))
@@ -1412,10 +1442,15 @@ def extract_gshhs_vector_wet_domain(
     anchors: dict[str, Any] | None = None,
     land_union_xy=None,
     obc_placement_policy: str = "offshore-first",
+    physical_land_boundary_xy=None,
 ) -> dict[str, Any]:
     """Build a GSHHS-first wet domain from a coastline-anchor deformed frame."""
     land_union = land_union_xy if land_union_xy is not None else (unary_union(land_polygons_xy).buffer(0) if land_polygons_xy else GeometryCollection())
-    land_boundary = land_union.boundary if not land_union.is_empty else GeometryCollection()
+    land_boundary = (
+        physical_land_boundary_xy
+        if physical_land_boundary_xy is not None and not physical_land_boundary_xy.is_empty
+        else (land_union.boundary if not land_union.is_empty else GeometryCollection())
+    )
     deformed_frame, frame_meta = _deformed_bpoly_frame(bpoly_xy, offshore_arc_xy, anchors)
     base_water = deformed_frame.difference(land_union).buffer(0) if not land_union.is_empty else deformed_frame.buffer(0)
     if not base_water.is_valid:
@@ -2570,22 +2605,26 @@ def _is_resolved_ring_in_domain(line: LineString, wet_domain_xy: Polygon, min_ar
 
 
 def _fetch_gshhs_coastline(
-    bbox_wsen: tuple[float, float, float, float],
+    model_bbox_wsen: tuple[float, float, float, float],
     run_dir: Path,
     name: str,
     gshhs_skill_dir: str | None,
     resolution: str,
     levels: str,
+    coverage_factor: float = 3.0,
+    lookahead_km: float = 0.0,
     progress_interval_s: float = 30.0,
 ) -> tuple[Path, dict[str, Any]]:
-    """Run the installed gshhs-coastline fetch script for a buffered bbox."""
+    """Run the installed GSHHS connector with centered topology coverage."""
     run_dir.mkdir(parents=True, exist_ok=True)
     skill_dir = _resolve_gshhs_skill_dir(gshhs_skill_dir)
     request_json = run_dir / "gshhs_request.json"
     request = {
-        "schema_version": "gshhs_request_for_fvcom_bdry_arc_v1",
+        "schema_version": "gshhs_request_for_fvcom_bdry_arc_v2",
         "name": name,
-        "bbox": list(map(float, bbox_wsen)),
+        "model_bbox": list(map(float, model_bbox_wsen)),
+        "coverage_factor": float(coverage_factor),
+        "lookahead_km": float(lookahead_km),
         "resolution": resolution,
         "levels": levels,
         "source": "fvcom-bdry-arc --fetch-coastline",
@@ -2618,8 +2657,12 @@ def _fetch_gshhs_coastline(
         [
             sys.executable,
             str(fetch_script),
-            "--bbox",
-            *(str(v) for v in bbox_wsen),
+            "--model-bbox",
+            *(str(v) for v in model_bbox_wsen),
+            "--coverage-factor",
+            str(coverage_factor),
+            "--lookahead-km",
+            str(lookahead_km),
             "--run-dir",
             str(run_dir),
             "--name",
@@ -2653,6 +2696,8 @@ def _fetch_gshhs_coastline(
             gshhs_manifest = _read_json(manifest)
             metadata["gshhs_selected_resolution"] = gshhs_manifest.get("source", {}).get("selected_resolution")
             metadata["gshhs_selected_levels"] = gshhs_manifest.get("source", {}).get("selected_levels")
+            metadata["gshhs_topology_coverage"] = gshhs_manifest.get("topology_coverage")
+            metadata["gshhs_manifest_sha256"] = file_sha256(manifest)
         except Exception:
             pass
     return gpkg, metadata
@@ -2977,6 +3022,8 @@ def _load_coastline_product(
             metadata["gshhs_requested_resolution"] = gshhs_manifest.get("request", {}).get("resolution")
             metadata["gshhs_selected_resolution"] = gshhs_manifest.get("source", {}).get("selected_resolution")
             metadata["gshhs_selected_levels"] = gshhs_manifest.get("source", {}).get("selected_levels")
+            metadata["gshhs_topology_coverage"] = gshhs_manifest.get("topology_coverage")
+            metadata["gshhs_manifest_sha256"] = file_sha256(manifest_path)
         except Exception:
             pass
     return coastline, land, metadata

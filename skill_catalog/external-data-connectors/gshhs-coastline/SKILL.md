@@ -38,6 +38,12 @@ python scripts/estimate_data_request.py --request request.json --run-dir runs/ca
 python scripts/fetch_gshhs_coastline.py --bbox W S E N --run-dir runs/case --name case --resolution h --levels 1
 ```
 
+For FVCOM topology, pass the controlling RegionBPoly envelope as `--model-bbox`, not `--bbox`. The connector centers it in a 3x source footprint, rejects factors below 2x, and applies any requested symmetric look-ahead halo:
+
+```powershell
+python scripts/fetch_gshhs_coastline.py --model-bbox W S E N --coverage-factor 3 --lookahead-km 100 --run-dir runs/case --name case --resolution f --levels 1
+```
+
 5. Run the health gate:
 
 ```powershell
@@ -48,7 +54,7 @@ python scripts/check_download_health.py --run-dir runs/case --output runs/case/h
 
 For a run named `case`, write:
 
-- `case_gshhs_land.gpkg` with layers `land_polygons`, `coastline_lines`, `request_bbox`, and `source_footprint`;
+- `case_gshhs_land.gpkg` with `land_polygons`, physical `coastline_lines`, `request_bbox`, `source_footprint`, and `source_frame`; topology requests also include `model_bbox`;
 - `case_gshhs_land.geojson` and `case_gshhs_coastline.geojson` when requested;
 - optional shapefile folders when requested;
 - `case_gshhs_map.png`;
@@ -69,6 +75,8 @@ Use `--levels 1` by default. Level 1 is land. Other levels may be useful for lak
 
 - Treat GSHHS/GSHHG as the robust topology base. Do not treat CUSP as part of this connector.
 - Clip land polygons by bbox for wet/land masking, and derive coastline lines from source polygon boundaries clipped to bbox.
+- Keep exact `--bbox` behavior for generic extraction. Require `--model-bbox` for new FVCOM topology products, with centered 3x coverage and 2x as the hard minimum.
+- Treat `coastline_lines` as the only physical shoreline layer. Never reinterpret the boundary of clipped `land_polygons` as coastline because it contains artificial source-frame edges.
 - Preserve CRS, selected resolution, requested levels, source paths, source URL, cache status, bbox split/antimeridian metadata, feature counts, and warnings in the manifest.
 - Handle antimeridian bboxes by splitting the request into two longitude windows and recording that split.
 - Keep model-specific topology decisions in downstream skills such as `fvcom-bdry-arc`.

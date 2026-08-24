@@ -106,6 +106,7 @@ def build_region_bpoly_arc_feedback(
     open_xy = _project_geometries(open_gdf, projection)
     open_union = unary_union(open_xy) if open_xy else GeometryCollection()
     land_union_for_contract = _load_land_union(coastline_gpkg, projection)
+    physical_coastline_for_contract = _load_physical_coastline_union(coastline_gpkg, projection)
     target_resolution_m = float(source_manifest.get("settings", {}).get("target_resolution_m", 250.0))
     tolerance_m = float(
         frame_clip_tolerance_m
@@ -136,10 +137,10 @@ def build_region_bpoly_arc_feedback(
         landfall_tolerance_m = max(250.0, 0.25 * target_resolution_m)
         endpoint_distances = (
             [
-                float(Point(line.coords[0]).distance(land_union_for_contract.boundary)),
-                float(Point(line.coords[-1]).distance(land_union_for_contract.boundary)),
+                float(Point(line.coords[0]).distance(physical_coastline_for_contract)),
+                float(Point(line.coords[-1]).distance(physical_coastline_for_contract)),
             ]
-            if not land_union_for_contract.is_empty
+            if not physical_coastline_for_contract.is_empty
             else [None, None]
         )
         endpoint_buffers = Point(line.coords[0]).buffer(10.0).union(
@@ -151,14 +152,14 @@ def build_region_bpoly_arc_feedback(
             if not land_union_for_contract.is_empty
             else math.inf
         )
+        nonendpoint_land_crossing_limit_m = 1.0e-6
         deterministic_solid_eligible = bool(
             line.is_simple
             and all(
                 value is not None and value <= landfall_tolerance_m
                 for value in endpoint_distances
             )
-            and nonendpoint_land_crossing_m
-            <= max(1.0, 0.01 * target_resolution_m)
+            and nonendpoint_land_crossing_m <= nonendpoint_land_crossing_limit_m
         )
         record = {
             "segment_id": int(segment_id),
@@ -182,9 +183,7 @@ def build_region_bpoly_arc_feedback(
                 "endpoint_distance_to_shoreline_m": endpoint_distances,
                 "landfall_tolerance_m": float(landfall_tolerance_m),
                 "nonendpoint_land_crossing_m": nonendpoint_land_crossing_m,
-                "nonendpoint_land_crossing_limit_m": float(
-                    max(1.0, 0.01 * target_resolution_m)
-                ),
+                "nonendpoint_land_crossing_limit_m": nonendpoint_land_crossing_limit_m,
                 "wet_component_preserved": None,
                 "eligible": deterministic_solid_eligible,
             },
@@ -238,6 +237,15 @@ def build_region_bpoly_arc_feedback(
         and domain_type not in {"lake", "island", "archipelago"}
     )
     structural_failures: list[str] = []
+    coastline_coverage = source_manifest.get("coastline_source_coverage") or {}
+    coastline_coverage_required = str(
+        source_manifest.get("inputs", {}).get("coastline_source", "")
+    ) == "gshhs"
+    if coastline_coverage_required and coastline_coverage.get("downstream_eligible") is not True:
+        structural_failures.extend(
+            coastline_coverage.get("failure_taxonomy")
+            or ["coastline_source_footprint_incomplete"]
+        )
     if wet_component_count != 1:
         structural_failures.append("wet_component_count_not_one")
     if delivered_obc_count != expected_obc_count and not (
@@ -246,7 +254,7 @@ def build_region_bpoly_arc_feedback(
         and expected_obc_count - delivered_obc_count <= len(unintended)
     ):
         structural_failures.append("unexpected_open_boundary_count")
-    if arc_land_length_m > tolerance_m:
+    if arc_land_length_m > 1.0e-6:
         structural_failures.append("open_boundary_intersects_land")
     coastal_single_obc = bool(
         expected_obc_count == 1
@@ -258,7 +266,7 @@ def build_region_bpoly_arc_feedback(
             structural_failures.append("open_boundary_not_one_simple_arc")
         elif not bool(getattr(open_xy[0], "is_simple", False)):
             structural_failures.append("open_boundary_self_intersects_or_branches")
-        land_boundary_for_contract = getattr(land_union_for_contract, "boundary", GeometryCollection())
+        land_boundary_for_contract = physical_coastline_for_contract
         if len(open_xy) == 1 and not land_boundary_for_contract.is_empty:
             landfall_tolerance_m = max(250.0, 0.25 * target_resolution_m)
             endpoint_hits = sum(
@@ -347,6 +355,7 @@ def build_region_bpoly_arc_feedback(
             "bdry_arc_gpkg": file_sha256(package_path),
             "coastline_gpkg": file_sha256(coastline_gpkg),
             "model_boundary_loop_manifest": file_sha256(loop_path),
+            "coastline_source_coverage": file_sha256(coastline_coverage.get("contract_path")),
         },
         "gshhs": {
             "source_version": source_manifest.get("inputs", {}).get("coastline_load", {}).get("source_version", "GSHHG 2.3.7"),
@@ -354,6 +363,7 @@ def build_region_bpoly_arc_feedback(
             "selected_resolution": source_manifest.get("inputs", {}).get("coastline_load", {}).get("gshhs_selected_resolution"),
             "levels": source_manifest.get("settings", {}).get("gshhs_levels"),
         },
+        "coastline_source_coverage": coastline_coverage,
         "metrics": {
             "target_resolution_m": target_resolution_m,
             "wet_component_count": int(wet_component_count),
@@ -415,7 +425,11 @@ def build_region_bpoly_arc_feedback(
     contract_path = output_dir / "open_exterior_contract.json"
     decision_path = output_dir / "open_exterior_agent_decision.json"
     report_only = frame_clip_policy == "report-only"
-    metric_gate_pass = bool(diagnostic_pass and not structural_failures)
+    coastline_coverage_pass = bool(
+        not coastline_coverage_required
+        or coastline_coverage.get("downstream_eligible") is True
+    )
+    metric_gate_pass = bool(diagnostic_pass and not structural_failures and coastline_coverage_pass)
     contract_schema = (
         "fvcom_open_exterior_contract_v2"
         if role_contract_enabled
@@ -466,6 +480,7 @@ def build_region_bpoly_arc_feedback(
             "coverage_minimum": 0.999,
             "coverage_gate_pass": coverage_gate,
             "all_independent_metric_gates_pass": metric_gate_pass,
+            "coastline_source_coverage_gate_pass": coastline_coverage_pass,
             "metric_subject": "unassigned_residual" if role_contract_enabled else "raw_residual",
         },
         "obc_geometry": {
@@ -486,6 +501,8 @@ def build_region_bpoly_arc_feedback(
             "assigned_secondary_obc_length_m": 0.0,
         },
         "per_side": side_summaries,
+        "coastline_source_coverage_required": coastline_coverage_required,
+        "coastline_source_coverage": coastline_coverage,
         "source_hashes": dict(feedback["input_sha256"]),
         "map": {"path": str(map_path), "sha256": file_sha256(map_path)},
         "component_maps": component_maps,
@@ -518,6 +535,8 @@ def build_region_bpoly_arc_feedback(
         "assessed_contract_sha256": file_sha256(contract_path),
         "inspected_map_sha256": file_sha256(map_path),
         "bound_source_hashes": contract["source_hashes"],
+        "inspected_coastline_coverage_map_sha256": (coastline_coverage.get("maps", {}).get("whole_domain", {}) or {}).get("sha256"),
+        "inspected_coastline_coverage_zoom_sha256": (coastline_coverage.get("maps", {}).get("source_edge_zoom", {}) or {}).get("sha256"),
         "rationale": None,
         "residual_roles": [
             {
@@ -745,6 +764,19 @@ def _load_land_union(path: str | Path | None, projection):
         if not projected.is_empty:
             polygons.append(projected)
     return unary_union(polygons) if polygons else GeometryCollection()
+
+
+def _load_physical_coastline_union(path: str | Path | None, projection):
+    if not path:
+        return GeometryCollection()
+    source = Path(path)
+    if not source.exists():
+        return GeometryCollection()
+    coastline = _read_layer(source, "coastline_lines")
+    if coastline.empty:
+        return GeometryCollection()
+    lines = _project_geometries(coastline, projection)
+    return unary_union(lines) if lines else GeometryCollection()
 
 
 def _project_geometries(gdf: gpd.GeoDataFrame, projection) -> list[LineString]:

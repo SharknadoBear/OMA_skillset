@@ -45,6 +45,13 @@ for high-accuracy local contemporary shoreline surveys. Use CUSP later as a
 local detail/refinement overlay only after the GSHHS topology component is
 known.
 
+For FVCOM topology, distinguish the controlling model bbox from the source
+clip. Center the model bbox inside a source footprint at least twice as wide
+and high; use three times by default and enlarge symmetrically when the
+RegionBPoly feedback look-ahead needs more room. Derive physical coastline
+from the original polygon boundary before clipping. A clipped land polygon's
+boundary includes the artificial request frame and is never shoreline evidence.
+
 ## Local Cache Policy
 
 Search for cache in this order:

@@ -42,6 +42,14 @@ def _plot_health(gpkg: Path, plots_dir: Path) -> str | None:
     try:
         land = gpd.read_file(gpkg, layer="land_polygons")
         coastline = gpd.read_file(gpkg, layer="coastline_lines")
+        try:
+            source_frame = gpd.read_file(gpkg, layer="source_frame")
+        except Exception:
+            source_frame = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        try:
+            model_bbox = gpd.read_file(gpkg, layer="model_bbox")
+        except Exception:
+            model_bbox = gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
     except Exception:
         return None
     if land.empty and coastline.empty:
@@ -54,6 +62,10 @@ def _plot_health(gpkg: Path, plots_dir: Path) -> str | None:
         land.plot(ax=ax, facecolor="#eee6d6", edgecolor="#475569", linewidth=0.4)
     if not coastline.empty:
         coastline.plot(ax=ax, color="#111827", linewidth=0.7)
+    if not source_frame.empty:
+        source_frame.plot(ax=ax, color="#dc2626", linewidth=1.0, linestyle="--")
+    if not model_bbox.empty:
+        model_bbox.boundary.plot(ax=ax, color="#2563eb", linewidth=1.5, linestyle="-.")
     ax.set_title(gpkg.name)
     ax.grid(True, alpha=0.25)
     fig.savefig(path, dpi=150)
@@ -84,7 +96,7 @@ def main() -> int:
         print(json.dumps(result, indent=2))
         return 1
 
-    summary = summarize_product(gpkg)
+    summary = summarize_product(gpkg, request)
     plot = _plot_health(gpkg, Path(args.plots_dir))
     result = {
         "schema_version": "external_data_health_v1",

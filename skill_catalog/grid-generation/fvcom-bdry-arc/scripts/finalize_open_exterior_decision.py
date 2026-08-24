@@ -193,7 +193,10 @@ def _apply_residual_roles(
         "metric_subject": "unassigned_residual",
     })
     hard["all_independent_metric_gates_pass"] = bool(
-        hard["absolute_gate_pass"] and hard["fraction_gate_pass"] and hard["coverage_gate_pass"]
+        hard["absolute_gate_pass"]
+        and hard["fraction_gate_pass"]
+        and hard["coverage_gate_pass"]
+        and hard.get("coastline_source_coverage_gate_pass", True)
     )
     contract["residual_role_summary"] = {
         "pending_count": pending,
@@ -325,11 +328,23 @@ def finalize(
             station_screen_path=station_screen_path,
         )
     metrics = contract.get("hard_metrics", {})
+    source_coverage = contract.get("coastline_source_coverage") or {}
+    source_coverage_required = bool(contract.get("coastline_source_coverage_required", False))
+    source_coverage_pass = bool(
+        not source_coverage_required
+        or source_coverage.get("downstream_eligible") is True
+    )
+    if source_coverage_required:
+        for map_record in (source_coverage.get("maps") or {}).values():
+            coverage_map = Path(str((map_record or {}).get("path", "")))
+            if not coverage_map.is_file() or (map_record or {}).get("sha256") != sha256_file(coverage_map):
+                source_coverage_pass = False
     hard_pass = bool(
         metrics.get("absolute_gate_pass")
         and metrics.get("fraction_gate_pass")
         and metrics.get("coverage_gate_pass")
         and metrics.get("all_independent_metric_gates_pass")
+        and source_coverage_pass
     )
     if decision == "pass" and (not hard_pass or not role_pass or contract.get("report_only")):
         raise ValueError("Codex cannot pass failed hard metrics or a report-only package")
@@ -344,6 +359,8 @@ def finalize(
         "assessed_contract_sha256": assessed_hash,
         "inspected_map_sha256": sha256_file(map_path),
         "bound_source_hashes": contract.get("source_hashes", {}),
+        "inspected_coastline_coverage_map_sha256": (source_coverage.get("maps", {}).get("whole_domain", {}) or {}).get("sha256"),
+        "inspected_coastline_coverage_zoom_sha256": (source_coverage.get("maps", {}).get("source_edge_zoom", {}) or {}).get("sha256"),
         "rationale": rationale.strip(),
         "confirmation": {
             "whole_domain_map_inspected": True,
@@ -365,6 +382,7 @@ def finalize(
         decision == "pass"
         and hard_pass
         and role_pass
+        and source_coverage_pass
         and not contract.get("report_only")
     )
     # Adaptive construction can be expensive.  Finish or recover it before

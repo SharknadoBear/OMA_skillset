@@ -15,7 +15,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from gshhs_coastline.fetch import fetch_gshhs_bbox  # noqa: E402
 from gshhs_coastline.quality import summarize_product  # noqa: E402
-from gshhs_coastline.sources import find_gshhs_cache, split_bbox_antimeridian  # noqa: E402
+from gshhs_coastline.sources import (  # noqa: E402
+    expand_centered_topology_bbox,
+    find_gshhs_cache,
+    split_bbox_antimeridian,
+)
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -95,6 +99,66 @@ def test_antimeridian_split() -> None:
     assert meta["antimeridian_split"] is True
 
 
+def test_centered_topology_coverage_contract() -> None:
+    source, coverage = expand_centered_topology_bbox(
+        (-75.8, 38.1, -74.7, 40.4), coverage_factor=3.0, lookahead_km=0.0
+    )
+    assert coverage["coverage_factor_lon"] == 3.0
+    assert coverage["coverage_factor_lat"] == 3.0
+    assert coverage["model_bbox_centrally_contained"] is True
+    assert coverage["margins_degrees"]["west"] == coverage["margins_degrees"]["east"]
+    assert coverage["margins_degrees"]["south"] == coverage["margins_degrees"]["north"]
+    assert abs((source[0] + source[2]) / 2.0 - (-75.25)) < 1.0e-12
+    try:
+        expand_centered_topology_bbox((-75.8, 38.1, -74.7, 40.4), coverage_factor=1.99)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("coverage factor below two must fail")
+
+    dateline_source, dateline = expand_centered_topology_bbox(
+        (179.2, -1.0, -179.2, 1.0), coverage_factor=3.0, lookahead_km=100.0
+    )
+    dateline_parts, dateline_split = split_bbox_antimeridian(dateline_source)
+    assert dateline["center_lonlat_unwrapped"][0] == 180.0
+    assert dateline_split["antimeridian_split"] is True
+    assert len(dateline_parts) == 2
+
+    _high_lat_source, high_lat = expand_centered_topology_bbox(
+        (-151.0, 59.0, -149.0, 60.0), coverage_factor=3.0, lookahead_km=100.0
+    )
+    assert high_lat["downstream_topology_eligible"] is True
+    assert high_lat["coverage_factor_lon"] >= 3.0
+    assert high_lat["coverage_factor_lat"] >= 3.0
+
+
+def test_topology_product_layers_and_physical_coastline() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        result = fetch_gshhs_bbox(
+            model_bbox=(-75.25, 38.82, -75.05, 39.02),
+            coverage_factor=3.0,
+            lookahead_km=0.0,
+            run_dir=tmp,
+            name="delaware_topology",
+            resolution="h",
+            levels="1",
+            formats="gpkg",
+            make_plot=False,
+            quiet=True,
+        )
+        assert result.manifest["schema_version"] == "gshhs_coastline_fetch_v2"
+        coverage = result.manifest["topology_coverage"]
+        assert coverage["downstream_topology_eligible"] is True, coverage
+        assert coverage["physical_coastline_source_frame_overlap_m"] <= 1.0
+        assert coverage["source_bbox_handling"]["parts"]
+        assert coverage["source_component_sha256"]
+        gpkg = Path(result.manifest["outputs"]["gpkg"])
+        layers = set(gpd.list_layers(gpkg)["name"].tolist())
+        assert {"land_polygons", "coastline_lines", "request_bbox", "source_footprint", "source_frame", "model_bbox"}.issubset(layers)
+        summary = summarize_product(gpkg, result.manifest)
+        assert summary["status"] == "pass", summary
+
+
 def test_health_check_script() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         result = fetch_gshhs_bbox(
@@ -139,6 +203,8 @@ def main() -> None:
     test_full_resolution_clip()
     test_empty_bbox_behavior()
     test_antimeridian_split()
+    test_centered_topology_coverage_contract()
+    test_topology_product_layers_and_physical_coastline()
     test_health_check_script()
     print("gshhs-coastline selftests passed")
 

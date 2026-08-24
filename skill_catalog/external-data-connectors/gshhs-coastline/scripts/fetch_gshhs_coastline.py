@@ -15,7 +15,11 @@ from gshhs_coastline.fetch import fetch_gshhs_bbox  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bbox", nargs=4, type=float, required=True, metavar=("W", "S", "E", "N"))
+    selector = parser.add_mutually_exclusive_group(required=True)
+    selector.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"), help="Exact generic clip bbox.")
+    selector.add_argument("--model-bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"), help="FVCOM model bbox centered inside an expanded topology footprint.")
+    parser.add_argument("--coverage-factor", type=float, default=3.0, help="Centered FVCOM topology coverage factor; minimum 2.0.")
+    parser.add_argument("--lookahead-km", type=float, default=0.0, help="Symmetric minimum halo for FVCOM topology feedback.")
     parser.add_argument("--run-dir", required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--resolution", default="auto", choices=("auto", "c", "l", "i", "h", "f"))
@@ -29,7 +33,10 @@ def main() -> int:
     args = parser.parse_args()
 
     result = fetch_gshhs_bbox(
-        tuple(args.bbox),
+        tuple(args.bbox) if args.bbox else None,
+        model_bbox=tuple(args.model_bbox) if args.model_bbox else None,
+        coverage_factor=args.coverage_factor,
+        lookahead_km=args.lookahead_km,
         run_dir=args.run_dir,
         name=args.name,
         resolution=args.resolution,

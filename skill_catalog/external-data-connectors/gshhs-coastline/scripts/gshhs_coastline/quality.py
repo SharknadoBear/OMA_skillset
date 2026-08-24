@@ -43,9 +43,12 @@ def read_vector_layers(gpkg: str | Path) -> dict[str, gpd.GeoDataFrame]:
     return {name: gpd.read_file(path, layer=name) for name in names}
 
 
-def summarize_product(gpkg: str | Path) -> dict[str, Any]:
+def summarize_product(gpkg: str | Path, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
     layers = read_vector_layers(gpkg)
     required = {"land_polygons", "coastline_lines", "request_bbox", "source_footprint"}
+    topology = (manifest or {}).get("topology_coverage")
+    if topology is not None:
+        required.update({"model_bbox", "source_frame"})
     missing = sorted(required.difference(layers))
     layer_summaries = {name: summarize_gdf(gdf) for name, gdf in layers.items()}
     warnings: list[str] = []
@@ -59,11 +62,25 @@ def summarize_product(gpkg: str | Path) -> dict[str, Any]:
     coastline = layers.get("coastline_lines")
     if coastline is None or coastline.empty:
         warnings.append("No derived coastline lines were found in the product.")
+    hard_failures: list[str] = []
+    if topology is not None:
+        if topology.get("downstream_topology_eligible") is not True:
+            hard_failures.append("topology_coverage_not_downstream_eligible")
+        if float(topology.get("coverage_factor_lon", 0.0) or 0.0) < 2.0:
+            hard_failures.append("topology_longitude_coverage_below_two")
+        if float(topology.get("coverage_factor_lat", 0.0) or 0.0) < 2.0:
+            hard_failures.append("topology_latitude_coverage_below_two")
+        if topology.get("model_bbox_centrally_contained") is not True:
+            hard_failures.append("topology_model_bbox_not_centrally_contained")
+        if float(topology.get("physical_coastline_source_frame_overlap_m", 0.0) or 0.0) > 1.0:
+            hard_failures.append("physical_coastline_overlaps_source_frame")
     return {
         "gpkg": str(gpkg),
         "layers": sorted(layers),
         "missing_required_layers": missing,
         "layer_summaries": layer_summaries,
         "warnings": warnings,
-        "status": "pass" if not warnings else "needs_review",
+        "hard_failures": hard_failures,
+        "topology_coverage": topology,
+        "status": "fail" if hard_failures else ("pass" if not warnings else "needs_review"),
     }
