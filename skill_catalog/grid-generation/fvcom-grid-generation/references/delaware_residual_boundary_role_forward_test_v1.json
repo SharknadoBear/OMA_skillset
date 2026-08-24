@@ -1,0 +1,110 @@
+{
+  "schema_version": "fvcom_residual_boundary_role_forward_test_v1",
+  "case_id": "delaware_river_estuary",
+  "test_date_utc": "2026-08-24",
+  "campaign_id": "delaware_residual_boundary_role_v1_20260823T233949Z",
+  "project_relative_path": "delaware_residual_boundary_role_v1_20260823T233949Z/01_delaware_river_estuary",
+  "execution_baseline": {
+    "implementation_commit": "45cf6e3305cbb776667fdd82b337a8d9113f5c98",
+    "python_version": "3.13.14",
+    "gmsh_version": "4.15.2",
+    "gmsh_algorithm": 6,
+    "gmsh_algorithm_name": "Frontal-Delaunay",
+    "gmsh_fallback_enabled": false,
+    "context_policy": "fresh_subagent_with_only_the_approved_case_prompt"
+  },
+  "source_provenance": {
+    "gshhs_version": "2.3.7",
+    "gshhs_resolution": "f",
+    "gshhs_levels": [
+      1
+    ],
+    "gshhs_manifest_sha256": "87d92799295453c2475b9e1a36f5f0710e9531fde93e70859647def54aa21a13",
+    "gshhs_health_sha256": "9cf82ed0ebc46a0dbb1dbc327f851edd13ca670b9334d67d0f45d241b885b026",
+    "region_bpoly_sha256": "77623c08e505d142832efbc142268146d215b238a8e9f403c281ca3b72e84e9a",
+    "promoted_coastline_sha256": "bb82d28c232edb1b96a5e603883b8a378abf3e5446882cda95cb4312beb69f6c",
+    "promoted_bathymetry_sha256": "f14a66d98a165ad04a31bc2e1984b9cd5e38e47a26468967fad77162f1d145d7"
+  },
+  "solid_role_candidate_evidence": {
+    "candidate_id": "bdry_v5",
+    "contract_relative_path": "03_boundary/_work/bdry_v5/fb/open_exterior_contract.json",
+    "contract_sha256": "92513e7ca8505e839dc8e2cf16d75876f7cbddb41f2b403b6cc482e853c0380a",
+    "whole_domain_map_sha256": "fe29394606778c957a0aa2095922ad1bb31093649fd98061abe4e38d8cdd7a36",
+    "component_role_map_sha256": "267460569557c2b105588449b76232d7decd13792fb219fbf23487b7f1136bec",
+    "agent_decision_sha256": "163bc6b94714d03486de76b66c80af60c0c20dad4ac7a5fba729b6f16d0d7a73",
+    "coops_station_screen_sha256": "710ab0f54221f320617314c05a649f6801cf0a02a8d90efaab45a19f01bb6d32",
+    "raw_residual_length_m": 44788.30395232635,
+    "assigned_solid_length_m": 44788.30395232635,
+    "unassigned_residual_length_m": 0.0,
+    "coops_screen_radius_km": 25.0,
+    "eligible_station_count": 1,
+    "nearest_eligible_station": {
+      "station_id": "8555889",
+      "name": "Brandywine Shoal Light",
+      "distance_km": 14.049715047376909
+    },
+    "requested_obc_count": 1,
+    "secondary_obc_created": false,
+    "contract_downstream_eligible": true,
+    "independent_visual_classification": "invalid_geometry",
+    "independent_visual_reason": "The candidate solid segment closed about 44.8 km of the western Delaware Bay mouth rather than a minor inland lagoon. It was hydraulically major and was superseded before project promotion."
+  },
+  "selected_boundary_evidence": {
+    "candidate_id": "bdry_v7_west_clear",
+    "contract_relative_path": "03_boundary/_work/bdry_v7_west_clear/fb/open_exterior_contract.json",
+    "contract_schema": "fvcom_open_exterior_contract_v2",
+    "contract_sha256": "d7b1ab56697856ed01fd8c978a89c2bc4d30ed0537a72e4977385a773de99196",
+    "whole_domain_map_sha256": "1b1757a7211ef6290a6997aff5a729f84df986fe59a46a4d78e4663d87eb9815",
+    "agent_decision_sha256": "a658ccf952d708dd1c98c2d3b0552434346defd256567cae0d92efb297eaa9f8",
+    "final_status": "pass",
+    "downstream_eligible": true,
+    "obc_placement_family": "complete-offshore",
+    "expected_obc_count": 1,
+    "delivered_obc_count": 1,
+    "delivered_obc_length_m": 169230.5487351109,
+    "raw_residual_length_m": 0.0,
+    "solid_lagoon_closure_count": 0,
+    "secondary_tidal_obc_count": 0,
+    "unassigned_residual_length_m": 0.0,
+    "nonendpoint_land_crossing_m": 0.0
+  },
+  "terminal_result": {
+    "state": "mesh_published",
+    "machine_benchmark_grid_baseline_ready": true,
+    "machine_fvcom_ready_alias": true,
+    "submission_eligible": false,
+    "submission_blockers": [
+      "open_boundary_forcing_incompatible",
+      "open_boundary_forcing_missing"
+    ],
+    "nodes": 52042,
+    "triangles": 92137,
+    "q_min": 0.4295924007042725,
+    "q_l3_sigma": 0.8335553329751597,
+    "minimum_angle_deg": 14.85540291036075,
+    "maximum_angle_deg": 126.84423340864848,
+    "maximum_valence": 8,
+    "superthin_count": 0,
+    "mesh_sha256": "34c9612b0b5746e49e94e937ad30d6c82e5a1b6db653fd387aec8fb360a0e357",
+    "raw_mesh_sha256": "dc55284cba2a428413aaa571f6db3759a7d486d8f384605a9f3237c271e194f4",
+    "mesh_review_map_sha256": "f46eca94750af2939f22dd8eadc40130bbc92924ceec5dd016ce45f3506c87d6",
+    "mesh_review_map_manifest_sha256": "ff4351dbedd3ba5875611c1a05c1863e6b990bb1ff282392d4d9513964f2b749",
+    "project_manifest_sha256": "4495a7f7ce47dff4bf660520c4d00819cd6dfbdd02e1fe3eec6692264a36200a",
+    "delivery_status_sha256": "6fd1d8dfc1c35df0ce6d09440405c1a05d94690b38152b0b62699b3d18f67b0c",
+    "final_audit_sha256": "0af64778444ed376977752a3fa86c3c2f9253c83c73643ace9d770eeba4c1c77"
+  },
+  "independent_audit": {
+    "standard_project_validation_passed": true,
+    "require_benchmark_ready_passed": true,
+    "exact_mesh_hash_verified": true,
+    "gshhs_full_resolution_verified": true,
+    "gmsh_frontal_delaunay_6_verified": true,
+    "open_boundary_count_and_order_verified": true,
+    "solid_default_did_not_create_a_second_obc": true,
+    "final_residual_role_contract_verified": true,
+    "compact_atlantic_mouth_context_passed": false,
+    "scientific_failure_code": "open_boundary_scientific_placement_not_compact",
+    "scientific_failure_reason": "The selected zero-residual OBC is approximately 169.2 km long and extends far south of the Delaware Bay mouth. It is geometrically complete but does not satisfy the clean prompt's compact Atlantic mouth context.",
+    "overall_forward_test_interpretation": "Package validation passed and the role contract protected the requested one-OBC count. The machine benchmark mesh is structurally ready, but the clean-prompt scientific domain/OBC placement failed. The test also exposed that visual hydraulic-role classification must not accept a major bay-mouth segment as a solid lagoon closure."
+  }
+}
