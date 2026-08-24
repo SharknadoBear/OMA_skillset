@@ -1,0 +1,156 @@
+{
+  "schema_version": "fvcom_centered_gshhs_coverage_forward_test_v1",
+  "case_id": "delaware_river_estuary",
+  "test_date_utc": "2026-08-24",
+  "campaign_id": "delaware_coastline_coverage_v1_20260824T032412Z",
+  "project_relative_path": "delaware_coastline_coverage_v1_20260824T032412Z/01_delaware_river_estuary",
+  "execution_baseline": {
+    "implementation_commit": "990d15ae19055bb988e2b1938eafeb6e490af97e",
+    "python_version": "3.13.14",
+    "gmsh_version": "4.15.2",
+    "context_policy": "fresh_subagent_with_only_the_approved_case_prompt",
+    "immutable_download_caches_only": true,
+    "active_stage_manifest_parity_verified": true
+  },
+  "coastline_source_coverage": {
+    "schema_version": "fvcom_coastline_source_coverage_v1",
+    "gshhs_version": "2.3.7",
+    "gshhs_resolution": "f",
+    "gshhs_levels": [
+      1
+    ],
+    "requested_coverage_factor": 3.0,
+    "declared_longitude_factor": 3.423635856247261,
+    "declared_latitude_factor": 3.000000000000004,
+    "projected_audit_factor_x": 3.502731564852532,
+    "projected_audit_factor_y": 3.000463983718204,
+    "model_bbox_wsen": [
+      -75.6,
+      38.603,
+      -74.64,
+      40.297
+    ],
+    "source_bbox_wsen": [
+      -76.76334521099868,
+      36.909000000000006,
+      -73.47665478900133,
+      41.991
+    ],
+    "symmetric_margins_approx_km": {
+      "west": 100.0,
+      "east": 100.0,
+      "south": 187.25475999999952,
+      "north": 187.25475999999952
+    },
+    "model_bbox_centrally_contained": true,
+    "region_bpoly_covered": true,
+    "full_delmarva_land_coverage_beyond_model_south_verified": true,
+    "physical_coastline_source_frame_overlap_m": 0.0,
+    "delivered_boundary_source_frame_dependency_m": 0.0,
+    "anchor_to_source_frame_distance_m": [
+      100313.2783348046,
+      138628.50801816094
+    ],
+    "maximum_anchor_to_physical_coastline_distance_m": 1.699971675922082e-10,
+    "downstream_eligible": true,
+    "failure_taxonomy": [],
+    "gshhs_manifest_sha256": "4cb5cc8874b070c13297fcbb04ef055d5009d0b9185b05078bd527fa8d289db5",
+    "promoted_coastline_sha256": "f2cef172335067bb1e668840e755b13232d35d0655295feb0b93736d46fbd7ce",
+    "coverage_map_sha256": "9b29aaaf20ec6d3a64ff80bb211ed692423ef6a21b1ec8296e7c64a5024b82ba",
+    "coverage_zoom_sha256": "10ceb5787faa871e26436d3dfea80634933f029de33e33078601b0e9da98efc9"
+  },
+  "boundary_result": {
+    "contract_schema": "fvcom_open_exterior_contract_v2",
+    "contract_sha256": "719fabdfed32b9d53a0fd90c4f20596b95f6bda2ab61aecd3652dd04b74653f3",
+    "agent_decision_sha256": "06719adfebffb6575af66cb9cbc1a7fc919583d48ff53aea9ec74599ef239050",
+    "final_status": "pass",
+    "downstream_eligible": true,
+    "obc_placement_family": "compact-mouth-fallback",
+    "expected_obc_count": 1,
+    "delivered_obc_count": 1,
+    "delivered_obc_node_count": 102,
+    "delivered_obc_length_m": 83548.60697003084,
+    "open_boundary_land_intersection_m": 0.0,
+    "open_boundary_exterior_overlap_fraction": 1.0,
+    "solid_lagoon_closure_count": 3,
+    "assigned_solid_length_m": 10850.13462450422,
+    "unassigned_residual_length_m": 0.0,
+    "adaptive_coastal_v2_status": "pass"
+  },
+  "bathymetry_result": {
+    "promoted_bathymetry_sha256": "1611664cbb06f133bab0e24ac197bd245252de9f46b45512b03455d9a67eb821",
+    "finite_envelope_fraction": 1.0,
+    "finite_positive_depths_at_all_mesh_nodes": true,
+    "minimum_delivered_depth_m": 0.4999999999999999,
+    "maximum_delivered_depth_m": 47.019391782631146,
+    "vertical_datum_harmonization_claimed": false
+  },
+  "mesher_provenance": {
+    "candidate_id": "gmsh_frontal_delaunay_6",
+    "algorithm": 6,
+    "algorithm_name": "Frontal-Delaunay",
+    "thread_count": 1,
+    "random_seed": 1,
+    "native_smoothing_steps": 8,
+    "element_order": 1,
+    "fallback_used": false,
+    "raw_mesh_sha256": "85f606b94c16344d2bd6674bc0dfb4db22a7caf464d618fafac521ef632a24a0",
+    "candidate_manifest_sha256": "7dad2668320857290e11bd4e058775f49526579ff3ffee8192e8efc5a480b625"
+  },
+  "terminal_result": {
+    "state": "mesh_published",
+    "benchmark_grid_baseline_ready": true,
+    "fvcom_ready_alias": true,
+    "accepted_alias": true,
+    "minimal_local_debt_closed": true,
+    "submission_eligible": false,
+    "submission_blockers": [
+      "open_boundary_forcing_incompatible",
+      "open_boundary_forcing_missing"
+    ],
+    "nodes": 53168,
+    "triangles": 97787,
+    "q_min": 0.5082196316751316,
+    "q_l3_sigma": 0.8641146940092893,
+    "minimum_angle_deg": 19.409798703667708,
+    "maximum_angle_deg": 120.12460154120558,
+    "maximum_valence": 8,
+    "superthin_count": 0,
+    "connected_component_count": 1,
+    "nonmanifold_edge_count": 0,
+    "nonpositive_area_count": 0,
+    "unused_node_count": 0,
+    "maximum_adjacent_area_change": 0.6993599126675072,
+    "maximum_bathymetric_slope": 0.10733548410645936,
+    "maximum_l_over_h": 1.437781330373245,
+    "p95_l_over_h": 1.081942616014765,
+    "final_mesh_sha256": "1f7a95d91a6dae27197ef486a8b29b3e132a4f91f13b00920f4fb5f0c0d012dc",
+    "final_audit_sha256": "f30978076d48ec09240ad5714e8075abbb47851d68ec3b937f53cacebfd4c44e",
+    "delivery_status_sha256": "1cbddc3173736d41905cd77981a4c9466bf05c0339797e766bc602c121e845b6",
+    "mesh_review_map_sha256": "b08873140443b51f1f3c099c6f7b73ae23b8ee2a40835b34abf221bb81280154",
+    "mesh_review_map_manifest_sha256": "efd513c0fe499f995e2aa4e8d45382ecc29c897bac7bc19698e4bfc82ded44ff",
+    "roundtrip_audit_sha256": "c00840a744d4ea3446e443e0502b9a6804b6a4de676c844331a54629780724ac"
+  },
+  "regional_refinement_debt": [
+    "adjacent_area_change_above_threshold",
+    "bathymetric_slope_above_threshold",
+    "edge_size_continuity:boundary_field_interface_ratio_limit_exceeded",
+    "min_angle_below_threshold",
+    "singly_connected_elements_present"
+  ],
+  "independent_audit": {
+    "standard_project_validation_passed": true,
+    "require_benchmark_ready_passed": true,
+    "exact_final_mesh_hash_verified": true,
+    "exact_raw_candidate_hash_verified": true,
+    "gmsh_frontal_delaunay_6_verified": true,
+    "one_obc_count_and_order_verified": true,
+    "complete_centered_source_footprint_verified": true,
+    "source_frame_independence_verified": true,
+    "coverage_maps_and_decision_bindings_verified": true,
+    "whole_coverage_map_visually_inspected": true,
+    "final_bathymetric_mesh_and_obc_map_visually_inspected": true,
+    "exact_2dm_roundtrip_verified": true,
+    "scientific_scope_advisory": "The GSHHS-defined retained river reach ends near 39.805 degrees north; it represents the lower tidal reach but not the complete tidal river to Trenton."
+  }
+}
