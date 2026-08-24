@@ -30,7 +30,7 @@ Run `scripts/run_region_bpoly.py` by default:
 - `--review-depth auto|fast|full` defaults to `auto`.
 - `--full-side-review` remains a backward-compatible alias for `--review-depth full`.
 - `--heuristic-mode auto|memory|unknown` defaults to `auto`: execute resolves to `memory`; test resolves to `unknown`.
-- `--basemap-provider auto` is the default. Every initial, candidate, zoom, adjustment, and final map must include background map context.
+- `--basemap-provider auto` is the default. Every initial, candidate, focus, side-review, adjustment, and final map must include usable geographic background context. A flat water fill or coordinate grid is diagnostic only and must yield `final_status=needs_review`; it is never sufficient for RegionBPoly acceptance.
 - `--offshore-azimuth-deg` can override the selected offshore side after candidate repair when map review requires a different side selector.
 
 If execute mode cannot pass, it keeps `intermediate/` and marks `final_status` as `needs_review`.
@@ -72,7 +72,7 @@ Feature plans may include non-required `offshore_boundary_exclusion` / `obstruct
 
 Never accept a blank lat/lon-only plot as visual evidence. `region_bpoly_final_map.png`, initial guess maps, candidate maps, focus maps, side zoom maps, and adjustment maps must include background geography.
 
-With `--basemap-provider auto`, small-estuary and creek-scale cases use `road_detail`, while regional, lake, island-chain, and archipelago cases use topographic context. `road_detail` tries Esri World Street Map, then CARTO Voyager, then OpenStreetMap Mapnik, then local coastline/minimal fallback. `none/off/false` means skip online tiles and use the required offline fallback; it does not permit a blank map.
+With `--basemap-provider auto`, small-estuary and creek-scale cases use `road_detail`, while regional, lake, island-chain, and archipelago cases use topographic context. Do not override `auto` merely for deterministic execution. `road_detail` tries Esri World Street Map, CARTO Voyager, and OpenStreetMap Mapnik. Regional topographic context tries Esri World Topographic Map, OpenTopoMap, CARTO Voyager, and OpenStreetMap Mapnik. Both chains then use a local coastline fallback. Offline coastline discovery follows the project output path as well as the current process path so Windows short-drive launchers cannot hide the workspace cache, and prefers full-resolution GSHHS over high-resolution GSHHS and Natural Earth. Record the selected provider and every failed predecessor. `none/off/false` means skip online tiles and require a real offline coastline; if no coastline is found, the workflow retains diagnostic maps but cannot pass.
 
 For small-estuary cases, side zoom maps use a smaller focus radius and explicit target zoom, normally 13 within the 13-15 inspection range, so the agent can inspect river mouth, tidal-creek, and immediate-bay geometry instead of a coarse regional frame. The resolved map-detail policy is recorded in final JSON and map metadata. In test mode, small-estuary cases write a `basemap_comparison/` folder with Esri Street, CARTO Voyager, OSM, topo, and offline fallback maps.
 

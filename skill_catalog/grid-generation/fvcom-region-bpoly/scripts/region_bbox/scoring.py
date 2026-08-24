@@ -385,6 +385,15 @@ def score_bpoly_quality(
     if not basemap_meta.get("enabled", False):
         map_warnings.append("Map background is missing.")
         taxonomy.append({"code": "missing_background_map", "severity": "fail", "message": "A visible background map is required."})
+    elif not basemap_meta.get("geography_usable", False):
+        map_warnings.append("Map has no geographic detail; a coordinate grid or flat fill is not a usable background map.")
+        taxonomy.append(
+            {
+                "code": "background_geography_unavailable",
+                "severity": "fail",
+                "message": "RegionBPoly acceptance requires rendered tiles or an offline coastline; minimal grid/fill fallback is diagnostic only.",
+            }
+        )
     if display_lon_span is not None and display_lon_span > 120.0:
         map_warnings.append("Map frame is too wide to visually review the target region.")
         taxonomy.append({"code": "unreviewable_map_extent", "severity": "fail", "message": "Map longitude span is too wide for practical visual QA."})
@@ -430,6 +439,7 @@ def score_bpoly_quality(
             "enabled": basemap_meta.get("enabled", False),
             "source": basemap_meta.get("source"),
             "status": basemap_meta.get("status"),
+            "geography_usable": basemap_meta.get("geography_usable", False),
             "display_frame": display_frame,
             "warnings": map_warnings,
         },

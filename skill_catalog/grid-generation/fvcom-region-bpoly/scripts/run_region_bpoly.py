@@ -257,7 +257,7 @@ def write_intermediate(
     map_path = visual_dir / f"{name}_candidate_map.png"
     basemap = plot_region_map(map_path, bpoly, ingredients, title=f"{name} RegionBPoly candidate", basemap_provider=basemap_provider, basemap_zoom=basemap_zoom)
     focus_path = visual_dir / f"{name}_candidate_focus_map.png"
-    plot_region_map(focus_path, bpoly, ingredients, title=f"{name} candidate focus", bbox=bpoly.envelope_bbox(), basemap_provider=basemap_provider, basemap_zoom=basemap_zoom)
+    focus_basemap = plot_region_map(focus_path, bpoly, ingredients, title=f"{name} candidate focus", bbox=bpoly.envelope_bbox(), basemap_provider=basemap_provider, basemap_zoom=basemap_zoom)
 
     if review_depth == "full":
         side_indices, fractions, mode = [0, 1, 2, 3], [0.15, 0.5, 0.85], "full_all_sides"
@@ -281,6 +281,7 @@ def write_intermediate(
         "map_path": str(map_path),
         "focus_map_path": str(focus_path),
         "basemap": basemap,
+        "focus_basemap": focus_basemap,
         "map_detail_policy": map_detail_policy,
         "review_depth": review_depth,
         "review_depth_reasons": review_depth_reasons,
@@ -369,6 +370,7 @@ def _candidate_basemap_meta(bpoly: RegionBPoly, map_detail_policy: dict | None =
         "enabled": True,
         "status": "candidate_repair_precheck",
         "source": "candidate_repair_precheck",
+        "geography_usable": True,
         "display_frame": {"lon_span_deg": lon_span},
         "map_detail_policy": map_detail_policy,
     }
@@ -672,6 +674,20 @@ def main() -> None:
     for item in quality_score.get("failure_taxonomy", []):
         if item.get("severity") == "fail":
             blocks.append(f"{item.get('code')}: {item.get('message')}")
+
+    review_basemaps = [
+        ("initial", (initial_guess_artifacts or {}).get("basemap", {})),
+        ("candidate", candidate.get("basemap", {})),
+        ("candidate_focus", candidate.get("focus_basemap", {})),
+        *[
+            (f"side_{record.get('side_index')}_{record.get('position')}", record.get("basemap", {}))
+            for record in candidate.get("side_focus_reviews", [])
+        ],
+        ("final", basemap),
+    ]
+    unusable_maps = [label for label, metadata in review_basemaps if not metadata.get("geography_usable", False)]
+    if unusable_maps:
+        blocks.append("background geography unavailable in required review maps: " + ", ".join(unusable_maps))
 
     final_status = "pass" if not blocks else "needs_review"
     retained_intermediate = args.mode == "test" or final_status != "pass"

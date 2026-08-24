@@ -44,6 +44,20 @@ def resolve_basemap_provider(
                 }
             )
             return "road_detail", policy
+        if requested in {"topo", "topographic", "regional_context", "regional-context"}:
+            policy.update(
+                {
+                    "resolved_provider": "topo",
+                    "provider_chain": [
+                        "Esri.WorldTopoMap",
+                        "OpenTopoMap",
+                        "CartoDB.Voyager",
+                        "OpenStreetMap.Mapnik",
+                    ],
+                    "reason": "explicit_regional_topographic_provider_chain",
+                }
+            )
+            return "topo", policy
         return requested, policy
 
     key = canonical_region_key(request)
@@ -60,6 +74,16 @@ def resolve_basemap_provider(
     else:
         resolved = "topo"
         reason = "regional_or_lake_scale_uses_topographic_context"
+        policy.update(
+            {
+                "provider_chain": [
+                    "Esri.WorldTopoMap",
+                    "OpenTopoMap",
+                    "CartoDB.Voyager",
+                    "OpenStreetMap.Mapnik",
+                ]
+            }
+        )
     policy.update({"resolved_provider": resolved, "reason": reason})
     return resolved, policy
 

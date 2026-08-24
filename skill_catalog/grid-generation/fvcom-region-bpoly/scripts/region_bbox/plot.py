@@ -140,7 +140,14 @@ def plot_region_map(
     fig, ax = plt.subplots(figsize=(10, 8))
     ax.set_xlim(display_bbox[0], display_bbox[2])
     ax.set_ylim(display_bbox[1], display_bbox[3])
-    base = add_basemap(ax, display_bbox, provider=basemap_provider, zoom=basemap_zoom)
+    output_path = Path(path)
+    base = add_basemap(
+        ax,
+        display_bbox,
+        provider=basemap_provider,
+        zoom=basemap_zoom,
+        search_roots=[output_path.parent],
+    )
     base["display_frame"] = {
         "longitude_origin": origin,
         "uses_unwrapped_longitude": origin is not None,
@@ -180,7 +187,7 @@ def plot_region_map(
     if handles:
         fig.legend(handles, labels, loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8)
     fig.subplots_adjust(left=0.08, right=0.78, bottom=0.08, top=0.92)
-    p = Path(path)
+    p = output_path
     p.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(p, dpi=180)
     plt.close(fig)

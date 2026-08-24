@@ -6,9 +6,17 @@ import sys
 import tempfile
 from pathlib import Path
 
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from shapely.geometry import LineString
+from unittest.mock import patch
+
+import region_bbox.basemap as basemap_module
 from region_bbox.features import infer_target_region_features
+from region_bbox.basemap import _coastline_candidates, _draw_offline_coastline
 from region_bbox.geometry import RegionBPoly
 from region_bbox.map_policy import resolve_basemap_provider
+from region_bbox.scoring import score_bpoly_quality
 
 ROOT = Path(__file__).resolve().parent
 
@@ -48,7 +56,95 @@ def assert_feature_artifacts(candidate: dict, expected_zoom_count: int) -> None:
 
 def main() -> None:
     with tempfile.TemporaryDirectory() as td:
-        run_dir = Path(td)
+        temp_root = Path(td)
+
+        # A short-path launcher must not hide a coastline cache located above
+        # the project output path.
+        cache_root = temp_root / "workspace_root"
+        cached_coast = cache_root / "Workspace" / "Preprocessing" / "fvcom-cusp-coastline" / "cache" / "gshhg" / "GSHHS_shp" / "f" / "GSHHS_f_L1.shp"
+        cached_coast.parent.mkdir(parents=True)
+        # The named GSHHS fixture has global bounds but no Delaware feature, so
+        # it is valid water-only coverage evidence if online providers fail.
+        gpd.GeoDataFrame(
+            {"fixture": [1]},
+            geometry=[LineString([(-180.0, -89.0), (180.0, 89.0)])],
+            crs="EPSG:4326",
+        ).to_file(cached_coast)
+        nested_output = cache_root / "Workspace" / "Preprocessing" / "fvcom-grid-generation" / "runs" / "case" / "01_region"
+        nested_output.mkdir(parents=True)
+        assert cached_coast in _coastline_candidates([nested_output])
+        run_dir = cache_root / "Workspace" / "Preprocessing" / "fvcom-grid-generation" / "runs" / "selftest"
+        run_dir.mkdir(parents=True)
+
+        # Regional maps fall through independent online providers before the
+        # verified offline coastline. A transient Esri failure must select the
+        # next provider rather than disabling geographic review.
+        fig, ax = plt.subplots()
+        ax.set_xlim(-75.8, -74.4)
+        ax.set_ylim(38.4, 40.5)
+        basemap_module._ONLINE_PROVIDER_FAILURES.clear()
+        with patch.object(
+            basemap_module,
+            "_add_online_tiles",
+            side_effect=[
+                RuntimeError("synthetic Esri outage"),
+                {
+                    "effective_zoom": 8,
+                    "requested_zoom": None,
+                    "adjusted": False,
+                    "tile_count": 4,
+                    "max_tile_count": 64,
+                },
+            ],
+        ):
+            failover = basemap_module.add_basemap(
+                ax,
+                [-75.8, 38.4, -74.4, 40.5],
+                provider="topo",
+                search_roots=[nested_output],
+            )
+        plt.close(fig)
+        assert failover["selected_provider"] == "OpenTopoMap", failover
+        assert failover["provider_failures"][0]["provider"] == "Esri World Topographic Map", failover
+        assert failover["geography_usable"] is True
+        basemap_module._ONLINE_PROVIDER_FAILURES.clear()
+
+        # A readable but geographically unrelated regional subset must not be
+        # mislabeled as verified water-only background coverage.
+        incomplete_coast = temp_root / "incomplete" / "GSHHS_f_L1.shp"
+        incomplete_coast.parent.mkdir(parents=True)
+        gpd.GeoDataFrame(
+            {"fixture": [1]},
+            geometry=[LineString([(-0.1, -0.1), (0.1, 0.1)])],
+            crs="EPSG:4326",
+        ).to_file(incomplete_coast)
+        fig, ax = plt.subplots()
+        ax.set_xlim(-75.8, -74.4)
+        ax.set_ylim(38.4, 40.5)
+        with patch.object(basemap_module, "_coastline_candidates", return_value=[incomplete_coast]):
+            assert _draw_offline_coastline(ax, [-75.8, 38.4, -74.4, 40.5]) is None
+        plt.close(fig)
+
+        # A colored coordinate grid is diagnostic evidence, not a geographic
+        # basemap and must block RegionBPoly acceptance.
+        minimal_quality = score_bpoly_quality(
+            RegionBPoly([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]], 180.0),
+            [],
+            {"request": "generic coastal domain"},
+            "coastal",
+            "coastal_arc_with_land_anchors",
+            {"side_index": 0, "side_name": "open_or_south"},
+            {
+                "enabled": True,
+                "status": "fallback_minimal",
+                "source": "minimal geographic background",
+                "geography_usable": False,
+                "display_frame": {"lon_span_deg": 2.0},
+            },
+        )
+        minimal_codes = {item["code"] for item in minimal_quality["failure_taxonomy"]}
+        assert "background_geography_unavailable" in minimal_codes, minimal_quality
+        assert minimal_quality["blocking_failure"] is True
 
         # Fast review: one zoom per side.
         murderkill_features = infer_target_region_features({"request": "Murderkill River DE small estuary salinity intrusion"})
@@ -57,6 +153,19 @@ def main() -> None:
         assert policy["domain_scale"] == "small_estuary"
         assert policy["target_zoom"] == 13
         assert policy["provider_chain"] == ["Esri.WorldStreetMap", "CartoDB.Voyager", "OpenStreetMap.Mapnik"]
+
+        regional_provider, regional_policy = resolve_basemap_provider(
+            {"request": "Delaware Bay regional coastal circulation"},
+            "auto",
+            {"domain_scale": "regional"},
+        )
+        assert regional_provider == "topo", regional_policy
+        assert regional_policy["provider_chain"] == [
+            "Esri.WorldTopoMap",
+            "OpenTopoMap",
+            "CartoDB.Voyager",
+            "OpenStreetMap.Mapnik",
+        ], regional_policy
 
         run(
             [
