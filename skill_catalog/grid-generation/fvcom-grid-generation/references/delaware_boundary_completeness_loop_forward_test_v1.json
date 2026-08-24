@@ -1,0 +1,132 @@
+{
+  "schema_version": "fvcom_boundary_completeness_loop_forward_test_v1",
+  "recorded_utc": "2026-08-24T23:30:00Z",
+  "case_id": "delaware_river_estuary",
+  "implementation_commit": "30dbbb1",
+  "execution_contract": {
+    "clean_context": true,
+    "prior_case_artifacts_reused": false,
+    "immutable_external_cache_reuse_permitted": true,
+    "campaign_leaf": "delaware_bpoly_arc_completeness_loop_v1_20260824T210832Z/01_delaware_river_estuary",
+    "python_version": "3.13.14",
+    "gmsh_version": "4.15.2"
+  },
+  "package_validation": {
+    "catalog_and_installed_quick_validate": "pass",
+    "region_bpoly_selftests": {
+      "passed": 2,
+      "failed": 0
+    },
+    "boundary_arc_selftests": {
+      "passed": 3,
+      "failed": 0
+    },
+    "grid_generation_selftests": {
+      "passed": 28,
+      "failed": 0
+    },
+    "bytecode_free_python_ast_files": 146,
+    "staged_active_manifest_parity": "pass"
+  },
+  "boundary_completeness_loop": {
+    "schema_version": "region_bpoly_arc_feedback_loop_v2",
+    "final_status": "pass",
+    "geometry_loop_status": "pass",
+    "boundary_package_status": "pass",
+    "gshhs_resolution": "f",
+    "gshhs_level": 1,
+    "centered_coverage_factor_requested": 3.0,
+    "source_frame_dependency_length_m": 0.0,
+    "accepted_adjustment_count": 2,
+    "accepted_adjustments": [
+      {
+        "iteration": 1,
+        "side_index": 3,
+        "profile": "full_edge",
+        "displacement_km": 1.0,
+        "residual_length_after_m": 4908.157523928436
+      },
+      {
+        "iteration": 2,
+        "side_index": 3,
+        "profile": "start_taper",
+        "displacement_km": 8.0,
+        "cumulative_side_expansion_km": 9.0,
+        "residual_length_after_m": 35.846364209945065
+      }
+    ],
+    "initial_residual_length_m": 5580.951776528562,
+    "terminal_residual": {
+      "length_m": 35.846364209945065,
+      "nontrivial_limit_m": 400.0,
+      "route": "retain_for_role_classification",
+      "assigned_role": "solid_lagoon_closure",
+      "unassigned_residual_length_m": 0.0
+    },
+    "open_exterior_contract_schema": "fvcom_open_exterior_contract_v3",
+    "open_exterior_contract_sha256": "d1f22f2f7dd980cc2fba5417866c92ca191d4c62186719e73935cf82942bb881",
+    "geometry_evidence_sha256": "f1074392ed3f9e326ff610a4a0f58cb30470fbdda8aa661ee9267fd5ae812030",
+    "delivered_obc_count": 1,
+    "obc_status": "pass",
+    "visual_audit": {
+      "whole_domain_before_after_maps": "pass",
+      "component_zoom_map": "pass",
+      "geography_usable": true,
+      "interpretation": "The east-side shoreline truncation was removed. The remaining 35.85 m numerical-scale segment is shoreline-bracketed and does not form a frame-supported bar."
+    }
+  },
+  "mesh_generation": {
+    "backend": "gmsh",
+    "algorithm": 6,
+    "algorithm_name": "Frontal-Delaunay",
+    "algorithm_fallback_enabled": false,
+    "thread_count": 1,
+    "random_seed": 1,
+    "native_smoothing_steps": 8,
+    "raw_stage": true,
+    "common_conditioning_applied_to_raw": false,
+    "conditioning_profile": "minimal-topology-v1",
+    "node_count": 326950,
+    "triangle_count": 602620,
+    "final_mesh_sha256": "7c79261205c32fad3ef184f2575e84da8a8ca055c95c5b5fd16da3e92a83a050",
+    "roundtrip_passed": true
+  },
+  "mesh_quality": {
+    "q_min": 0.3581411756297613,
+    "q_l3_sigma": 0.8668593999726997,
+    "minimum_angle_deg": 16.100760573068712,
+    "maximum_angle_deg": 143.85506578500625,
+    "maximum_valence": 8,
+    "count_valence_above_8": 0,
+    "superthin_triangle_count": 0,
+    "connected_component_count": 1,
+    "nonmanifold_edge_count": 0,
+    "singly_connected_triangle_count": 201
+  },
+  "policy_engine_result": {
+    "standard_project_validation": "pass",
+    "require_benchmark_ready_validation": "pass",
+    "benchmark_grid_baseline_ready": true,
+    "fvcom_ready": true,
+    "submission_eligible": false,
+    "submission_failure_taxonomy": [
+      "open_boundary_forcing_incompatible"
+    ]
+  },
+  "independent_scientific_audit": {
+    "status": "fail_bathymetry_implausible",
+    "final_depth_minimum_m": 0.5,
+    "final_depth_maximum_m": 4488.7301,
+    "node_count_depth_above_1000_m": 80002,
+    "bathymetry_sha256": "0f15acf90afd55c1bf3a81b57c90b216cb3d10158565b2ab9dec8d7542cf0e7c",
+    "cause_evidence": "The fallback bathymetry mosaic assigns ETOPO depths near 4,000-4,500 m across the Delaware shelf east of the CUDEM footprint. Finite-positive and roundtrip checks pass, but the values are physically implausible for this domain.",
+    "interpretation": "The boundary-completeness implementation and mesh topology proof pass. This particular 2DM must not be used as a scientific Delaware benchmark until bathymetry is corrected and republished.",
+    "policy_gap": "The current benchmark validator checks finite positive-down coverage but has no regional plausibility or source-transition bathymetry gate."
+  },
+  "retained_first_attempt_regression": {
+    "campaign_leaf": "delaware_bpoly_arc_completeness_loop_v1_20260824T204945Z/01_delaware_river_estuary",
+    "status": "package_renderer_failure",
+    "failure": "Empty source-frame boundary plotting produced a non-finite map aspect.",
+    "resolution": "Plot the source-footprint polygon as water context and the source-frame LineString directly; reproduce against full-resolution Delaware GSHHS before rerun."
+  }
+}
