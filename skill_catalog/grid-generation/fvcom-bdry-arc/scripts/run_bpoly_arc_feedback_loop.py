@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,24 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2), encoding="utf-8")
+
+
+def _file_sha256(path: str | Path | None) -> str | None:
+    if not path:
+        return None
+    source = Path(path)
+    if not source.is_file():
+        return None
+    digest = hashlib.sha256()
+    with source.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_sha256(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _run(command: list[str], cwd: Path, log_path: Path, allow_nonzero: bool = False) -> int:
@@ -103,7 +122,7 @@ def _run_arc(args, region: Path, offshore: Path, output_dir: Path, name: str) ->
     manifest = _read_json(manifest_path)
     feedback_path = Path(manifest.get("outputs", {}).get("feedback_json", ""))
     if not feedback_path.is_file():
-        raise FileNotFoundError("Boundary arc run did not produce region_bpoly_arc_feedback_v1.json")
+        raise FileNotFoundError("Boundary arc run did not produce RegionBPoly arc-feedback evidence")
     return manifest, _read_json(feedback_path), feedback_path
 
 
@@ -126,6 +145,8 @@ def _row(iteration: int, trial: str, manifest: dict, feedback: dict, candidate: 
         "wet_component_count": metrics.get("wet_component_count"),
         "delivered_obc_count": metrics.get("delivered_obc_count"),
         "open_boundary_land_intersection_m": metrics.get("open_boundary_land_intersection_m"),
+        "boundary_completeness_status": feedback.get("boundary_completeness", {}).get("status"),
+        "truncating_component_count": len(feedback.get("boundary_completeness", {}).get("automatic_adjust_segment_ids", [])),
         "selected": selected,
         "failure_taxonomy": feedback.get("failure_taxonomy", []),
     }
@@ -183,9 +204,10 @@ def _area_growth_fraction(source: dict, adjusted: dict) -> float:
     return max(0.0, adjusted_area / source_area - 1.0) if source_area > 0.0 else float("inf")
 
 
-def _trial_rank(item: dict) -> tuple[float, float, float]:
+def _trial_rank(item: dict) -> tuple[float, float, float, float]:
     """Rank comparable hard-gate outcomes by residual, area growth, then movement."""
     return (
+        float(len(item["feedback"].get("boundary_completeness", {}).get("automatic_adjust_segment_ids", []))),
         _clip_length(item["feedback"]),
         float(item.get("area_growth_fraction", float("inf"))),
         _candidate_max_vertex_displacement_km(item["candidate"]),
@@ -205,6 +227,23 @@ def _select_trial(
     ]
     if passing:
         return min(passing, key=_trial_rank), "pass", "full_boundary_gate_passed"
+
+    geometry_ready = [
+        item
+        for item in trial_results
+        if item["feedback"].get("status") == "assign_boundary_roles"
+        and item["feedback"].get("boundary_completeness", {}).get("status") == "pass"
+    ]
+    if geometry_ready:
+        return min(geometry_ready, key=_trial_rank), "boundary_roles_required", "boundary_geometry_closed_roles_pending"
+
+    decision_required = [
+        item
+        for item in trial_results
+        if item["feedback"].get("status") == "boundary_completeness_decision_required"
+    ]
+    if decision_required:
+        return min(decision_required, key=_trial_rank), "agent_decision_required", "ambiguous_boundary_completeness"
 
     # Once a candidate closes the frame-clipping and structural gates, an
     # adaptive-only failure is not evidence for another bbox displacement.
@@ -255,6 +294,8 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         "wet_component_count",
         "delivered_obc_count",
         "open_boundary_land_intersection_m",
+        "boundary_completeness_status",
+        "truncating_component_count",
         "selected",
         "failure_taxonomy",
     ]
@@ -267,6 +308,44 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
             writer.writerow(copy)
 
 
+def _current_state(manifest: dict, feedback: dict, adaptive_profile: str) -> tuple[str, str]:
+    if _full_pass(manifest, feedback, adaptive_profile):
+        return "pass", "boundary_package_passed"
+    status = feedback.get("status")
+    completeness = feedback.get("boundary_completeness", {})
+    if status == "assign_boundary_roles" and completeness.get("status") == "pass":
+        return "boundary_roles_required", "boundary_geometry_closed_roles_pending"
+    if status == "boundary_completeness_decision_required":
+        return "agent_decision_required", "ambiguous_boundary_completeness"
+    if status == "adjust_bpoly":
+        return "adjust_bpoly", "boundary_truncation_adjustment_required"
+    return "input_needs_review", "feedback_not_adjustable"
+
+
+def _selected_manifest_path(feedback_path: Path) -> Path:
+    candidate = feedback_path.parents[1] / "bdry_arc_manifest.json"
+    if not candidate.is_file():
+        raise FileNotFoundError(f"Selected boundary manifest is missing: {candidate}")
+    return candidate
+
+
+def _geometry_evidence(
+    region_path: Path,
+    offshore_path: Path,
+    manifest_path: Path,
+    feedback_path: Path,
+    accepted_adjustments: list[dict],
+) -> dict[str, Any]:
+    evidence = {
+        "region_bpoly_sha256": _file_sha256(region_path),
+        "offshore_artifacts_sha256": _file_sha256(offshore_path),
+        "bdry_arc_manifest_sha256": _file_sha256(manifest_path),
+        "feedback_sha256": _file_sha256(feedback_path),
+        "accepted_adjustments": accepted_adjustments,
+    }
+    return {**evidence, "sha256": _canonical_sha256(evidence)}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--region-bpoly-json", required=True)
@@ -276,7 +355,7 @@ def main() -> int:
     parser.add_argument("--coastline-gpkg")
     parser.add_argument("--gshhs-skill-dir")
     parser.add_argument("--region-bpoly-skill-dir")
-    parser.add_argument("--gshhs-resolution", default="h", choices=("c", "l", "i", "h", "f"))
+    parser.add_argument("--gshhs-resolution", default="f", choices=("c", "l", "i", "h", "f"))
     parser.add_argument("--gshhs-levels", default="1")
     parser.add_argument("--gshhs-lookahead-km", type=float, default=100.0)
     parser.add_argument("--target-resolution-m", type=float, default=8000.0)
@@ -287,43 +366,72 @@ def main() -> int:
     parser.add_argument("--max-adjustments", type=int, default=4)
     parser.add_argument("--max-candidates-per-adjustment", type=int, default=3)
     parser.add_argument("--max-side-expansion-km", type=float, default=100.0)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
     root = Path(args.run_dir).resolve()
-    if root.exists() and any(root.iterdir()):
+    summary_path = root / "feedback_loop_summary.json"
+    csv_path = root / "feedback_loop_summary.csv"
+    resuming = bool(args.resume and summary_path.is_file())
+    if root.exists() and any(root.iterdir()) and not resuming:
         raise ValueError(f"Refusing to overwrite nonempty feedback-loop directory: {root}")
     root.mkdir(parents=True, exist_ok=True)
     # Keep physical paths compact for GDAL/SQLite on Windows. Human-readable
     # iteration and candidate identifiers remain in the JSON/CSV manifests.
-    seed_dir = root / "i00" / "region"
-    seed_dir.mkdir(parents=True, exist_ok=True)
-    current_region = seed_dir / "region_bpoly.json"
-    current_offshore = seed_dir / "offshore_boundary_artifacts.json"
-    shutil.copy2(Path(args.region_bpoly_json).resolve(), current_region)
-    shutil.copy2(Path(args.offshore_artifacts_json).resolve(), current_offshore)
-
     skill_parent = Path(__file__).resolve().parents[2]
     region_skill = Path(args.region_bpoly_skill_dir).resolve() if args.region_bpoly_skill_dir else skill_parent / "fvcom-region-bpoly"
     apply_script = region_skill / "scripts" / "apply_arc_feedback.py"
     if not apply_script.is_file():
         raise FileNotFoundError(f"Could not locate RegionBPoly feedback applier: {apply_script}")
 
-    rows: list[dict] = []
-    accepted_adjustments: list[dict] = []
-    cumulative_by_side: dict[int, float] = {}
-    current_manifest, current_feedback, current_feedback_path = _run_arc(
-        args,
-        current_region,
-        current_offshore,
-        root / "i00" / "arc",
-        "fb_i00",
-    )
-    rows.append(_row(0, "seed", current_manifest, current_feedback, None, selected=True))
-    final_status = "pass" if _full_pass(current_manifest, current_feedback, args.boundary_resolution_profile) else "input_needs_review"
-    stop_reason = "seed_passed" if final_status == "pass" else None
+    if resuming:
+        previous = _read_json(summary_path)
+        if previous.get("schema_version") != "region_bpoly_arc_feedback_loop_v2":
+            raise ValueError("--resume requires a v2 feedback-loop summary")
+        selected_outputs = previous.get("selected_outputs", {})
+        current_region = Path(selected_outputs["region_bpoly_json"]).resolve()
+        current_offshore = Path(selected_outputs["offshore_artifacts_json"]).resolve()
+        current_feedback_path = Path(selected_outputs["feedback_json"]).resolve()
+        current_manifest_path = Path(selected_outputs["bdry_arc_manifest"]).resolve()
+        for selected_path in (current_region, current_offshore, current_feedback_path, current_manifest_path):
+            if not selected_path.is_file():
+                raise FileNotFoundError(f"Cannot resume with missing selected evidence: {selected_path}")
+        current_manifest = _read_json(current_manifest_path)
+        current_feedback = _read_json(current_feedback_path)
+        rows = list(previous.get("trials", []))
+        accepted_adjustments = list(previous.get("accepted_adjustments", []))
+        cumulative_by_side = {
+            int(key): float(value)
+            for key, value in previous.get("cumulative_side_expansion_km", {}).items()
+        }
+        start_adjustment = len(accepted_adjustments) + 1
+    else:
+        seed_dir = root / "i00" / "region"
+        seed_dir.mkdir(parents=True, exist_ok=True)
+        current_region = seed_dir / "region_bpoly.json"
+        current_offshore = seed_dir / "offshore_boundary_artifacts.json"
+        shutil.copy2(Path(args.region_bpoly_json).resolve(), current_region)
+        shutil.copy2(Path(args.offshore_artifacts_json).resolve(), current_offshore)
+        rows = []
+        accepted_adjustments = []
+        cumulative_by_side = {}
+        current_manifest, current_feedback, current_feedback_path = _run_arc(
+            args,
+            current_region,
+            current_offshore,
+            root / "i00" / "arc",
+            "fb_i00",
+        )
+        current_manifest_path = _selected_manifest_path(current_feedback_path)
+        rows.append(_row(0, "seed", current_manifest, current_feedback, None, selected=True))
+        start_adjustment = 1
 
-    for adjustment_index in range(1, args.max_adjustments + 1):
-        if final_status == "pass":
+    final_status, stop_reason = _current_state(
+        current_manifest, current_feedback, args.boundary_resolution_profile
+    )
+
+    for adjustment_index in range(start_adjustment, args.max_adjustments + 1):
+        if final_status in {"pass", "boundary_roles_required", "agent_decision_required"}:
             break
         if current_feedback.get("status") != "adjust_bpoly":
             stop_reason = "feedback_not_adjustable"
@@ -358,7 +466,7 @@ def main() -> int:
                 "--output-dir",
                 str(region_dir),
                 "--basemap-provider",
-                "none",
+                "auto",
             ]
             apply_code = _run(apply_command, trial_dir, trial_dir / "apply_feedback.log", allow_nonzero=True)
             region_json = region_dir / "region_bpoly.json"
@@ -432,13 +540,32 @@ def main() -> int:
         current_manifest = selected["manifest"]
         current_feedback = selected["feedback"]
         current_feedback_path = selected["feedback_path"]
-        if stop_reason == "adaptive_failure_after_frame_clip_closed":
+        current_manifest_path = _selected_manifest_path(current_feedback_path)
+        if final_status in {"pass", "boundary_roles_required", "agent_decision_required"} or stop_reason == "adaptive_failure_after_frame_clip_closed":
             break
 
+    geometry_loop_status = (
+        "pass"
+        if final_status in {"pass", "boundary_roles_required"}
+        else "decision_required"
+        if final_status == "agent_decision_required"
+        else "needs_review"
+    )
+    geometry_evidence = _geometry_evidence(
+        current_region,
+        current_offshore,
+        current_manifest_path,
+        current_feedback_path,
+        accepted_adjustments,
+    )
     summary = {
-        "schema_version": "region_bpoly_arc_feedback_loop_v1",
+        "schema_version": "region_bpoly_arc_feedback_loop_v2",
         "name": args.name,
         "final_status": final_status,
+        "geometry_loop_status": geometry_loop_status,
+        "boundary_package_status": "pass" if final_status == "pass" else "pending",
+        "geometry_evidence_sha256": geometry_evidence["sha256"],
+        "geometry_evidence": geometry_evidence,
         "stop_reason": stop_reason or "maximum_adjustments_exhausted",
         "policy": {
             "max_adjustments": args.max_adjustments,
@@ -455,19 +582,17 @@ def main() -> int:
         "selected_outputs": {
             "region_bpoly_json": str(current_region),
             "offshore_artifacts_json": str(current_offshore),
-            "bdry_arc_manifest": str(Path(current_manifest.get("outputs", {}).get("feedback_json", "")).parents[1] / "bdry_arc_manifest.json") if current_manifest else None,
+            "bdry_arc_manifest": str(current_manifest_path),
             "feedback_json": str(current_feedback_path),
             **current_manifest.get("outputs", {}),
         },
         "final_feedback": current_feedback,
         "trials": rows,
     }
-    summary_path = root / "feedback_loop_summary.json"
-    csv_path = root / "feedback_loop_summary.csv"
     _write_json(summary_path, summary)
     _write_csv(csv_path, rows)
     print(json.dumps({"final_status": final_status, "stop_reason": summary["stop_reason"], "summary_json": str(summary_path), "summary_csv": str(csv_path)}, indent=2))
-    return 0 if final_status == "pass" else 2
+    return 0 if final_status == "pass" else 3 if final_status in {"boundary_roles_required", "agent_decision_required"} else 2
 
 
 if __name__ == "__main__":

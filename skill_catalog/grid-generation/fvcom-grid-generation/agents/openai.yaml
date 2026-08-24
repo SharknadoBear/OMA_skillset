@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM Grid Generation"
   short_description: "Generate benchmark-ready Gmsh-6 FVCOM grids"
-  default_prompt: "Use $fvcom-grid-generation to generate a deterministic Gmsh-6 FVCOM grid, close valence and superthin debt, classify regional refinement debt, and publish a fully audited project with the standard bathymetric review map."
+  default_prompt: "Use $fvcom-grid-generation to require the completed RegionBPoly boundary-completeness loop, generate a deterministic Gmsh-6 FVCOM grid, close valence and superthin debt, classify regional refinement debt, and publish a fully audited project with the standard bathymetric review map."

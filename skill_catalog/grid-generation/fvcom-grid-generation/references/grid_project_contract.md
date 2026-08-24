@@ -48,6 +48,12 @@ from physical coastline lines, the delivered exterior has zero source-frame
 dependency, and the whole/zoom coverage maps and hashes remain current.
 Historical exact-bbox packages are diagnostic-only for new projects.
 
+The boundary must also carry `fvcom_open_exterior_contract_v3` bound to a
+passing `region_bpoly_arc_feedback_loop_v2`. The loop assesses shoreline and
+waterway truncation before solid/OBC role assignment; every non-OBC residual
+must be explicitly cleared for role classification. Missing, stale, pending,
+or diagnostic-only loop evidence blocks mesh readiness and publication.
+
 When a raw or conditioned terminal mesh exists, `publish` requires the mesh
 quality, conditioning, boundary-node, OBC-remap, and roundtrip companions. It
 automatically writes the standard positive-down bathymetry/triangle review map,

@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM Boundary Arc"
   short_description: "Build and correct FVCOM boundary chains"
-  default_prompt: "Use $fvcom-bdry-arc to build FVCOM boundary loops, preserve exact delivered-OBC lineage, classify real-water frame residuals as solid by default with hash-bound maps, and return bounded RegionBPoly feedback only for invalid geometry."
+  default_prompt: "Use $fvcom-bdry-arc to run the full-resolution RegionBPoly boundary-completeness loop, preserve exact delivered-OBC lineage, and classify only geometry-cleared real-water residuals as solid by default with hash-bound maps."

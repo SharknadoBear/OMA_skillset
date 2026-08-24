@@ -1495,7 +1495,11 @@ def check_case_readiness(
     if lineage_source:
         lineage_path = resolve_input_path(lineage_source, workspace)
         if lineage_path and lineage_path.is_file():
-            open_audit = validate_open_exterior_contract(lineage_path, required=coastal_required)
+            open_audit = validate_open_exterior_contract(
+                lineage_path,
+                required=coastal_required,
+                require_boundary_completeness_loop=coastal_required,
+            )
             if not open_audit["passed"]:
                 blockers.extend(open_audit["failure_taxonomy"])
         elif coastal_required:

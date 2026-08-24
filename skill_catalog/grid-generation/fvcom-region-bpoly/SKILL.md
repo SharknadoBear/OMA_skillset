@@ -13,7 +13,7 @@ The four-sided `polygon_lonlat` is the controlling model-domain envelope. The `e
 
 Do not generate meshes or coastline boundary arcs in this skill.
 
-GSHHS remains downstream in `fvcom-bdry-arc`. This skill may consume its `region_bpoly_arc_feedback_v1` artifact to reshape the four-corner polygon, but it must not fetch or interpret coastline data itself.
+GSHHS remains downstream in `fvcom-bdry-arc`. This skill may consume its current `region_bpoly_arc_feedback_v2` artifact (or historical v1 evidence) to reshape the four-corner polygon, but it must not fetch or interpret coastline data itself.
 
 ## Offshore Point Purpose
 
@@ -137,7 +137,7 @@ Every accepted bpoly needs a domain type in final JSON:
 
 Use `scripts/adjust_region_bpoly.py` when the agent needs direct final-stage polygon edits from map review.
 
-Use `scripts/apply_arc_feedback.py` for a geometry-only adjustment requested by `fvcom-bdry-arc`. The command verifies the feedback hash, applies one named full-edge or tapered reshape candidate, preserves `target_region_features` exactly by canonical hash, recomputes required-feature and obstruction QA, resnaps the offshore reference, and writes a complete downstream-compatible RegionBPoly plus comparison map. Reject stale feedback, semantic mutations, invalid polygons, lost required features, and new obstruction conflicts.
+Use `scripts/apply_arc_feedback.py` for a geometry-only adjustment requested by `fvcom-bdry-arc`. The command defaults to the resilient `auto` basemap chain, verifies the feedback hash, applies one named full-edge or tapered reshape candidate, preserves `target_region_features` exactly by canonical hash, recomputes required-feature and obstruction QA, resnaps the offshore reference, and writes a complete downstream-compatible RegionBPoly plus a geography-usable comparison map. Reject stale feedback, semantic mutations, invalid polygons, lost required features, and new obstruction conflicts.
 
 The adjustment manifest supports:
 

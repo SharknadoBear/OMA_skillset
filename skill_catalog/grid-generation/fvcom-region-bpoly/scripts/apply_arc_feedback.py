@@ -75,7 +75,7 @@ def main() -> int:
     parser.add_argument("--feedback-json", required=True)
     parser.add_argument("--candidate-id", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--basemap-provider", default="none")
+    parser.add_argument("--basemap-provider", default="auto")
     args = parser.parse_args()
 
     input_path = Path(args.input_json).resolve()

@@ -57,5 +57,5 @@ instructions: |
   the adjusted polygon solid.
 
   Use scripts/apply_arc_feedback.py only with a hash-matched
-  region_bpoly_arc_feedback_v1 artifact. Preserve target_region_features exactly,
+  current region_bpoly_arc_feedback_v2 artifact (or historical v1 evidence). Preserve target_region_features exactly,
   rerun feature/guard/offshore QA, and reject stale or semantic-changing feedback.

@@ -640,14 +640,14 @@ def run_bdry_arc(
         feedback_failed = True
         feedback_dir.mkdir(parents=True, exist_ok=True)
         feedback = {
-            "schema_version": "region_bpoly_arc_feedback_v1",
+            "schema_version": "region_bpoly_arc_feedback_v2",
             "status": "input_needs_review",
             "diagnostic_status": "failed",
             "failure_taxonomy": ["region_bpoly_arc_feedback_failed"],
             "error": str(exc),
             "outputs": {},
         }
-        feedback_path = feedback_dir / "region_bpoly_arc_feedback_v1.json"
+        feedback_path = feedback_dir / "region_bpoly_arc_feedback_v2.json"
         feedback_path.write_text(json.dumps(_json_safe(feedback), indent=2), encoding="utf-8")
         feedback["outputs"]["feedback_json"] = str(feedback_path)
     manifest["region_bpoly_arc_feedback"] = feedback

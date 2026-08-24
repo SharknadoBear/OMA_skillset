@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 from pathlib import Path
 import sys
@@ -999,7 +1000,8 @@ def test_region_bpoly_feedback_classifies_landward_clip_and_obc() -> None:
         gpd.GeoDataFrame([{"geometry": LineString([(4.0, 0.0), (4.0, 4.0)])}], geometry="geometry", crs="EPSG:4326").to_file(package, layer="open_boundary_arc", driver="GPKG")
         gpd.GeoDataFrame(
             [
-                {"geometry": LineString([(0.0, 0.8), (0.0, 2.8)])},
+                {"geometry": LineString([(0.0, 0.5), (0.0, 1.5)])},
+                {"geometry": LineString([(0.0, 2.1), (0.0, 3.1)])},
                 {"geometry": LineString([(4.0, 0.0), (4.0, 4.0)])},
             ],
             geometry="geometry",
@@ -1032,16 +1034,96 @@ def test_region_bpoly_feedback_classifies_landward_clip_and_obc() -> None:
             frame_clip_tolerance_m=250.0,
             candidate_max_km=100.0,
         )
+        assert feedback["schema_version"] == "region_bpoly_arc_feedback_v2"
         assert feedback["status"] == "adjust_bpoly"
+        assert feedback["boundary_completeness"]["status"] == "adjust_bpoly"
+        assert len(feedback["boundary_completeness"]["automatic_adjust_segment_ids"]) == 2
         assert feedback["metrics"]["delivered_obc_count"] == 1
         unintended = [item for item in feedback["frame_clip_segments"] if item["classification"] == "unintended_frame_clip"]
         intentional = [item for item in feedback["frame_clip_segments"] if item["classification"] == "intentional_open_boundary"]
-        assert len(unintended) == 1 and unintended[0]["side_index"] == 1
+        assert len(unintended) == 2 and all(item["side_index"] == 1 for item in unintended)
+        assert all(
+            "repeated_nontrivial_same_side_cut"
+            in item["boundary_completeness"]["automatic_trigger_reasons"]
+            for item in unintended
+        )
         assert len(intentional) == 1 and intentional[0]["side_index"] == 3
         assert feedback["candidate_recommendations"]
         assert feedback["candidate_recommendations"][0]["displacement_km"] <= 100.0
         assert Path(feedback["outputs"]["feedback_map"]).exists()
         assert Path(feedback["outputs"]["segments_geojson"]).exists()
+
+        ambiguous_package = root / "ambiguous.gpkg"
+        gpd.GeoDataFrame([{"geometry": wet}], geometry="geometry", crs="EPSG:4326").to_file(ambiguous_package, layer="wet_domain", driver="GPKG")
+        gpd.GeoDataFrame([{"geometry": LineString([(4.0, 0.0), (4.0, 4.0)])}], geometry="geometry", crs="EPSG:4326").to_file(ambiguous_package, layer="open_boundary_arc", driver="GPKG")
+        gpd.GeoDataFrame(
+            [
+                {"geometry": LineString([(0.0, 0.8), (0.0, 2.8)])},
+                {"geometry": LineString([(4.0, 0.0), (4.0, 4.0)])},
+            ],
+            geometry="geometry",
+            crs="EPSG:4326",
+        ).to_file(ambiguous_package, layer="frame_clip_boundary_arcs", driver="GPKG")
+        ambiguous = build_region_bpoly_arc_feedback(
+            region_path,
+            offshore_path,
+            ambiguous_package,
+            land_path,
+            loop_path,
+            root / "ambiguous_feedback",
+            {
+                "inputs": {"coastline_source": "gshhs", "coastline_load": {"source_version": "GSHHG 2.3.7"}},
+                "settings": {"target_resolution_m": 1000.0, "gshhs_resolution": "f", "gshhs_levels": "1"},
+                "wet_domain": {"arc_land_intersection_length_m": 0.0},
+                "coastline_source_coverage": {"downstream_eligible": True, "failure_taxonomy": []},
+            },
+            frame_clip_policy="reject-unintended",
+            residual_boundary_policy="solid-default",
+            frame_clip_tolerance_m=250.0,
+            candidate_max_km=100.0,
+        )
+        assert ambiguous["status"] == "boundary_completeness_decision_required"
+        assert ambiguous["boundary_completeness"]["agent_decision_segment_ids"] == [0]
+        ambiguous_manifest = root / "ambiguous_manifest.json"
+        _write_json(
+            ambiguous_manifest,
+            {
+                "final_status": "needs_review",
+                "failure_taxonomy": ["region_bpoly_boundary_completeness_decision_required"],
+                "outputs": ambiguous["outputs"],
+                "region_bpoly_arc_feedback": ambiguous,
+                "open_exterior_contract": ambiguous["open_exterior_contract"],
+            },
+        )
+        decision_script = Path(__file__).resolve().parent / "finalize_boundary_completeness_decision.py"
+        missing = subprocess.run(
+            [sys.executable, str(decision_script), "--bdry-arc-manifest", str(ambiguous_manifest), "--rationale", "Inspected maps."],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert missing.returncode != 0
+        component_map = Path(ambiguous["outputs"]["residual_component_maps"]["0"]["path"])
+        original_map = component_map.read_bytes()
+        component_map.write_bytes(b"stale")
+        stale = subprocess.run(
+            [sys.executable, str(decision_script), "--bdry-arc-manifest", str(ambiguous_manifest), "--route", "0=retain_for_role_classification", "--rationale", "Isolated transverse closure retained after map review."],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert stale.returncode != 0 and "stale" in stale.stderr.lower()
+        component_map.write_bytes(original_map)
+        accepted = subprocess.run(
+            [sys.executable, str(decision_script), "--bdry-arc-manifest", str(ambiguous_manifest), "--route", "0=retain_for_role_classification", "--rationale", "Isolated transverse closure retained after map review."],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert accepted.returncode == 0, accepted.stderr
+        resolved = json.loads(Path(ambiguous["outputs"]["feedback_json"]).read_text(encoding="utf-8"))
+        assert resolved["status"] == "assign_boundary_roles"
+        assert resolved["boundary_completeness"]["decision_status"] == "accepted"
 
 
 def test_region_bpoly_feedback_absolute_sliver_does_not_waive_other_gates() -> None:

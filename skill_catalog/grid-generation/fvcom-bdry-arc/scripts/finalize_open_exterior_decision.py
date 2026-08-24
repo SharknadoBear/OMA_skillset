@@ -28,6 +28,8 @@ DECISION_FAILURES = {
     "residual_boundary_role_pending",
     "unintended_frame_clip_nontrivial",
     "gshhs_coastline_incomplete_on_landward_boundary",
+    "region_bpoly_boundary_completeness_decision_required",
+    "region_bpoly_boundary_truncation_detected",
 }
 
 RESIDUAL_ROLES = {
@@ -244,6 +246,45 @@ def _verify_component_maps(contract: dict) -> None:
             raise ValueError(f"Residual component {segment_id} map is missing or stale")
 
 
+def _validate_boundary_completeness(contract: dict) -> None:
+    completeness = contract.get("boundary_completeness") or {}
+    if completeness.get("schema_version") != "fvcom_boundary_completeness_assessment_v1":
+        raise ValueError("current open-exterior contract lacks boundary-completeness evidence")
+    if completeness.get("status") != "pass":
+        raise ValueError("RegionBPoly boundary completeness has not passed")
+    for component in contract.get("residual_components", []):
+        if component.get("classification") == "intentional_open_boundary":
+            continue
+        route = (component.get("boundary_completeness") or {}).get("route")
+        if route != "retain_for_role_classification":
+            raise ValueError(
+                f"Residual segment {component.get('segment_id')} is not cleared for boundary-role classification"
+            )
+
+
+def _bind_feedback_loop_summary(manifest_path: Path, summary_path: Path | None) -> tuple[dict | None, dict | None]:
+    if summary_path is None:
+        return None, None
+    if not summary_path.is_file():
+        raise ValueError("feedback-loop summary does not exist")
+    summary = read_json(summary_path)
+    if summary.get("schema_version") != "region_bpoly_arc_feedback_loop_v2":
+        raise ValueError("unsupported feedback-loop summary schema")
+    selected_manifest = Path(summary.get("selected_outputs", {}).get("bdry_arc_manifest", "")).resolve()
+    if selected_manifest != manifest_path.resolve():
+        raise ValueError("feedback-loop summary does not select this boundary manifest")
+    if summary.get("geometry_loop_status") != "pass":
+        raise ValueError("feedback-loop geometry stage has not passed")
+    evidence_hash = summary.get("geometry_evidence_sha256")
+    if not evidence_hash:
+        raise ValueError("feedback-loop summary lacks immutable geometry evidence hash")
+    return summary, {
+        "schema_version": "region_bpoly_arc_feedback_loop_v2",
+        "path": str(summary_path),
+        "geometry_evidence_sha256": evidence_hash,
+    }
+
+
 def _clear_loop_role_failures(manifest: dict) -> None:
     loop_path = Path(manifest.get("outputs", {}).get("model_boundary_loop_manifest", ""))
     if not loop_path.is_file():
@@ -304,6 +345,7 @@ def finalize(
     resume_adaptive: bool,
     residual_roles: dict[int, str] | None = None,
     station_screen_path: Path | None = None,
+    feedback_loop_summary_path: Path | None = None,
 ) -> dict:
     manifest = read_json(manifest_path)
     contract_path = Path(manifest.get("outputs", {}).get("open_exterior_contract", ""))
@@ -313,11 +355,21 @@ def finalize(
         raise ValueError("boundary manifest does not resolve a complete open-exterior evidence package")
     contract = read_json(contract_path)
     schema = contract.get("schema_version")
-    if schema not in {"fvcom_open_exterior_contract_v1", "fvcom_open_exterior_contract_v2"}:
+    if schema not in {"fvcom_open_exterior_contract_v1", "fvcom_open_exterior_contract_v2", "fvcom_open_exterior_contract_v3"}:
         raise ValueError("unsupported open-exterior contract")
+    if schema == "fvcom_open_exterior_contract_v3" and feedback_loop_summary_path is None:
+        raise ValueError("v3 open-exterior contracts require the completed RegionBPoly feedback-loop summary")
+    loop_summary, loop_binding = _bind_feedback_loop_summary(
+        manifest_path, feedback_loop_summary_path
+    )
+    if loop_binding is not None:
+        contract["region_bpoly_arc_feedback_loop"] = loop_binding
+        atomic_json(contract_path, contract)
     assessed_hash = sha256_file(contract_path)
     role_pass = True
-    if schema == "fvcom_open_exterior_contract_v2":
+    if schema in {"fvcom_open_exterior_contract_v2", "fvcom_open_exterior_contract_v3"}:
+        if schema == "fvcom_open_exterior_contract_v3" and decision == "pass":
+            _validate_boundary_completeness(contract)
         if decision == "pass":
             _verify_component_maps(contract)
         role_pass = _apply_residual_roles(
@@ -352,7 +404,13 @@ def finalize(
         raise ValueError("a concise visual rationale is required")
 
     decision_doc = {
-        "schema_version": "open_exterior_agent_decision_v2" if schema.endswith("v2") else "open_exterior_agent_decision_v1",
+        "schema_version": (
+            "open_exterior_agent_decision_v3"
+            if schema.endswith("v3")
+            else "open_exterior_agent_decision_v2"
+            if schema.endswith("v2")
+            else "open_exterior_agent_decision_v1"
+        ),
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "status": decision,
         "decision_actor": {"kind": "codex_agent"},
@@ -457,6 +515,15 @@ def finalize(
     if eligible and not manifest.get("failure_taxonomy"):
         manifest["final_status"] = "pass"
     atomic_json(manifest_path, manifest)
+    if loop_summary is not None:
+        loop_summary["boundary_package_status"] = "pass" if manifest.get("final_status") == "pass" else "needs_review"
+        loop_summary["final_status"] = loop_summary["boundary_package_status"]
+        loop_summary["selected_outputs"] = {
+            **loop_summary.get("selected_outputs", {}),
+            **manifest.get("outputs", {}),
+            "bdry_arc_manifest": str(manifest_path),
+        }
+        atomic_json(feedback_loop_summary_path, loop_summary)
     return manifest
 
 
@@ -474,6 +541,7 @@ def main() -> int:
         help="Override the solid default for one residual component.",
     )
     parser.add_argument("--station-screen-json", type=Path)
+    parser.add_argument("--feedback-loop-summary", type=Path)
     args = parser.parse_args()
     result = finalize(
         args.bdry_arc_manifest.resolve(),
@@ -482,6 +550,7 @@ def main() -> int:
         resume_adaptive=args.resume_adaptive,
         residual_roles=_parse_roles(args.residual_role),
         station_screen_path=(args.station_screen_json.resolve() if args.station_screen_json else None),
+        feedback_loop_summary_path=(args.feedback_loop_summary.resolve() if args.feedback_loop_summary else None),
     )
     print(json.dumps({
         "final_status": result.get("final_status"),

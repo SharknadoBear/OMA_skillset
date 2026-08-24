@@ -402,7 +402,11 @@ def publish(
     all_findings = list(map(str, failures))
     open_audit = None
     if open_exterior_source:
-        open_audit = validate_open_exterior_contract(open_exterior_source, required=True)
+        open_audit = validate_open_exterior_contract(
+            open_exterior_source,
+            required=True,
+            require_boundary_completeness_loop=True,
+        )
         if not open_audit["passed"]:
             all_findings.extend(open_audit["failure_taxonomy"])
         # Delivery manifests remain portable: retain the evidence hash and

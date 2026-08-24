@@ -170,6 +170,36 @@ def role_contract_fixture(root: Path, *, stale_component_map: bool = False) -> P
     return path
 
 
+def completeness_contract_fixture(root: Path, *, stale_loop: bool = False) -> Path:
+    path = role_contract_fixture(root)
+    contract = json.loads(path.read_text(encoding="utf-8"))
+    contract["schema_version"] = "fvcom_open_exterior_contract_v3"
+    contract["boundary_completeness"] = {
+        "schema_version": "fvcom_boundary_completeness_assessment_v1",
+        "status": "pass",
+        "decision_required": False,
+    }
+    contract["residual_components"][0]["boundary_completeness"] = {
+        "status": "role_classification_ready",
+        "route": "retain_for_role_classification",
+    }
+    loop_path = root / "feedback_loop_summary.json"
+    loop_path.write_text(json.dumps({
+        "schema_version": "region_bpoly_arc_feedback_loop_v2",
+        "geometry_loop_status": "pass",
+        "final_status": "pass",
+        "geometry_evidence_sha256": "geometry-hash",
+    }), encoding="utf-8")
+    contract["region_bpoly_arc_feedback_loop"] = {
+        "schema_version": "region_bpoly_arc_feedback_loop_v2",
+        "path": str(loop_path),
+        "geometry_evidence_sha256": "stale" if stale_loop else "geometry-hash",
+    }
+    path = root / "contract_v3.json"
+    path.write_text(json.dumps(contract), encoding="utf-8")
+    return path
+
+
 def mesh_fixture(path: Path, *, open_boundary: bool = True) -> Path:
     chains = [[1, 2]] if open_boundary else []
     return write_2dm(
@@ -286,6 +316,12 @@ def main() -> None:
         role_contract = role_contract_fixture(base / "role_evidence")
         role_audit = validate_open_exterior_contract(role_contract)
         assert role_audit["passed"], role_audit
+        completeness_contract = completeness_contract_fixture(base / "completeness_evidence")
+        completeness_audit = validate_open_exterior_contract(completeness_contract)
+        assert completeness_audit["passed"], completeness_audit
+        stale_loop_contract = completeness_contract_fixture(base / "stale_loop_evidence", stale_loop=True)
+        stale_loop_audit = validate_open_exterior_contract(stale_loop_contract)
+        assert "region_bpoly_arc_feedback_loop_evidence_stale" in stale_loop_audit["failure_taxonomy"]
         stale_role_contract = role_contract_fixture(base / "stale_role_evidence", stale_component_map=True)
         stale_audit = validate_open_exterior_contract(stale_role_contract)
         assert not stale_audit["passed"]
@@ -344,6 +380,7 @@ def main() -> None:
         assert not validate(project, require_submission_ready=True)["passed"]
 
         ready = base / "ready"
+        current_contract = completeness_contract_fixture(base / "current_project_contract")
         init_project(ready, "ready")
         publish(
             ready,
@@ -379,7 +416,7 @@ def main() -> None:
             obc_status="pass",
             forcing_status="compatible",
             failures=[],
-            open_exterior_source=contract,
+            open_exterior_source=current_contract,
             basemap_provider="offline",
         )
         assert validate(ready, require_benchmark_ready=True)["passed"]
