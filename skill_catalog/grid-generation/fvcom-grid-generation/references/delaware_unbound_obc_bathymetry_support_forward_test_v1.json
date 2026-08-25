@@ -1,0 +1,296 @@
+{
+  "schema_version": "fvcom_unbound_obc_bathymetry_support_forward_test_v1",
+  "recorded_utc": "2026-08-25T06:38:12Z",
+  "case_id": "delaware_river_estuary",
+  "baseline_commit": "f801d59852508fc9e8ca65176b9c8aeb536b4d01",
+  "implementation_commit_tested": "0e0d7077b790df35044a65e350f3ee6e4d13cbc2",
+  "execution_contract": {
+    "clean_context": true,
+    "fork_turns": "none",
+    "model_and_reasoning": "inherited",
+    "repair_hints_supplied": false,
+    "status_only_messages_supplied": true,
+    "prior_delaware_case_artifacts_reused": false,
+    "immutable_external_cache_reuse_permitted": true,
+    "prompt": "Use the installed FVCOM skills to build a fresh standardized Delaware River estuary grid from the lower tidal Delaware River through Delaware Bay to one Atlantic-facing offshore open boundary. Complete the workflow autonomously, retain all evidence, and stop honestly on any blocking failure.",
+    "authoritative_project": "Workspace/g/duo25"
+  },
+  "implementation_validation": {
+    "region_bpoly_selftests": "pass",
+    "boundary_arc_selftests": "pass",
+    "grid_generation_full_script_matrix": "pass",
+    "grid_portfolio_tests": {
+      "passed": 29,
+      "failed": 0
+    },
+    "compileall_and_ast_checks": "pass",
+    "catalog_quick_validate": "pass",
+    "installed_copy_quick_validate": "pass",
+    "catalog_installed_parity": {
+      "fvcom_region_bpoly_files": 27,
+      "fvcom_bdry_arc_files": 21,
+      "fvcom_grid_generation_files": 134,
+      "path_size_sha256_parity": "pass",
+      "excluded": [
+        "__pycache__",
+        "*.pyc"
+      ]
+    }
+  },
+  "contract_behavior": {
+    "loop_scope": "land_boundary_only",
+    "offshore_obc_bpoly_containment_required": false,
+    "region_bpoly_adjustment_caused_by_offshore_excursion": false,
+    "authoritative_run_accepted_adjustment_count": 0,
+    "authoritative_obc_outside_region_bpoly_fraction": 6.885728605774563e-13,
+    "interpretation": "The authoritative Delaware candidate was effectively inside RegionBPoly, so this forward run did not directly exercise a material offshore excursion. Dedicated regressions prove that a valid OBC mostly or wholly outside RegionBPoly passes without BPoly deformation. The retained south-side attempt independently proves that genuine land-side truncation still routes to adjust_bpoly."
+  },
+  "authoritative_region": {
+    "final_status": "pass",
+    "envelope_bbox_wsen": [
+      -75.6,
+      38.603,
+      -74.64,
+      40.297
+    ],
+    "required_feature_checkpoint_count": 8,
+    "required_feature_checkpoints_present": true,
+    "domain_type": "coastal",
+    "requested_open_boundary_count": 1,
+    "open_boundary_intent": "exactly one Atlantic-facing ocean OBC outside the Delaware Capes"
+  },
+  "authoritative_coastline": {
+    "source": "GSHHG 2.3.7 GSHHS level 1",
+    "resolution": "f",
+    "health_status": "pass",
+    "land_polygon_count": 531,
+    "coastline_line_count": 543,
+    "invalid_geometry_count": 0,
+    "coverage_factor_x": 3.502731564852532,
+    "coverage_factor_y": 3.000463983718204,
+    "source_frame_dependency_length_m": 0.0,
+    "model_bbox_centrally_contained": true,
+    "region_bpoly_covered": true
+  },
+  "independent_boundary_geometry_audit": {
+    "crs": "EPSG:32618",
+    "obc_feature_count": 1,
+    "obc_geometry_type": "LineString",
+    "obc_is_valid": true,
+    "obc_is_simple": true,
+    "obc_is_nonbranching": true,
+    "obc_length_m": 57921.42747122094,
+    "obc_endpoint_lonlat": [
+      [
+        -74.76377124039256,
+        39.04205600069598
+      ],
+      [
+        -75.05456048113832,
+        38.60396610656219
+      ]
+    ],
+    "anchor_point_count": 2,
+    "endpoint_to_nearest_anchor_m": [
+      0.0,
+      0.0
+    ],
+    "endpoint_to_physical_coastline_m": [
+      4.505319366151123e-11,
+      294.6111515418113
+    ],
+    "physical_landfall_tolerance_m": 250.0,
+    "physical_landfall_excess_m": 44.6111515418113,
+    "physical_landfall_gate_pass": false,
+    "obc_land_intersection_length_m": 0.0,
+    "obc_wet_exterior_overlap_fraction": 1.0,
+    "obc_outside_region_bpoly_length_m": 3.988312300258826e-08,
+    "obc_outside_region_bpoly_fraction": 6.885728605774563e-13,
+    "wet_domain_geometry_type": "Polygon",
+    "wet_domain_valid": true,
+    "wet_domain_connected": true,
+    "wet_domain_area_m2": 2614759328.758873,
+    "frame_clip_feature_count": 2,
+    "unassigned_residual_length_m": 6294.397598471676,
+    "boundary_completeness_status": "pass",
+    "open_exterior_downstream_eligible": false
+  },
+  "terminal_delivery": {
+    "state": "failed_pre_mesh",
+    "obc_status": "failed",
+    "benchmark_grid_baseline_ready": false,
+    "fvcom_ready": false,
+    "accepted": false,
+    "submission_eligible": false,
+    "bathymetry_started": false,
+    "bathymetry_request_bounds_available": false,
+    "bathymetry_obc_support_report_available": false,
+    "bathymetry_source_transition_audit": "not_evaluated_pre_mesh_stop",
+    "delaware_depth_plausibility_audit": "not_evaluated_pre_mesh_stop",
+    "gmsh_started": false,
+    "mesh_available": false,
+    "mesh_topology_audit": "not_evaluated_pre_mesh_stop",
+    "obc_node_order_audit": "not_evaluated_pre_mesh_stop",
+    "node_budget_audit": "not_evaluated_pre_mesh_stop",
+    "standard_project_validation": "pass",
+    "benchmark_ready_validation": {
+      "passed": false,
+      "failure_taxonomy": [
+        "project_not_benchmark_ready",
+        "benchmark_mesh_missing"
+      ]
+    }
+  },
+  "retained_attempt_failure_pattern": [
+    {
+      "attempt": "canonical_long_path",
+      "path": "Workspace/Preprocessing/fvcom-grid-generation/runs/delaware_unbound_obc_test_20260825T054828Z/01_delaware_river_estuary",
+      "classification": "infrastructure_path_length_failure",
+      "failure": "pyogrio DataSourceError: unable to open database file while creating a GPKG on the long canonical Windows path",
+      "autonomous_response": "The clean-context agent retained the failure and moved to a new short-path project without scientific repair guidance."
+    },
+    {
+      "attempt": "broad_zero_residual",
+      "path": "Workspace/g/delaware_unbound_obc_20260825",
+      "classification": "v3_finalizer_state_deadlock",
+      "feedback_status": "pass",
+      "geometry_loop_status": "needs_review",
+      "obc_length_m": 111837.89199787719,
+      "land_crossing_m": 0.0,
+      "unintended_residual_length_m": 0.0,
+      "stop_reason": "feedback_not_adjustable",
+      "interpretation": "Automatic geometry passed, but role/finalization remained pending."
+    },
+    {
+      "attempt": "south_side_land_truncation",
+      "path": "Workspace/g/d3",
+      "classification": "genuine_land_side_truncation",
+      "feedback_status": "adjust_bpoly",
+      "stop_reason": "no_monotonic_clip_improvement",
+      "seed_obc_length_m": 416.477956930449,
+      "seed_residual_length_m": 94796.7583435473,
+      "candidate_residual_length_m": [
+        96552.67665454434,
+        97141.65897917698,
+        97877.41278860212
+      ],
+      "accepted_adjustment_count": 0,
+      "interpretation": "The land-only loop correctly requested BPoly adjustment and rejected all candidates because each worsened the residual."
+    },
+    {
+      "attempt": "east_120_and_authoritative",
+      "path": "Workspace/g/probe_e120 and Workspace/g/duo25",
+      "classification": "physical_landfall_and_residual_role_failure",
+      "physical_landfall_distance_m": 294.6111515418113,
+      "physical_landfall_tolerance_m": 250.0,
+      "unassigned_residual_length_m": 6294.397598471676,
+      "interpretation": "The same endpoint-lineage miss reproduced under the final supported orientation, so boundary generation was terminal."
+    }
+  ],
+  "artifact_evidence": [
+    {
+      "path": "Workspace/g/duo25/00_request/request.json",
+      "bytes": 3589,
+      "sha256": "086c333616a5642f5aab87760582cbd31981bea577fe6a095943f8107322d94f"
+    },
+    {
+      "path": "Workspace/g/duo25/01_region/region_bpoly.json",
+      "bytes": 14038,
+      "sha256": "08f3cfb180275d8394a353cec0d57fc98cae407f3a16351cd53cb75dc206f5e1"
+    },
+    {
+      "path": "Workspace/g/duo25/01_region/_work/initial_v2/region_bpoly_final_map.png",
+      "bytes": 1601803,
+      "sha256": "1921203b8120ee823f318d2f35606632172ac47ceb8650bb48df8328d54de694"
+    },
+    {
+      "path": "Workspace/g/duo25/02_coastline/coastline.gpkg",
+      "bytes": 2531328,
+      "sha256": "216f0e378d822df886f7e741acbd25d4e6243011d9463bb254bf9e3785458e20"
+    },
+    {
+      "path": "Workspace/g/duo25/02_coastline/_work/topology/health_check.json",
+      "bytes": 3302,
+      "sha256": "ffbfac1f9d96ff98b29f34dc2a38d9b7e18da7b8e1498d423296360f2381e4a3"
+    },
+    {
+      "path": "Workspace/g/duo25/03_boundary/bdry_arc_manifest.json",
+      "bytes": 85717,
+      "sha256": "e68b31c59bf085509302371b2df832d8f3211a2a8cf5feed6dc4b74218d3cef2"
+    },
+    {
+      "path": "Workspace/g/duo25/03_boundary/_work/fb/feedback_loop_summary.json",
+      "bytes": 48778,
+      "sha256": "eeb424d588c94b55338766bf9925f71a4336182e67d94e5269b6508260dd6288"
+    },
+    {
+      "path": "Workspace/g/duo25/03_boundary/_work/fb/i00/arc/bdry_arc_review_map.png",
+      "bytes": 267239,
+      "sha256": "a97f27ee363e7a6b981115269fe7742d3a22b3cb7aff7cf74554331d897a246c"
+    },
+    {
+      "path": "Workspace/g/duo25/final/fvcom_grid_status.json",
+      "bytes": 8031,
+      "sha256": "9360430b2c3149081404eb103c4c58d19cf3d81dfadfd5c674187f1ce4899701"
+    },
+    {
+      "path": "Workspace/Preprocessing/fvcom-grid-generation/runs/delaware_unbound_obc_test_20260825T054828Z/01_delaware_river_estuary/03_boundary/_work/feedback_loop/i00/arc/command.log",
+      "bytes": 20187,
+      "sha256": "5ac9488dd43f9e4e08f8d3af57d07b9d15c03fabf2db0761f28b724f86b7376e"
+    },
+    {
+      "path": "Workspace/g/delaware_unbound_obc_20260825/03_boundary/_work/fb/feedback_loop_summary.json",
+      "bytes": 30083,
+      "sha256": "ea6a7d7226dabd144dd861cc224a4b0cfa996dafeb65560866f3458820500099"
+    },
+    {
+      "path": "Workspace/g/d3/03_boundary/_work/fb/feedback_loop_summary.json",
+      "bytes": 70511,
+      "sha256": "aabe90254cfc0256adea72b0c57b6a3ab29789db75487c17326b8385603f6dbb"
+    },
+    {
+      "path": "Workspace/g/probe_e120/fb/feedback_loop_summary.json",
+      "bytes": 48058,
+      "sha256": "774270e1587ca51a415b0ee937e35e71cb104996394ac7a498225056e3773a00"
+    },
+    {
+      "path": "Workspace/g/probe_e150/fb/feedback_loop_summary.json",
+      "bytes": 69899,
+      "sha256": "1717f8beb4287218ffce250485d275007891ab70c3dca0a496054cf89db2ba8a"
+    }
+  ],
+  "post_run_audit_correction": {
+    "classification": "nonbehavioral_generated_contract_prose_fix",
+    "finding": "The tested RegionBPoly JSON still described envelope_bbox as a downstream bathymetry extent even though the grid implementation already used final model_domain_polygon plus halo.",
+    "correction": "Generated downstream_contract now limits envelope_bbox to RegionBPoly-stage coastline-source planning, explicitly names final model_domain_polygon plus halo for bathymetry, and states that the offshore OBC may deform outside RegionBPoly.",
+    "catalog_selftests": "pass",
+    "catalog_quick_validate": "pass",
+    "installed_quick_validate": "pass",
+    "catalog_installed_file_count": 27,
+    "catalog_installed_path_size_sha256_parity": "pass",
+    "run_region_bpoly_py_sha256": "273492b5b318f8db38f23cc33fe070e332a0a163f50a18d6b2f131aaf0ed0f33",
+    "selftest_region_bpoly_py_sha256": "cb0086741b9028a1645a29b00ec7c53d20d4f37308fcf5fec07e05e210c266f1",
+    "scientific_run_result_changed": false
+  },
+  "memory_update": {
+    "memo_path": "Memory/memo_v028.html",
+    "memo_bytes": 16416,
+    "memo_sha256": "2bb2e90ef66c216f0497257f85a84181881156a5f41e3d84ea138df653e28df2",
+    "index_path": "Memory/index.html",
+    "index_bytes": 22422,
+    "index_sha256": "3d669978e1993420adee575ff95be23d29d3f84d42de544d323390c3ecd65b2e",
+    "repository_tracking": "The Memory folder is outside the Agent_skill_dev Git worktree; hashes bind the external workspace memory update to this repository record."
+  },
+  "independent_scientific_verdict": {
+    "status": "fail_boundary_blocked_pre_mesh",
+    "unbound_obc_contract_status": "pass_regression_and_no_containment_related_forward_failure",
+    "delaware_grid_status": "not_generated",
+    "bathymetry_support_status": "not_exercised_by_forward_run",
+    "interpretation": "The requested containment removal behaved as designed: no candidate was rejected or BPoly-adjusted because of offshore OBC containment. The clean Delaware workflow nevertheless cannot publish a grid because a real physical-landfall lineage gate and residual-role gate remain unresolved. Keeping those gates strict was correct; no bathymetry or mesh should be generated from this boundary package.",
+    "next_failure_targets": [
+      "Resolve the 44.611 m physical-coastline landfall-lineage miss without weakening the land-crossing or physical-landfall contract.",
+      "Resolve the v3 pass-versus-finalizer state deadlock exposed by the broad zero-residual attempt.",
+      "Rerun from a short canonical project path, then exercise final-domain bathymetry fetch and the 100% OBC-support gate on real Delaware data."
+    ]
+  }
+}

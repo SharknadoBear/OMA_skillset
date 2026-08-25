@@ -759,8 +759,15 @@ def main() -> None:
         },
         "deformation_notes": deformation_notes,
         "downstream_contract": {
-            "bathymetry_and_coastline_fetch": "Use envelope_bbox.",
-            "domain_and_grid_generation": "Use polygon_lonlat / region_bpoly as controlling geometry.",
+            "bathymetry_and_coastline_fetch": (
+                "Use envelope_bbox only for RegionBPoly-stage coastline-source planning. "
+                "Fetch downstream bathymetry from the final model_domain_polygon plus the configured halo."
+            ),
+            "domain_and_grid_generation": (
+                "Use polygon_lonlat / region_bpoly as the mission and land-boundary completeness frame. "
+                "The delivered offshore OBC may deform outside it; the assembled model_domain_polygon "
+                "is authoritative for downstream grid generation."
+            ),
             "offshore_point": "Use the offshore point only to identify the intended offshore side for later coastline-anchor snapping; do not interpret it as a generated boundary arc.",
         },
     }

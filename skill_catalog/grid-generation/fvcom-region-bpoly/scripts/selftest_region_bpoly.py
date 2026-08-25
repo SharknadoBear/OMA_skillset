@@ -281,6 +281,11 @@ def main() -> None:
         assert not (exec_dir / "intermediate").exists()
         assert final["offshore_boundary_artifacts_path"].endswith("offshore_boundary_artifacts.json")
         assert final["qa"]["initial_guess_artifacts"]["retained"] is False
+        downstream = final["downstream_contract"]
+        assert "only for RegionBPoly-stage coastline-source planning" in downstream["bathymetry_and_coastline_fetch"]
+        assert "final model_domain_polygon" in downstream["bathymetry_and_coastline_fetch"]
+        assert "delivered offshore OBC may deform outside" in downstream["domain_and_grid_generation"]
+        assert "authoritative for downstream grid generation" in downstream["domain_and_grid_generation"]
         tight = final["qa"]["bpoly_quality"]["tight_feature_fit"]
         assert tight["domain_scale"] == "small_estuary", tight
         assert tight["approx_width_km"] <= tight["small_estuary_limits"]["max_width_km"], tight
