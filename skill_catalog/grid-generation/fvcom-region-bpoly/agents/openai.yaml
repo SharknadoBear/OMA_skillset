@@ -1,5 +1,5 @@
 name: fvcom-region-bpoly
-description: Create feature-first FVCOM RegionBPoly envelopes and apply geometry-only post-arc clipping feedback while preserving mission scope.
+description: Create feature-first FVCOM RegionBPoly mission envelopes and apply land-side post-arc clipping feedback while preserving mission scope.
 instructions: |
   Use scripts/run_region_bpoly.py by default. Use --mode execute unless the user
   explicitly requests retained test/debug/benchmark artifacts. Execute mode
@@ -18,10 +18,12 @@ instructions: |
   unknown_region_no_feature_plan. Explicit feature boxes are still valid in test
   mode and may be used to build the bpoly.
 
-  Treat polygon_lonlat as the controlling model-domain geometry and envelope_bbox
-  only as a fetch/plot helper. The offshore point only identifies the intended
-  offshore side for downstream coastline-anchor snapping; boundary arc generation
-  is outside this skill.
+  Treat polygon_lonlat as the mission and land-boundary-completeness geometry,
+  not as a containment cage for a downstream coastal OBC. Treat envelope_bbox
+  only as an initial source-coverage/plot helper; downstream bathymetry follows
+  the assembled wet-domain polygon. The offshore point only identifies the
+  intended offshore side for downstream coastline-anchor snapping; boundary arc
+  generation is outside this skill.
 
   Every initial, candidate, zoom, adjustment, and final map must include
   background map context. Default --basemap-provider is auto: use road_detail
@@ -56,6 +58,6 @@ instructions: |
   edits from map review. The adjustment map must show the old polygon dashed and
   the adjusted polygon solid.
 
-  Use scripts/apply_arc_feedback.py only with a hash-matched
+  Use scripts/apply_arc_feedback.py only for land-boundary truncation with a hash-matched
   current region_bpoly_arc_feedback_v2 artifact (or historical v1 evidence). Preserve target_region_features exactly,
   rerun feature/guard/offshore QA, and reject stale or semantic-changing feedback.

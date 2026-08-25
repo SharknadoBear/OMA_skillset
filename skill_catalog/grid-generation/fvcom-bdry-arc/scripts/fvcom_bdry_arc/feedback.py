@@ -224,6 +224,17 @@ def build_region_bpoly_arc_feedback(
     frame_xy = _project_geometries(frame_gdf, projection)
     open_xy = _project_geometries(open_gdf, projection)
     open_union = unary_union(open_xy) if open_xy else GeometryCollection()
+    open_length_for_bpoly_m = float(getattr(open_union, "length", 0.0))
+    open_outside_bpoly_length_m = float(
+        getattr(open_union.difference(polygon_xy), "length", 0.0)
+        if not open_union.is_empty
+        else 0.0
+    )
+    open_outside_bpoly_fraction = float(
+        open_outside_bpoly_length_m / open_length_for_bpoly_m
+        if open_length_for_bpoly_m > 0.0
+        else 0.0
+    )
     land_union_for_contract = _load_land_union(coastline_gpkg, projection)
     physical_coastline_for_contract = _load_physical_coastline_union(coastline_gpkg, projection)
     target_resolution_m = float(source_manifest.get("settings", {}).get("target_resolution_m", 250.0))
@@ -587,6 +598,8 @@ def build_region_bpoly_arc_feedback(
             "candidate_max_km": float(candidate_max_km),
             "semantics_policy": "geometry_only_no_feature_inference",
             "boundary_completeness_policy": "hybrid",
+            "loop_scope": "land_boundary_only",
+            "offshore_obc_bpoly_containment_required": False,
         },
         "inputs": {
             "region_bpoly_json": str(region_path),
@@ -619,6 +632,8 @@ def build_region_bpoly_arc_feedback(
             "open_boundary_exterior_overlap_fraction": float(loop_manifest.get("qa", {}).get("open_boundary_exterior_overlap_fraction", 0.0) or 0.0),
             "outer_boundary_length_m": outer_length_m,
             "open_boundary_length_m": open_length_m,
+            "open_boundary_outside_region_bpoly_length_m": open_outside_bpoly_length_m,
+            "open_boundary_outside_region_bpoly_fraction": open_outside_bpoly_fraction,
             "landward_boundary_length_m": landward_length_m,
             "unintended_frame_clip_length_m": unintended_length_m,
             "unintended_frame_clip_fraction": unintended_fraction,
@@ -759,6 +774,8 @@ def build_region_bpoly_arc_feedback(
         "boundary_lengths": {
             "outer_boundary_length_m": outer_length_m,
             "open_boundary_length_m": open_length_m,
+            "open_boundary_outside_region_bpoly_length_m": open_outside_bpoly_length_m,
+            "open_boundary_outside_region_bpoly_fraction": open_outside_bpoly_fraction,
             "landward_boundary_length_m": landward_length_m,
         },
         "hard_metrics": {

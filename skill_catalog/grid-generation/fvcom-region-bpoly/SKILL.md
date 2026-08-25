@@ -1,6 +1,6 @@
 ---
 name: fvcom-region-bpoly
-description: Create and geometrically adjust map-guided, feature-first four-sided RegionBPoly envelopes for FVCOM preprocessing, including post-arc GSHHS clipping feedback, target-feature preservation, offshore-side artifacts, and QA scoring.
+description: Create and geometrically adjust map-guided, feature-first four-sided RegionBPoly mission envelopes for FVCOM preprocessing, including land-side GSHHS clipping feedback, target-feature preservation, offshore-side artifacts, and QA scoring.
 ---
 
 # fvcom-region-bpoly
@@ -9,7 +9,16 @@ Use this skill to turn a natural-language FVCOM regional ocean, estuary, lake, i
 
 ## Core Rule
 
-The four-sided `polygon_lonlat` is the controlling model-domain envelope. The `envelope_bbox` is only a helper for bathymetry/coastline fetching, source-coverage checks, and plot limits.
+The four-sided `polygon_lonlat` controls mission scope, required-feature coverage,
+and the downstream land-boundary completeness frame. It is not a containment
+cage for a coastal delivered offshore OBC. The OBC may deform beyond the
+polygon after it passes topology, landfall, land-intersection, and downstream
+bathymetry-support gates. The assembled downstream `model_domain_polygon` is
+the authoritative wet-domain geometry.
+
+The `envelope_bbox` is an initial coastline/source-coverage and plot helper.
+It is not the downstream bathymetry request extent; downstream tools derive
+that extent from the assembled wet-domain polygon plus their sampling halo.
 
 Do not generate meshes or coastline boundary arcs in this skill.
 
@@ -17,7 +26,7 @@ GSHHS remains downstream in `fvcom-bdry-arc`. This skill may consume its current
 
 ## Offshore Point Purpose
 
-The offshore point only identifies the intended offshore side for downstream coastline-anchor snapping. Downstream tools can use that side to snap onto the two outermost coastline anchor points and decide where the offshore boundary arc belongs.
+The offshore point only identifies the intended offshore side for downstream coastline-anchor snapping. Downstream tools can use that side to snap onto the two outermost coastline anchor points and decide where the offshore boundary arc belongs. It does not require the delivered arc to remain inside RegionBPoly.
 
 This skill does not generate that boundary arc.
 
@@ -137,7 +146,7 @@ Every accepted bpoly needs a domain type in final JSON:
 
 Use `scripts/adjust_region_bpoly.py` when the agent needs direct final-stage polygon edits from map review.
 
-Use `scripts/apply_arc_feedback.py` for a geometry-only adjustment requested by `fvcom-bdry-arc`. The command defaults to the resilient `auto` basemap chain, verifies the feedback hash, applies one named full-edge or tapered reshape candidate, preserves `target_region_features` exactly by canonical hash, recomputes required-feature and obstruction QA, resnaps the offshore reference, and writes a complete downstream-compatible RegionBPoly plus a geography-usable comparison map. Reject stale feedback, semantic mutations, invalid polygons, lost required features, and new obstruction conflicts.
+Use `scripts/apply_arc_feedback.py` for a geometry-only land-boundary completeness adjustment requested by `fvcom-bdry-arc`. An offshore OBC excursion outside RegionBPoly is diagnostic and must never request this adjustment. The command defaults to the resilient `auto` basemap chain, verifies the feedback hash, applies one named full-edge or tapered reshape candidate, preserves `target_region_features` exactly by canonical hash, recomputes required-feature and obstruction QA, resnaps the offshore reference, and writes a complete downstream-compatible RegionBPoly plus a geography-usable comparison map. Reject stale feedback, semantic mutations, invalid polygons, lost required features, and new obstruction conflicts.
 
 The adjustment manifest supports:
 

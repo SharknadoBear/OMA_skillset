@@ -16,7 +16,7 @@ Expected connector output:
 - Metadata JSON with `coverage_by_source`, `no_data_cells`, `finite_output_fraction`, and `outputs.netcdf`.
 - Source-id diagnostic PNG and health-check JSON.
 
-`fvcom-grid-generation` consumes the NetCDF and normalizes it to positive-down depth. If no bathymetry file is supplied and `--request-text` is used, `run_fvcom_grid.py` calls the connector using the upstream `region_bpoly.json` envelope bbox.
+`fvcom-grid-generation` consumes the NetCDF and normalizes it to positive-down depth. If no bathymetry file is supplied, `run_fvcom_grid.py` calls the connector using the assembled `model_domain_polygon` buffered in projected coordinates by `--bathy-fetch-halo-m` (2 km by default). RegionBPoly is provenance and initial source-coverage intent, not the bathymetry fetch extent. Before any size-field or mesh work, require at least 95% finite sampled wet-domain coverage and 100% finite support along every densified delivered OBC.
 
 Prefer the NetCDF variable `depth_m` when present. Treat `elevation_m` as positive-up and convert it to positive-down depth only when no depth variable is available.
 

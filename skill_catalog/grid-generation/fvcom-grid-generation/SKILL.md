@@ -19,6 +19,13 @@ fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> fvcom-grid-generation
 - Revalidate `fvcom_open_exterior_contract_v1|v2|v3` at every coastal entry point. New standardized coastal projects require v3 plus a passing hash-bound `region_bpoly_arc_feedback_loop_v2`; every residual must clear boundary completeness before it can receive a role. Treat approved lagoon closures as fixed solid boundary, require station evidence and requested-count permission for secondary tidal OBCs, and reject truncating/unassigned water, missing or stale decisions/maps/loop evidence, invalid geometry, report-only packages, or `downstream_eligible=false` even when an upstream manifest says `pass`. Historical v1/v2 remain readable diagnostics.
 - Revalidate `fvcom_coastline_source_coverage_v1` with every coastal open-exterior contract. Require at least 2x centered coverage, a physical-coastline-only landfall lineage, zero source-frame dependency, and current whole/zoom map hashes. Historical exact-bbox evidence remains readable but is ineligible for new standardized projects without this proof.
 - Keep full bathymetry for final node sampling and bound only the in-memory size-field grid.
+- For automatic acquisition, derive the bathymetry request bbox from the
+  assembled `model_domain_polygon` with the configured projected halo (2 km by
+  default), never from the earlier RegionBPoly envelope. Require at least 95%
+  finite sampled wet-domain coverage and 100% finite support along every
+  delivered OBC before size-field construction. Sample the OBC at no more than
+  half the minimum raster-axis step and use `NaN`, not a median fallback,
+  outside source support.
 - Build nearshore sizing from the solid-boundary background, bathymetric gradient, and a geometry-derived paired-bank hydraulic skeleton. Detect the skeleton from land and island segments only; never use an open-boundary segment as a bank.
 - Do not consume or generate an external drainage/flow-network package. Infer hydraulic corridors directly from the wet model polygon, solid boundary geometry, and the supplied bathymetry.
 - For open domains, propagate the delivered OBC target and distance through connected wet cells, hold offshore authority near the OBC, then transfer smoothly in log space to the nearshore target. Treat the configured transfer distance as a minimum and extend it automatically when the declared gradation requires more wet distance. For closed domains, omit this transfer.
@@ -170,6 +177,11 @@ Important controls:
 - `--postprocess-profile`, compatibility default `none`; non-`none` integrated requests are rejected with standalone-tool guidance.
 - `--max-total-nodes` and `--node-budget-stop-fraction` default to 1,000,000 and `0.90`, producing a 900,000-node planning gate. They audit the pre-triangulation estimate, including explicit boundary and boundary-front seeds. The audit is recorded for every boundary package and remains a hard gate for adaptive-coastal-v2. Independently audit the delivered node count after every generator; exceeding 1,000,000 is a hard failure even when preflight passed.
 - `--land-spacing-m`, `--open-spacing-m`, `--max-interior-points`, and `--size-field-max-cells` set the boundary targets and execution limits. The default interior-seed ceiling is 900,000 so it does not retain the former 80,000-point bottleneck.
+- `--bathy-fetch-halo-m`, default `2000`, buffers the assembled wet-domain
+  polygon in projected meters before automatic CUDEM/NBS/CRM/ETOPO acquisition.
+  RegionBPoly remains provenance and source-coverage intent, not the fetch
+  extent. `open_boundary_bathymetry_support_incomplete` is a distinct pre-mesh
+  failure.
 
 To stop after the initial constrained mesh, explicitly use
 `--no-regional-spring-relaxation --no-thin-triangle-repair

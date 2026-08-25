@@ -16,7 +16,7 @@ import xarray as xr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fvcom_grid_generation.bathymetry import BathymetryGrid, coarsen_for_size_field, write_synthetic_bathymetry  # noqa: E402
+from fvcom_grid_generation.bathymetry import BathymetryGrid, bathymetry_coverage_report, coarsen_for_size_field, write_synthetic_bathymetry  # noqa: E402
 from fvcom_grid_generation.boundary import BoundaryConfig, _resolve_manifest_output, load_boundary_package, load_boundary_resolution, prepare_boundary_nodes  # noqa: E402
 from fvcom_grid_generation.mesh import _ordered_boundary_kind_group  # noqa: E402
 from fvcom_grid_generation.local_topology import AggressiveConditioningConfig, condition_mesh_aggressive, inventory_high_valence  # noqa: E402
@@ -36,6 +36,7 @@ from fvcom_grid_generation.bathymetry import load_bathymetry  # noqa: E402
 from fvcom_grid_generation.sms_2dm import read_2dm, write_2dm  # noqa: E402
 from fvcom_grid_generation.workflow import (  # noqa: E402
     GridConfig,
+    _boundary_domain_bbox,
     _bathy_fetch_command,
     _parse_required_source_count,
     run_fvcom_grid,
@@ -424,6 +425,53 @@ def test_generated_chain_uses_fallback_bathy_command() -> None:
     assert "cudem-nbs-crm-etopo" in cmd
     assert "1.0" in cmd
     assert _parse_required_source_count("641 sources intersect bbox, exceeding max_sources=256.") == 641
+
+
+def test_bathymetry_extent_follows_final_domain_with_projected_halo() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        loops = _simple_synthetic_boundary_package(Path(tmp) / "loops.gpkg")
+        package = load_boundary_package(loops)
+        raw_bounds = package.domain_polygon_lonlat.bounds
+        requested = _boundary_domain_bbox(loops, halo_m=2000.0)
+        assert requested[0] < raw_bounds[0]
+        assert requested[1] < raw_bounds[1]
+        assert requested[2] > raw_bounds[2]
+        assert requested[3] > raw_bounds[3]
+        no_halo = _boundary_domain_bbox(loops, halo_m=0.0)
+        assert np.allclose(no_halo, raw_bounds, atol=1.0e-10)
+
+
+def test_bathymetry_coverage_requires_complete_obc_support() -> None:
+    lon = np.linspace(-1.0, 1.0, 101)
+    lat = np.linspace(-1.0, 1.0, 101)
+    depth = np.full((len(lat), len(lon)), 10.0, dtype=float)
+    domain = Polygon([(-0.8, -0.8), (0.8, -0.8), (0.8, 0.8), (-0.8, 0.8)])
+    inside_obc = LineString([(0.8, -0.8), (0.8, 0.8)])
+    bathy = BathymetryGrid(lon=lon, lat=lat, depth=depth)
+
+    supported = bathymetry_coverage_report(bathy, domain, inside_obc)
+    assert supported["passed"] is True
+    assert supported["finite_open_boundary_fraction"] == 1.0
+    assert supported["unsupported_open_boundary_sample_count"] == 0
+
+    outside_obc = LineString([(1.1, -0.8), (1.1, 0.8)])
+    outside = bathymetry_coverage_report(bathy, domain, outside_obc)
+    assert outside["finite_wet_fraction"] == 1.0
+    assert outside["open_boundary_bathymetry_support_passed"] is False
+    assert "open_boundary_bathymetry_support_incomplete" in outside["failure_taxonomy"]
+
+    depth_with_strip = depth.copy()
+    depth_with_strip[:, len(lon) // 2] = np.nan
+    strip_bathy = BathymetryGrid(lon=lon, lat=lat, depth=depth_with_strip)
+    strip_obc = LineString([(0.0, -0.8), (0.0, 0.8)])
+    strip = bathymetry_coverage_report(strip_bathy, domain, strip_obc)
+    assert strip["finite_wet_fraction"] >= 0.95
+    assert strip["open_boundary_bathymetry_support_passed"] is False
+    assert strip["open_boundary_outside_support_fill"] == "nan"
+
+    closed = bathymetry_coverage_report(bathy, domain, LineString())
+    assert closed["passed"] is True
+    assert closed["open_boundary_required"] is False
 
 
 def test_oceanmesh_metrics_and_true_neighbor_valence() -> None:
@@ -898,6 +946,8 @@ def main() -> int:
     test_elevation_m_only_is_positive_up()
     test_size_field_bathy_coarsening_caps_cells()
     test_generated_chain_uses_fallback_bathy_command()
+    test_bathymetry_extent_follows_final_domain_with_projected_halo()
+    test_bathymetry_coverage_requires_complete_obc_support()
     test_oceanmesh_metrics_and_true_neighbor_valence()
     test_ordered_open_boundary_group_is_contiguous()
     test_constraint_preserving_rpw2019_postprocess()

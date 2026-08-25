@@ -14,7 +14,11 @@ from typing import Any
 
 import numpy as np
 
-from .bathymetry import coarsen_for_size_field, load_bathymetry
+from .bathymetry import (
+    bathymetry_coverage_report,
+    coarsen_for_size_field,
+    load_bathymetry,
+)
 from .boundary import (
     BoundaryConfig,
     boundary_nodes_geojson,
@@ -34,7 +38,12 @@ from .node_budget import (
 from .plotting import write_mesh_gpkg, write_mesh_quality_gpkg, write_mesh_review_map
 from .progress import ProgressTracker
 from .open_exterior import validate_open_exterior_contract
-from .projection import project_points, unproject_points
+from .projection import (
+    project_geometry,
+    project_points,
+    unproject_geometry,
+    unproject_points,
+)
 from .quality import evaluate_mesh_quality
 from .quality_policy import apply_quality_policy, load_quality_policy
 from .size_field import (
@@ -76,6 +85,7 @@ class GridConfig:
     bathy_resolution_policy: str = "source-priority"
     bathy_target_spacing_arcsec: float = 1.0
     bathy_max_sources: int = 256
+    bathy_fetch_halo_m: float = 2000.0
     progress_interval_s: float = 10.0
     size_field_max_cells: int = 1_500_000
     boundary_resolution_profile: str = "legacy"
@@ -153,6 +163,11 @@ def run_fvcom_grid(
         or float(config.coastal_distance_m) < 0.0
     ):
         raise ValueError("coastal_distance_m must be nonnegative")
+    if (
+        not np.isfinite(float(config.bathy_fetch_halo_m))
+        or float(config.bathy_fetch_halo_m) < 0.0
+    ):
+        raise ValueError("bathy_fetch_halo_m must be nonnegative")
     if config.conditioning_profile not in {
         "auto",
         "minimal-topology-v1",
@@ -286,6 +301,31 @@ def run_fvcom_grid(
 
     progress.update("load_bathymetry", 28.0, message="Loading positive-down bathymetry grid.", artifact=bathy_nc)
     bathy = load_bathymetry(bathy_nc)
+    bathymetry_coverage = bathymetry_coverage_report(
+        bathy,
+        boundary_package.domain_polygon_lonlat,
+        boundary_package.open_boundary_lonlat,
+    )
+    bathymetry_coverage_path = run_dir / "bathymetry_coverage.json"
+    bathymetry_coverage_path.write_text(
+        json.dumps(_json_safe(bathymetry_coverage), indent=2),
+        encoding="utf-8",
+    )
+    progress.update(
+        "audit_bathymetry_coverage",
+        29.0,
+        message="Auditing wet-domain and strict delivered-OBC bathymetry support.",
+        artifact=bathymetry_coverage_path,
+        extra={
+            "passed": bool(bathymetry_coverage["passed"]),
+            "failure_taxonomy": bathymetry_coverage["failure_taxonomy"],
+        },
+    )
+    if not bathymetry_coverage["passed"]:
+        raise ValueError(
+            "bathymetry coverage contract failed: "
+            + ", ".join(bathymetry_coverage["failure_taxonomy"])
+        )
     progress.update(
         "prepare_size_field_bathymetry",
         31.0,
@@ -692,6 +732,7 @@ def run_fvcom_grid(
             "bathy_resolution_policy": config.bathy_resolution_policy,
             "bathy_target_spacing_arcsec": float(config.bathy_target_spacing_arcsec),
             "bathy_max_sources": int(config.bathy_max_sources),
+            "bathy_fetch_halo_m": float(config.bathy_fetch_halo_m),
             "size_field_max_cells": int(config.size_field_max_cells),
             "boundary_resolution_profile": config.boundary_resolution_profile,
             "regional_spring_relaxation": bool(config.regional_spring_relaxation),
@@ -779,6 +820,8 @@ def run_fvcom_grid(
             "fetch_metadata_json": upstream.get("bathy_metadata_json"),
             "source_id_map": upstream.get("bathy_source_png"),
             "health_check_json": upstream.get("bathy_health_check_json"),
+            "coverage": bathymetry_coverage,
+            "coverage_json": str(bathymetry_coverage_path),
         },
         "mesh": mesh.report,
         "boundary_resolution": resolution_doc,
@@ -812,6 +855,7 @@ def run_fvcom_grid(
             "node_budget_delivered_json": str(
                 delivered_node_budget_path
             ),
+            "bathymetry_coverage_json": str(bathymetry_coverage_path),
             "delivered_boundary_nodes_geojson": str(delivered_boundary_nodes_path),
             "mesh_nodes_elements_gpkg": str(mesh_gpkg),
             "mesh_quality_elements_gpkg": str(mesh_quality_gpkg),
@@ -867,11 +911,9 @@ def _resolve_upstream_artifacts(
     cudem_skill = _find_skill("cudem-bathy", catalog_relative=("external-data-connectors", "cudem-bathy"))
 
     if boundary_loops_gpkg and bathy_nc is None:
-        if not region_bpoly_json:
-            raise ValueError("Provide --region-bpoly-json when fetching bathymetry for supplied --boundary-loops-gpkg")
         bathy_info = _fetch_bathy_sources(
             cudem_skill,
-            Path(region_bpoly_json),
+            Path(boundary_loops_gpkg),
             bathy_dir,
             name,
             config,
@@ -879,7 +921,7 @@ def _resolve_upstream_artifacts(
         )
         result.update(
             {
-                "region_bpoly_json": str(region_bpoly_json),
+                "region_bpoly_json": str(region_bpoly_json) if region_bpoly_json else None,
                 "offshore_artifacts_json": str(offshore_artifacts_json) if offshore_artifacts_json else None,
                 "bdry_arc_manifest": str(bdry_arc_manifest) if bdry_arc_manifest else None,
                 "boundary_loops_gpkg": str(boundary_loops_gpkg),
@@ -890,7 +932,7 @@ def _resolve_upstream_artifacts(
         return result
 
     if not request_text:
-        raise ValueError("Provide --request-text, or provide --boundary-loops-gpkg with --region-bpoly-json so bathymetry can be fetched.")
+        raise ValueError("Provide --request-text, or provide --boundary-loops-gpkg so bathymetry can be fetched from the assembled wet-domain footprint.")
 
     region_bpoly_json = Path(region_bpoly_json) if region_bpoly_json else bpoly_dir / "region_bpoly.json"
     offshore_artifacts_json = Path(offshore_artifacts_json) if offshore_artifacts_json else bpoly_dir / "offshore_boundary_artifacts.json"
@@ -952,7 +994,7 @@ def _resolve_upstream_artifacts(
         raise ValueError(f"{config.boundary_resolution_profile} requires a passing boundary_resolution_manifest")
 
     if bathy_nc is None:
-        bathy_info = _fetch_bathy_sources(cudem_skill, Path(region_bpoly_json), bathy_dir, name, config, progress)
+        bathy_info = _fetch_bathy_sources(cudem_skill, Path(boundary_loops_gpkg), bathy_dir, name, config, progress)
         bathy_nc = bathy_info["bathy_nc"]
     else:
         bathy_info = {"bathy_nc": str(bathy_nc)}
@@ -972,13 +1014,16 @@ def _resolve_upstream_artifacts(
 
 def _fetch_bathy_sources(
     cudem_skill: Path,
-    region_bpoly_json: Path,
+    boundary_loops_gpkg: Path,
     bathy_dir: Path,
     name: str,
     config: GridConfig,
     progress: ProgressTracker,
 ) -> dict[str, Any]:
-    bbox = _region_bbox(region_bpoly_json)
+    bbox = _boundary_domain_bbox(
+        boundary_loops_gpkg,
+        halo_m=float(config.bathy_fetch_halo_m),
+    )
     bathy_dir.mkdir(parents=True, exist_ok=True)
     fetch_name = f"{name}_bathy"
     index_path = bathy_dir / "bathy_source_index.json"
@@ -994,6 +1039,9 @@ def _fetch_bathy_sources(
         "resolution_policy": config.bathy_resolution_policy,
         "target_spacing_arcsec": float(config.bathy_target_spacing_arcsec),
         "max_sources": int(config.bathy_max_sources),
+        "footprint_source": "model_domain_polygon_buffer",
+        "boundary_loops_gpkg": str(boundary_loops_gpkg),
+        "bathymetry_fetch_halo_m": float(config.bathy_fetch_halo_m),
     }
     request_path.write_text(json.dumps(request, indent=2) + "\n", encoding="utf-8")
     if nc_path.exists() and metadata_path.exists():
@@ -1056,6 +1104,8 @@ def _fetch_bathy_sources(
         "bathy_health_check_json": str(health_path),
         "bathy_request_json": str(request_path),
         "bathy_source_index_json": str(index_path),
+        "bathy_request_bbox_wsen": bbox,
+        "bathy_request_footprint_source": "model_domain_polygon_buffer",
     }
 
 
@@ -1090,14 +1140,19 @@ def _bathy_fetch_command(
     ]
 
 
-def _region_bbox(region_bpoly_json: Path) -> list[float]:
-    region_doc = json.loads(region_bpoly_json.read_text(encoding="utf-8-sig"))
-    bbox = region_doc.get("envelope_bbox")
-    if not bbox:
-        bbox = region_doc.get("region_bpoly", {}).get("envelope_bbox")
-    if not bbox:
-        raise ValueError("Cannot fetch bathymetry without region_bpoly envelope_bbox")
-    return [float(value) for value in bbox]
+def _boundary_domain_bbox(
+    boundary_loops_gpkg: Path,
+    halo_m: float = 2000.0,
+) -> list[float]:
+    """Return the assembled model-domain bbox with a projected sampling halo."""
+    package = load_boundary_package(boundary_loops_gpkg)
+    domain_xy = project_geometry(
+        package.domain_polygon_lonlat,
+        package.projection,
+    )
+    buffered = domain_xy.buffer(float(halo_m)) if halo_m > 0.0 else domain_xy
+    domain_with_halo = unproject_geometry(buffered, package.projection)
+    return [float(value) for value in domain_with_halo.bounds]
 
 
 def _parse_required_source_count(text: str) -> int | None:

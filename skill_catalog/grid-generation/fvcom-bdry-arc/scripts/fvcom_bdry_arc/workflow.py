@@ -1032,7 +1032,7 @@ def score_and_select_bdry_arc(
     bpoly_xy: Polygon,
     target_resolution_m: float,
 ) -> dict[str, Any]:
-    """Score offshore arcs and select the best candidate."""
+    """Score coastal OBC candidates without treating RegionBPoly as a cage."""
     scored: list[dict[str, Any]] = []
     endpoint_mask_factor = max(3.0 * target_resolution_m, 500.0)
     for candidate in candidates:
@@ -1050,21 +1050,37 @@ def score_and_select_bdry_arc(
         inside_fraction = sum(1 for pt in samples if bpoly_xy.buffer(target_resolution_m).contains(pt)) / max(len(samples), 1)
         chord = Point(coords[0]).distance(Point(coords[-1]))
         length_ratio = float(line.length / max(chord, 1.0))
-        score = 100.0 * inside_fraction
-        score += min(float(candidate["bow_distance_m"] / max(chord, 1.0)), 2.0) * 10.0
-        score -= max(length_ratio - 1.8, 0.0) * 20.0
+        bow_ratio = float(candidate.get("bow_distance_m", 0.0)) / max(chord, 1.0)
+        # RegionBPoly provides mission/land-side intent and candidate
+        # orientation.  The delivered offshore OBC is allowed to deform beyond
+        # it, so containment remains diagnostic-only.  Prefer the least excess
+        # geometry before the topology stage performs the hard scientific
+        # checks.
+        score = -25.0 * max(length_ratio - 1.0, 0.0)
+        score -= 10.0 * max(bow_ratio, 0.0)
         if extra_intersection:
             score -= 80.0 + min(extra_intersection_length_m / max(target_resolution_m, 1.0), 80.0)
         item = dict(candidate)
         item["score"] = float(score)
         item["metrics"] = {
             "inside_bpoly_fraction": float(inside_fraction),
+            "outside_bpoly_fraction": float(max(0.0, 1.0 - inside_fraction)),
+            "offshore_obc_bpoly_containment_required": False,
             "length_ratio": float(length_ratio),
+            "bow_ratio": float(bow_ratio),
             "extra_coastline_intersection": bool(extra_intersection),
             "extra_intersection_length_m": float(extra_intersection_length_m),
         }
         scored.append(item)
-    scored.sort(key=lambda obj: obj["score"], reverse=True)
+    scored.sort(
+        key=lambda obj: (
+            bool(not obj["metrics"]["extra_coastline_intersection"]),
+            -float(obj["metrics"]["length_ratio"]),
+            -float(obj["metrics"]["bow_ratio"]),
+            str(obj.get("candidate_id", "")),
+        ),
+        reverse=True,
+    )
     return {"selected": scored[0], "candidates": scored}
 
 
@@ -1204,17 +1220,30 @@ def select_gshhs_open_side_topology(
             topology_score += 140.0
         if metadata.get("deformed_frame_valid"):
             topology_score += 80.0
-        topology_score += 35.0 * min(max(bow_ratio, 0.0) / 0.20, 1.0)
         topology_score -= max(0.98 - float(metadata.get("open_arc_boundary_overlap_fraction", 0.0)), 0.0) * 600.0
         topology_score -= max(float(metrics.get("length_ratio", 1.0)) - 1.25, 0.0) * 100.0
+        topology_score -= 20.0 * max(bow_ratio, 0.0)
         if metadata.get("arc_land_intersection"):
             topology_score -= 180.0
             topology_score -= min(float(metadata.get("arc_land_intersection_length_m", 0.0)) / max(target_resolution_m, 1.0), 100.0) * 5.0
         if metadata.get("gshhs_missing_land_polygons"):
             topology_score -= 120.0
 
+        delivered_arc = result.get("open_arc_xy", candidate["geometry"])
+        structural_topology_pass = bool(
+            getattr(delivered_arc, "is_simple", False)
+            and float(metadata.get("open_arc_boundary_overlap_fraction", 0.0)) >= 0.98
+            and metadata.get("seed_inside")
+            and metadata.get("deformed_frame_valid")
+            and not metadata.get("arc_land_intersection")
+            and not metadata.get("gshhs_missing_land_polygons")
+        )
+        metrics["bow_ratio"] = float(bow_ratio)
+        metrics["structural_topology_pass"] = structural_topology_pass
+        metrics["offshore_obc_bpoly_containment_required"] = False
+
         item = dict(candidate)
-        item["geometry"] = result.get("open_arc_xy", candidate["geometry"])
+        item["geometry"] = delivered_arc
         item["metrics"] = metrics
         item["score"] = float(topology_score)
         result["metadata"]["candidate_id"] = candidate.get("candidate_id")
@@ -1247,7 +1276,19 @@ def select_gshhs_open_side_topology(
                 )
             break
 
-    evaluated.sort(key=lambda pair: pair[0]["score"], reverse=True)
+    evaluated.sort(
+        key=lambda pair: (
+            bool(pair[0]["metrics"].get("structural_topology_pass")),
+            float(pair[0]["metrics"].get("open_arc_boundary_overlap_fraction", 0.0)),
+            bool(pair[1]["metadata"].get("seed_inside")),
+            bool(pair[1]["metadata"].get("deformed_frame_valid")),
+            -float(pair[1]["metadata"].get("arc_land_intersection_length_m", 0.0)),
+            -float(pair[0]["metrics"].get("length_ratio", 1.0)),
+            -float(pair[0]["metrics"].get("bow_ratio", 0.0)),
+            str(pair[0].get("candidate_id", "")),
+        ),
+        reverse=True,
+    )
     selected, wet_result = evaluated[0]
     if budget_exceeded:
         wet_result["metadata"]["topology_budget_exceeded"] = True
@@ -4137,6 +4178,13 @@ def _final_status(
     if metadata.get("arc_land_intersection") and closure_method != "island_archipelago_offshore_loop":
         failures.append("gshhs_open_arc_crosses_land")
     if closure_method in {"deformed_bpoly_frame_minus_gshhs_land", "coastline_anchor_seaward_bpoly_chain", "island_archipelago_offshore_loop"}:
+        delivered_open_arc = wet_result.get("open_arc_xy")
+        if (
+            closure_method != "island_archipelago_offshore_loop"
+            and delivered_open_arc is not None
+            and not bool(getattr(delivered_open_arc, "is_simple", False))
+        ):
+            failures.append("open_arc_self_intersects_or_branches")
         if not metadata.get("deformed_frame_valid"):
             failures.append("deformed_bpoly_frame_invalid")
         threshold = 0.90 if closure_method == "island_archipelago_offshore_loop" and metadata.get("island_blocker_land_patch_used") else 0.98

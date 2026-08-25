@@ -7,8 +7,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import shapely
 import xarray as xr
 from scipy.interpolate import RegularGridInterpolator
+from shapely.geometry import LineString, MultiLineString, Polygon
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,171 @@ class BathymetryGrid:
             fill_value=fill,
         )
         return np.asarray(interp(np.column_stack([lat, lon])), dtype=float)
+
+
+def bathymetry_coverage_report(
+    bathymetry: BathymetryGrid,
+    domain_lonlat: Polygon,
+    open_boundary_lonlat: LineString | MultiLineString | None = None,
+) -> dict[str, Any]:
+    """Audit domain coverage and require complete finite support on every OBC."""
+    lon = np.asarray(bathymetry.lon, dtype=float)
+    lat = np.asarray(bathymetry.lat, dtype=float)
+    depth = np.asarray(bathymetry.depth, dtype=float)
+    lon_monotonic = bool(np.all(np.diff(lon) > 0.0) or np.all(np.diff(lon) < 0.0))
+    lat_monotonic = bool(np.all(np.diff(lat) > 0.0) or np.all(np.diff(lat) < 0.0))
+    lon_step = float(np.quantile(np.abs(np.diff(lon)), 0.95)) if len(lon) > 1 else 0.0
+    lat_step = float(np.quantile(np.abs(np.diff(lat)), 0.95)) if len(lat) > 1 else 0.0
+    west, south, east, north = domain_lonlat.bounds
+    bbox_covers = bool(
+        float(np.min(lon)) <= west + lon_step
+        and float(np.max(lon)) >= east - lon_step
+        and float(np.min(lat)) <= south + lat_step
+        and float(np.max(lat)) >= north - lat_step
+    )
+    stride = max(1, int(np.ceil(np.sqrt(depth.size / 500_000))))
+    lon_sample = lon[::stride]
+    lat_sample = lat[::stride]
+    depth_sample = depth[::stride, ::stride]
+    llon, llat = np.meshgrid(lon_sample, lat_sample)
+    wet = np.asarray(shapely.contains_xy(domain_lonlat, llon, llat), dtype=bool)
+    wet_count = int(np.count_nonzero(wet))
+    finite_fraction = (
+        float(np.count_nonzero(np.isfinite(depth_sample[wet])) / wet_count)
+        if wet_count
+        else 0.0
+    )
+
+    obc_points = _densify_open_boundary_for_bathymetry(
+        open_boundary_lonlat,
+        lon,
+        lat,
+    )
+    obc_required = bool(len(obc_points))
+    if obc_required:
+        sampled_points = _snap_roundoff_to_raster_bounds(obc_points, lon, lat)
+        sampled_obc = bathymetry.sample(
+            sampled_points[:, 0],
+            sampled_points[:, 1],
+            fill_value=np.nan,
+        )
+        finite_obc = np.isfinite(sampled_obc)
+        unsupported_obc_count = int(np.count_nonzero(~finite_obc))
+        finite_obc_fraction = float(np.count_nonzero(finite_obc) / len(finite_obc))
+        obc_support_passed = unsupported_obc_count == 0
+    else:
+        unsupported_obc_count = 0
+        finite_obc_fraction = 1.0
+        obc_support_passed = True
+
+    failures: list[str] = []
+    if not lon_monotonic or not lat_monotonic:
+        failures.append("bathymetry_coordinate_monotonicity_failed")
+    if not bbox_covers:
+        failures.append("bathymetry_domain_bbox_incomplete")
+    if finite_fraction < 0.95:
+        failures.append("bathymetry_domain_finite_coverage_below_95pct")
+    if not obc_support_passed:
+        failures.append("open_boundary_bathymetry_support_incomplete")
+
+    return {
+        "lon_monotonic": lon_monotonic,
+        "lat_monotonic": lat_monotonic,
+        "raster_bbox_wsen": [
+            float(np.min(lon)),
+            float(np.min(lat)),
+            float(np.max(lon)),
+            float(np.max(lat)),
+        ],
+        "domain_bbox_wsen": [float(west), float(south), float(east), float(north)],
+        "bbox_covers_domain_with_one_cell_tolerance": bbox_covers,
+        "wet_sample_count": wet_count,
+        "finite_wet_fraction": finite_fraction,
+        "open_boundary_required": obc_required,
+        "open_boundary_sample_count": int(len(obc_points)),
+        "finite_open_boundary_fraction": finite_obc_fraction,
+        "unsupported_open_boundary_sample_count": unsupported_obc_count,
+        "open_boundary_bathymetry_support_passed": obc_support_passed,
+        "open_boundary_sampling_policy": "every_segment_at_no_more_than_half_minimum_raster_axis_step",
+        "open_boundary_outside_support_fill": "nan",
+        "open_boundary_raster_edge_tolerance": "1e-8_of_minimum_axis_step",
+        "failure_taxonomy": failures,
+        "passed": not failures,
+    }
+
+
+def _densify_open_boundary_for_bathymetry(
+    geometry: LineString | MultiLineString | None,
+    lon: np.ndarray,
+    lat: np.ndarray,
+) -> np.ndarray:
+    """Sample every OBC chord at no more than half a raster-axis cell."""
+    parts = _line_parts(geometry)
+    if not parts:
+        return np.empty((0, 2), dtype=float)
+    lon_step = _minimum_positive_axis_step(lon)
+    lat_step = _minimum_positive_axis_step(lat)
+    sampled: list[tuple[float, float]] = []
+    for line in parts:
+        coords = list(line.coords)
+        for start, end in zip(coords[:-1], coords[1:]):
+            ratios = []
+            if np.isfinite(lon_step):
+                ratios.append(abs(float(end[0]) - float(start[0])) / lon_step)
+            if np.isfinite(lat_step):
+                ratios.append(abs(float(end[1]) - float(start[1])) / lat_step)
+            intervals = max(1, int(np.ceil(2.0 * max(ratios, default=1.0))))
+            if not sampled or sampled[-1] != (float(start[0]), float(start[1])):
+                sampled.append((float(start[0]), float(start[1])))
+            for index in range(1, intervals + 1):
+                fraction = index / intervals
+                sampled.append(
+                    (
+                        float(start[0]) + fraction * (float(end[0]) - float(start[0])),
+                        float(start[1]) + fraction * (float(end[1]) - float(start[1])),
+                    )
+                )
+    return np.asarray(sampled, dtype=float).reshape((-1, 2))
+
+
+def _minimum_positive_axis_step(values: np.ndarray) -> float:
+    delta = np.abs(np.diff(np.asarray(values, dtype=float)))
+    positive = delta[np.isfinite(delta) & (delta > 0.0)]
+    return float(np.min(positive)) if len(positive) else float("inf")
+
+
+def _snap_roundoff_to_raster_bounds(
+    points: np.ndarray,
+    lon: np.ndarray,
+    lat: np.ndarray,
+) -> np.ndarray:
+    """Snap projection roundoff at a raster edge without masking real overrun."""
+    output = np.asarray(points, dtype=float).copy()
+    for column, axis in ((0, lon), (1, lat)):
+        lower = float(np.min(axis))
+        upper = float(np.max(axis))
+        step = _minimum_positive_axis_step(axis)
+        tolerance = max(
+            (step * 1.0e-8 if np.isfinite(step) else 0.0),
+            64.0 * np.finfo(float).eps * max(abs(lower), abs(upper), 1.0),
+        )
+        near_lower = np.abs(output[:, column] - lower) <= tolerance
+        near_upper = np.abs(output[:, column] - upper) <= tolerance
+        output[near_lower, column] = lower
+        output[near_upper, column] = upper
+    return output
+
+
+def _line_parts(geometry: LineString | MultiLineString | None) -> list[LineString]:
+    if geometry is None or geometry.is_empty:
+        return []
+    if isinstance(geometry, LineString):
+        return [geometry]
+    parts: list[LineString] = []
+    for item in getattr(geometry, "geoms", []):
+        if isinstance(item, LineString) and not item.is_empty:
+            parts.append(item)
+    return parts
 
 
 def coarsen_for_size_field(bathy: BathymetryGrid, max_cells: int = 1_500_000) -> BathymetryGrid:

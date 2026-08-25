@@ -55,6 +55,7 @@ from .gmsh_experiment import (
     integration_samples,
     prepare_case,
     select_uniform_target_m,
+    source_open_boundary_lonlat,
 )
 from .mesh import MeshConfig, generate_mesh
 from .node_budget import (
@@ -3508,6 +3509,11 @@ def run_portfolio_case(
     coverage = bathymetry_coverage_report(
         prepared.bathymetry,
         prepared.source_domain_lonlat,
+        source_open_boundary_lonlat(
+            prepared.exterior_xy,
+            prepared.open_boundaries,
+            prepared.projection,
+        ),
     )
     if not coverage["passed"]:
         raise ValueError(f"bathymetry coverage contract failed: {coverage}")

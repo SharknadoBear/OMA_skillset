@@ -98,6 +98,12 @@ def main() -> int:
     )
     parser.add_argument("--bathy-target-spacing-arcsec", type=float, default=1.0)
     parser.add_argument("--bathy-max-sources", type=int, default=256)
+    parser.add_argument(
+        "--bathy-fetch-halo-m",
+        type=float,
+        default=2000.0,
+        help="Projected halo around the assembled model_domain_polygon used for automatic bathymetry acquisition.",
+    )
     parser.add_argument("--progress-interval-s", type=float, default=10.0)
     parser.add_argument("--size-field-max-cells", type=int, default=1_500_000)
     parser.add_argument(
@@ -274,6 +280,7 @@ def main() -> int:
             bathy_resolution_policy=args.bathy_resolution_policy,
             bathy_target_spacing_arcsec=args.bathy_target_spacing_arcsec,
             bathy_max_sources=args.bathy_max_sources,
+            bathy_fetch_halo_m=args.bathy_fetch_halo_m,
             progress_interval_s=args.progress_interval_s,
             size_field_max_cells=args.size_field_max_cells,
             boundary_resolution_profile=args.boundary_resolution_profile,

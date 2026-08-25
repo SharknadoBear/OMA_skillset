@@ -44,6 +44,7 @@ from fvcom_bdry_arc.workflow import (  # noqa: E402
     _uses_island_loop_branch,
     extract_gshhs_vector_wet_domain,
     repair_coastline_graph,
+    score_and_select_bdry_arc,
 )
 
 
@@ -1166,6 +1167,123 @@ def test_region_bpoly_feedback_absolute_sliver_does_not_waive_other_gates() -> N
         assert feedback["status"] in {"adjust_bpoly", "input_needs_review"}
 
 
+def test_coastal_obc_scoring_is_compact_not_bpoly_containment_driven() -> None:
+    bpoly = box(0.0, 0.0, 10.0, 10.0)
+    compact = {
+        "candidate_id": "compact",
+        "geometry": LineString([(10.0, 2.0), (12.0, 5.0), (10.0, 8.0)]),
+        "bow_distance_m": 2.0,
+    }
+    excessive = {
+        "candidate_id": "excessive",
+        "geometry": LineString([(10.0, 2.0), (18.0, 5.0), (10.0, 8.0)]),
+        "bow_distance_m": 8.0,
+    }
+    scored = score_and_select_bdry_arc(
+        [excessive, compact],
+        None,
+        bpoly,
+        target_resolution_m=0.25,
+    )
+    assert scored["selected"]["candidate_id"] == "compact"
+    assert scored["selected"]["metrics"]["outside_bpoly_fraction"] > 0.0
+    assert scored["selected"]["metrics"]["offshore_obc_bpoly_containment_required"] is False
+
+
+def test_coastal_obc_self_intersection_remains_blocking() -> None:
+    status, failures = _final_status(
+        {"selected": {"metrics": {"extra_coastline_intersection": False}}},
+        {
+            "open_arc_xy": LineString([(0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0)]),
+            "metadata": {
+                "closure_method": "coastline_anchor_seaward_bpoly_chain",
+                "deformed_frame_valid": True,
+                "seed_inside": True,
+                "open_arc_boundary_overlap_fraction": 1.0,
+                "arc_land_intersection": False,
+                "forbidden_overlap": [],
+            },
+        },
+        {"source": "synthetic", "start_distance_m": 0.0, "end_distance_m": 0.0},
+        [],
+    )
+    assert status == "needs_review"
+    assert "open_arc_self_intersects_or_branches" in failures
+
+
+def test_feedback_ignores_valid_obc_outside_bpoly() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        region_path = root / "region_bpoly.json"
+        offshore_path = root / "offshore_boundary_artifacts.json"
+        _write_json(
+            region_path,
+            {
+                "name": "unbound_obc",
+                "domain_type": "coastal",
+                "boundary_policy": "coastal_arc_with_land_anchors",
+                "expected_obc_count": 1,
+                "polygon_lonlat": [[4.0, 0.0], [0.0, 0.0], [0.0, 4.0], [4.0, 4.0], [4.0, 0.0]],
+                "region_bpoly": {
+                    "polygon_lonlat": [[4.0, 0.0], [0.0, 0.0], [0.0, 4.0], [4.0, 4.0], [4.0, 0.0]],
+                    "edge_labels": ["south", "west", "north", "east"],
+                },
+            },
+        )
+        _write_json(offshore_path, {"expected_obc_count": 1, "selected_side_index": 3})
+        package = root / "package.gpkg"
+        wet = Polygon([(0.0, 0.0), (6.0, 0.0), (6.0, 4.0), (0.0, 4.0)])
+        obc = LineString([(6.0, 0.0), (6.0, 4.0)])
+        gpd.GeoDataFrame([{"geometry": wet}], geometry="geometry", crs="EPSG:4326").to_file(package, layer="wet_domain", driver="GPKG")
+        gpd.GeoDataFrame([{"geometry": obc}], geometry="geometry", crs="EPSG:4326").to_file(package, layer="open_boundary_arc", driver="GPKG")
+        gpd.GeoDataFrame([{"geometry": obc}], geometry="geometry", crs="EPSG:4326").to_file(package, layer="frame_clip_boundary_arcs", driver="GPKG")
+
+        land_path = root / "land.gpkg"
+        land = gpd.GeoDataFrame(
+            [
+                {"geometry": Polygon([(-1.0, -1.0), (7.0, -1.0), (7.0, 0.0), (-1.0, 0.0)])},
+                {"geometry": Polygon([(-1.0, 4.0), (7.0, 4.0), (7.0, 5.0), (-1.0, 5.0)])},
+            ],
+            geometry="geometry",
+            crs="EPSG:4326",
+        )
+        land.to_file(land_path, layer="land_polygons", driver="GPKG")
+        land.boundary.to_frame("geometry").set_crs("EPSG:4326").to_file(land_path, layer="coastline_lines", driver="GPKG")
+        loop_path = root / "loop.json"
+        _write_json(loop_path, {"final_status": "pass", "failure_taxonomy": [], "qa": {"open_boundary_exterior_overlap_fraction": 1.0}})
+        feedback = build_region_bpoly_arc_feedback(
+            region_path,
+            offshore_path,
+            package,
+            land_path,
+            loop_path,
+            root / "feedback",
+            {
+                "inputs": {"coastline_source": "gshhs", "coastline_load": {"source_version": "GSHHG 2.3.7"}},
+                "settings": {"target_resolution_m": 5000.0, "gshhs_resolution": "f", "gshhs_levels": "1", "obc_placement_policy": "offshore-first"},
+                "wet_domain": {"arc_land_intersection_length_m": 0.0},
+                "coastline_source_coverage": {"downstream_eligible": True, "failure_taxonomy": []},
+            },
+            frame_clip_policy="reject-unintended",
+            frame_clip_tolerance_m=250.0,
+            candidate_max_km=100.0,
+        )
+        assert feedback["status"] == "pass", json.dumps(
+            {
+                "status": feedback["status"],
+                "failure_taxonomy": feedback["failure_taxonomy"],
+                "metrics": feedback["metrics"],
+                "segments": feedback["frame_clip_segments"],
+            },
+            indent=2,
+        )
+        assert feedback["policy"]["loop_scope"] == "land_boundary_only"
+        assert feedback["policy"]["offshore_obc_bpoly_containment_required"] is False
+        assert feedback["metrics"]["open_boundary_outside_region_bpoly_fraction"] > 0.99
+        assert feedback["boundary_completeness"]["automatic_adjust_segment_ids"] == []
+        assert feedback["candidate_recommendations"] == []
+
+
 def test_feedback_reader_drops_empty_geometry_placeholders() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "empty.gpkg"
@@ -1241,6 +1359,9 @@ def main() -> int:
     test_v2_feature_anchors_and_junction_spacing()
     test_v2_passage_inventory_harmonizes_or_gates_without_closure()
     test_region_bpoly_feedback_classifies_landward_clip_and_obc()
+    test_coastal_obc_scoring_is_compact_not_bpoly_containment_driven()
+    test_coastal_obc_self_intersection_remains_blocking()
+    test_feedback_ignores_valid_obc_outside_bpoly()
     test_region_bpoly_feedback_absolute_sliver_does_not_waive_other_gates()
     test_feedback_reader_drops_empty_geometry_placeholders()
     test_adaptive_failure_after_clip_closure_stops_bbox_adjustment()

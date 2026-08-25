@@ -26,7 +26,7 @@ import shapely
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 from shapely.ops import unary_union
 
-from .bathymetry import BathymetryGrid, load_bathymetry
+from .bathymetry import BathymetryGrid, bathymetry_coverage_report, load_bathymetry
 from .node_budget import (
     DEFAULT_HARD_NODE_LIMIT,
     DEFAULT_PREFLIGHT_NODE_LIMIT,
@@ -93,6 +93,37 @@ class BudgetConfig:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def source_open_boundary_lonlat(
+    exterior_xy: np.ndarray,
+    open_boundaries: Iterable[SourceOpenBoundary],
+    projection: LocalProjection,
+) -> LineString | MultiLineString:
+    """Reconstruct delivered source OBC lines from exterior segment runs."""
+    exterior = np.asarray(exterior_xy, dtype=float)
+    count = len(exterior)
+    parts: list[LineString] = []
+    for boundary in open_boundaries:
+        indices = list(boundary.exterior_segment_indices)
+        if not indices:
+            continue
+        xy = np.vstack(
+            [
+                exterior[int(indices[0]) % count],
+                *[
+                    exterior[(int(segment_index) + 1) % count]
+                    for segment_index in indices
+                ],
+            ]
+        )
+        lonlat = unproject_points(xy, projection)
+        parts.append(LineString(lonlat))
+    if not parts:
+        return LineString()
+    if len(parts) == 1:
+        return parts[0]
+    return MultiLineString(parts)
 
 
 def load_case_manifest(path: str | Path) -> dict[str, Any]:
@@ -1419,58 +1450,6 @@ def integration_samples(
     }
 
 
-def bathymetry_coverage_report(
-    bathymetry: BathymetryGrid,
-    domain_lonlat: Polygon,
-) -> dict[str, Any]:
-    """Audit coordinate monotonicity, footprint, and finite wet-cell coverage."""
-    lon = np.asarray(bathymetry.lon, dtype=float)
-    lat = np.asarray(bathymetry.lat, dtype=float)
-    depth = np.asarray(bathymetry.depth, dtype=float)
-    lon_monotonic = bool(np.all(np.diff(lon) > 0.0) or np.all(np.diff(lon) < 0.0))
-    lat_monotonic = bool(np.all(np.diff(lat) > 0.0) or np.all(np.diff(lat) < 0.0))
-    lon_step = float(np.quantile(np.abs(np.diff(lon)), 0.95)) if len(lon) > 1 else 0.0
-    lat_step = float(np.quantile(np.abs(np.diff(lat)), 0.95)) if len(lat) > 1 else 0.0
-    west, south, east, north = domain_lonlat.bounds
-    bbox_covers = bool(
-        float(np.min(lon)) <= west + lon_step
-        and float(np.max(lon)) >= east - lon_step
-        and float(np.min(lat)) <= south + lat_step
-        and float(np.max(lat)) >= north - lat_step
-    )
-    stride = max(1, int(math.ceil(math.sqrt(depth.size / 500_000))))
-    lon_sample = lon[::stride]
-    lat_sample = lat[::stride]
-    depth_sample = depth[::stride, ::stride]
-    llon, llat = np.meshgrid(lon_sample, lat_sample)
-    wet = np.asarray(shapely.contains_xy(domain_lonlat, llon, llat), dtype=bool)
-    finite_fraction = (
-        float(np.count_nonzero(np.isfinite(depth_sample[wet])) / np.count_nonzero(wet))
-        if np.count_nonzero(wet)
-        else 0.0
-    )
-    return {
-        "lon_monotonic": lon_monotonic,
-        "lat_monotonic": lat_monotonic,
-        "raster_bbox_wsen": [
-            float(np.min(lon)),
-            float(np.min(lat)),
-            float(np.max(lon)),
-            float(np.max(lat)),
-        ],
-        "domain_bbox_wsen": [float(west), float(south), float(east), float(north)],
-        "bbox_covers_domain_with_one_cell_tolerance": bbox_covers,
-        "wet_sample_count": int(np.count_nonzero(wet)),
-        "finite_wet_fraction": finite_fraction,
-        "passed": bool(
-            lon_monotonic
-            and lat_monotonic
-            and bbox_covers
-            and finite_fraction >= 0.95
-        ),
-    }
-
-
 def check_case_readiness(
     case_manifest_path: str | Path,
     workspace_root: str | Path,
@@ -1563,7 +1542,15 @@ def check_case_readiness(
             if domain_lonlat is None or projection is None:
                 bathy_report = {"passed": False, "reason": "boundary_unavailable"}
             else:
-                bathy_report = bathymetry_coverage_report(bathymetry, domain_lonlat)
+                bathy_report = bathymetry_coverage_report(
+                    bathymetry,
+                    domain_lonlat,
+                    source_open_boundary_lonlat(
+                        exterior,
+                        open_boundaries,
+                        projection,
+                    ),
+                )
                 floor, floor_report = bathymetry_resolution_floor_m(
                     bathymetry,
                     projection,
@@ -1571,7 +1558,10 @@ def check_case_readiness(
                 bathy_report["resolution_floor"] = floor_report
                 bathy_report["bathymetry_floor_m"] = float(floor)
                 if not bathy_report["passed"]:
-                    blockers.append("bathymetry_coverage_contract_failed")
+                    blockers.extend(
+                        bathy_report.get("failure_taxonomy")
+                        or ["bathymetry_coverage_contract_failed"]
+                    )
         except Exception as exc:
             blockers.append(f"bathymetry_unreadable: {exc}")
 
@@ -2397,6 +2387,11 @@ def run_gmsh_experiment(
     coverage = bathymetry_coverage_report(
         prepared.bathymetry,
         prepared.source_domain_lonlat,
+        source_open_boundary_lonlat(
+            prepared.exterior_xy,
+            prepared.open_boundaries,
+            prepared.projection,
+        ),
     )
     if not coverage["passed"]:
         raise ValueError(f"Bathymetry coverage contract failed: {coverage}")
