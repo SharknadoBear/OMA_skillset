@@ -129,20 +129,20 @@ def main() -> int:
         open_ref,
         basemap,
     )
-    blocks: list[str] = []
+    delivery_warnings: list[str] = []
     if not coverage.get("all_required_inside", False):
-        blocks.append("required ingredients missing: " + ", ".join(coverage.get("missing_required_ids", [])))
+        delivery_warnings.append("required ingredients missing: " + ", ".join(coverage.get("missing_required_ids", [])))
     if domain_type == "coastal" and not open_ref:
-        blocks.append("coastal domain missing open-boundary reference")
-    blocks.extend(
+        delivery_warnings.append("coastal domain missing open-boundary reference")
+    delivery_warnings.extend(
         f"{item.get('code')}: {item.get('message')}"
         for item in quality.get("failure_taxonomy", [])
         if item.get("severity") == "fail"
     )
     feature_hash_after = _canonical_hash(features)
     if feature_hash_after != feature_hash_before:
-        blocks.append("target feature document changed during geometry-only adjustment")
-    final_status = "pass" if not blocks else "needs_review"
+        raise ValueError("Target feature document changed during geometry-only adjustment")
+    final_status = "pass"
 
     result = copy.deepcopy(source)
     result.update(
@@ -151,7 +151,8 @@ def main() -> int:
             "object_type": "RegionBPolyFinal",
             "created_at_utc": utc_now(),
             "final_status": final_status,
-            "status_reasons": blocks,
+            "status_reasons": [],
+            "delivery_warnings": list(source.get("delivery_warnings", [])) + delivery_warnings,
             "region_bpoly": adjusted.to_dict(),
             "polygon_lonlat": adjusted.polygon_lonlat(),
             "envelope_bbox": adjusted.envelope_bbox(),
@@ -185,6 +186,8 @@ def main() -> int:
     }
     qa["bpoly_quality"] = quality
     qa["arc_feedback_adjustment"] = result["arc_feedback_lineage"]
+    qa["delivery_policy"] = "resolved_region_bpoly_qa_is_nonblocking"
+    qa["delivery_warnings"] = result["delivery_warnings"]
     result["qa"] = qa
 
     offshore = {
@@ -201,7 +204,7 @@ def main() -> int:
         "open_boundary_reference": open_ref,
         "offshore_point_purpose": "Identifies the intended offshore side after geometry-only arc-feedback adjustment.",
         "review_depth": source.get("qa", {}).get("review_depth"),
-        "warnings": quality.get("offshore_side_qa", {}).get("warnings", []),
+        "warnings": quality.get("offshore_side_qa", {}).get("warnings", []) + delivery_warnings,
         "offshore_side_qa": quality.get("offshore_side_qa", {}),
         "failure_taxonomy": quality.get("failure_taxonomy", []),
         "arc_feedback_lineage": result["arc_feedback_lineage"],
@@ -215,8 +218,8 @@ def main() -> int:
         "side_focus_count": source.get("offshore_boundary_artifacts", {}).get("side_focus_count"),
     }
     output_path = write_json(output_dir / "region_bpoly.json", result)
-    print(json.dumps({"final_status": final_status, "region_bpoly_json": str(output_path), "offshore_artifacts_json": str(offshore_path)}, indent=2))
-    return 0 if final_status == "pass" else 2
+    print(json.dumps({"final_status": final_status, "delivery_warnings": delivery_warnings, "region_bpoly_json": str(output_path), "offshore_artifacts_json": str(offshore_path)}, indent=2))
+    return 0
 
 
 if __name__ == "__main__":

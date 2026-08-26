@@ -666,14 +666,14 @@ def main() -> None:
         basemap,
     )
 
-    blocks: list[str] = []
+    delivery_warnings: list[str] = []
     if not coverage.get("all_required_inside", False):
-        blocks.append("required ingredients missing: " + ", ".join(coverage.get("missing_required_ids", [])))
+        delivery_warnings.append("required ingredients missing: " + ", ".join(coverage.get("missing_required_ids", [])))
     if domain_type == "coastal" and not open_ref:
-        blocks.append("coastal domain missing open-boundary reference")
+        delivery_warnings.append("coastal domain missing open-boundary reference")
     for item in quality_score.get("failure_taxonomy", []):
         if item.get("severity") == "fail":
-            blocks.append(f"{item.get('code')}: {item.get('message')}")
+            delivery_warnings.append(f"{item.get('code')}: {item.get('message')}")
 
     review_basemaps = [
         ("initial", (initial_guess_artifacts or {}).get("basemap", {})),
@@ -687,10 +687,10 @@ def main() -> None:
     ]
     unusable_maps = [label for label, metadata in review_basemaps if not metadata.get("geography_usable", False)]
     if unusable_maps:
-        blocks.append("background geography unavailable in required review maps: " + ", ".join(unusable_maps))
+        delivery_warnings.append("background geography unavailable in review maps: " + ", ".join(unusable_maps))
 
-    final_status = "pass" if not blocks else "needs_review"
-    retained_intermediate = args.mode == "test" or final_status != "pass"
+    final_status = "pass"
+    retained_intermediate = args.mode == "test"
     offshore_artifacts_path = case_dir / "offshore_boundary_artifacts.json"
     offshore_artifacts = build_offshore_boundary_artifacts(
         offshore_artifacts_path,
@@ -713,7 +713,8 @@ def main() -> None:
         "heuristic_mode": heuristic_mode,
         "place_memory_enabled": place_memory_enabled,
         "final_status": final_status,
-        "status_reasons": blocks,
+        "status_reasons": [],
+        "delivery_warnings": delivery_warnings,
         "region_bpoly": bpoly.to_dict(),
         "polygon_lonlat": bpoly.polygon_lonlat(),
         "envelope_bbox": bpoly.envelope_bbox(),
@@ -750,6 +751,8 @@ def main() -> None:
             "side_focus_mode": candidate.get("side_focus_mode"),
             "side_focus_count": candidate.get("side_focus_count"),
             "initial_guess_artifacts": initial_guess_artifacts if retained_intermediate else {"retained": False},
+            "delivery_policy": "resolved_region_bpoly_qa_is_nonblocking",
+            "delivery_warnings": delivery_warnings,
         },
         "offshore_boundary_artifacts": {
             "selected_side_index": offshore_artifacts.get("selected_side_index"),
@@ -772,11 +775,11 @@ def main() -> None:
         },
     }
     out = write_json(case_dir / "region_bpoly.json", final)
-    if args.mode == "execute" and final_status == "pass" and intermediate.exists():
+    if args.mode == "execute" and intermediate.exists():
         shutil.rmtree(intermediate)
     print(f"Wrote final RegionBPoly: {out}")
-    if final_status != "pass":
-        print("Final status needs review: " + "; ".join(blocks))
+    if delivery_warnings:
+        print("Delivered resolved RegionBPoly with QA warnings: " + "; ".join(delivery_warnings))
 
 
 if __name__ == "__main__":

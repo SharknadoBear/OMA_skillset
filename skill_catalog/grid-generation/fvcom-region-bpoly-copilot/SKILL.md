@@ -34,13 +34,13 @@ Use `--offshore-azimuth-deg` only when map review requires an explicit offshore-
 python "Agent_skill_dev\skill_catalog\grid-generation\fvcom-region-bpoly\scripts\run_region_bpoly.py" --request-text "Puget Sound tidal energy model" --run-dir Workspace/Preprocessing/fvcom-region-bpoly/runs/case --name case --mode execute
 ```
 
-On pass, execute mode outputs only:
+For every resolved proposal, execute mode outputs only:
 
 - `region_bpoly.json`
 - `region_bpoly_final_map.png`
 - `offshore_boundary_artifacts.json`
 
-It removes `intermediate/` after a successful pass.
+It removes `intermediate/` after delivery. Late map, tightness, obstruction, landing, and related QA findings remain in `delivery_warnings` and do not stop automatic handoff.
 
 ## Test / Review Mode
 
@@ -66,7 +66,7 @@ Use `--heuristic-mode auto|memory|unknown` for memory hygiene. `auto` resolves t
 - `--review-depth auto`: full for complex archipelago, all-channel, connectivity, multiple river/channel, lake-connection, geopolitical, antimeridian, or failed-coverage cases.
 - `--full-side-review`: backward-compatible alias for full review.
 
-## Visual QA Gate
+## Visual QA Diagnostics
 
 When candidate maps are retained:
 
@@ -74,7 +74,7 @@ When candidate maps are retained:
 2. Use `read_file` on score JSON, `target_region_features.json`, `region_bpoly.json`, and `offshore_boundary_artifacts.json`.
 3. Use `vscode_askQuestions` for pass/revise/fail or targeted side-boundary decisions when needed.
 
-Reject or revise outputs whose map metadata shows no enabled background context. The plotting layer should report `enabled: true` and `required: true`, using Esri topo tiles, OSM road tiles, an offline coastline background, or the minimal geographic fallback.
+Record a delivery warning when map metadata shows no enabled background context. The plotting layer should report `enabled: true` and `required: true`, using Esri topo tiles, OSM road tiles, an offline coastline background, or the minimal geographic fallback, but missing context does not stop a resolved polygon from automatic delivery.
 
 ## QA Expectations
 
@@ -96,7 +96,7 @@ Reject or revise outputs whose map metadata shows no enabled background context.
 
 Use `adjust_region_bpoly.py` when direct map-based polygon edits are needed.
 
-The workflow may also test deterministic four-sided repair candidates before final pass. Accept a repair only if it preserves required-feature coverage, avoids obstruction guards, improves tightness or removes blocking failures, and remains a valid RegionBPoly. Otherwise mark `final_status: needs_review`.
+The workflow may also test deterministic four-sided repair candidates before delivery. Use a repair only if it preserves required-feature coverage, avoids obstruction guards, improves tightness or removes reported failures, and remains a valid RegionBPoly. Otherwise retain the current resolved polygon, record the remaining QA findings, and continue downstream.
 
 Supported manifest operations:
 
@@ -118,4 +118,4 @@ Pass downstream:
 - `region_bpoly_final_map.png`
 - `offshore_boundary_artifacts.json`
 
-The final PNG must include background map geography, not only the polygon and grid.
+The final PNG should include background map geography, not only the polygon and grid. If geography is unavailable, retain that fact in `delivery_warnings` rather than creating a late delivery stop.

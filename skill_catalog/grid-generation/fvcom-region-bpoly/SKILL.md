@@ -34,15 +34,15 @@ This skill does not generate that boundary arc.
 
 Run `scripts/run_region_bpoly.py` by default:
 
-- `--mode execute`: final-only downstream output. On pass, writes `region_bpoly.json`, `region_bpoly_final_map.png`, and `offshore_boundary_artifacts.json`, then removes `intermediate/`.
+- `--mode execute`: final-only downstream output. For every resolved proposal, writes `region_bpoly.json`, `region_bpoly_final_map.png`, and `offshore_boundary_artifacts.json`, then removes `intermediate/`.
 - `--mode test`: writes the same final outputs and retains `intermediate/visual_review/` with initial guess maps, feature plans, feature GeoJSON, candidate maps, side zoom maps, score JSON, and coverage JSON.
 - `--review-depth auto|fast|full` defaults to `auto`.
 - `--full-side-review` remains a backward-compatible alias for `--review-depth full`.
 - `--heuristic-mode auto|memory|unknown` defaults to `auto`: execute resolves to `memory`; test resolves to `unknown`.
-- `--basemap-provider auto` is the default. Every initial, candidate, focus, side-review, adjustment, and final map must include usable geographic background context. A flat water fill or coordinate grid is diagnostic only and must yield `final_status=needs_review`; it is never sufficient for RegionBPoly acceptance.
+- `--basemap-provider auto` is the default. Every initial, candidate, focus, side-review, adjustment, and final map should include usable geographic background context. A flat water fill or coordinate grid is diagnostic only and is recorded in `delivery_warnings`, but it does not block a resolved RegionBPoly from automatic downstream delivery.
 - `--offshore-azimuth-deg` can override the selected offshore side after candidate repair when map review requires a different side selector.
 
-If execute mode cannot pass, it keeps `intermediate/` and marks `final_status` as `needs_review`.
+Only an unresolved request without an authorized feature plan or polygon seed uses `final_status: needs_review`. Once a four-sided proposal is resolved, late map-usability, tightness, obstruction, landing, and related QA findings remain explicit diagnostics and do not create a second stop before automatic gridding.
 
 Prefer `--mode test` for benchmarks, subagent tests, debugging, or retained VLM/agent-review evidence.
 
@@ -79,9 +79,9 @@ Feature plans may include non-required `offshore_boundary_exclusion` / `obstruct
 
 ## Background Maps
 
-Never accept a blank lat/lon-only plot as visual evidence. `region_bpoly_final_map.png`, initial guess maps, candidate maps, focus maps, side zoom maps, and adjustment maps must include background geography.
+Do not treat a blank lat/lon-only plot as positive visual evidence. `region_bpoly_final_map.png`, initial guess maps, candidate maps, focus maps, side zoom maps, and adjustment maps should include background geography; any unavailable geography is recorded as a delivery warning rather than a resolved-workflow blocker.
 
-With `--basemap-provider auto`, small-estuary and creek-scale cases use `road_detail`, while regional, lake, island-chain, and archipelago cases use topographic context. Do not override `auto` merely for deterministic execution. `road_detail` tries Esri World Street Map, CARTO Voyager, and OpenStreetMap Mapnik. Regional topographic context tries Esri World Topographic Map, OpenTopoMap, CARTO Voyager, and OpenStreetMap Mapnik. Both chains then use a local coastline fallback. Offline coastline discovery follows the project output path as well as the current process path so Windows short-drive launchers cannot hide the workspace cache, and prefers full-resolution GSHHS over high-resolution GSHHS and Natural Earth. Record the selected provider and every failed predecessor. `none/off/false` means skip online tiles and require a real offline coastline; if no coastline is found, the workflow retains diagnostic maps but cannot pass.
+With `--basemap-provider auto`, small-estuary and creek-scale cases use `road_detail`, while regional, lake, island-chain, and archipelago cases use topographic context. Do not override `auto` merely for deterministic execution. `road_detail` tries Esri World Street Map, CARTO Voyager, and OpenStreetMap Mapnik. Regional topographic context tries Esri World Topographic Map, OpenTopoMap, CARTO Voyager, and OpenStreetMap Mapnik. Both chains then use a local coastline fallback. Offline coastline discovery follows the project output path as well as the current process path so Windows short-drive launchers cannot hide the workspace cache, and prefers full-resolution GSHHS over high-resolution GSHHS and Natural Earth. Record the selected provider and every failed predecessor. `none/off/false` means skip online tiles and request a real offline coastline; if no coastline is found, retain the diagnostic map and report the missing geography in `delivery_warnings`.
 
 For small-estuary cases, side zoom maps use a smaller focus radius and explicit target zoom, normally 13 within the 13-15 inspection range, so the agent can inspect river mouth, tidal-creek, and immediate-bay geometry instead of a coarse regional frame. The resolved map-detail policy is recorded in final JSON and map metadata. In test mode, small-estuary cases write a `basemap_comparison/` folder with Esri Street, CARTO Voyager, OSM, topo, and offline fallback maps.
 
@@ -120,6 +120,8 @@ Final JSON must include QA for:
 - antimeridian safety and map display span;
 - practical map usability.
 
+For a resolved four-corner proposal these QA fields are delivery diagnostics, not a late acceptance gate. Preserve failure taxonomy and warning detail so downstream agents can audit or voluntarily revise the envelope, while keeping `final_status: pass` for automatic handoff.
+
 Known scope rules:
 
 - Cook Inlet wave, wave-current, SWAN, wave-climate, offshore-wave-forcing, or fetch prompts use `domain_variant: cook_inlet_wave_fetch`: include Kodiak Island as required context, include Augustine Island and Ursus Cove/Kamishak west-side Cook Inlet context, push the offshore side well south/offshore for wave fetch, and avoid unnecessary Prince William Sound overreach on the east side.
@@ -146,7 +148,7 @@ Every accepted bpoly needs a domain type in final JSON:
 
 Use `scripts/adjust_region_bpoly.py` when the agent needs direct final-stage polygon edits from map review.
 
-Use `scripts/apply_arc_feedback.py` for a geometry-only land-boundary completeness adjustment requested by `fvcom-bdry-arc`. An offshore OBC excursion outside RegionBPoly is diagnostic and must never request this adjustment. The command defaults to the resilient `auto` basemap chain, verifies the feedback hash, applies one named full-edge or tapered reshape candidate, preserves `target_region_features` exactly by canonical hash, recomputes required-feature and obstruction QA, resnaps the offshore reference, and writes a complete downstream-compatible RegionBPoly plus a geography-usable comparison map. Reject stale feedback, semantic mutations, invalid polygons, lost required features, and new obstruction conflicts.
+Use `scripts/apply_arc_feedback.py` for a geometry-only land-boundary completeness adjustment requested by `fvcom-bdry-arc`. An offshore OBC excursion outside RegionBPoly is diagnostic and must never request this adjustment. The command defaults to the resilient `auto` basemap chain, verifies the feedback hash, applies one named full-edge or tapered reshape candidate, preserves `target_region_features` exactly by canonical hash, recomputes required-feature and obstruction QA, resnaps the offshore reference, and writes a complete downstream-compatible RegionBPoly plus a comparison map. Stale feedback, semantic mutations, and invalid input geometry remain invocation errors. Once a valid geometry-only candidate is applied, lost-feature, obstruction, map, or other QA findings are retained as `delivery_warnings` rather than creating a late `needs_review` terminal.
 
 The adjustment manifest supports:
 
@@ -156,7 +158,7 @@ The adjustment manifest supports:
 
 The adjustment map must overlay the old polygon as a dashed line and the adjusted polygon as a solid line.
 
-Before final pass, the workflow can test deterministic repair candidates generated from the same rotate/scale/reshape-style perturbation logic. A repair candidate may replace the current bpoly only when it preserves required-feature coverage, avoids obstruction guards, improves tightness or removes blocking failures, and remains a valid four-sided RegionBPoly. If no safe four-sided candidate exists, mark `final_status: needs_review`.
+Before delivery, the workflow can test deterministic repair candidates generated from the same rotate/scale/reshape-style perturbation logic. A repair candidate may replace the current bpoly only when it preserves required-feature coverage, avoids obstruction guards, improves tightness or removes reported failures, and remains a valid four-sided RegionBPoly. If no safer candidate exists, retain the current resolved bpoly, record the QA findings, and continue downstream.
 
 Example:
 
@@ -173,6 +175,8 @@ Pass downstream:
 - `offshore_boundary_artifacts.json`
 
 `offshore_boundary_artifacts.json` records selected side index/name, side endpoints, midpoint, snapped reference point, snap distance, offshore azimuth, boundary policy, review depth, zoom-review metadata, warnings, and failure taxonomy.
+
+Resolved `region_bpoly.json` products use `final_status: pass`, keep `status_reasons` empty, and place nonblocking late-stage findings in top-level and `qa.delivery_warnings`. `needs_review` is reserved for the early unresolved-region failure described above.
 
 ## Scripts
 

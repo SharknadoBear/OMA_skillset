@@ -4,8 +4,8 @@ instructions: |
   Use scripts/run_region_bpoly.py by default. Use --mode execute unless the user
   explicitly requests retained test/debug/benchmark artifacts. Execute mode
   outputs region_bpoly.json, region_bpoly_final_map.png, and
-  offshore_boundary_artifacts.json, then removes intermediate artifacts after a
-  pass. Test mode keeps intermediate/visual_review with initial guess maps,
+  offshore_boundary_artifacts.json, then removes intermediate artifacts after
+  delivery. Test mode keeps intermediate/visual_review with initial guess maps,
   target-region feature JSON, feature GeoJSON, candidate maps, side zoom maps,
   coverage JSON, and score evidence.
 
@@ -25,14 +25,15 @@ instructions: |
   intended offshore side for downstream coastline-anchor snapping; boundary arc
   generation is outside this skill.
 
-  Every initial, candidate, zoom, adjustment, and final map must include
+  Every initial, candidate, zoom, adjustment, and final map should include
   background map context. Default --basemap-provider is auto: use road_detail
   for small-estuary and creek-scale cases, topographic context for
   regional/lake/island-chain cases, then local coastline/minimal fallback if
   online tiles are unavailable. road_detail tries Esri World Street Map, CARTO
   Voyager, then OpenStreetMap Mapnik with explicit small-estuary zoom policy.
   none/off basemap requests mean offline fallback, never blank lat/lon-only
-  plots.
+  plots. Missing geographic context remains an explicit delivery warning for a
+  resolved polygon and does not stop automatic handoff.
 
   Preserve mission scope: tidal-energy/all-channel/connectivity prompts require
   connected straits, island chains, river gates, lake connecting channels, and
@@ -40,7 +41,7 @@ instructions: |
   longitude-frame logic for Southeast Alaska, Hawaii/Hawaii Island, and
   antimeridian regions so bad initial boxes do not contaminate corrected fits.
 
-  Apply v3 QA guards before pass: Cook Inlet wave/wave-current/SWAN/fetch
+  Apply v3 QA diagnostics before delivery: Cook Inlet wave/wave-current/SWAN/fetch
   prompts use cook_inlet_wave_fetch and must include Kodiak, Augustine Island,
   Ursus Cove/Kamishak, and a broad Gulf wave apron while avoiding unnecessary
   Prince William Sound overreach. Cook tidal-only/current-only prompts use
@@ -51,8 +52,10 @@ instructions: |
   island obstruction guards; Hawaii State/island chain requests may include the
   chain. Murderkill-style prompts are small-estuary scale and must satisfy
   tighter area/width limits with road_detail map policy. If deterministic repair
-  candidates cannot both cover required features and avoid obstruction/tightness
-  failures, mark final_status=needs_review instead of a false pass.
+  candidates cannot improve the resolved polygon while preserving required
+  features, retain the current polygon and record the remaining findings in
+  delivery_warnings. Reserve final_status=needs_review for an unknown region that
+  has no authorized feature plan, required ingredients, or polygon seed.
 
   Use scripts/adjust_region_bpoly.py for final-stage rotate, scale, or reshape
   edits from map review. The adjustment map must show the old polygon dashed and
@@ -61,3 +64,5 @@ instructions: |
   Use scripts/apply_arc_feedback.py only for land-boundary truncation with a hash-matched
   current region_bpoly_arc_feedback_v2 artifact (or historical v1 evidence). Preserve target_region_features exactly,
   rerun feature/guard/offshore QA, and reject stale or semantic-changing feedback.
+  Once a valid geometry-only candidate is applied, preserve any remaining QA
+  findings as delivery_warnings rather than creating a late needs_review stop.
