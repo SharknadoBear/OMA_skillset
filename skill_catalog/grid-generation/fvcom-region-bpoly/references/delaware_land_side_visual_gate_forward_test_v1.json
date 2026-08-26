@@ -1,0 +1,221 @@
+{
+  "schema_version": "delaware_region_bpoly_land_side_visual_gate_forward_test_v1",
+  "created_at_utc": "2026-08-26T19:38:42.9655298Z",
+  "implementation": {
+    "commit": "47ba92ecd6b1000374374ff56a70607acf06ad31",
+    "branch": "main",
+    "architecture": {
+      "region_bpoly_owns_land_side_truncation": true,
+      "boundary_arc_emits_region_bpoly_feedback": false,
+      "grid_requires_boundary_completeness_loop": false,
+      "active_open_exterior_contracts": [
+        "fvcom_open_exterior_contract_v1",
+        "fvcom_open_exterior_contract_v2"
+      ],
+      "v3_active_support": false,
+      "historical_records_modified": false
+    },
+    "implementation_commit_installed_catalog_parity": {
+      "fvcom-region-bpoly": {
+        "source_files": 26,
+        "installed_files": 26,
+        "mismatches": 0
+      },
+      "fvcom-bdry-arc": {
+        "source_files": 19,
+        "installed_files": 19,
+        "mismatches": 0
+      },
+      "fvcom-grid-generation": {
+        "source_files": 135,
+        "installed_files": 135,
+        "mismatches": 0
+      }
+    },
+    "publication_catalog_parity": {
+      "fvcom-region-bpoly": {
+        "source_files": 27,
+        "installed_files": 27,
+        "mismatches": 0
+      },
+      "fvcom-bdry-arc": {
+        "source_files": 19,
+        "installed_files": 19,
+        "mismatches": 0
+      },
+      "fvcom-grid-generation": {
+        "source_files": 135,
+        "installed_files": 135,
+        "mismatches": 0
+      }
+    }
+  },
+  "deterministic_verification": {
+    "exact_commit_tested": "47ba92ecd6b1000374374ff56a70607acf06ad31",
+    "region_bpoly_selftest": "pass",
+    "boundary_selftest_programs": {
+      "passed": 3,
+      "failed": 0
+    },
+    "grid_selftest_programs": {
+      "passed": 28,
+      "failed": 0
+    },
+    "portfolio_case_tests": {
+      "passed": 29,
+      "failed": 0,
+      "note": "The removed historical Lake Ontario boundary/bathymetry inputs produce the explicit documented smoke-test skip before that test records pass."
+    },
+    "python_compileall": "pass",
+    "ast_parse": {
+      "status": "pass",
+      "python_files": 143
+    },
+    "quick_validate": {
+      "fvcom-region-bpoly": "pass",
+      "fvcom-bdry-arc": "pass",
+      "fvcom-grid-generation": "pass"
+    },
+    "interpreter_note": "A dependency-incomplete Python 3.11 boundary invocation failed before collection because geopandas was absent; the required suite then passed unchanged under the dependency-complete Python 3.13 environment."
+  },
+  "forward_test": {
+    "agent_history": "zero",
+    "prompt": "Use the installed FVCOM RegionBPoly skill to create a fresh QA-ready RegionBPoly for the lower tidal Delaware River through Delaware Bay with one Atlantic-facing offshore side. Complete the RegionBPoly workflow autonomously, retain all evidence, and stop before boundary-arc, bathymetry, or mesh generation.",
+    "promoted_run": "Workspace/Preprocessing/fvcom-region-bpoly/runs/delaware_land_side_visual_gate_20260826T191552Z",
+    "run_file_count": 27,
+    "run_snapshot_sha256": "af51d657eb887084bdb9c20009489481acf9a41e45836e0a5ba46660ce18395e",
+    "result": {
+      "final_status": "pass",
+      "domain_type": "coastal",
+      "envelope_bbox": [
+        -75.91499999999999,
+        37.4625,
+        -73.385,
+        40.487500000000004
+      ],
+      "approximate_length_km": 336.7430000000006,
+      "approximate_width_km": 218.952393101046,
+      "offshore_side_index": 3,
+      "offshore_side_name": "east_or_right",
+      "land_side_indices": [0, 1, 2],
+      "review_iteration": 1,
+      "whole_domain_map_count": 1,
+      "land_side_map_count": 9,
+      "all_bound_hashes_match": true,
+      "all_required_features_covered": true,
+      "polygon_closed_with_four_unique_corners": true,
+      "expansion_operations": 0,
+      "boundary_arc_products": 0,
+      "bathymetry_products": 0,
+      "mesh_products": 0,
+      "failure_taxonomy": []
+    },
+    "side_reviews": [
+      {
+        "side_index": 0,
+        "status": "pass",
+        "agent_evidence": "South: no required Delaware waterway."
+      },
+      {
+        "side_index": 1,
+        "status": "pass",
+        "agent_evidence": "West: no required Delaware waterway."
+      },
+      {
+        "side_index": 2,
+        "status": "pass",
+        "agent_evidence": "North: no required Delaware waterway."
+      }
+    ],
+    "independent_scientific_verdict": {
+      "status": "pass_with_nonblocking_compactness_caveat",
+      "visible_required_waterway_truncation": false,
+      "feature_scope_complete": true,
+      "offshore_orientation_plausible": true,
+      "notes": "The focused land-side completeness objective passes. The envelope is deliberately conservative and extends well beyond the estuary on the north, west, and south sides; this avoids truncation but is broader and less computationally efficient than an optimized mission envelope."
+    },
+    "key_artifacts": {
+      "region_bpoly.json": {
+        "bytes": 26450,
+        "sha256": "6d1dfeeb6fa7d542cd76740d25fb0b9cbf229b9d32d10432086103c832710d86"
+      },
+      "region_bpoly_final_map.png": {
+        "bytes": 1010201,
+        "sha256": "9c749115aefc5d80f89e98fc748ef9ae45115ace14f1d7016130cf0676c2a31d"
+      },
+      "region_bpoly_land_side_review.json": {
+        "bytes": 6625,
+        "sha256": "98f4bf068011389a062915a448c5e2e1bafbd2134375c8f8d94668b26b2a9002"
+      },
+      "region_bpoly_land_side_review.png": {
+        "bytes": 3187595,
+        "sha256": "93bcc14f79d1abc207ee6cae2f1c60dff521248b7696c15e22e21c78229744ad"
+      },
+      "offshore_boundary_artifacts.json": {
+        "bytes": 6758,
+        "sha256": "2f86c217764f28d0bfa7bcd9ee05789526397aaf7b3648ed1c9c424c43e3d66a"
+      }
+    },
+    "unpromoted_preflight_evidence": {
+      "path": "Workspace/Preprocessing/fvcom-region-bpoly/runs/delaware_land_side_visual_gate_20260826T191511Z",
+      "file_count": 1,
+      "snapshot_sha256": "fe2683515ace2316f120a8c17f5d54dcc44ba169e5189e6339a27184601953b9",
+      "classification": "initial-map-only partial attempt; not reused or promoted"
+    }
+  },
+  "skill_xray": {
+    "run": "Workspace/Skill_Xray/runs/fvcom-region-bpoly/20260826T192915Z",
+    "run_file_count": 11,
+    "run_snapshot_sha256": "3bb18f425c5d5cf3a86880cd6321be5a8c0bf42f0930af0bb110cd67ff8a6252",
+    "source_snapshot_sha256": "7052d158e76b243016916dfccaa33a79edbcc15c5de1f8be84df145460250851",
+    "source_file_count": 26,
+    "source_unchanged": true,
+    "source_snapshot_timing": "The before/after 26-file inventories bind the operational installed skill during casting. The compact unreferenced forward-test evidence file was mirrored only after X-Ray completed and did not alter the cast workflow.",
+    "validation": {
+      "errors": 0,
+      "warnings": 6,
+      "semantic_fingerprint": "93d4aae62f93e914d225205b3818b4ed29fb7360c3602079721e9c301e347ec7"
+    },
+    "browser": {
+      "name": "Microsoft Edge",
+      "version": "151.0.4129.107",
+      "layout": "RADIAL",
+      "selftest_status": "pass",
+      "checks_passed": 16,
+      "symbol_overlap": false
+    },
+    "graph": {
+      "working_states": 13,
+      "gates": 3,
+      "tools": 5,
+      "examples": 1,
+      "edges": 25,
+      "identifiers_consecutive": true,
+      "required_expand_loop": "W9 -> G3 -> W11 -> W9",
+      "required_pass_path": "W9 -> G3 -> W10 -> W12 -> W13",
+      "removed_downstream_nodes": ["T6", "W14"]
+    },
+    "key_artifacts": {
+      "artifact-manifest.json": {
+        "bytes": 3176,
+        "sha256": "8ce04ac0dedc565d551cfb70892beb272856b6f756c76fdbda8047f014b00073"
+      },
+      "fvcom-region-bpoly-xray.json": {
+        "bytes": 44163,
+        "sha256": "d0d54805832a835eed9496679e625b476939b770658a5e7f5d4d146ca0104b6e"
+      },
+      "fvcom-region-bpoly-xray.html": {
+        "bytes": 824145,
+        "sha256": "294b7e6b4fcf0ef5d6094e0042e01a2bdb24c439c9d74994d7fc4ffe5a48f41b"
+      },
+      "fvcom-region-bpoly-xray.png": {
+        "bytes": 551283,
+        "sha256": "5f73f8039c9a13bae778aaa32258dd227e5387cd0bcd228e91d6bb3c59c98b3e"
+      },
+      "browser-smoke.json": {
+        "bytes": 5057,
+        "sha256": "a7af96709276d270aa4f22465616fd7636d713f768c702856d00761c7b5bbdc5"
+      }
+    }
+  }
+}
