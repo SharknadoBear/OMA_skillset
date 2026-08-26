@@ -1,4 +1,4 @@
-"""GSHHS-derived RegionBPoly feedback for residual model-frame clipping."""
+"""Non-mutating FVCOM open-exterior and residual-boundary contract builder."""
 
 from __future__ import annotations
 
@@ -17,9 +17,7 @@ from shapely.ops import unary_union
 from .projection import local_utm_projection, project_geometry, unproject_geometry
 
 
-CLIP_FAILURES = {
-    "unintended_frame_clip_nontrivial",
-    "gshhs_coastline_incomplete_on_landward_boundary",
+RESIDUAL_LOOP_FAILURES = {
     "model_boundary_loop_needs_review",
     "residual_boundary_role_pending",
 }
@@ -29,121 +27,6 @@ RESIDUAL_BOUNDARY_ROLES = {
     "secondary_tidal_obc",
     "invalid_geometry",
 }
-
-BOUNDARY_COMPLETENESS_ROUTES = {
-    "adjust_bpoly",
-    "retain_for_role_classification",
-    "invalid_geometry",
-}
-
-
-def _line_parts(geometry) -> list[LineString]:
-    if geometry is None or geometry.is_empty:
-        return []
-    if isinstance(geometry, LineString):
-        return [geometry]
-    parts: list[LineString] = []
-    for item in getattr(geometry, "geoms", []):
-        parts.extend(_line_parts(item))
-    return parts
-
-
-def _outward_normal(side: LineString, polygon: Polygon) -> tuple[float, float]:
-    p0, p1 = side.coords[0], side.coords[-1]
-    dx, dy = p1[0] - p0[0], p1[1] - p0[1]
-    norm = math.hypot(dx, dy) or 1.0
-    nx, ny = -dy / norm, dx / norm
-    midpoint = side.interpolate(0.5, normalized=True)
-    centroid = polygon.centroid
-    if nx * (midpoint.x - centroid.x) + ny * (midpoint.y - centroid.y) < 0.0:
-        nx, ny = -nx, -ny
-    return float(nx), float(ny)
-
-
-def _water_continuation_evidence(
-    line: LineString,
-    side: LineString,
-    polygon: Polygon,
-    land_union,
-    target_resolution_m: float,
-) -> dict[str, Any]:
-    """Probe the expanded GSHHS mask just outside one RegionBPoly side."""
-    if land_union is None or land_union.is_empty:
-        return {
-            "status": "unavailable",
-            "continues_outward": None,
-            "wet_sample_fraction": None,
-            "probe_distance_m": None,
-        }
-    nx, ny = _outward_normal(side, polygon)
-    probe_distance = min(
-        25_000.0,
-        max(1_000.0, 2.0 * target_resolution_m, 0.5 * float(line.length)),
-    )
-    samples: list[bool] = []
-    for along in (0.2, 0.5, 0.8):
-        point = line.interpolate(along, normalized=True)
-        for fraction in (0.25, 0.5, 1.0):
-            sample = Point(
-                point.x + nx * probe_distance * fraction,
-                point.y + ny * probe_distance * fraction,
-            )
-            samples.append(not bool(land_union.buffer(0.25).covers(sample)))
-    wet_fraction = float(sum(samples) / max(len(samples), 1))
-    return {
-        "status": "pass",
-        "continues_outward": bool(wet_fraction >= 2.0 / 3.0),
-        "wet_sample_fraction": wet_fraction,
-        "probe_distance_m": float(probe_distance),
-        "outward_unit_east_north": [nx, ny],
-        "sample_count": len(samples),
-    }
-
-
-def _shoreline_tangent_angle_deg(point: Point, line: LineString, coastline, window_m: float) -> float | None:
-    if coastline is None or coastline.is_empty:
-        return None
-    nearby = _line_parts(coastline.intersection(point.buffer(window_m)))
-    if not nearby:
-        return None
-    selected = max(nearby, key=lambda item: item.length)
-    if selected.length <= 0.0 or len(selected.coords) < 2:
-        return None
-    sx = float(selected.coords[-1][0] - selected.coords[0][0])
-    sy = float(selected.coords[-1][1] - selected.coords[0][1])
-    lx = float(line.coords[-1][0] - line.coords[0][0])
-    ly = float(line.coords[-1][1] - line.coords[0][1])
-    denom = math.hypot(sx, sy) * math.hypot(lx, ly)
-    if denom <= 0.0:
-        return None
-    cosine = max(-1.0, min(1.0, abs((sx * lx + sy * ly) / denom)))
-    return float(math.degrees(math.acos(cosine)))
-
-
-def _required_feature_conflicts(
-    region: dict[str, Any],
-    line: LineString,
-    projection,
-    target_resolution_m: float,
-) -> list[str]:
-    conflicts: list[str] = []
-    influence_m = max(5_000.0, 2.0 * target_resolution_m, 2.0 * float(line.length))
-    features = (region.get("target_region_features") or {}).get("features", [])
-    for feature in features:
-        if not feature.get("required", False):
-            continue
-        category = str(feature.get("category", "")).lower()
-        role = str(feature.get("role", "")).lower()
-        if not any(token in f"{category} {role}" for token in ("river", "channel", "water", "target_region")):
-            continue
-        geometry = feature.get("geometry")
-        if feature.get("type") != "point" or not isinstance(geometry, list) or len(geometry) < 2:
-            continue
-        point_xy = project_geometry(Point(float(geometry[0]), float(geometry[1])), projection)
-        if point_xy.distance(line) <= influence_m:
-            conflicts.append(str(feature.get("id") or feature.get("label") or "required_feature"))
-    return sorted(set(conflicts))
-
 
 def evaluate_open_exterior_metrics(
     unintended_length_m: float,
@@ -180,12 +63,7 @@ def file_sha256(path: str | Path | None) -> str | None:
     return digest.hexdigest()
 
 
-def canonical_sha256(value: Any) -> str:
-    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def build_region_bpoly_arc_feedback(
+def build_open_exterior_contract(
     region_bpoly_json: str | Path,
     offshore_artifacts_json: str | Path,
     bdry_arc_gpkg: str | Path,
@@ -197,11 +75,10 @@ def build_region_bpoly_arc_feedback(
     frame_clip_policy: str,
     residual_boundary_policy: str = "strict-reject",
     frame_clip_tolerance_m: float | None,
-    candidate_max_km: float = 100.0,
     adaptive_status: str = "pending",
     adaptive_failures: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Write a side-aware feedback artifact without changing the RegionBPoly."""
+    """Write a non-mutating v1/v2 open-exterior contract and review maps."""
     region_path = Path(region_bpoly_json)
     offshore_path = Path(offshore_artifacts_json)
     package_path = Path(bdry_arc_gpkg)
@@ -317,17 +194,6 @@ def build_region_bpoly_arc_feedback(
                 "wet_component_preserved": None,
                 "eligible": deterministic_solid_eligible,
             },
-            "boundary_completeness": {
-                "status": "not_applicable" if intentional else "pending",
-                "nontrivial": None,
-                "same_side_nontrivial_count": None,
-                "physical_water_continuation": None,
-                "shoreline_tangent_angle_deg": [],
-                "longitudinal_frame_supported_bar": None,
-                "required_feature_conflicts": [],
-                "automatic_trigger_reasons": [],
-                "route": "intentional_open_boundary" if intentional else None,
-            },
             "geometry_lonlat": [[float(x), float(y)] for x, y in line_lonlat.coords],
         }
         records.append(record)
@@ -341,102 +207,6 @@ def build_region_bpoly_arc_feedback(
         })
 
     unintended = [item for item in records if item["classification"] == "unintended_frame_clip"]
-    nontrivial_limit_m = max(250.0, 0.05 * target_resolution_m)
-    nontrivial_counts_by_side: dict[int, int] = {}
-    for item in unintended:
-        if float(item["length_m"]) > nontrivial_limit_m:
-            side_index = int(item["side_index"])
-            nontrivial_counts_by_side[side_index] = nontrivial_counts_by_side.get(side_index, 0) + 1
-
-    automatic_truncation: list[dict[str, Any]] = []
-    ambiguous_truncation: list[dict[str, Any]] = []
-    for item, line in zip(
-        unintended,
-        [
-            geometry
-            for record, geometry in zip(records, frame_xy)
-            if record.get("classification") == "unintended_frame_clip"
-        ],
-    ):
-        side_index = int(item["side_index"])
-        side = side_lines_xy[side_index]
-        nontrivial = bool(float(item["length_m"]) > nontrivial_limit_m)
-        continuation = _water_continuation_evidence(
-            line,
-            side,
-            polygon_xy,
-            land_union_for_contract,
-            target_resolution_m,
-        )
-        tangent_window_m = max(500.0, 2.0 * target_resolution_m)
-        tangent_angles = [
-            value
-            for value in (
-                _shoreline_tangent_angle_deg(Point(line.coords[0]), line, physical_coastline_for_contract, tangent_window_m),
-                _shoreline_tangent_angle_deg(Point(line.coords[-1]), line, physical_coastline_for_contract, tangent_window_m),
-            )
-            if value is not None
-        ]
-        longitudinal = bool(
-            nontrivial
-            and continuation.get("continues_outward") is True
-            and tangent_angles
-            and sum(tangent_angles) / len(tangent_angles) <= 35.0
-        )
-        feature_conflicts = _required_feature_conflicts(
-            region,
-            line,
-            projection,
-            target_resolution_m,
-        )
-        reasons: list[str] = []
-        if nontrivial and nontrivial_counts_by_side.get(side_index, 0) >= 2:
-            reasons.append("repeated_nontrivial_same_side_cut")
-        if nontrivial and feature_conflicts and continuation.get("continues_outward") is True:
-            reasons.append("required_feature_or_connectivity_truncation")
-        if longitudinal:
-            reasons.append("longitudinal_frame_supported_bar")
-        completeness = item["boundary_completeness"]
-        completeness.update(
-            {
-                "status": "adjust_bpoly" if reasons else "pending",
-                "nontrivial": nontrivial,
-                "nontrivial_limit_m": float(nontrivial_limit_m),
-                "same_side_nontrivial_count": int(nontrivial_counts_by_side.get(side_index, 0)),
-                "physical_water_continuation": continuation,
-                "shoreline_tangent_angle_deg": tangent_angles,
-                "longitudinal_frame_supported_bar": longitudinal,
-                "required_feature_conflicts": feature_conflicts,
-                "automatic_trigger_reasons": reasons,
-                "route": "adjust_bpoly" if reasons else None,
-            }
-        )
-        if reasons:
-            automatic_truncation.append(item)
-        elif nontrivial and continuation.get("continues_outward") is True:
-            # A clearly transverse single closure may proceed to the ordinary
-            # residual-role decision. Everything else is bound to a Codex map
-            # decision rather than silently becoming a solid boundary.
-            transverse = bool(tangent_angles and min(tangent_angles) >= 45.0)
-            if transverse:
-                completeness.update(
-                    {
-                        "status": "role_classification_ready",
-                        "route": "retain_for_role_classification",
-                        "automatic_clear_reason": "isolated_transverse_closure",
-                    }
-                )
-            else:
-                completeness["status"] = "agent_decision_required"
-                ambiguous_truncation.append(item)
-        else:
-            completeness.update(
-                {
-                    "status": "role_classification_ready",
-                    "route": "retain_for_role_classification",
-                    "automatic_clear_reason": "numerical_or_no_outward_water_continuation",
-                }
-            )
     unintended_length_m = float(sum(item["length_m"] for item in unintended))
     wet_polygon_xy = _largest_projected_polygon(wet_gdf, projection)
     outer_length_m = float(wet_polygon_xy.exterior.length) if wet_polygon_xy is not None else 0.0
@@ -456,7 +226,7 @@ def build_region_bpoly_arc_feedback(
     ) == "gshhs"
 
     loop_failures = list(loop_manifest.get("failure_taxonomy", []))
-    nonclip_loop_failures = [failure for failure in loop_failures if failure not in CLIP_FAILURES]
+    nonrole_loop_failures = [failure for failure in loop_failures if failure not in RESIDUAL_LOOP_FAILURES]
     arc_land_length_m = float(source_manifest.get("wet_domain", {}).get("arc_land_intersection_length_m", 0.0) or 0.0)
     wet_component_count = _wet_component_count(wet_gdf)
     for item in unintended:
@@ -512,175 +282,28 @@ def build_region_bpoly_arc_feedback(
             )
             if endpoint_hits != 2:
                 structural_failures.append("open_boundary_requires_exactly_two_coastline_landfalls")
-    structural_failures.extend(nonclip_loop_failures)
+    structural_failures.extend(nonrole_loop_failures)
 
-    recommendation_sources = (
-        automatic_truncation
-        if automatic_truncation
-        else ambiguous_truncation
-        if ambiguous_truncation
-        else unintended
-    )
-    recommendations = _candidate_recommendations(
-        polygon_xy,
-        region,
-        recommendation_sources,
-        land_union_for_contract,
-        tolerance_m=tolerance_m,
-        candidate_max_km=float(candidate_max_km),
-    )
     if frame_clip_policy == "report-only":
         status = "input_needs_review"
     elif structural_failures:
         status = "input_needs_review"
-    elif automatic_truncation:
-        status = "adjust_bpoly" if recommendations else "input_needs_review"
-    elif ambiguous_truncation:
-        status = "boundary_completeness_decision_required"
     elif role_contract_enabled and unintended and not structural_failures:
         status = "assign_boundary_roles"
     elif not diagnostic_pass:
-        status = "adjust_bpoly" if recommendations and not structural_failures else "input_needs_review"
+        status = "input_needs_review"
     elif adaptive_status in {"needs_review", "failed"}:
         status = "input_needs_review"
     else:
         status = "pass"
-
-    side_summaries = []
-    for side_index in range(4):
-        selected = [item for item in unintended if item["side_index"] == side_index]
-        side_summaries.append(
-            {
-                "side_index": side_index,
-                "side_name": _side_name(region, side_index),
-                "unintended_segment_count": len(selected),
-                "unintended_frame_clip_length_m": float(sum(item["length_m"] for item in selected)),
-                "side_position_min": min((item["side_position"] for item in selected), default=None),
-                "side_position_max": max((item["side_position"] for item in selected), default=None),
-            }
-        )
-
-    completeness_failures = (
-        ["region_bpoly_boundary_truncation_detected"]
-        if automatic_truncation
-        else ["region_bpoly_boundary_completeness_decision_required"]
-        if ambiguous_truncation
-        else []
-    )
-    feedback_failures = (
-        list(dict.fromkeys(
-            structural_failures
-            + completeness_failures
-            + (["residual_boundary_role_decision_required"] if unintended and not automatic_truncation and not ambiguous_truncation else [])
-        ))
-        if role_contract_enabled
-        else _feedback_failures(
-            diagnostic_pass,
-            structural_failures,
-            adaptive_status,
-            adaptive_failures or [],
-        )
-    )
-    feedback = {
-        "schema_version": "region_bpoly_arc_feedback_v2",
-        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "status": status,
-        "diagnostic_status": "pass" if diagnostic_pass else "fail",
-        "failure_taxonomy": feedback_failures,
-        "policy": {
-            "frame_clip_policy": frame_clip_policy,
-            "residual_boundary_policy": residual_boundary_policy,
-            "role_contract_enabled": role_contract_enabled,
-            "gate_enabled": gate_enabled,
-            "frame_clip_tolerance_m": tolerance_m,
-            "unintended_fraction_threshold": 0.001,
-            "intended_exterior_coverage_threshold": 0.999,
-            "candidate_max_km": float(candidate_max_km),
-            "semantics_policy": "geometry_only_no_feature_inference",
-            "boundary_completeness_policy": "hybrid",
-            "loop_scope": "land_boundary_only",
-            "offshore_obc_bpoly_containment_required": False,
-        },
-        "inputs": {
-            "region_bpoly_json": str(region_path),
-            "offshore_artifacts_json": str(offshore_path),
-            "bdry_arc_gpkg": str(package_path),
-            "coastline_gpkg": str(coastline_gpkg) if coastline_gpkg else None,
-            "model_boundary_loop_manifest": str(loop_path),
-        },
-        "input_sha256": {
-            "region_bpoly_json": file_sha256(region_path),
-            "offshore_artifacts_json": file_sha256(offshore_path),
-            "bdry_arc_gpkg": file_sha256(package_path),
-            "coastline_gpkg": file_sha256(coastline_gpkg),
-            "model_boundary_loop_manifest": file_sha256(loop_path),
-            "coastline_source_coverage": file_sha256(coastline_coverage.get("contract_path")),
-        },
-        "gshhs": {
-            "source_version": source_manifest.get("inputs", {}).get("coastline_load", {}).get("source_version", "GSHHG 2.3.7"),
-            "requested_resolution": source_manifest.get("settings", {}).get("gshhs_resolution"),
-            "selected_resolution": source_manifest.get("inputs", {}).get("coastline_load", {}).get("gshhs_selected_resolution"),
-            "levels": source_manifest.get("settings", {}).get("gshhs_levels"),
-        },
-        "coastline_source_coverage": coastline_coverage,
-        "metrics": {
-            "target_resolution_m": target_resolution_m,
-            "wet_component_count": int(wet_component_count),
-            "expected_obc_count": int(expected_obc_count),
-            "delivered_obc_count": int(delivered_obc_count),
-            "open_boundary_land_intersection_m": arc_land_length_m,
-            "open_boundary_exterior_overlap_fraction": float(loop_manifest.get("qa", {}).get("open_boundary_exterior_overlap_fraction", 0.0) or 0.0),
-            "outer_boundary_length_m": outer_length_m,
-            "open_boundary_length_m": open_length_m,
-            "open_boundary_outside_region_bpoly_length_m": open_outside_bpoly_length_m,
-            "open_boundary_outside_region_bpoly_fraction": open_outside_bpoly_fraction,
-            "landward_boundary_length_m": landward_length_m,
-            "unintended_frame_clip_length_m": unintended_length_m,
-            "unintended_frame_clip_fraction": unintended_fraction,
-            "intended_land_open_exterior_coverage_fraction": intended_coverage,
-            "length_gate_pass": length_gate,
-            "fraction_gate_pass": fraction_gate,
-            "coverage_gate_pass": coverage_gate,
-            "model_loop_status": loop_manifest.get("final_status"),
-            "adaptive_status": adaptive_status,
-        },
-        "frame_clip_segments": records,
-        "boundary_completeness": {
-            "schema_version": "fvcom_boundary_completeness_assessment_v1",
-            "policy": "hybrid",
-            "status": (
-                "adjust_bpoly"
-                if automatic_truncation
-                else "agent_decision_required"
-                if ambiguous_truncation
-                else "pass"
-            ),
-            "nontrivial_limit_m": float(nontrivial_limit_m),
-            "automatic_adjust_segment_ids": [int(item["segment_id"]) for item in automatic_truncation],
-            "agent_decision_segment_ids": [int(item["segment_id"]) for item in ambiguous_truncation],
-            "role_ready_segment_ids": [
-                int(item["segment_id"])
-                for item in unintended
-                if item["boundary_completeness"].get("route") == "retain_for_role_classification"
-            ],
-            "decision_required": bool(ambiguous_truncation),
-            "decision_status": "pending" if ambiguous_truncation else "not_required",
-        },
-        "side_summaries": side_summaries,
-        "candidate_recommendations": recommendations,
-        "adaptive": {
-            "status": adaptive_status,
-            "failure_taxonomy": list(adaptive_failures or []),
-        },
-    }
 
     segments_path = output_dir / "segments.geojson"
     if geo_records:
         gpd.GeoDataFrame(geo_records, geometry="geometry", crs="EPSG:4326").to_file(segments_path, driver="GeoJSON")
     else:
         segments_path.write_text('{"type":"FeatureCollection","features":[]}\n', encoding="utf-8")
-    map_path = output_dir / "feedback_map.png"
-    whole_map_context = _plot_feedback(
+    map_path = output_dir / "open_exterior_review_map.png"
+    whole_map_context = _plot_open_exterior(
         map_path,
         polygon_lonlat,
         wet_gdf,
@@ -704,23 +327,16 @@ def build_region_bpoly_arc_feedback(
         and all(record.get("geography_usable") is True for record in component_maps.values())
     )
     if not geography_usable:
-        feedback["status"] = "input_needs_review"
-        feedback["boundary_completeness"]["status"] = "needs_review"
-        feedback["failure_taxonomy"] = list(dict.fromkeys(
-            feedback.get("failure_taxonomy", [])
-            + ["boundary_completeness_map_background_unusable"]
-        ))
-    map_failures = [] if geography_usable else ["boundary_completeness_map_background_unusable"]
-    feedback["outputs"] = {
-        "segments_geojson": str(segments_path),
-        "feedback_map": str(map_path),
-        "residual_component_maps": component_maps,
-        "whole_map_context": whole_map_context,
+        status = "input_needs_review"
+    map_failures = [] if geography_usable else ["open_exterior_map_background_unusable"]
+    source_hashes = {
+        "region_bpoly_json": file_sha256(region_path),
+        "offshore_artifacts_json": file_sha256(offshore_path),
+        "bdry_arc_gpkg": file_sha256(package_path),
+        "coastline_gpkg": file_sha256(coastline_gpkg),
+        "model_boundary_loop_manifest": file_sha256(loop_path),
+        "coastline_source_coverage": file_sha256(coastline_coverage.get("contract_path")),
     }
-    feedback_path = output_dir / "region_bpoly_arc_feedback_v2.json"
-    feedback_path.write_text(json.dumps(feedback, indent=2), encoding="utf-8")
-    feedback["outputs"]["feedback_json"] = str(feedback_path)
-    feedback_path.write_text(json.dumps(feedback, indent=2), encoding="utf-8")
 
     placement_family = str(
         source_manifest.get("wet_domain", {}).get("obc_placement_family")
@@ -736,20 +352,24 @@ def build_region_bpoly_arc_feedback(
     )
     metric_gate_pass = bool(diagnostic_pass and not structural_failures and coastline_coverage_pass)
     contract_schema = (
-        "fvcom_open_exterior_contract_v3"
+        "fvcom_open_exterior_contract_v2"
         if role_contract_enabled
         else "fvcom_open_exterior_contract_v1"
     )
     contract_failures = (
         list(dict.fromkeys(
             structural_failures
-            + completeness_failures
             + map_failures
             + (["residual_boundary_role_decision_required"] if unintended else [])
             + ["open_exterior_agent_decision_required"]
         ))
         if role_contract_enabled
-        else list(feedback["failure_taxonomy"])
+        else list(dict.fromkeys(
+            structural_failures
+            + map_failures
+            + ([] if diagnostic_pass else ["residual_open_exterior_metric_gate_failed"])
+            + ["open_exterior_agent_decision_required"]
+        ))
     )
     contract = {
         "schema_version": contract_schema,
@@ -809,11 +429,11 @@ def build_region_bpoly_arc_feedback(
             "assigned_solid_length_m": 0.0,
             "assigned_secondary_obc_length_m": 0.0,
         },
-        "boundary_completeness": feedback["boundary_completeness"],
-        "per_side": side_summaries,
         "coastline_source_coverage_required": coastline_coverage_required,
         "coastline_source_coverage": coastline_coverage,
-        "source_hashes": dict(feedback["input_sha256"]),
+        "source_hashes": source_hashes,
+        "region_bpoly_role": "provenance_and_offshore_orientation_only",
+        "offshore_obc_bpoly_containment_required": False,
         "map": {"path": str(map_path), "sha256": file_sha256(map_path), **whole_map_context},
         "component_maps": component_maps,
         "station_screen": {
@@ -832,11 +452,19 @@ def build_region_bpoly_arc_feedback(
             + (["diagnostic_only_report_only_policy"] if report_only else [])
             + (["open_exterior_agent_decision_required"] if metric_gate_pass and not report_only and not role_contract_enabled else [])
         )),
+        "outputs": {
+            "segments_geojson": str(segments_path),
+            "open_exterior_contract": str(contract_path),
+            "open_exterior_agent_decision": str(decision_path),
+            "open_exterior_review_map": str(map_path),
+            "residual_component_maps": component_maps,
+            "whole_map_context": whole_map_context,
+        },
     }
     contract_path.write_text(json.dumps(contract, indent=2), encoding="utf-8")
     pending_decision = {
         "schema_version": (
-            "open_exterior_agent_decision_v3"
+            "open_exterior_agent_decision_v2"
             if role_contract_enabled
             else "open_exterior_agent_decision_v1"
         ),
@@ -861,192 +489,7 @@ def build_region_bpoly_arc_feedback(
         ],
     }
     decision_path.write_text(json.dumps(pending_decision, indent=2), encoding="utf-8")
-    completeness_decision_path = output_dir / "region_bpoly_boundary_completeness_decision_v1.json"
-    pending_completeness_decision = {
-        "schema_version": "region_bpoly_boundary_completeness_decision_v1",
-        "status": "pending" if ambiguous_truncation else "not_required",
-        "decision_actor": {"kind": "codex_agent"},
-        "assessed_feedback_core_sha256": canonical_sha256(
-            {
-                "boundary_completeness": feedback["boundary_completeness"],
-                "source_hashes": feedback["input_sha256"],
-                "whole_map_sha256": file_sha256(map_path),
-                "component_map_sha256": {
-                    key: value.get("sha256") for key, value in component_maps.items()
-                },
-            }
-        ),
-        "bound_source_hashes": feedback["input_sha256"],
-        "inspected_map_sha256": file_sha256(map_path),
-        "component_decisions": [
-            {
-                "segment_id": int(item["segment_id"]),
-                "route": None,
-                "component_map_sha256": component_maps.get(str(item["segment_id"]), {}).get("sha256"),
-                "rationale": None,
-            }
-            for item in ambiguous_truncation
-        ],
-    }
-    completeness_decision_path.write_text(
-        json.dumps(pending_completeness_decision, indent=2), encoding="utf-8"
-    )
-    feedback["open_exterior_contract"] = contract
-    feedback["outputs"].update({
-        "open_exterior_contract": str(contract_path),
-        "open_exterior_agent_decision": str(decision_path),
-        "open_exterior_review_map": str(map_path),
-        "boundary_completeness_decision": str(completeness_decision_path),
-    })
-    feedback_path.write_text(json.dumps(feedback, indent=2), encoding="utf-8")
-    return feedback
-
-
-def _feedback_failures(
-    diagnostic_pass: bool,
-    structural_failures: list[str],
-    adaptive_status: str,
-    adaptive_failures: list[str],
-) -> list[str]:
-    failures = list(structural_failures)
-    if not diagnostic_pass:
-        failures.extend(
-            [
-                "unintended_frame_clip_nontrivial",
-                "gshhs_coastline_incomplete_on_landward_boundary",
-            ]
-        )
-    if adaptive_status in {"needs_review", "failed"}:
-        failures.extend(adaptive_failures or ["adaptive_boundary_resolution_needs_review"])
-    return list(dict.fromkeys(failures))
-
-
-def _candidate_recommendations(
-    polygon_xy: Polygon,
-    region: dict[str, Any],
-    unintended: list[dict[str, Any]],
-    land_union,
-    *,
-    tolerance_m: float,
-    candidate_max_km: float,
-) -> list[dict[str, Any]]:
-    by_side: dict[int, list[dict[str, Any]]] = {}
-    for item in unintended:
-        by_side.setdefault(int(item["side_index"]), []).append(item)
-    if not by_side:
-        return []
-    recommendations: list[dict[str, Any]] = []
-    coords = list(polygon_xy.exterior.coords)[:-1]
-    centroid = polygon_xy.centroid
-    for side_index, records in sorted(by_side.items(), key=lambda item: -sum(r["length_m"] for r in item[1])):
-        p0 = coords[side_index]
-        p1 = coords[(side_index + 1) % 4]
-        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
-        norm = math.hypot(dx, dy) or 1.0
-        nx, ny = -dy / norm, dx / norm
-        midpoint = Point(0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1]))
-        if nx * (midpoint.x - centroid.x) + ny * (midpoint.y - centroid.y) < 0.0:
-            nx, ny = -nx, -ny
-        mean_position = sum(record["side_position"] * record["length_m"] for record in records) / max(
-            sum(record["length_m"] for record in records), 1.0
-        )
-        profile_specs = [("full_edge", 1.0, 1.0), ("start_taper", 1.0, 0.25), ("end_taper", 0.25, 1.0)]
-        for profile, weight0, weight1 in profile_specs:
-            distance_km, predicted_uncovered_m = _scan_outward_distance(
-                p0,
-                p1,
-                nx,
-                ny,
-                weight0,
-                weight1,
-                land_union,
-                tolerance_m=tolerance_m,
-                candidate_max_km=candidate_max_km,
-            )
-            if distance_km is None:
-                continue
-            deltas = {
-                str(side_index): [float(nx * distance_km * weight0), float(ny * distance_km * weight0)],
-                str((side_index + 1) % 4): [float(nx * distance_km * weight1), float(ny * distance_km * weight1)],
-            }
-            recommendations.append(
-                {
-                    "candidate_id": f"side_{side_index}_{profile}_{int(round(distance_km * 1000.0)):06d}m",
-                    "operation": "reshape",
-                    "side_index": int(side_index),
-                    "side_name": _side_name(region, side_index),
-                    "profile": profile,
-                    "displacement_km": float(distance_km),
-                    "outward_unit_east_north": [float(nx), float(ny)],
-                    "vertex_delta_km": deltas,
-                    "source_unintended_frame_clip_length_m": float(sum(r["length_m"] for r in records)),
-                    "source_segment_ids": [int(r["segment_id"]) for r in records],
-                    "source_side_position_mean": float(mean_position),
-                    "predicted_uncovered_side_length_m": float(predicted_uncovered_m),
-                    "distance_search": {
-                        "coarse_increment_km": 1.0,
-                        "refinement_increment_km": 0.25,
-                        "maximum_km": float(candidate_max_km),
-                    },
-                    "semantic_feature_changes": [],
-                }
-            )
-    recommendations.sort(
-        key=lambda item: (
-            float(item.get("predicted_uncovered_side_length_m", float("inf"))),
-            0 if item.get("profile") == "full_edge" else 1,
-            float(item.get("displacement_km", float("inf"))),
-        )
-    )
-    return recommendations[:12]
-
-
-def _scan_outward_distance(
-    p0,
-    p1,
-    nx: float,
-    ny: float,
-    weight0: float,
-    weight1: float,
-    land_union,
-    *,
-    tolerance_m: float,
-    candidate_max_km: float,
-) -> tuple[float | None, float]:
-    if land_union is None or land_union.is_empty:
-        return None, float("inf")
-
-    def uncovered(distance_km: float) -> float:
-        q0 = (p0[0] + nx * distance_km * 1000.0 * weight0, p0[1] + ny * distance_km * 1000.0 * weight0)
-        q1 = (p1[0] + nx * distance_km * 1000.0 * weight1, p1[1] + ny * distance_km * 1000.0 * weight1)
-        line = LineString([q0, q1])
-        try:
-            return float(line.difference(land_union).length)
-        except Exception:
-            return float(line.length)
-
-    coarse = []
-    distance = 1.0
-    while distance <= candidate_max_km + 1.0e-9:
-        value = uncovered(distance)
-        coarse.append((distance, value))
-        if value <= tolerance_m:
-            break
-        distance += 1.0
-    if not coarse:
-        return None, float("inf")
-    coarse_choice = min(coarse, key=lambda item: (item[1] > tolerance_m, item[1], item[0]))
-    if coarse_choice[1] <= tolerance_m:
-        lower = max(0.25, coarse_choice[0] - 1.0)
-        refined = []
-        distance = lower
-        while distance <= coarse_choice[0] + 1.0e-9:
-            refined.append((distance, uncovered(distance)))
-            distance += 0.25
-        passing = [item for item in refined if item[1] <= tolerance_m]
-        if passing:
-            return min(passing, key=lambda item: item[0])
-    return coarse_choice
+    return contract
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -1056,12 +499,12 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _region_points(region: dict[str, Any]) -> list[list[float]]:
     points = region.get("polygon_lonlat") or region.get("region_bpoly", {}).get("polygon_lonlat")
     if not points:
-        raise ValueError("RegionBPoly feedback requires polygon_lonlat")
+        raise ValueError("Open-exterior contract requires RegionBPoly polygon_lonlat provenance")
     points = [list(map(float, point)) for point in points]
     if len(points) == 5 and points[0] == points[-1]:
         points = points[:-1]
     if len(points) != 4:
-        raise ValueError("RegionBPoly feedback requires exactly four vertices")
+        raise ValueError("Open-exterior contract requires exactly four RegionBPoly vertices")
     return points
 
 
@@ -1159,7 +602,7 @@ def _wet_component_count(gdf: gpd.GeoDataFrame) -> int:
     return count
 
 
-def _plot_feedback(
+def _plot_open_exterior(
     path: Path,
     region: Polygon,
     wet_gdf: gpd.GeoDataFrame,
@@ -1195,7 +638,7 @@ def _plot_feedback(
         open_gdf.plot(ax=ax, color="#d00000", linewidth=2.2, label="open boundary")
     if not frame_gdf.empty:
         frame_gdf.plot(ax=ax, color="#ff8c00", linewidth=3.0, label="residual frame clip")
-    ax.set_title(f"RegionBPoly arc feedback - {status}")
+    ax.set_title(f"FVCOM open-exterior review - {status}")
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_aspect("equal", adjustable="datalim")

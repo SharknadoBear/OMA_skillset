@@ -30,8 +30,60 @@ def run(cmd, expect_ok=True):
     return p
 
 
-def load(path: Path) -> dict:
+def load_raw(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load(path: Path) -> dict:
+    doc = load_raw(path)
+    request = doc.get("land_side_visual_review_request") if path.name == "region_bpoly.json" else None
+    if (
+        request
+        and doc.get("domain_type") == "coastal"
+        and doc.get("final_status") == "needs_review"
+        and not doc.get("land_side_visual_review")
+    ):
+        cmd: list[object] = [
+            "review_region_bpoly.py",
+            "--candidate-json",
+            path,
+            "--decision",
+            "pass",
+            "--map-visibility-status",
+            "pass",
+            "--map-visibility-notes",
+            "All hash-bound maps are readable in the regression fixture.",
+            "--mission-scope-status",
+            "pass",
+            "--single-open-boundary-status",
+            "pass",
+        ]
+        for idx in request["required_land_side_indices"]:
+            cmd.extend(["--side-status", f"{idx}:pass", "--side-note", f"{idx}:No waterway is visibly cut at this land-side frame in the synthetic regression review."])
+        run(cmd)
+        doc = load_raw(path)
+    return doc
+
+
+def review_cmd(path: Path, decision: str, statuses: dict[int, str]) -> list[object]:
+    cmd: list[object] = [
+        "review_region_bpoly.py",
+        "--candidate-json",
+        path,
+        "--decision",
+        decision,
+        "--map-visibility-status",
+        "pass",
+        "--map-visibility-notes",
+        "Whole-domain and side maps are readable.",
+        "--mission-scope-status",
+        "pass",
+        "--single-open-boundary-status",
+        "pass",
+    ]
+    for idx, status in sorted(statuses.items()):
+        cmd.extend(["--side-status", f"{idx}:{status}", "--side-note", f"{idx}:Geographic evidence recorded for side {idx} with status {status}."])
+    return cmd
 
 
 def assert_feature_artifacts(candidate: dict, expected_zoom_count: int) -> None:
@@ -235,7 +287,8 @@ def main() -> None:
             )
             final = load(out_dir / "region_bpoly.json")
             assert final["qa"]["review_depth"] == "full", final["qa"]
-            assert final["qa"]["side_focus_count"] == 12, final["qa"]
+            expected_side_maps = 9 if final["domain_type"] == "coastal" else 12
+            assert final["qa"]["side_focus_count"] == expected_side_maps, final["qa"]
             if name == "puget":
                 assert final["domain_type"] == "coastal"
             if name == "seak":
@@ -269,11 +322,16 @@ def main() -> None:
                 "none",
             ]
         )
+        provisional = load_raw(exec_dir / "region_bpoly.json")
+        assert provisional["final_status"] == "needs_review"
+        assert provisional["status_reasons"] == ["land_side_visual_review_required"]
+        assert provisional["land_side_visual_review"] is None
+        assert len(provisional["land_side_visual_review_request"]["required_land_side_indices"]) == 3
         final = load(exec_dir / "region_bpoly.json")
         assert final["mode"] == "execute"
         assert final["final_status"] == "pass"
-        assert final["qa"]["review_depth"] == "fast"
-        assert final["qa"]["side_focus_count"] == 4
+        assert final["qa"]["review_depth"] == "full"
+        assert final["qa"]["side_focus_count"] == 9
         assert final["final_map_basemap"]["enabled"] is True
         assert final["final_map_basemap"]["required"] is True
         assert (exec_dir / "region_bpoly_final_map.png").exists()
@@ -432,7 +490,7 @@ def main() -> None:
         assert (visual_dir / "target_region_feature_polygons.geojson").exists()
         assert (visual_dir / "basemap_comparison" / "basemap_comparison_manifest.json").exists()
         offshore = load(test_dir / "offshore_boundary_artifacts.json")
-        assert offshore["side_focus_count"] == 4
+        assert offshore["side_focus_count"] == 9
         assert all(z["retained"] for z in offshore["zoom_maps_used"])
         assert test_final["final_map_basemap"]["enabled"] is True
         assert test_final["qa"]["bpoly_quality"]["schema_version"] == "bpoly_quality_score_v1"
@@ -630,81 +688,217 @@ def main() -> None:
         assert adjusted["source_region_bpoly"]["polygon_lonlat"] != adjusted["adjusted_region_bpoly"]["polygon_lonlat"]
         assert adjusted["adjustment_map_basemap"]["enabled"] is True
 
-        # Geometry-only arc feedback preserves the exact feature document and
-        # rejects candidates that move the RegionBPoly into an obstruction guard.
-        arc_source = load(test_dir / "region_bpoly.json")
-        arc_source_path = run_dir / "arc_source.json"
-        arc_source_path.write_text(json.dumps(arc_source, indent=2), encoding="utf-8")
-        import hashlib
-
-        source_sha = hashlib.sha256(arc_source_path.read_bytes()).hexdigest()
-        feedback_path = run_dir / "arc_feedback.json"
-        feedback_path.write_text(
-            json.dumps(
-                {
-                    "schema_version": "region_bpoly_arc_feedback_v1",
-                    "status": "adjust_bpoly",
-                    "input_sha256": {"region_bpoly_json": source_sha},
-                    "candidate_recommendations": [
-                        {
-                            "candidate_id": "safe-east-5km",
-                            "operation": "reshape",
-                            "side_index": 3,
-                            "profile": "full_edge",
-                            "displacement_km": 5.0,
-                            "vertex_delta_km": {"3": [5.0, 0.0], "0": [5.0, 0.0]},
-                            "semantic_feature_changes": [],
-                        }
-                    ],
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        feedback_dir = run_dir / "arc_feedback_adjusted"
+        # The coastal gate can request one named land-side expansion, and the
+        # resulting geometry must return through a fresh hash-bound visual pass.
+        repair_dir = run_dir / "land_side_repair"
         run(
             [
-                "apply_arc_feedback.py",
-                "--input-json",
-                arc_source_path,
-                "--feedback-json",
-                feedback_path,
-                "--candidate-id",
-                "safe-east-5km",
-                "--output-dir",
-                feedback_dir,
+                "run_region_bpoly.py",
+                "--request-text",
+                "Delaware River and Delaware Bay with one Atlantic-facing offshore side",
+                "--run-dir",
+                repair_dir,
+                "--name",
+                "land_side_repair",
+                "--mode",
+                "test",
+                "--heuristic-mode",
+                "memory",
                 "--basemap-provider",
                 "none",
             ]
         )
-        arc_adjusted = load(feedback_dir / "region_bpoly.json")
-        assert arc_adjusted["final_status"] == "pass"
-        assert arc_adjusted["target_region_features"] == arc_source["target_region_features"]
-        assert arc_adjusted["region_bpoly"]["offshore_azimuth_deg"] == arc_source["region_bpoly"]["offshore_azimuth_deg"]
-        assert arc_adjusted["region_bpoly"]["edge_labels"] == arc_source["region_bpoly"]["edge_labels"]
-        assert arc_adjusted["offshore_boundary_artifacts"]["selected_side_index"] == arc_source["offshore_boundary_artifacts"]["selected_side_index"]
-        lineage = arc_adjusted["arc_feedback_lineage"]
-        assert lineage["semantic_feature_changes"] == []
-        assert lineage["target_region_features_sha256_before"] == lineage["target_region_features_sha256_after"]
+        repair_path = repair_dir / "region_bpoly.json"
+        repair = load_raw(repair_path)
+        required_sides = repair["land_side_visual_review_request"]["required_land_side_indices"]
+        offshore_side = repair["land_side_visual_review_request"]["offshore_side_index"]
+        expand_side = required_sides[0]
+        statuses = {idx: ("expand_required" if idx == expand_side else "pass") for idx in required_sides}
+        run(review_cmd(repair_path, "revise", statuses))
+        reviewed = load_raw(repair_path)
+        assert reviewed["final_status"] == "needs_review"
+        assert reviewed["land_side_visual_review"]["next_action"]["side_index"] == expand_side
 
-        stale_feedback = load(feedback_path)
-        stale_feedback["input_sha256"]["region_bpoly_json"] = "0" * 64
-        stale_path = run_dir / "stale_feedback.json"
-        stale_path.write_text(json.dumps(stale_feedback), encoding="utf-8")
+        expand_manifest = run_dir / "expand_side_manifest.json"
+        expand_manifest.write_text(
+            json.dumps({"operation": "expand_side", "side_index": expand_side, "distance_km": 10.0}),
+            encoding="utf-8",
+        )
+        expanded_json = run_dir / "expanded_land_side.json"
         run(
             [
-                "apply_arc_feedback.py",
+                "adjust_region_bpoly.py",
                 "--input-json",
-                arc_source_path,
-                "--feedback-json",
-                stale_path,
-                "--candidate-id",
-                "safe-east-5km",
-                "--output-dir",
-                run_dir / "stale_output",
+                repair_path,
+                "--adjustment-manifest",
+                expand_manifest,
+                "--output-json",
+                expanded_json,
+                "--map-path",
+                run_dir / "expanded_land_side_map.png",
+                "--basemap-provider",
+                "none",
+                "--truncation-loop",
+            ]
+        )
+        expanded = load_raw(expanded_json)
+        before = expanded["source_region_bpoly"]["polygon_lonlat"][:4]
+        after = expanded["adjusted_region_bpoly"]["polygon_lonlat"][:4]
+        changed = {idx for idx, (old, new) in enumerate(zip(before, after)) if old != new}
+        assert changed == {expand_side, (expand_side + 1) % 4}
+        assert expanded["adjustment_history"][0]["operation"] == "expand_side"
+
+        # Rotation/global scaling are forbidden inside the truncation loop.
+        rotate_manifest = run_dir / "rotate_in_loop.json"
+        rotate_manifest.write_text(json.dumps({"operation": "rotate", "angle_deg": 2.0}), encoding="utf-8")
+        run(
+            [
+                "adjust_region_bpoly.py",
+                "--input-json",
+                repair_path,
+                "--adjustment-manifest",
+                rotate_manifest,
+                "--output-json",
+                run_dir / "forbidden_rotate.json",
+                "--truncation-loop",
             ],
             expect_ok=False,
         )
+
+        # The selected offshore side cannot request expansion, even as an
+        # explicit edit outside the loop.
+        offshore_manifest = run_dir / "offshore_expand.json"
+        offshore_manifest.write_text(
+            json.dumps({"operation": "expand_side", "side_index": offshore_side, "distance_km": 5.0}),
+            encoding="utf-8",
+        )
+        run(
+            [
+                "adjust_region_bpoly.py",
+                "--input-json",
+                repair_path,
+                "--adjustment-manifest",
+                offshore_manifest,
+                "--output-json",
+                run_dir / "forbidden_offshore.json",
+            ],
+            expect_ok=False,
+        )
+
+        iteration2_dir = run_dir / "land_side_repair_iteration2"
+        run(
+            [
+                "run_region_bpoly.py",
+                "--request-text",
+                "Delaware River and Delaware Bay with one Atlantic-facing offshore side",
+                "--input-region-json",
+                expanded_json,
+                "--land-side-review-iteration",
+                "2",
+                "--run-dir",
+                iteration2_dir,
+                "--name",
+                "land_side_repair_iteration2",
+                "--mode",
+                "test",
+                "--heuristic-mode",
+                "memory",
+                "--basemap-provider",
+                "none",
+            ]
+        )
+        iteration2_path = iteration2_dir / "region_bpoly.json"
+        iteration2 = load_raw(iteration2_path)
+        assert iteration2["land_side_visual_review_request"]["iteration"] == 2
+        assert iteration2["final_status"] == "needs_review"
+        iteration2_passed = load(iteration2_path)
+        assert iteration2_passed["final_status"] == "pass"
+        assert iteration2_passed["qa"]["land_side_visual_gate"]["iteration"] == 2
+        assert (iteration2_dir / "region_bpoly_land_side_review.json").exists()
+        assert (iteration2_dir / "region_bpoly_land_side_review.png").exists()
+
+        # Stale or unusable maps cannot be passed.
+        stale_dir = run_dir / "stale_map_gate"
+        run(
+            [
+                "run_region_bpoly.py",
+                "--request-text",
+                "Delaware River and Delaware Bay",
+                "--run-dir",
+                stale_dir,
+                "--name",
+                "stale_map_gate",
+                "--mode",
+                "test",
+                "--heuristic-mode",
+                "memory",
+                "--basemap-provider",
+                "none",
+            ]
+        )
+        stale_path = stale_dir / "region_bpoly.json"
+        stale_doc = load_raw(stale_path)
+        stale_statuses = {idx: "pass" for idx in stale_doc["land_side_visual_review_request"]["required_land_side_indices"]}
+        whole_map = Path(stale_doc["land_side_visual_review_request"]["whole_domain_map"]["map_path"])
+        whole_map.write_bytes(whole_map.read_bytes() + b"stale")
+        run(review_cmd(stale_path, "pass", stale_statuses), expect_ok=False)
+        assert load_raw(stale_path)["final_status"] == "needs_review"
+
+        unusable_dir = run_dir / "unusable_map_gate"
+        run(
+            [
+                "run_region_bpoly.py",
+                "--request-text",
+                "Delaware River and Delaware Bay",
+                "--run-dir",
+                unusable_dir,
+                "--name",
+                "unusable_map_gate",
+                "--mode",
+                "test",
+                "--heuristic-mode",
+                "memory",
+                "--basemap-provider",
+                "none",
+            ]
+        )
+        unusable_path = unusable_dir / "region_bpoly.json"
+        unusable = load_raw(unusable_path)
+        unusable["land_side_visual_review_request"]["whole_domain_map"]["geography_usable"] = False
+        unusable_path.write_text(json.dumps(unusable, indent=2), encoding="utf-8")
+        unusable_statuses = {idx: "pass" for idx in unusable["land_side_visual_review_request"]["required_land_side_indices"]}
+        run(review_cmd(unusable_path, "pass", unusable_statuses), expect_ok=False)
+        assert load_raw(unusable_path)["final_status"] == "needs_review"
+
+        # A nonpass third review is terminal needs_review; iteration four is
+        # rejected at invocation.
+        exhausted = load_raw(repair_path)
+        exhausted["land_side_visual_review_request"]["iteration"] = 3
+        exhausted_dir = run_dir / "exhausted_gate"
+        exhausted_dir.mkdir()
+        exhausted_path = exhausted_dir / "region_bpoly.json"
+        exhausted_path.write_text(json.dumps(exhausted, indent=2), encoding="utf-8")
+        run(review_cmd(exhausted_path, "revise", statuses), expect_ok=False)
+        exhausted_result = load_raw(exhausted_path)
+        assert exhausted_result["final_status"] == "needs_review"
+        assert exhausted_result["status_reasons"] == ["land_side_visual_review_unresolved"]
+        run(
+            [
+                "run_region_bpoly.py",
+                "--request-text",
+                "Delaware River and Delaware Bay",
+                "--input-region-json",
+                expanded_json,
+                "--land-side-review-iteration",
+                "4",
+                "--run-dir",
+                run_dir / "fourth_attempt",
+                "--name",
+                "fourth_attempt",
+            ],
+            expect_ok=False,
+        )
+        assert not (ROOT / "apply_arc_feedback.py").exists()
 
     print("fvcom-region-bpoly selftest passed")
 

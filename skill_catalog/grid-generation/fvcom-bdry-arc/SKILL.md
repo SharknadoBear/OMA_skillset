@@ -1,75 +1,65 @@
 ---
 name: fvcom-bdry-arc
-description: Create QA-ready FVCOM open-boundary arcs, continuous model loops, solid-by-default residual water closures, GSHHS-derived RegionBPoly feedback, and optional adaptive coastal boundary-resolution packages. Use when Codex needs coastline-anchor arc construction, residual boundary-role classification, post-arc bbox correction, mainland/island topology, graded OBC nodes, or gridding-ready boundary chains before fvcom-grid-generation.
+description: Create QA-ready FVCOM open-boundary arcs, continuous model loops, solid-by-default residual water closures, v2 open-exterior contracts, and optional adaptive coastal boundary-resolution packages without changing RegionBPoly.
 ---
 
-# fvcom-bdry-arc
+# FVCOM Boundary Arc
 
 Use this skill after `fvcom-region-bpoly` and before `fvcom-grid-generation`.
 
-## Core Rules
+## Ownership and Core Rules
 
-- Treat the bpoly offshore point as a side selector, not a final endpoint.
-- Treat RegionBPoly as the mission and land-boundary-completeness frame, not a
-  coastal OBC containment cage. A delivered OBC may deform outside it. Keep
-  RegionBPoly inside/outside measurements as diagnostics only; never adjust
-  RegionBPoly merely because the OBC is outside.
-- Use `--obc-placement-policy offshore-first` for coastal estuaries. First seek one complete simple offshore arc with exactly two coastline landfalls and complete ownership of the open-water exterior; use a compact mouth fallback only when its wet domain removes the offshore apron and leaves no artificial frame-supported strip. `mouth-first` is an explicit alternative. Lake and island branches are unchanged.
-- Use GSHHS/GSHHG polygons as the topology base. Keep CUSP as an explicit legacy/debug input.
-- For every new GSHHS-backed topology run, fetch a centered 3x RegionBPoly source footprint with 2x as the hard minimum. Apply the feedback look-ahead symmetrically when it requires a larger footprint.
-- Use the connector's physical `coastline_lines` for anchors and landfalls. Use clipped land polygons only as a wet/dry mask; their source-frame edges are never coastline or residual-role candidates.
-- After model-loop construction, complete the land-boundary-only RegionBPoly boundary-completeness loop before residual-role assignment. Two nontrivial land-side cuts, required-feature/connectivity truncation, or a longitudinal land-side frame-supported bar must move the polygon outward. Delivered-OBC overlap and OBC excursion outside RegionBPoly are excluded from adjustment decisions. A single ambiguous land-side cut receives a hash-bound Codex decision; an isolated transverse intentional closure may proceed directly. Never let a solid role hide a suspected truncation.
-- After geometry closure, classify real-water frame residuals. Use a simple shoreline-bracketed solid closure by default when the component does not create an artificial bar, cross unrelated land, split the retained wet domain, or conflict with protected features. Keep invalid or unassigned components blocking.
-- Treat a nearby NOAA CO-OPS tidal station as eligibility evidence only. Never open a residual automatically, never use a river gauge, and never exceed the requested OBC count.
-- Carry the exact delivered OBC into the model-loop package as `delivered_open_boundary_arc`. Adaptive profiles must use that line and its landfall anchors directly; never reconstruct the adaptive OBC from resolution-scaled proximity classifications. Retain `source_open_boundary_arc` only as a compatibility alias.
-- Preserve lake and island/archipelago branches; do not apply mainland anchor logic to them.
-- Keep `--boundary-resolution-profile legacy` as the default and preserve all legacy outputs.
-- Treat the GPL OceanMesh2D snapshot as a method reference only; do not translate its MATLAB code.
+- Accept a delivered RegionBPoly; never resize, rotate, reshape, regenerate, or request adjustment of it.
+- A `region_bpoly_final_v1` coastal input must already have `final_status: pass` and a passing RegionBPoly land-side visual gate.
+- Treat the RegionBPoly offshore point as a side selector, not a final endpoint or containment cage.
+- Permit a topology-valid offshore OBC to deform beyond RegionBPoly. Preserve inside/outside fractions for audit only.
+- For coastal estuaries, prefer `--obc-placement-policy offshore-first`: seek one complete simple offshore arc with exactly two physical-coastline landfalls and complete ownership of the open-water exterior. `mouth-first` is explicit.
+- Use GSHHS/GSHHG polygons as the topology base. Keep CUSP as explicit legacy/debug input.
+- Fetch a centered 3x RegionBPoly GSHHS source footprint, with 2x the hard minimum. Source-frame edges are never coastline, landfalls, or residual-role candidates.
+- Preserve strict blockers for physical landfalls, nonendpoint land crossing, simple/nonbranching topology, valid connected closure, coastline-source coverage, wet-component count, and requested OBC count.
+- Classify real-water residual exterior components without interpreting them as RegionBPoly truncation. A simple shoreline-bracketed solid closure is the default only when it creates no artificial bar, crosses no unrelated land, preserves the wet component, and conflicts with no protected feature.
+- A nearby NOAA CO-OPS tidal station is eligibility evidence only. Never open a residual automatically and never exceed the requested OBC count.
+- Preserve lake and island/archipelago branches; do not apply mainland-anchor logic to them.
+- Carry the exact delivered OBC as `delivered_open_boundary_arc`. Adaptive profiles must use it and its landfalls directly.
+- Keep `--boundary-resolution-profile legacy` as the default.
+
+This skill contains no RegionBPoly mutation, adjustment candidate, or boundary-regeneration loop.
 
 Read `references/oceanmesh2d_rpw2019_notes.md` before changing topology, arc repair, or island filtering.
 
 ## Primary Workflow
 
-Legacy behavior:
-
 ```powershell
 python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --coastline-gpkg gshhs_land.gpkg --coastline-source gshhs --run-dir runs/case --name case --mode test
 ```
 
-Opt-in adaptive coastal resolution:
-
-```powershell
-python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --coastline-gpkg gshhs_land.gpkg --coastline-source gshhs --run-dir runs/case --name case --mode test --boundary-resolution-profile adaptive-coastal-v1
-```
-
-Feature-anchored, passage-aware prevention profile:
+Adaptive profiles remain opt-in:
 
 ```powershell
 python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --coastline-gpkg gshhs_land.gpkg --coastline-source gshhs --run-dir runs/case --name case --mode test --boundary-resolution-profile adaptive-coastal-v2
 ```
 
-Bounded RegionBPoly feedback loop:
+The boundary geometry is generated once from the accepted RegionBPoly.
+
+The default `--residual-boundary-policy solid-default` writes `fvcom_open_exterior_contract_v2`. `strict-reject` writes v1. v3 is historical and unsupported by active generation or validation.
+
+The open-exterior component is non-mutating. It writes:
+
+- `open_exterior/open_exterior_contract.json`
+- `open_exterior/open_exterior_review_map.png`
+- one map per residual component
+- `open_exterior/open_exterior_agent_decision.json`
+
+Every GSHHS run also writes `fvcom_coastline_source_coverage_v1`. Require central containment, at least 2x coverage on both axes, physical-coastline landfalls, zero delivered-boundary dependence on the source frame, current hashes, and whole/zoom maps.
+
+Before finalizing residual roles, use `$noaa-coops-tides` within 25 km whenever a secondary tidal OBC is considered. Inspect the whole-domain and component maps. A passing decision assigns eligible residuals to `solid_lagoon_closure` unless an explicit, station-qualified `secondary_tidal_obc` is permitted by the requested count.
 
 ```powershell
-python scripts/run_bpoly_arc_feedback_loop.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --run-dir runs/case_feedback --name case --gshhs-resolution f --gshhs-levels 1 --gshhs-lookahead-km 100 --boundary-resolution-profile adaptive-coastal-v2
+python C:\Users\huan111\.codex\skills\noaa-coops-tides\scripts\screen_tidal_stations.py --open-exterior-contract runs/case/open_exterior/open_exterior_contract.json --wet-domain-gpkg runs/case/bdry_arc_package.gpkg --output-dir runs/case/open_exterior/coops_screen --radius-km 25
+python scripts/finalize_open_exterior_decision.py --bdry-arc-manifest runs/case/bdry_arc_manifest.json --station-screen-json runs/case/open_exterior/coops_screen/noaa_coops_tidal_station_screen_v1.json --decision pass --rationale "Inspected the whole-domain and component maps; residual closures are simple, protected-feature-safe, and do not create artificial bars." --resume-adaptive
 ```
 
-The loop writes `region_bpoly_arc_feedback_v2` and `region_bpoly_arc_feedback_loop_v2`. The feedback declares `loop_scope=land_boundary_only` and `offshore_obc_bpoly_containment_required=false`. It searches 1 km outward steps refined to 250 m, keeps at most three full arc candidates per iteration and four monotonic adjustments, and caps cumulative side motion at 100 km. Every retained adjustment map must have `geography_usable=true`. If the loop stops at `agent_decision_required`, inspect the whole/component maps, run `finalize_boundary_completeness_decision.py`, then resume the same loop with `--resume`. No human-review pause is used.
-
-The default `--residual-boundary-policy solid-default` writes `fvcom_open_exterior_contract_v3`. It preserves raw residual measurements, binds the completed geometry loop, then applies the absolute, fractional, and coverage gates only to water left unassigned after the Codex role decision. Count GSHHS coastline, delivered OBCs, and approved solid closures as recognized exterior. Historical v1/v2 contracts remain readable evidence but are not current standardized coastal inputs. `report-only` remains diagnostic-only and downstream-ineligible.
-
-Every GSHHS run also writes `fvcom_coastline_source_coverage_v1`. Require central containment, at least 2x coverage on both axes, zero delivered-boundary dependence on the source frame, physical-coastline landfalls, zero nonendpoint OBC or solid-closure overlap with the complete expanded land mask, current hashes, and whole/zoom coverage maps before residual classification. A source truncation can never be accepted as a solid lagoon closure.
-
-Every default coastal run writes a whole-domain map, one zoom map per residual component, a pending `region_bpoly_boundary_completeness_decision_v1` when needed, and a pending `open_exterior_agent_decision_v3`. Before finalizing roles, use `$noaa-coops-tides` to screen stations within 25 km whenever a residual exists. Inspect every map; a passing decision assigns geometrically eligible components to `solid_lagoon_closure` unless `--residual-role SEGMENT_ID=secondary_tidal_obc` is explicit, station-qualified, and permitted by the requested OBC count.
-
-```powershell
-python C:\Users\huan111\.codex\skills\noaa-coops-tides\scripts\screen_tidal_stations.py --open-exterior-contract runs/case/fb/open_exterior_contract.json --wet-domain-gpkg runs/case/bdry_arc_package.gpkg --output-dir runs/case/fb/coops_screen --radius-km 25
-python scripts/finalize_open_exterior_decision.py --bdry-arc-manifest runs/case/bdry_arc_manifest.json --feedback-loop-summary runs/case_feedback/feedback_loop_summary.json --station-screen-json runs/case/fb/coops_screen/noaa_coops_tidal_station_screen_v1.json --decision pass --rationale "Inspected the whole-domain and component maps; the residual is a simple lagoon closure with no artificial bar or protected conflict." --resume-adaptive
-```
-
-Do not mark `pass` from JSON alone. The finalizer verifies whole/component map hashes, deterministic closure geometry, station-screen freshness, requested OBC count, and the unassigned-residual gates. It clears the raw frame warning only after the accepted solid role is propagated as a fixed landward chain.
-
-The loop retains immutable iterations, tests at most three geometry-only candidates per adjustment, accepts at most four monotonic adjustments, and caps cumulative outward movement at 100 km per implicated side. It never changes the feature plan. Stop as `input_needs_review` when geometry adjustment cannot satisfy both RegionBPoly QA and the complete boundary gate.
+The finalizer verifies current map hashes, deterministic closure geometry, station-screen freshness, requested OBC count, and zero unassigned residual water. It propagates accepted solid roles as fixed landward chains.
 
 `adaptive-coastal-v1`:
 
@@ -99,8 +89,7 @@ V2 never closes a channel automatically. Its default minimum passage spacing fol
 - `scripts/analyze_boundary_resolution.py`: analyze an existing loop package without changing it.
 - `scripts/refine_boundary_resolution.py`: write an adaptive resolution package from existing loop, mission, and GSHHS artifacts.
 - `scripts/build_model_boundary_loops.py`: rebuild legacy loop classification for debugging.
-- `scripts/run_bpoly_arc_feedback_loop.py`: iterate RegionBPoly, GSHHS, model loops, and adaptive-v2 under bounded geometry-only adjustment.
-- `scripts/finalize_open_exterior_decision.py`: record the mandatory hash-bound Codex map judgment, assign v2 residual roles, bind optional CO-OPS evidence, preserve raw diagnostics, and resume adaptive construction only after the unassigned-water gate closes.
+- `scripts/finalize_open_exterior_decision.py`: record the mandatory hash-bound Codex map judgment, assign residual roles, bind optional CO-OPS evidence, preserve raw diagnostics, and resume adaptive construction only after the unassigned-water gate closes.
 
 ## Outputs
 

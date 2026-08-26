@@ -22,7 +22,7 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from fvcom_grid_generation.bathymetry import BathymetryGrid, coarsen_for_size_field
-from fvcom_grid_generation.gmsh_experiment import PreparedCase, prepare_case
+from fvcom_grid_generation.gmsh_experiment import PreparedCase, prepare_case, resolve_input_path
 from fvcom_grid_generation.portfolio_case import (
     DEFAULT_PRIMARY_CANDIDATE,
     BoundaryTraceSizeSampler,
@@ -1789,6 +1789,14 @@ def test_lake_ontario_adaptive_boundary_and_fresh_v4_smoke() -> None:
     )
     if not case_manifest.exists():
         print("SKIP Lake Ontario smoke: case manifest is unavailable")
+        return
+    case_doc = json.loads(case_manifest.read_text(encoding="utf-8"))
+    external_inputs = [
+        resolve_input_path((case_doc.get("boundary") or {}).get("resolution_manifest"), workspace),
+        resolve_input_path((case_doc.get("bathymetry") or {}).get("netcdf"), workspace),
+    ]
+    if any(path is None or not path.exists() for path in external_inputs):
+        print("SKIP Lake Ontario smoke: cleaned historical boundary/bathymetry inputs are unavailable")
         return
     prepared = prepare_case(case_manifest, workspace)
     config = PortfolioCaseConfig(size_field_max_cells=40_000)

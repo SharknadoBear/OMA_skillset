@@ -98,6 +98,54 @@ def _reshape_xy(xy: list[tuple[float, float]], op: dict[str, Any]) -> list[tuple
     return [(x + float(delta[0]), y + float(delta[1])) for (x, y), delta in zip(xy, deltas)]
 
 
+def _expand_side_xy(
+    region: RegionBPoly,
+    xy: list[tuple[float, float]],
+    op: dict[str, Any],
+) -> tuple[list[tuple[float, float]], dict[str, Any]]:
+    """Move exactly one complete land side outward in the local projected frame."""
+    side_index = int(op.get("side_index", -1))
+    if side_index not in range(4):
+        raise ValueError("expand_side requires side_index in 0..3")
+    offshore_side_index = region.offshore_side_index()
+    if side_index == offshore_side_index:
+        raise ValueError("expand_side cannot move the selected offshore side")
+    distance_km = float(op.get("distance_km", 0.0))
+    if not math.isfinite(distance_km) or distance_km <= 0.0:
+        raise ValueError("expand_side requires a positive finite distance_km")
+
+    start_index = side_index
+    end_index = (side_index + 1) % 4
+    x0, y0 = xy[start_index]
+    x1, y1 = xy[end_index]
+    dx, dy = x1 - x0, y1 - y0
+    length = math.hypot(dx, dy)
+    if length <= 1e-9:
+        raise ValueError("expand_side cannot move a zero-length side")
+
+    # Pick the normal pointing away from the polygon centroid. This is stable for
+    # clockwise and counter-clockwise vertex orderings.
+    nx, ny = -dy / length, dx / length
+    cx = sum(x for x, _ in xy) / 4.0
+    cy = sum(y for _, y in xy) / 4.0
+    mx, my = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    if nx * (mx - cx) + ny * (my - cy) < 0.0:
+        nx, ny = -nx, -ny
+
+    out = list(xy)
+    shift_x, shift_y = nx * distance_km, ny * distance_km
+    out[start_index] = (x0 + shift_x, y0 + shift_y)
+    out[end_index] = (x1 + shift_x, y1 + shift_y)
+    details = {
+        "side_index": side_index,
+        "offshore_side_index": offshore_side_index,
+        "distance_km": distance_km,
+        "outward_unit_normal_xy": [nx, ny],
+        "moved_vertex_indices": [start_index, end_index],
+    }
+    return out, details
+
+
 def apply_adjustment_manifest(region: RegionBPoly, manifest: dict[str, Any]) -> tuple[RegionBPoly, list[dict[str, Any]]]:
     operations = manifest.get("operations")
     if operations is None:
@@ -108,17 +156,23 @@ def apply_adjustment_manifest(region: RegionBPoly, manifest: dict[str, Any]) -> 
 
     for op in operations:
         op_type = str(op.get("operation", op.get("type", ""))).lower()
-        pivot = _pivot_xy(region, op)
         if op_type == "rotate":
+            pivot = _pivot_xy(region, op)
             xy = _rotate_xy(xy, op, pivot)
+            details = {}
         elif op_type in {"scale", "resize", "enlarge", "shrink"}:
+            pivot = _pivot_xy(region, op)
             xy = _scale_xy(region, xy, op, pivot)
+            details = {}
         elif op_type == "reshape":
             xy = _reshape_xy(xy, op)
+            details = {}
+        elif op_type == "expand_side":
+            xy, details = _expand_side_xy(region, xy, op)
         else:
             raise ValueError(f"Unsupported adjustment operation {op_type!r}")
         _validate_xy(xy)
-        history.append({"operation": op_type, "parameters": op})
+        history.append({"operation": op_type, "parameters": op, **details})
         if "offshore_azimuth_deg" in op:
             offshore = float(op["offshore_azimuth_deg"])
 

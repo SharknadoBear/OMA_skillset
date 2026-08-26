@@ -405,7 +405,6 @@ def publish(
         open_audit = validate_open_exterior_contract(
             open_exterior_source,
             required=True,
-            require_boundary_completeness_loop=True,
         )
         if not open_audit["passed"]:
             all_findings.extend(open_audit["failure_taxonomy"])

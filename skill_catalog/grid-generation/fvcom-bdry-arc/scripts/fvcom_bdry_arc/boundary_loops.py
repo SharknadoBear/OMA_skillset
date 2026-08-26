@@ -121,12 +121,12 @@ def build_model_boundary_loops(
         failures.append("residual_boundary_role_pending")
     elif frame_gate_enabled:
         if gate_frame_clip_length_m > frame_clip_tolerance_m:
-            failures.append("unintended_frame_clip_nontrivial")
+            failures.append("residual_open_exterior_length_nontrivial")
         if (
             unintended_frame_clip_fraction > 0.001
             or intended_exterior_coverage_fraction < 0.999
         ):
-            failures.append("gshhs_coastline_incomplete_on_landward_boundary")
+            failures.append("residual_open_exterior_fraction_or_coverage_failed")
     final_status = "pass" if not failures else "needs_review"
 
     layers = _build_layers(

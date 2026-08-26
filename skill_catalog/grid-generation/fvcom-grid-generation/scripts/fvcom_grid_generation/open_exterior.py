@@ -1,4 +1,4 @@
-"""Strict downstream validation for FVCOM open-exterior contracts v1-v3."""
+"""Strict downstream validation for active FVCOM open-exterior contracts v1-v2."""
 
 from __future__ import annotations
 
@@ -65,7 +65,6 @@ def validate_open_exterior_contract(
     *,
     required: bool = True,
     require_topology_coverage: bool = True,
-    require_boundary_completeness_loop: bool = False,
 ) -> dict[str, Any]:
     contract, contract_path = discover_open_exterior_contract(source)
     failures: list[str] = []
@@ -76,10 +75,8 @@ def validate_open_exterior_contract(
     if contract.get("report_only"):
         failures.append("diagnostic_only_report_only_policy")
     schema = contract.get("schema_version")
-    if schema not in {"fvcom_open_exterior_contract_v1", "fvcom_open_exterior_contract_v2", "fvcom_open_exterior_contract_v3"}:
+    if schema not in {"fvcom_open_exterior_contract_v1", "fvcom_open_exterior_contract_v2"}:
         failures.append("open_exterior_contract_schema_unsupported")
-    if require_boundary_completeness_loop and schema != "fvcom_open_exterior_contract_v3":
-        failures.append("region_bpoly_arc_feedback_loop_missing")
     metrics = contract.get("hard_metrics", {})
     for field, failure in (
         ("absolute_gate_pass", "open_exterior_absolute_gate_failed"),
@@ -115,16 +112,13 @@ def validate_open_exterior_contract(
             failures.append("open_exterior_map_hash_stale")
         if decision_doc.get("bound_source_hashes") != contract.get("source_hashes"):
             failures.append("open_exterior_source_hash_binding_stale")
-        if schema in {"fvcom_open_exterior_contract_v2", "fvcom_open_exterior_contract_v3"}:
+        if schema == "fvcom_open_exterior_contract_v2":
             _validate_residual_roles(
                 contract,
                 contract_path,
                 decision_doc,
                 failures,
             )
-        if schema == "fvcom_open_exterior_contract_v3":
-            _validate_boundary_completeness(contract, contract_path, failures)
-            _validate_feedback_loop(contract, contract_path, failures)
     if coverage_required:
         if contract.get("coastline_source_coverage_required") is not True or not coverage:
             failures.append("coastline_source_coverage_missing")
@@ -155,55 +149,6 @@ def validate_open_exterior_contract(
         "residual_role_summary": contract.get("residual_role_summary"),
         "coastline_source_coverage": coverage,
     }
-
-
-def _validate_boundary_completeness(
-    contract: dict[str, Any],
-    contract_path: Path,
-    failures: list[str],
-) -> None:
-    completeness = contract.get("boundary_completeness") or {}
-    if completeness.get("schema_version") != "fvcom_boundary_completeness_assessment_v1":
-        failures.append("region_bpoly_boundary_completeness_missing")
-        return
-    if completeness.get("status") != "pass":
-        failures.append("region_bpoly_boundary_completeness_not_passed")
-    for component in contract.get("residual_components", []):
-        if component.get("classification") == "intentional_open_boundary":
-            continue
-        route = (component.get("boundary_completeness") or {}).get("route")
-        if route != "retain_for_role_classification":
-            failures.append("residual_role_bypassed_boundary_completeness")
-    if completeness.get("decision_required"):
-        decision_path = _resolve(completeness.get("decision_path"), contract_path.parent)
-        if completeness.get("decision_status") != "accepted" or not decision_path or not decision_path.is_file():
-            failures.append("region_bpoly_boundary_completeness_decision_missing")
-        elif completeness.get("decision_sha256") != sha256_file(decision_path):
-            failures.append("region_bpoly_boundary_completeness_decision_stale")
-        elif _read(decision_path).get("schema_version") != "region_bpoly_boundary_completeness_decision_v1":
-            failures.append("region_bpoly_boundary_completeness_decision_schema_unsupported")
-
-
-def _validate_feedback_loop(
-    contract: dict[str, Any],
-    contract_path: Path,
-    failures: list[str],
-) -> None:
-    binding = contract.get("region_bpoly_arc_feedback_loop") or {}
-    if binding.get("schema_version") != "region_bpoly_arc_feedback_loop_v2":
-        failures.append("region_bpoly_arc_feedback_loop_missing")
-        return
-    summary_path = _resolve(binding.get("path"), contract_path.parent)
-    if not summary_path or not summary_path.is_file():
-        failures.append("region_bpoly_arc_feedback_loop_file_missing")
-        return
-    summary = _read(summary_path)
-    if summary.get("schema_version") != "region_bpoly_arc_feedback_loop_v2":
-        failures.append("region_bpoly_arc_feedback_loop_schema_unsupported")
-    if summary.get("geometry_loop_status") != "pass" or summary.get("final_status") != "pass":
-        failures.append("region_bpoly_arc_feedback_loop_not_passed")
-    if not binding.get("geometry_evidence_sha256") or binding.get("geometry_evidence_sha256") != summary.get("geometry_evidence_sha256"):
-        failures.append("region_bpoly_arc_feedback_loop_evidence_stale")
 
 
 def _validate_residual_roles(

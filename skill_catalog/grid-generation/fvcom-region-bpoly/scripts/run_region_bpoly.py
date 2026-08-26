@@ -15,7 +15,7 @@ from region_bbox.features import (
 from propose_region_bpoly import deform_bpoly, guess_region_box, known_repair_candidates, load_request
 from region_bbox.geometry import RegionBPoly
 from region_bbox.ingredients import mission_scope_notes, required_ingredients, request_text
-from region_bbox.io import utc_now, write_json
+from region_bbox.io import canonical_sha256, file_sha256, read_json, utc_now, write_json
 from region_bbox.map_policy import resolve_basemap_provider, side_focus_radius_km
 from region_bbox.normalization import canonical_region_key, normalize_request_text
 from region_bbox.plot import plot_region_map, side_focus_records
@@ -244,6 +244,7 @@ def write_intermediate(
     map_detail_policy: dict | None,
     review_depth: str,
     review_depth_reasons: list[str],
+    domain_type: str,
     initial_guess_artifacts: dict | None = None,
     side_focus_radius: float = 45.0,
     basemap_zoom: int | None = None,
@@ -259,7 +260,11 @@ def write_intermediate(
     focus_path = visual_dir / f"{name}_candidate_focus_map.png"
     focus_basemap = plot_region_map(focus_path, bpoly, ingredients, title=f"{name} candidate focus", bbox=bpoly.envelope_bbox(), basemap_provider=basemap_provider, basemap_zoom=basemap_zoom)
 
-    if review_depth == "full":
+    offshore_side_index = bpoly.offshore_side_index()
+    if domain_type == "coastal":
+        side_indices = [idx for idx in range(4) if idx != offshore_side_index]
+        fractions, mode = [0.15, 0.5, 0.85], "coastal_land_sides_start_middle_end"
+    elif review_depth == "full":
         side_indices, fractions, mode = [0, 1, 2, 3], [0.15, 0.5, 0.85], "full_all_sides"
     else:
         side_indices, fractions, mode = [0, 1, 2, 3], [0.5], "fast_all_sides"
@@ -288,6 +293,7 @@ def write_intermediate(
         "side_focus_mode": mode,
         "side_focus_count": len(side_reviews),
         "side_focus_required_side_indices": side_indices,
+        "offshore_side_index": offshore_side_index,
         "side_focus_reviews": side_reviews,
     }
     write_json(visual_dir / f"{name}_region_bpoly_candidate.json", candidate)
@@ -306,6 +312,57 @@ def write_intermediate(
     )
     write_json(visual_dir / f"{name}_ingredient_coverage.json", coverage)
     return candidate
+
+
+def _land_side_visual_review_request(
+    *,
+    candidate: dict,
+    candidate_json: Path,
+    final_map: Path,
+    final_map_basemap: dict,
+    bpoly: RegionBPoly,
+    iteration: int,
+) -> dict:
+    required_sides = list(candidate.get("side_focus_required_side_indices", []))
+    side_views: dict[str, list[dict]] = {}
+    for idx in required_sides:
+        records = []
+        for record in candidate.get("side_focus_reviews", []):
+            if int(record.get("side_index", -1)) != int(idx):
+                continue
+            map_path = Path(record["map_path"])
+            records.append(
+                {
+                    "position": record.get("position"),
+                    "fraction": record.get("fraction"),
+                    "map_path": str(map_path),
+                    "map_sha256": file_sha256(map_path),
+                    "geography_usable": bool(record.get("basemap", {}).get("geography_usable", False)),
+                }
+            )
+        side_views[str(idx)] = records
+    return {
+        "schema_version": "region_bpoly_land_side_visual_review_request_v1",
+        "iteration": iteration,
+        "maximum_iterations": 3,
+        "candidate_json": str(candidate_json),
+        "candidate_json_sha256": file_sha256(candidate_json),
+        "region_bpoly_sha256": canonical_sha256(bpoly.to_dict()),
+        "offshore_side_index": bpoly.offshore_side_index(),
+        "required_land_side_indices": required_sides,
+        "required_positions": ["start", "middle", "end"],
+        "whole_domain_map": {
+            "map_path": str(final_map),
+            "map_sha256": file_sha256(final_map),
+            "geography_usable": bool(final_map_basemap.get("geography_usable", False)),
+        },
+        "side_views": side_views,
+        "allowed_statuses": ["pass", "expand_required", "unresolved"],
+        "gate_policy": (
+            "Inspect the whole-domain map and start/middle/end maps for every required land side. "
+            "The selected offshore side is excluded and cannot request expansion."
+        ),
+    }
 
 
 def write_basemap_comparison(
@@ -509,6 +566,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Run the streamlined RegionBPoly workflow.")
     ap.add_argument("--request-json")
     ap.add_argument("--request-text")
+    ap.add_argument("--input-region-json", help="Adjusted RegionBPoly input for a land-side repair iteration.")
+    ap.add_argument("--land-side-review-iteration", type=int, choices=[1, 2, 3], default=1)
     ap.add_argument("--run-dir", required=True, help="Final case output folder.")
     ap.add_argument("--name", required=True)
     ap.add_argument("--mode", choices=["execute", "test"], default="execute")
@@ -534,7 +593,22 @@ def main() -> None:
     ingredients = features_as_ingredients(features_doc) or required_ingredients(effective_request, use_place_memory=place_memory_enabled)
     bpoly: RegionBPoly | None = None
     deformation_notes: list[str] = []
-    if place_memory_enabled:
+    adjusted_source: dict | None = None
+    if args.input_region_json:
+        adjusted_source = read_json(args.input_region_json)
+        bpoly = RegionBPoly.from_dict(adjusted_source)
+        deformation_notes.append(f"Started land-side review iteration {args.land_side_review_iteration} from {args.input_region_json}.")
+        if args.land_side_review_iteration == 1:
+            raise SystemExit("--input-region-json is only valid for land-side review iterations 2 or 3")
+        prior_review = adjusted_source.get("source_land_side_visual_review") or adjusted_source.get("land_side_visual_review")
+        prior_iteration = int((prior_review or {}).get("iteration", 0))
+        if prior_iteration != args.land_side_review_iteration - 1:
+            raise SystemExit("Adjusted input is not bound to the immediately preceding land-side review iteration")
+        if (prior_review or {}).get("decision") != "revise":
+            raise SystemExit("Adjusted input does not follow an expand_required review decision")
+    elif args.land_side_review_iteration != 1:
+        raise SystemExit("Review iterations 2 and 3 require --input-region-json")
+    elif place_memory_enabled:
         try:
             bpoly, deformation_notes = deform_bpoly(RegionBPoly.from_region_box(guess_region_box(effective_request)), effective_request)
         except ValueError:
@@ -576,15 +650,17 @@ def main() -> None:
             coverage = score_region_box(bpoly, ingredients)
     mission_notes = mission_scope_notes(effective_request)
     domain_type = args.domain_type or infer_domain_type(effective_request)
-    bpoly, coverage, repair_notes = apply_candidate_repairs(
-        args.name,
-        effective_request,
-        bpoly,
-        ingredients,
-        coverage,
-        domain_type,
-        map_detail_policy,
-    )
+    repair_notes: list[str] = []
+    if adjusted_source is None:
+        bpoly, coverage, repair_notes = apply_candidate_repairs(
+            args.name,
+            effective_request,
+            bpoly,
+            ingredients,
+            coverage,
+            domain_type,
+            map_detail_policy,
+        )
     if repair_notes:
         deformation_notes.extend(repair_notes)
     if args.offshore_azimuth_deg is not None:
@@ -596,6 +672,9 @@ def main() -> None:
         deformation_notes.append(f"Set offshore azimuth to {float(args.offshore_azimuth_deg):g} degrees from CLI override.")
     requested_review_depth = "full" if args.full_side_review else args.review_depth
     review_depth, review_depth_reasons = select_review_depth(effective_request, features_doc, coverage, bpoly, requested_review_depth, first_coverage_failed)
+    if domain_type == "coastal" and review_depth != "full":
+        review_depth = "full"
+        review_depth_reasons.append("coastal land-side truncation gate requires start/middle/end views")
 
     ref_guess = args.open_boundary_reference
     if not ref_guess and domain_type in {"coastal", "island"}:
@@ -628,6 +707,7 @@ def main() -> None:
         map_detail_policy,
         review_depth,
         review_depth_reasons,
+        domain_type,
         initial_guess_artifacts,
         side_radius_km,
         basemap_zoom,
@@ -689,7 +769,7 @@ def main() -> None:
     if unusable_maps:
         delivery_warnings.append("background geography unavailable in review maps: " + ", ".join(unusable_maps))
 
-    final_status = "pass"
+    final_status = "needs_review" if domain_type == "coastal" else "pass"
     retained_intermediate = args.mode == "test"
     offshore_artifacts_path = case_dir / "offshore_boundary_artifacts.json"
     offshore_artifacts = build_offshore_boundary_artifacts(
@@ -703,6 +783,17 @@ def main() -> None:
         retained_intermediate,
         quality_score,
     )
+    candidate_json = intermediate / "visual_review" / f"{args.name}_region_bpoly_candidate.json"
+    land_side_review_request = None
+    if domain_type == "coastal":
+        land_side_review_request = _land_side_visual_review_request(
+            candidate=candidate,
+            candidate_json=candidate_json,
+            final_map=final_map,
+            final_map_basemap=basemap,
+            bpoly=bpoly,
+            iteration=args.land_side_review_iteration,
+        )
 
     final = {
         "schema_version": "region_bpoly_final_v1",
@@ -713,7 +804,7 @@ def main() -> None:
         "heuristic_mode": heuristic_mode,
         "place_memory_enabled": place_memory_enabled,
         "final_status": final_status,
-        "status_reasons": [],
+        "status_reasons": (["land_side_visual_review_required"] if domain_type == "coastal" else []),
         "delivery_warnings": delivery_warnings,
         "region_bpoly": bpoly.to_dict(),
         "polygon_lonlat": bpoly.polygon_lonlat(),
@@ -724,6 +815,8 @@ def main() -> None:
         "boundary_policy": POLICY[domain_type],
         "open_boundary_reference": open_ref,
         "offshore_boundary_artifacts_path": str(offshore_artifacts_path),
+        "land_side_visual_review_request": land_side_review_request,
+        "land_side_visual_review": None,
         "final_map_path": str(final_map),
         "final_map_basemap": basemap,
         "map_detail_policy": map_detail_policy,
@@ -751,7 +844,11 @@ def main() -> None:
             "side_focus_mode": candidate.get("side_focus_mode"),
             "side_focus_count": candidate.get("side_focus_count"),
             "initial_guess_artifacts": initial_guess_artifacts if retained_intermediate else {"retained": False},
-            "delivery_policy": "resolved_region_bpoly_qa_is_nonblocking",
+            "delivery_policy": (
+                "coastal_land_side_visual_review_is_blocking"
+                if domain_type == "coastal"
+                else "resolved_region_bpoly_qa_is_nonblocking"
+            ),
             "delivery_warnings": delivery_warnings,
         },
         "offshore_boundary_artifacts": {
@@ -775,9 +872,11 @@ def main() -> None:
         },
     }
     out = write_json(case_dir / "region_bpoly.json", final)
-    if args.mode == "execute" and intermediate.exists():
+    if args.mode == "execute" and intermediate.exists() and final_status == "pass":
         shutil.rmtree(intermediate)
     print(f"Wrote final RegionBPoly: {out}")
+    if final_status == "needs_review":
+        print("Final status needs review: inspect and finalize the hash-bound coastal land-side maps.")
     if delivery_warnings:
         print("Delivered resolved RegionBPoly with QA warnings: " + "; ".join(delivery_warnings))
 

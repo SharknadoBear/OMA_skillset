@@ -57,7 +57,7 @@ def main() -> int:
         "--frame-clip-policy",
         default="reject-unintended",
         choices=("reject-unintended", "report-only"),
-        help="Reject residual GSHHS frame clips or retain historical report-only behavior.",
+        help="Reject residual open-exterior length or retain diagnostic report-only behavior.",
     )
     parser.add_argument(
         "--residual-boundary-policy",
@@ -69,12 +69,6 @@ def main() -> int:
         "--frame-clip-tolerance-m",
         type=float,
         help="Absolute residual-frame tolerance; default max(250 m, 0.05 * target resolution).",
-    )
-    parser.add_argument(
-        "--feedback-candidate-max-km",
-        type=float,
-        default=100.0,
-        help="Maximum outward displacement proposed by RegionBPoly feedback.",
     )
     args = parser.parse_args()
 
@@ -105,7 +99,6 @@ def main() -> int:
         frame_clip_policy=args.frame_clip_policy,
         residual_boundary_policy=args.residual_boundary_policy,
         frame_clip_tolerance_m=args.frame_clip_tolerance_m,
-        feedback_candidate_max_km=args.feedback_candidate_max_km,
         obc_placement_policy=args.obc_placement_policy,
     )
     manifest = run_bdry_arc(

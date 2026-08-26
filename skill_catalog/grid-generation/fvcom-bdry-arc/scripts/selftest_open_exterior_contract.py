@@ -8,7 +8,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fvcom_bdry_arc.feedback import evaluate_open_exterior_metrics
+from fvcom_bdry_arc.open_exterior import evaluate_open_exterior_metrics
 from fvcom_bdry_arc.workflow import BdryArcConfig
 import finalize_open_exterior_decision as finalizer
 
@@ -34,9 +34,9 @@ def main() -> None:
     assert defaults.obc_placement_policy == "offshore-first"
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        evidence = root / "fb"
+        evidence = root / "open_exterior"
         evidence.mkdir()
-        review_map = evidence / "feedback_map.png"
+        review_map = evidence / "open_exterior_review_map.png"
         review_map.write_bytes(b"map")
         decision_path = evidence / "open_exterior_agent_decision.json"
         decision_path.write_text("{}", encoding="utf-8")
@@ -64,7 +64,6 @@ def main() -> None:
                 "open_exterior_review_map": str(review_map),
                 "open_exterior_agent_decision": str(decision_path),
             },
-            "region_bpoly_arc_feedback": {},
         }), encoding="utf-8")
         result = finalizer.finalize(manifest_path, "pass", "Inspected full map; no frame bar remains.", resume_adaptive=False)
         assert result["open_exterior_contract"]["downstream_eligible"] is True
@@ -72,9 +71,9 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        evidence = root / "fb"
+        evidence = root / "open_exterior"
         evidence.mkdir()
-        review_map = evidence / "feedback_map.png"
+        review_map = evidence / "open_exterior_review_map.png"
         review_map.write_bytes(b"map")
         decision_path = evidence / "open_exterior_agent_decision.json"
         decision_path.write_text('{"status":"pending"}', encoding="utf-8")
@@ -122,9 +121,9 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        evidence = root / "fb"
+        evidence = root / "open_exterior"
         evidence.mkdir()
-        review_map = evidence / "feedback_map.png"
+        review_map = evidence / "open_exterior_review_map.png"
         component_map = evidence / "residual_component_000_role_map.png"
         review_map.write_bytes(b"whole map")
         component_map.write_bytes(b"component map")
@@ -167,14 +166,13 @@ def main() -> None:
         manifest_path = root / "bdry_arc_manifest.json"
         manifest_path.write_text(json.dumps({
             "final_status": "needs_review",
-            "failure_taxonomy": ["residual_boundary_role_decision_required", "blocked_by_region_bpoly_feedback"],
+            "failure_taxonomy": ["residual_boundary_role_decision_required", "blocked_by_open_exterior_contract"],
             "settings": {"boundary_resolution_profile": "legacy"},
             "outputs": {
                 "open_exterior_contract": str(contract_path),
                 "open_exterior_review_map": str(review_map),
                 "open_exterior_agent_decision": str(decision_path),
             },
-            "region_bpoly_arc_feedback": {"failure_taxonomy": ["residual_boundary_role_decision_required"], "outputs": {}},
         }), encoding="utf-8")
         result = finalizer.finalize(
             manifest_path,
@@ -213,11 +211,12 @@ def main() -> None:
         else:
             raise AssertionError("secondary OBC must respect the requested count")
 
+    # v3 is historical evidence only and is rejected by active finalization.
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        evidence = root / "fb"
+        evidence = root / "open_exterior"
         evidence.mkdir()
-        review_map = evidence / "feedback_map.png"
+        review_map = evidence / "open_exterior_review_map.png"
         review_map.write_bytes(b"map")
         decision_path = evidence / "open_exterior_agent_decision.json"
         decision_path.write_text('{"status":"pending"}', encoding="utf-8")
@@ -225,65 +224,26 @@ def main() -> None:
         contract_path.write_text(json.dumps({
             "schema_version": "fvcom_open_exterior_contract_v3",
             "report_only": False,
-            "downstream_eligible": False,
-            "hard_metrics": {
-                "absolute_limit_m": 250.0,
-                "absolute_gate_pass": True,
-                "fraction_limit": 0.001,
-                "fraction_gate_pass": True,
-                "coverage_minimum": 0.999,
-                "coverage_gate_pass": True,
-                "all_independent_metric_gates_pass": True,
-            },
-            "boundary_lengths": {"outer_boundary_length_m": 1000.0, "landward_boundary_length_m": 1000.0},
-            "obc_geometry": {"expected_count": 0, "delivered_count": 0, "simple_nonbranching": True, "nonendpoint_land_crossing_m": 0.0},
-            "boundary_completeness": {
-                "schema_version": "fvcom_boundary_completeness_assessment_v1",
-                "status": "pass",
-                "decision_required": False,
-            },
-            "residual_components": [],
-            "component_maps": {},
-            "source_hashes": {"region": "abc"},
-            "map": {"path": str(review_map), "sha256": finalizer.sha256_file(review_map)},
-            "failure_taxonomy": ["open_exterior_agent_decision_required"],
+            "hard_metrics": {},
+            "source_hashes": {},
         }), encoding="utf-8")
         manifest_path = root / "bdry_arc_manifest.json"
         manifest_path.write_text(json.dumps({
             "final_status": "needs_review",
-            "failure_taxonomy": ["open_exterior_agent_decision_required"],
+            "failure_taxonomy": [],
             "settings": {"boundary_resolution_profile": "legacy"},
             "outputs": {
                 "open_exterior_contract": str(contract_path),
                 "open_exterior_review_map": str(review_map),
                 "open_exterior_agent_decision": str(decision_path),
             },
-            "region_bpoly_arc_feedback": {"failure_taxonomy": [], "outputs": {}},
-        }), encoding="utf-8")
-        summary_path = root / "feedback_loop_summary.json"
-        summary_path.write_text(json.dumps({
-            "schema_version": "region_bpoly_arc_feedback_loop_v2",
-            "geometry_loop_status": "pass",
-            "boundary_package_status": "pending",
-            "final_status": "boundary_roles_required",
-            "geometry_evidence_sha256": "geometry-hash",
-            "selected_outputs": {"bdry_arc_manifest": str(manifest_path)},
         }), encoding="utf-8")
         try:
             finalizer.finalize(manifest_path, "pass", "Inspected complete geometry.", resume_adaptive=False)
         except ValueError as exc:
-            assert "feedback-loop summary" in str(exc)
+            assert "unsupported open-exterior contract" in str(exc)
         else:
-            raise AssertionError("v3 finalization must require loop evidence")
-        result = finalizer.finalize(
-            manifest_path,
-            "pass",
-            "Inspected complete geometry.",
-            resume_adaptive=False,
-            feedback_loop_summary_path=summary_path,
-        )
-        assert result["open_exterior_contract"]["region_bpoly_arc_feedback_loop"]["geometry_evidence_sha256"] == "geometry-hash"
-        assert json.loads(summary_path.read_text(encoding="utf-8"))["final_status"] == "pass"
+            raise AssertionError("historical v3 must be rejected by active finalization")
     print("passed strict and solid-default open-exterior policy tests")
 
 

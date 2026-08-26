@@ -1477,7 +1477,6 @@ def check_case_readiness(
             open_audit = validate_open_exterior_contract(
                 lineage_path,
                 required=coastal_required,
-                require_boundary_completeness_loop=coastal_required,
             )
             if not open_audit["passed"]:
                 blockers.extend(open_audit["failure_taxonomy"])

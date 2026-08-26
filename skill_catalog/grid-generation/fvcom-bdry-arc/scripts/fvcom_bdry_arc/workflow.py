@@ -31,7 +31,7 @@ from shapely.ops import linemerge, nearest_points, polygonize, substring, unary_
 from .boundary_loops import build_model_boundary_loops
 from .boundary_resolution import boundary_resolution_config, build_boundary_resolution
 from .coastline_coverage import audit_coastline_source_coverage
-from .feedback import build_region_bpoly_arc_feedback, file_sha256
+from .open_exterior import build_open_exterior_contract, file_sha256
 from .projection import LocalProjection, local_utm_projection, project_geometry, unproject_geometry, unwrap_geometry_longitudes, unwrap_longitude
 
 
@@ -65,7 +65,6 @@ class BdryArcConfig:
     frame_clip_policy: str = "reject-unintended"
     residual_boundary_policy: str = "solid-default"
     frame_clip_tolerance_m: float | None = None
-    feedback_candidate_max_km: float = 100.0
     obc_placement_policy: str = "offshore-first"
 
 
@@ -109,8 +108,6 @@ def run_bdry_arc(
         raise ValueError("--obc-placement-policy must be offshore-first or mouth-first")
     if config.frame_clip_tolerance_m is not None and config.frame_clip_tolerance_m < 0.0:
         raise ValueError("--frame-clip-tolerance-m must be nonnegative")
-    if config.feedback_candidate_max_km <= 0.0:
-        raise ValueError("--feedback-candidate-max-km must be positive")
     if config.gshhs_coverage_factor < 2.0:
         raise ValueError("--gshhs-coverage-factor must be at least 2.0")
     if config.topology_mode == "gshhs-vector" and config.coastline_source == "cusp-legacy":
@@ -481,7 +478,6 @@ def run_bdry_arc(
                 if config.frame_clip_tolerance_m is not None
                 else float(max(250.0, 0.05 * config.target_resolution_m))
             ),
-            "feedback_candidate_max_km": float(config.feedback_candidate_max_km),
         },
         "region_bpoly": {
             "domain_type": region.get("domain_type"),
@@ -618,41 +614,38 @@ def run_bdry_arc(
         "run_bdry_arc automatically builds continuous model-boundary loops; "
         "the main manifest needs review when the loop package needs review"
     )
-    feedback_dir = run_dir / "fb"
-    feedback: dict[str, Any]
-    feedback_failed = False
+    open_exterior_dir = run_dir / "open_exterior"
+    open_contract: dict[str, Any]
+    open_contract_failed = False
     try:
-        feedback = build_region_bpoly_arc_feedback(
+        open_contract = build_open_exterior_contract(
             region_bpoly_json,
             offshore_artifacts_json,
             outputs["bdry_arc_package_gpkg"],
             coastline_gpkg,
             loop_manifest_path,
-            feedback_dir,
+            open_exterior_dir,
             manifest,
             frame_clip_policy=config.frame_clip_policy,
             residual_boundary_policy=config.residual_boundary_policy,
             frame_clip_tolerance_m=config.frame_clip_tolerance_m,
-            candidate_max_km=config.feedback_candidate_max_km,
             adaptive_status=("disabled" if config.boundary_resolution_profile == "legacy" else "pending"),
         )
     except Exception as exc:
-        feedback_failed = True
-        feedback_dir.mkdir(parents=True, exist_ok=True)
-        feedback = {
-            "schema_version": "region_bpoly_arc_feedback_v2",
-            "status": "input_needs_review",
-            "diagnostic_status": "failed",
-            "failure_taxonomy": ["region_bpoly_arc_feedback_failed"],
+        open_contract_failed = True
+        open_exterior_dir.mkdir(parents=True, exist_ok=True)
+        open_contract = {
+            "schema_version": "fvcom_open_exterior_contract_v2",
+            "final_status": "needs_review",
+            "downstream_eligible": False,
+            "failure_taxonomy": ["open_exterior_contract_build_failed"],
             "error": str(exc),
             "outputs": {},
         }
-        feedback_path = feedback_dir / "region_bpoly_arc_feedback_v2.json"
-        feedback_path.write_text(json.dumps(_json_safe(feedback), indent=2), encoding="utf-8")
-        feedback["outputs"]["feedback_json"] = str(feedback_path)
-    manifest["region_bpoly_arc_feedback"] = feedback
-    manifest["outputs"].update(feedback.get("outputs", {}))
-    open_contract = dict(feedback.get("open_exterior_contract", {}))
+        contract_path = open_exterior_dir / "open_exterior_contract.json"
+        open_contract["outputs"]["open_exterior_contract"] = str(contract_path)
+        contract_path.write_text(json.dumps(_json_safe(open_contract), indent=2), encoding="utf-8")
+    manifest["outputs"].update(open_contract.get("outputs", {}))
     manifest["open_exterior_contract"] = open_contract
     frame_gate_blocked = bool(not open_contract.get("downstream_eligible", False))
     if frame_gate_blocked:
@@ -660,10 +653,10 @@ def run_bdry_arc(
         for failure in open_contract.get("failure_taxonomy", ["open_exterior_contract_not_downstream_eligible"]):
             if failure not in manifest["failure_taxonomy"]:
                 manifest["failure_taxonomy"].append(failure)
-    if feedback_failed:
+    if open_contract_failed:
         manifest["final_status"] = "needs_review"
-        if "region_bpoly_arc_feedback_failed" not in manifest["failure_taxonomy"]:
-            manifest["failure_taxonomy"].append("region_bpoly_arc_feedback_failed")
+        if "open_exterior_contract_build_failed" not in manifest["failure_taxonomy"]:
+            manifest["failure_taxonomy"].append("open_exterior_contract_build_failed")
 
     adaptive_requested = config.boundary_resolution_profile in {"adaptive-coastal-v1", "adaptive-coastal-v2"}
     adaptive_can_run = bool(
@@ -671,7 +664,7 @@ def run_bdry_arc(
         and loop_outputs.get("model_boundary_loops_gpkg")
         and loop_manifest.get("final_status") == "pass"
         and not frame_gate_blocked
-        and not feedback_failed
+        and not open_contract_failed
     )
     if adaptive_can_run:
         resolution_dir = run_dir / "boundary_resolution"
@@ -715,17 +708,17 @@ def run_bdry_arc(
             "profile": config.boundary_resolution_profile,
             "enabled": False,
             "final_status": "needs_review",
-            "failure_taxonomy": ["blocked_by_region_bpoly_feedback"],
+            "failure_taxonomy": ["blocked_by_open_exterior_contract"],
             "reason": (
                 "Residual boundary roles and the hash-bound Codex map decision must be finalized before adaptive boundary resolution."
                 if config.residual_boundary_policy == "solid-default"
-                else "Residual GSHHS frame clipping must be resolved by RegionBPoly adjustment before adaptive boundary resolution."
+                else "The open-exterior geometry and metric gates must pass before adaptive boundary resolution."
             ),
             "outputs": {},
         }
-        if "blocked_by_region_bpoly_feedback" not in manifest["failure_taxonomy"]:
-            manifest["failure_taxonomy"].append("blocked_by_region_bpoly_feedback")
-        _write_progress(run_dir, "boundary-resolution", "blocked", {"reason": "region_bpoly_feedback"})
+        if "blocked_by_open_exterior_contract" not in manifest["failure_taxonomy"]:
+            manifest["failure_taxonomy"].append("blocked_by_open_exterior_contract")
+        _write_progress(run_dir, "boundary-resolution", "blocked", {"reason": "open_exterior_contract"})
     elif adaptive_requested:
         manifest["boundary_resolution"] = {
             "profile": config.boundary_resolution_profile,
@@ -741,30 +734,6 @@ def run_bdry_arc(
             "reason": "legacy_profile_preserves_existing_boundary_workflow",
         }
 
-    if not feedback_failed and not frame_gate_blocked:
-        adaptive_manifest = manifest.get("boundary_resolution", {})
-        adaptive_status = (
-            "disabled"
-            if not adaptive_requested
-            else str(adaptive_manifest.get("final_status", "needs_review"))
-        )
-        feedback = build_region_bpoly_arc_feedback(
-            region_bpoly_json,
-            offshore_artifacts_json,
-            outputs["bdry_arc_package_gpkg"],
-            coastline_gpkg,
-            loop_manifest_path,
-            feedback_dir,
-            manifest,
-            frame_clip_policy=config.frame_clip_policy,
-            residual_boundary_policy=config.residual_boundary_policy,
-            frame_clip_tolerance_m=config.frame_clip_tolerance_m,
-            candidate_max_km=config.feedback_candidate_max_km,
-            adaptive_status=adaptive_status,
-            adaptive_failures=list(adaptive_manifest.get("failure_taxonomy", [])),
-        )
-        manifest["region_bpoly_arc_feedback"] = feedback
-        manifest["outputs"].update(feedback.get("outputs", {}))
     manifest_path.write_text(json.dumps(_json_safe(manifest), indent=2), encoding="utf-8")
     _write_progress(run_dir, "complete", "done", {"final_status": manifest["final_status"]})
     return manifest
@@ -2843,7 +2812,12 @@ def _upstream_bpoly_unresolved(region: dict[str, Any]) -> bool:
     status = str(region.get("final_status") or "").lower()
     domain_type = str(region.get("domain_type") or region.get("region_bpoly", {}).get("domain_type") or "").lower()
     coords = region.get("polygon_lonlat") or region.get("region_bpoly", {}).get("polygon_lonlat")
-    return domain_type == "unresolved_autonomous_failure" or (status == "needs_review" and not coords)
+    if domain_type == "unresolved_autonomous_failure" or status == "needs_review":
+        return True
+    if region.get("schema_version") == "region_bpoly_final_v1" and domain_type == "coastal":
+        gate = region.get("qa", {}).get("land_side_visual_gate", {})
+        return gate.get("status") != "pass"
+    return not bool(coords)
 
 
 def _write_unresolved_upstream_manifest(
