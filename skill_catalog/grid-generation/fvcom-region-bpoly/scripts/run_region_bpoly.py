@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from region_bbox.features import (
     infer_target_region_features,
     is_complex_feature_request,
 )
+from region_bbox.discovery import PlaceDiscoveryError, discover_named_region_features
 from propose_region_bpoly import deform_bpoly, guess_region_box, known_repair_candidates, load_request
 from region_bbox.geometry import RegionBPoly
 from region_bbox.ingredients import mission_scope_notes, required_ingredients, request_text
@@ -26,7 +28,6 @@ POLICY = {
     "coastal": "coastal_arc_with_land_anchors",
     "island": "offshore_loop_no_land_anchors",
     "lake": "no_open_boundary",
-    "unresolved_autonomous_failure": "unresolved",
 }
 
 
@@ -46,118 +47,6 @@ def _effective_request(request: dict | str, place_memory_enabled: bool) -> dict 
     return {"request": request, "_place_memory_enabled": bool(place_memory_enabled)}
 
 
-def _write_unresolved_region(
-    case_dir: Path,
-    intermediate: Path,
-    name: str,
-    request: dict,
-    mode: str,
-    heuristic_mode: str,
-    features_doc: dict,
-    ingredients: list[dict],
-    reason: str,
-) -> Path:
-    retained_intermediate = mode == "test"
-    if retained_intermediate:
-        visual_dir = intermediate / "visual_review"
-        visual_dir.mkdir(parents=True, exist_ok=True)
-        write_json(visual_dir / f"{name}_request.json", request)
-        write_json(visual_dir / "target_region_features.json", features_doc)
-        write_json(visual_dir / "target_region_feature_polygons.geojson", features_to_geojson(features_doc))
-        write_json(
-            visual_dir / f"{name}_ingredient_coverage.json",
-            {
-                "all_required_inside": False,
-                "required_count": sum(1 for item in ingredients if item.get("required", True)),
-                "ingredient_count": len(ingredients),
-                "missing_required_ids": [item.get("id", "unknown") for item in ingredients if item.get("required", True)],
-                "ingredients": ingredients,
-            },
-        )
-    offshore_path = case_dir / "offshore_boundary_artifacts.json"
-    offshore = {
-        "schema_version": "offshore_boundary_artifacts_v1",
-        "name": name,
-        "domain_type": "unresolved_autonomous_failure",
-        "boundary_policy": POLICY["unresolved_autonomous_failure"],
-        "selected_side_index": None,
-        "selected_side_name": None,
-        "open_boundary_reference": None,
-        "review_depth": None,
-        "side_focus_count": 0,
-        "warnings": [reason],
-        "failure_taxonomy": [
-            {
-                "code": "unknown_region_no_feature_plan",
-                "severity": "fail",
-                "message": reason,
-            }
-        ],
-    }
-    write_json(offshore_path, offshore)
-    final = {
-        "schema_version": "region_bpoly_final_v1",
-        "object_type": "RegionBPolyFinal",
-        "name": name,
-        "created_at_utc": utc_now(),
-        "mode": mode,
-        "heuristic_mode": heuristic_mode,
-        "place_memory_enabled": False,
-        "final_status": "needs_review",
-        "status_reasons": [reason],
-        "region_bpoly": None,
-        "polygon_lonlat": [],
-        "envelope_bbox": None,
-        "target_region_features": features_doc,
-        "domain_variant": features_doc.get("domain_variant"),
-        "domain_type": "unresolved_autonomous_failure",
-        "boundary_policy": POLICY["unresolved_autonomous_failure"],
-        "open_boundary_reference": None,
-        "offshore_boundary_artifacts_path": str(offshore_path),
-        "final_map_path": None,
-        "final_map_basemap": None,
-        "map_detail_policy": None,
-        "intermediate_dir": str(intermediate) if retained_intermediate else None,
-        "qa": {
-            "ingredient_coverage": {
-                "all_required_inside": False,
-                "missing_required_ids": [item.get("id", "unknown") for item in ingredients if item.get("required", True)],
-                "required_count": sum(1 for item in ingredients if item.get("required", True)),
-                "ingredient_count": len(ingredients),
-            },
-            "target_region_features": {
-                "feature_count": len(features_doc.get("features", [])),
-                "categories": sorted({f.get("category") for f in features_doc.get("features", []) if f.get("category")}),
-                "retained_path": str(intermediate / "visual_review" / "target_region_features.json") if retained_intermediate else None,
-                "retained_geojson_path": str(intermediate / "visual_review" / "target_region_feature_polygons.geojson") if retained_intermediate else None,
-            },
-            "bpoly_quality": {
-                "schema_version": "bpoly_quality_score_v1",
-                "canonical_region_key": "unknown",
-                "blocking_failure": True,
-                "failure_taxonomy": offshore["failure_taxonomy"],
-            },
-            "review_depth": None,
-            "side_focus_count": 0,
-        },
-        "offshore_boundary_artifacts": {
-            "selected_side_index": None,
-            "selected_side_name": None,
-            "review_depth": None,
-            "side_focus_count": 0,
-        },
-        "deformation_notes": [],
-        "downstream_contract": {
-            "bathymetry_and_coastline_fetch": "No bbox emitted because the autonomous region was unresolved.",
-            "domain_and_grid_generation": "Do not use this unresolved output for downstream gridding.",
-            "offshore_point": "No offshore point emitted.",
-        },
-    }
-    if mode == "execute" and intermediate.exists():
-        shutil.rmtree(intermediate)
-    return write_json(case_dir / "region_bpoly.json", final)
-
-
 def infer_domain_type(request: dict | str) -> str:
     text = normalize_request_text(request)
     key = canonical_region_key(request)
@@ -167,7 +56,18 @@ def infer_domain_type(request: dict | str) -> str:
         return "coastal"
     if key in {"aleutian", "hawaii_state", "hawaii_island"}:
         return "island"
+    if re.search(r"\blake\b", text):
+        return "lake"
+    if any(term in text for term in ["island", "archipelago", "atoll"]):
+        return "island"
     return "coastal"
+
+
+def _default_place_cache_dir(case_dir: Path) -> Path:
+    for parent in [case_dir, *case_dir.parents]:
+        if parent.name.casefold() == "fvcom-region-bpoly":
+            return parent / "cache" / "place-discovery"
+    return case_dir.parent / ".place-discovery-cache"
 
 
 def select_review_depth(
@@ -571,7 +471,13 @@ def main() -> None:
     ap.add_argument("--run-dir", required=True, help="Final case output folder.")
     ap.add_argument("--name", required=True)
     ap.add_argument("--mode", choices=["execute", "test"], default="execute")
-    ap.add_argument("--heuristic-mode", choices=["auto", "memory", "unknown"], default="auto", help="auto uses place memory in execute and disables it in test; memory keeps known-region heuristics; unknown requires explicit geometry.")
+    ap.add_argument("--heuristic-mode", choices=["auto", "memory", "unknown"], default="auto", help="auto uses place memory in execute and disables it in test; unknown bypasses catalog geometry but still permits named-place discovery.")
+    ap.add_argument("--place-discovery", choices=["auto", "off"], default="auto", help="When catalog or explicit geometry is absent, auto performs one cached named-place lookup; off requires --discovery-bbox or explicit request geometry.")
+    ap.add_argument("--discovery-bbox", nargs=4, type=float, metavar=("WEST", "SOUTH", "EAST", "NORTH"), help="Agent/user-supplied initial geographic bbox used only when no feature plan exists.")
+    ap.add_argument("--discovery-label", help="Label and provenance description for --discovery-bbox.")
+    ap.add_argument("--discovery-query", help="Override the named-place query extracted from the modeling request.")
+    ap.add_argument("--place-discovery-cache-dir", help="Persistent cache for online named-place responses.")
+    ap.add_argument("--place-discovery-timeout-s", type=float, default=20.0)
     ap.add_argument("--review-depth", choices=["auto", "fast", "full"], default="auto")
     ap.add_argument("--domain-type", choices=list(POLICY))
     ap.add_argument("--open-boundary-reference", nargs=2, type=float, metavar=("LON", "LAT"))
@@ -589,8 +495,35 @@ def main() -> None:
     request = load_request(args)
     heuristic_mode, place_memory_enabled = _resolve_heuristic_mode(args.heuristic_mode, args.mode)
     effective_request = _effective_request(request, place_memory_enabled)
+    domain_type = args.domain_type or infer_domain_type(effective_request)
     features_doc = infer_target_region_features(effective_request, use_place_memory=place_memory_enabled)
     ingredients = features_as_ingredients(features_doc) or required_ingredients(effective_request, use_place_memory=place_memory_enabled)
+    place_discovery: dict | None = None
+    place_discovery_path: Path | None = None
+    if not ingredients:
+        if args.place_discovery == "off" and args.discovery_bbox is None:
+            raise SystemExit(
+                "region_discovery_failed: no catalog or explicit feature geometry exists and online discovery is off; "
+                "supply --discovery-bbox WEST SOUTH EAST NORTH or target_region_features"
+            )
+        cache_dir = Path(args.place_discovery_cache_dir) if args.place_discovery_cache_dir else _default_place_cache_dir(case_dir)
+        try:
+            features_doc, place_discovery = discover_named_region_features(
+                effective_request,
+                domain_type,
+                bbox_override=args.discovery_bbox,
+                label_override=args.discovery_label,
+                query_override=args.discovery_query,
+                timeout_s=args.place_discovery_timeout_s,
+                cache_dir=cache_dir,
+            )
+        except PlaceDiscoveryError as exc:
+            raise SystemExit(
+                f"region_discovery_failed: {exc}. Research or infer an initial frame and rerun with "
+                "--discovery-bbox WEST SOUTH EAST NORTH; no unresolved RegionBPoly was delivered."
+            ) from exc
+        place_discovery_path = write_json(case_dir / "region_place_discovery.json", place_discovery)
+        ingredients = features_as_ingredients(features_doc)
     bpoly: RegionBPoly | None = None
     deformation_notes: list[str] = []
     adjusted_source: dict | None = None
@@ -614,18 +547,20 @@ def main() -> None:
         except ValueError:
             bpoly = None
     if bpoly is None:
-        bpoly, feature_seed_note = bpoly_from_feature_boxes(ingredients, args.offshore_azimuth_deg or 90.0)
+        seed_azimuth = float(args.offshore_azimuth_deg) if args.offshore_azimuth_deg is not None else (0.0 if domain_type == "lake" else 90.0)
+        edge_labels = (
+            ["south_lake_edge", "west_lake_edge", "north_lake_edge", "east_lake_edge"]
+            if domain_type == "lake"
+            else ["open_or_south", "west_or_left", "north_or_inner", "east_or_right"]
+        )
+        bpoly, feature_seed_note = bpoly_from_feature_boxes(ingredients, seed_azimuth, edge_labels=edge_labels)
         if feature_seed_note:
             deformation_notes.append(feature_seed_note)
     if bpoly is None:
-        reason = (
-            "Unknown or memory-disabled region has no explicit target_region_features, "
-            "required_ingredients, or polygon seed; refusing Delaware/NJ fallback."
+        raise SystemExit(
+            "region_discovery_failed: no valid four-corner seed could be built from catalog, explicit, "
+            "or discovered geometry; no unresolved RegionBPoly was delivered"
         )
-        out = _write_unresolved_region(case_dir, intermediate, args.name, request, args.mode, heuristic_mode, features_doc, ingredients, reason)
-        print(f"Wrote unresolved RegionBPoly: {out}")
-        print("Final status needs review: " + reason)
-        return
     basemap_provider, map_detail_policy = resolve_basemap_provider(effective_request, args.basemap_provider, features_doc)
     basemap_zoom = map_detail_policy.get("target_zoom") if map_detail_policy else None
     side_radius_km = side_focus_radius_km(effective_request, features_doc)
@@ -649,7 +584,6 @@ def main() -> None:
             deformation_notes.append(refit_note)
             coverage = score_region_box(bpoly, ingredients)
     mission_notes = mission_scope_notes(effective_request)
-    domain_type = args.domain_type or infer_domain_type(effective_request)
     repair_notes: list[str] = []
     if adjusted_source is None:
         bpoly, coverage, repair_notes = apply_candidate_repairs(
@@ -803,6 +737,8 @@ def main() -> None:
         "mode": args.mode,
         "heuristic_mode": heuristic_mode,
         "place_memory_enabled": place_memory_enabled,
+        "place_discovery": place_discovery,
+        "place_discovery_path": str(place_discovery_path) if place_discovery_path else None,
         "final_status": final_status,
         "status_reasons": (["land_side_visual_review_required"] if domain_type == "coastal" else []),
         "delivery_warnings": delivery_warnings,

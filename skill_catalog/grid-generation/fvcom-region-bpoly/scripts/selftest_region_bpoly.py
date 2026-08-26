@@ -12,6 +12,8 @@ from shapely.geometry import LineString
 from unittest.mock import patch
 
 import region_bbox.basemap as basemap_module
+import region_bbox.discovery as discovery_module
+from region_bbox.discovery import discover_named_region_features, extract_named_region_query
 from region_bbox.features import infer_target_region_features
 from region_bbox.basemap import _coastline_candidates, _draw_offline_coastline
 from region_bbox.geometry import RegionBPoly
@@ -349,8 +351,72 @@ def main() -> None:
         assert tight["approx_width_km"] <= tight["small_estuary_limits"]["max_width_km"], tight
         assert tight["region_area_km2"] <= tight["small_estuary_limits"]["max_region_area_km2"], tight
 
-        # Unknown or memory-disabled prompts must not pass through the old
-        # Delaware/NJ fallback box.
+        # Natural objective prompts expose a concise named-place query, and a
+        # point-like geocoder result is expanded into an auditable initial
+        # RegionBPoly seed rather than a terminal needs_review product.
+        galveston_prompt = (
+            "I am developing an FVCOM model of Galveston Bay to study estuarine "
+            "circulation, salinity intrusion, and tidal mixing. Use FVCOM "
+            "RegionBPoly to define an appropriate model region."
+        )
+        assert extract_named_region_query(galveston_prompt) == "Galveston Bay"
+        synthetic_result = {
+            "display_name": "Galveston Bay, Chambers County, Texas, United States",
+            "category": "natural",
+            "type": "bay",
+            "importance": 0.1,
+            "boundingbox": ["29.5696234", "29.5697234", "-94.9366420", "-94.9365420"],
+            "osm_type": "node",
+            "osm_id": 1,
+            "licence": "Data © OpenStreetMap contributors, ODbL 1.0",
+        }
+        with patch.object(discovery_module, "_nominatim_search", return_value=([synthetic_result], {"cache_hit": False, "cache_path": None})):
+            discovered_features, discovery = discover_named_region_features(galveston_prompt, "coastal")
+        discovered_bbox = discovered_features["features"][0]["geometry"]
+        assert discovered_features["source"] == "online_named_place_discovery"
+        assert discovery["selected_type"] == "bay"
+        assert discovered_bbox[2] - discovered_bbox[0] > 1.0, discovered_bbox
+        assert discovered_bbox[3] - discovered_bbox[1] > 1.0, discovered_bbox
+        assert discovery["requires_visual_offshore_side_confirmation"] is True
+
+        galveston_dir = run_dir / "galveston_discovered_seed"
+        run(
+            [
+                "run_region_bpoly.py",
+                "--request-text",
+                galveston_prompt,
+                "--run-dir",
+                galveston_dir,
+                "--name",
+                "galveston_discovered_seed",
+                "--mode",
+                "test",
+                "--heuristic-mode",
+                "memory",
+                "--discovery-bbox",
+                -95.57,
+                29.0,
+                -94.28,
+                30.15,
+                "--discovery-label",
+                "Galveston Bay, Texas, agent-supplied regression seed",
+                "--offshore-azimuth-deg",
+                180,
+                "--basemap-provider",
+                "none",
+            ]
+        )
+        galveston = load(galveston_dir / "region_bpoly.json")
+        assert galveston["final_status"] == "pass", galveston
+        assert galveston["domain_type"] == "coastal", galveston
+        assert galveston["target_region_features"]["source"] == "agent_supplied_place_discovery"
+        assert galveston["place_discovery"]["requires_visual_scope_confirmation"] is True
+        assert Path(galveston["place_discovery_path"]).exists()
+        assert galveston["open_boundary_reference"]["side_index"] == 0, galveston["open_boundary_reference"]
+
+        # Unknown or memory-disabled prompts must never pass through the old
+        # Delaware/NJ fallback box. With online discovery explicitly disabled,
+        # the runner fails without publishing a terminal needs_review product.
         unknown_cases = {
             "pws_unknown": "Prince William Sound tide/current/ocean-exchange modeling domain",
             "galveston_unknown": "Galveston-Trinity Bay complex tide and salinity modeling domain",
@@ -360,7 +426,7 @@ def main() -> None:
         }
         for name, text in unknown_cases.items():
             out_dir = run_dir / name
-            run(
+            result = run(
                 [
                     "run_region_bpoly.py",
                     "--request-text",
@@ -373,19 +439,16 @@ def main() -> None:
                     "test",
                     "--basemap-provider",
                     "none",
-                ]
+                    "--place-discovery",
+                    "off",
+                ],
+                expect_ok=False,
             )
-            unknown = load(out_dir / "region_bpoly.json")
-            assert unknown["final_status"] == "needs_review", unknown
-            assert unknown["domain_type"] == "unresolved_autonomous_failure", unknown
-            assert unknown["envelope_bbox"] is None, unknown
-            assert unknown["qa"]["bpoly_quality"]["canonical_region_key"] == "unknown"
-            assert "unknown_region_no_feature_plan" in {
-                item["code"] for item in unknown["qa"]["bpoly_quality"]["failure_taxonomy"]
-            }
+            assert "region_discovery_failed" in result.stderr
+            assert not (out_dir / "region_bpoly.json").exists()
 
         execute_unknown_dir = run_dir / "execute_unknown_no_fallback"
-        run(
+        execute_result = run(
             [
                 "run_region_bpoly.py",
                 "--request-text",
@@ -398,15 +461,13 @@ def main() -> None:
                 "execute",
                 "--basemap-provider",
                 "none",
-            ]
+                "--place-discovery",
+                "off",
+            ],
+            expect_ok=False,
         )
-        execute_unknown = load(execute_unknown_dir / "region_bpoly.json")
-        assert execute_unknown["final_status"] == "needs_review", execute_unknown
-        assert execute_unknown["domain_type"] == "unresolved_autonomous_failure", execute_unknown
-        assert execute_unknown["envelope_bbox"] is None, execute_unknown
-        assert "unknown_region_no_feature_plan" in {
-            item["code"] for item in execute_unknown["qa"]["bpoly_quality"]["failure_taxonomy"]
-        }
+        assert "region_discovery_failed" in execute_result.stderr
+        assert not (execute_unknown_dir / "region_bpoly.json").exists()
 
         explicit_dir = run_dir / "explicit_feature_test_mode"
         explicit_request = {

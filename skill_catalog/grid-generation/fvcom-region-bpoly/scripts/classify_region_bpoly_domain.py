@@ -11,7 +11,6 @@ POLICY = {
     "coastal": "coastal_arc_with_land_anchors",
     "island": "offshore_loop_no_land_anchors",
     "lake": "no_open_boundary",
-    "unresolved_autonomous_failure": "unresolved",
 }
 
 

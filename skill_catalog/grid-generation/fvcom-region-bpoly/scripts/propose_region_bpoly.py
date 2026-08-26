@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from region_bbox.geometry import RegionBPoly, RegionBox
+from region_bbox.discovery import PlaceDiscoveryError, discover_named_region_features
 from region_bbox.features import (
     bpoly_from_feature_boxes,
     cook_inlet_domain_variant,
@@ -48,7 +49,7 @@ def guess_region_box(request: dict | str) -> RegionBox:
         return RegionBox(-88.25, 30.55, 180, 145, 5, 180)
     if key == "southeast_alaska":
         return RegionBox(-134.0, 55.5, 1050, 620, 130, 215)
-    raise ValueError("unknown_region_no_feature_plan")
+    raise ValueError("catalog_region_geometry_unavailable")
 
 
 def _effective_request(request: dict | str, place_memory_enabled: bool) -> dict | str:
@@ -57,6 +58,16 @@ def _effective_request(request: dict | str, place_memory_enabled: bool) -> dict 
         out["_place_memory_enabled"] = bool(place_memory_enabled)
         return out
     return {"request": request, "_place_memory_enabled": bool(place_memory_enabled)}
+
+
+def _domain_type_hint(request: dict | str) -> str:
+    text = normalize_request_text(request)
+    key = canonical_region_key(request)
+    if key.startswith("lake_") or " lake " in f" {text} ":
+        return "lake"
+    if key in {"aleutian", "hawaii_state", "hawaii_island"} or any(term in text for term in ["island", "archipelago", "atoll"]):
+        return "island"
+    return "coastal"
 
 
 def deform_bpoly(base: RegionBPoly, request: dict | str) -> tuple[RegionBPoly, list[str]]:
@@ -212,7 +223,13 @@ def main() -> None:
     ap.add_argument("--basemap-provider", default="auto", help="auto/topo/road/street/satellite/offline provider; none/off still uses the required offline background fallback.")
     ap.add_argument("--full-side-review", action="store_true")
     ap.add_argument("--review-depth", choices=["auto", "fast", "full"], default="auto")
-    ap.add_argument("--heuristic-mode", choices=["memory", "unknown"], default="memory", help="memory uses built-in place heuristics; unknown disables them and requires explicit geometry.")
+    ap.add_argument("--heuristic-mode", choices=["memory", "unknown"], default="memory", help="memory uses catalog geometry; unknown bypasses it but still permits named-place discovery.")
+    ap.add_argument("--place-discovery", choices=["auto", "off"], default="auto")
+    ap.add_argument("--discovery-bbox", nargs=4, type=float, metavar=("WEST", "SOUTH", "EAST", "NORTH"))
+    ap.add_argument("--discovery-label")
+    ap.add_argument("--discovery-query")
+    ap.add_argument("--place-discovery-cache-dir")
+    ap.add_argument("--place-discovery-timeout-s", type=float, default=20.0)
     ap.add_argument("--iteration", type=int, default=1)
     args = ap.parse_args()
 
@@ -225,15 +242,42 @@ def main() -> None:
 
     features_doc = infer_target_region_features(effective_request, use_place_memory=place_memory_enabled)
     ingredients = features_as_ingredients(features_doc) or required_ingredients(effective_request, use_place_memory=place_memory_enabled)
+    domain_type = _domain_type_hint(effective_request)
+    place_discovery = None
+    place_discovery_path = None
+    if not ingredients and not args.polygon_lonlat:
+        if args.place_discovery == "off" and args.discovery_bbox is None:
+            raise SystemExit(
+                "region_discovery_failed: no catalog or explicit geometry exists and online discovery is off; "
+                "supply --discovery-bbox or explicit request geometry"
+            )
+        try:
+            features_doc, place_discovery = discover_named_region_features(
+                effective_request,
+                domain_type,
+                bbox_override=args.discovery_bbox,
+                label_override=args.discovery_label,
+                query_override=args.discovery_query,
+                timeout_s=args.place_discovery_timeout_s,
+                cache_dir=(Path(args.place_discovery_cache_dir) if args.place_discovery_cache_dir else run_dir.parent / ".place-discovery-cache"),
+            )
+        except PlaceDiscoveryError as exc:
+            raise SystemExit(
+                f"region_discovery_failed: {exc}. Supply a researched or inferred --discovery-bbox; "
+                "no unresolved RegionBPoly candidate was delivered."
+            ) from exc
+        ingredients = features_as_ingredients(features_doc)
+        place_discovery_path = write_json(run_dir / "region_place_discovery.json", place_discovery)
     if args.polygon_lonlat:
         import json
 
         bpoly = RegionBPoly(json.loads(args.polygon_lonlat), args.offshore_azimuth_deg or 90.0)
         deformation_notes = ["User supplied explicit four-corner polygon."]
-    elif not place_memory_enabled:
-        bpoly, feature_seed_note = bpoly_from_feature_boxes(ingredients, args.offshore_azimuth_deg or 90.0)
+    elif not place_memory_enabled or place_discovery is not None or canonical_region_key(effective_request) == "unknown":
+        seed_azimuth = float(args.offshore_azimuth_deg) if args.offshore_azimuth_deg is not None else (0.0 if domain_type == "lake" else 90.0)
+        bpoly, feature_seed_note = bpoly_from_feature_boxes(ingredients, seed_azimuth)
         if bpoly is None:
-            raise ValueError("unknown_region_no_feature_plan: test/unknown heuristic mode requires explicit target_region_features, required_ingredients, or --polygon-lonlat")
+            raise SystemExit("region_discovery_failed: no valid four-corner seed could be built; no candidate was delivered")
         deformation_notes = [feature_seed_note] if feature_seed_note else []
     else:
         bpoly, deformation_notes = deform_bpoly(RegionBPoly.from_region_box(guess_region_box(effective_request)), effective_request)
@@ -294,7 +338,7 @@ def main() -> None:
         side_indices, fractions, mode = [0, 1, 2, 3], [0.5], "fast_all_sides"
     side_reviews = side_focus_records(bpoly, run_dir, args.name, side_indices, fractions, basemap_provider=basemap_provider, radius_km=side_radius_km, basemap_zoom=basemap_zoom)
     open_ref = None
-    if not any(f.get("category") == "lake_connecting_channels" for f in features_doc.get("features", [])):
+    if domain_type != "lake":
         snap = bpoly.snap_point_to_edge(*bpoly.offshore_edge_midpoint_lonlat())
         open_ref = {
             "role": "arc_reference_point",
@@ -305,13 +349,6 @@ def main() -> None:
             "side_name": snap.get("side_name"),
             "notes": "Identifies intended offshore side for downstream coastline-anchor snapping only; boundary arc generation is outside this skill.",
         }
-    key = canonical_region_key(effective_request)
-    if key.startswith("lake_"):
-        domain_type = "lake"
-    elif key in {"aleutian", "hawaii_state", "hawaii_island"}:
-        domain_type = "island"
-    else:
-        domain_type = "coastal"
     boundary_policy = {"coastal": "coastal_arc_with_land_anchors", "island": "offshore_loop_no_land_anchors", "lake": "no_open_boundary"}[domain_type]
     quality_score = score_bpoly_quality(bpoly, ingredients, effective_request, domain_type, boundary_policy, open_ref, basemap)
 
@@ -325,6 +362,8 @@ def main() -> None:
         "domain_variant": features_doc.get("domain_variant"),
         "heuristic_mode": args.heuristic_mode,
         "place_memory_enabled": place_memory_enabled,
+        "place_discovery": place_discovery,
+        "place_discovery_path": str(place_discovery_path) if place_discovery_path else None,
         "review_depth": review_depth,
         "review_depth_reasons": review_reasons,
         "deformation_notes": deformation_notes,
@@ -358,6 +397,8 @@ def main() -> None:
         "target_region_features": features_doc,
         "target_region_features_path": str(feature_path),
         "target_region_feature_polygons_path": str(feature_geojson_path),
+        "place_discovery": place_discovery,
+        "place_discovery_path": str(place_discovery_path) if place_discovery_path else None,
         "review_depth": review_depth,
         "review_depth_reasons": review_reasons,
         "deformation_notes": deformation_notes,

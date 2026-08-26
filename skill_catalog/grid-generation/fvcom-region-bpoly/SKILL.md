@@ -38,13 +38,17 @@ Modes:
 
 - `execute` retains the provisional visual evidence until a coastal decision passes, then keeps the delivered JSON, final map, final review JSON, compact review map, and offshore-side artifact.
 - `test` retains all intermediate maps and evidence.
-- `--heuristic-mode auto` resolves to `memory` in execute mode and `unknown` in test mode.
+- `--heuristic-mode auto` resolves to `memory` in execute mode and `unknown` in test mode. `unknown` bypasses catalog geometry but still permits named-place discovery.
+- `--place-discovery auto` is the default. When no catalog or explicit feature geometry exists, make one cached OpenStreetMap Nominatim lookup for the named geographic target, retain its attribution and selected bbox in `region_place_discovery.json`, and use it only as an initial visual seed.
+- If automatic lookup is unavailable or ambiguous, research or infer a reasonable initial frame and pass it with `--discovery-bbox WEST SOUTH EAST NORTH` plus `--discovery-label`. The visual maps, not the guessed precision, decide whether the seed is acceptable.
 - `--basemap-provider auto` is the normal map policy. `none/off` requests a real offline coastline, not a blank positive review.
 - A coastal run always forces full land-side review even if fast review was requested.
 
 The primary runner never autonomously marks a coastal candidate `pass`. It writes `final_status: needs_review` and a `region_bpoly_land_side_visual_review_request_v1` binding the exact serialized RegionBPoly, candidate JSON, whole-domain map, and every required side map by SHA-256.
 
-Lake and island branches do not use the coastal land-side gate. Unknown requests without authorized feature geometry remain `needs_review` with `unknown_region_no_feature_plan`.
+Treat that coastal `needs_review` file only as an internal review state, never as the skill's delivered product. Continue through visual finalization and any authorized repairs. If a valid seed cannot be obtained or a blocking review cannot be resolved within the allowed loop, stop with an explicit failure and do not present an unresolved RegionBPoly as a delivery.
+
+Lake and island branches do not use the coastal land-side gate. Unknown named regions must enter place discovery instead of terminating at G1.
 
 ## Strict Coastal Visual Gate
 
@@ -109,7 +113,11 @@ After any expansion, render fresh whole-domain and start/middle/end maps and ret
 
 Every run derives target feature boxes before fitting the polygon. Required features may include upstream rivers, estuary/channel connectivity, forcing aprons, lake connections, island chains, and explicitly requested geopolitical or mission context.
 
-Unknown or memory-disabled requests must never fall back to Delaware or another known box. Explicit `target_region_features`, required ingredients, or polygon seeds remain valid in memory-off test mode.
+Unknown or memory-disabled requests must never fall back to Delaware or another known box. Resolve them in this order: explicit `target_region_features` or polygon seed, catalog memory when enabled, cached online named-place discovery, then an agent-supplied researched or inferred `--discovery-bbox`. If all routes fail, return a nonzero `region_discovery_failed` error without writing a final `region_bpoly.json`.
+
+Nominatim discovery is a bounded, user-triggered lookup: extract a concise named place from the modeling objective, issue at most one query, use an identifying User-Agent, cache the result, retain OpenStreetMap attribution, and record how the result was selected. A point-like result is expanded to a regional initial frame; it is not treated as authoritative mission coverage.
+
+For every discovery-seeded coastal case, inspect the initial whole-domain map before final review. Confirm the scientific scope and explicitly correct `--offshore-azimuth-deg` when the inferred/default side is not ocean-facing. Then apply the normal hash-bound land-side truncation gate. Do not accept a discovered bbox merely because it geocoded successfully.
 
 Use road-detail maps for small estuaries and topographic context for regional, lake, island-chain, and archipelago cases. Antimeridian domains require a compact longitude display frame.
 
@@ -120,7 +128,6 @@ After the strict coastal land-side gate passes, resolved tightness, obstruction,
 - `coastal`: one selected Atlantic/ocean-facing side for a later coastline-anchored OBC;
 - `island`: offshore loop without mainland landfall anchors;
 - `lake`: no ocean OBC;
-- `unresolved_autonomous_failure`: no accepted geometry.
 
 The offshore reference point selects a side only. It is not an OBC endpoint or arc.
 
@@ -130,8 +137,10 @@ Preserve this operational ordering and loop:
 
 - W1 interpret request
 - W2 resolve heuristic mode
-- W3 derive target features
-- G1 authorized feature geometry exists
+- W3 derive target features from explicit input, catalog memory, or bounded named-place discovery
+- G1 usable initial geographic seed exists
+  - absent catalog/explicit geometry: discover or supply an initial bbox and re-evaluate G1
+  - all discovery routes fail: stop with `region_discovery_failed` and no delivered RegionBPoly
 - W4 seed four-corner geometry
 - W5 score/refit required coverage
 - G2 required features and valid geometry
@@ -160,6 +169,7 @@ A passing delivery contains:
 - `region_bpoly_final_map.png`
 - `offshore_boundary_artifacts.json`
 - `region_bpoly_land_side_review.json` and `.png` for coastal domains
+- `region_place_discovery.json` when catalog/explicit feature geometry was unavailable
 
 The final coastal JSON retains the review decision, iteration, side evidence, source hashes, and compact-map path. `final_status: pass` is impossible without this evidence.
 
