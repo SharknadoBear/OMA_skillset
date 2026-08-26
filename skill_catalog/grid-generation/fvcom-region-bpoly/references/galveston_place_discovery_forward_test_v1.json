@@ -1,0 +1,50 @@
+{
+  "schema_version": "galveston_region_bpoly_place_discovery_forward_test_v1",
+  "recorded_at_utc": "2026-08-26T21:19:38Z",
+  "implementation_commit": "16bea164d151fbbe1d64419663f1f3401c75bac3",
+  "tested_skill_tree_sha256": "ce3dcb038f31784dd46dbd2e69649f19e4df404f9568ca1d7216a8357c5693e3",
+  "campaign_path": "Workspace/Preprocessing/fvcom-region-bpoly/runs/galveston_place_discovery_20260826T211418Z",
+  "prompt": "I am developing an FVCOM model of Galveston Bay to study estuarine circulation, salinity intrusion, and tidal mixing. Use FVCOM RegionBPoly to define an appropriate model region.",
+  "result": {
+    "status": "pass",
+    "feature_source": "online_named_place_discovery",
+    "provider": "OpenStreetMap Nominatim",
+    "query": "Galveston Bay",
+    "selected_display_name": "Galveston Bay, Chambers County, Texas, United States",
+    "first_lookup_cache_hit": false,
+    "corrected_attempt_cache_hit": true,
+    "raw_bbox": [-94.936642, 29.5696234, -94.936542, 29.5697234],
+    "normalized_seed_bbox": [-95.6575147, 28.9426464, -94.2156693, 30.1967004],
+    "final_envelope_bbox": [-95.73751469999999, 28.879943700000002, -94.1356693, 30.2594031],
+    "domain_type": "coastal",
+    "offshore_side_index": 0,
+    "offshore_side_name": "open_or_south",
+    "review_iteration": 1,
+    "expand_side_count": 0,
+    "land_side_statuses": {"1": "pass", "2": "pass", "3": "pass"},
+    "required_feature_coverage": true,
+    "map_geography_usable": true,
+    "blocking_failure": false,
+    "downstream_artifact_count": 0,
+    "independent_verdict": "pass_with_broad_initial_envelope_caveat"
+  },
+  "key_hashes": {
+    "region_bpoly.json": "2b2d0bc87e3145e80199e6894bdf084e87d7eae998807411ac704be30c721e35",
+    "region_bpoly_final_map.png": "83befee4136acff1d2f34c086451e44c300d209dd71001d069b028cc01b00582",
+    "region_bpoly_land_side_review.json": "5ab8de082243a3f93f9113d91082b1cdcf03e2771fa2d3dd7882674dc137534e",
+    "region_bpoly_land_side_review.png": "187791c91c84ead19fa39a1d1f6f958e5ff9b46e8080148881d4c0d982d7d982",
+    "region_place_discovery.json": "611918c544308f86bf67dd77802d0f88fc11e9f1ffda06c21cf103ba5466ee20"
+  },
+  "validation": {
+    "selftest_region_bpoly": "pass",
+    "compileall": "pass",
+    "quick_validate_python_3_13": "pass",
+    "catalog_installed_mismatch_count": 0,
+    "source_unchanged_during_forward_test": true
+  },
+  "notes": [
+    "The uncatalogued-region G1 stop was removed; W3 obtained an auditable initial seed through bounded online discovery.",
+    "The first map correctly exposed that the default east-facing offshore selector was wrong. A second fresh attempt changed only the selector to the visually supported south-facing Gulf side.",
+    "The accepted box is a broad first mission envelope, not a tight Galveston-only production domain."
+  ]
+}
