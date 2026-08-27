@@ -146,3 +146,8 @@ conservative passage-pair broad phase. Apply exact nearest-distance and wet
 connector tests to every retained candidate; the index may admit false
 positives for speed but may not remove a pair whose exact separation is within
 the configured maximum width.
+
+Prepare the exact buffered-domain cover predicates once per passage inventory
+and reuse them for all connector samples. Reconstructing an unchanged
+many-island domain buffer per sample changes no decision and is prohibitively
+expensive for archipelagos.

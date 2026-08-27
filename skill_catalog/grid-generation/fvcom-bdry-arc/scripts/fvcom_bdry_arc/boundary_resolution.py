@@ -1889,6 +1889,11 @@ def _inventory_narrow_passages(
     raw_candidates: list[dict[str, Any]] = []
     land_lines = [landward] if isinstance(landward, LineString) else list(landward)
     land_lines = [line for line in land_lines if isinstance(line, LineString) and not line.is_empty and line.length > 1.0]
+    # These exact cover geometries depend only on the accepted domain.  Large
+    # archipelagos make buffering the many-hole polygon expensive, so prepare
+    # each one once instead of rebuilding it for every connector sample.
+    connector_domain_cover = prep(domain.buffer(2.0))
+    connector_sample_cover = prep(domain.buffer(0.25))
 
     # Same-chain search captures opposite banks of a narrow inlet/channel.
     for land_id, land_line in enumerate(land_lines):
@@ -1919,7 +1924,12 @@ def _inventory_narrow_passages(
                     if abs(float(np.dot(tangent_a, connector_unit))) > 0.70 or abs(float(np.dot(tangent_b, connector_unit))) > 0.70:
                         continue
                     connector = LineString([sample_xy[first], sample_xy[second]])
-                    if not _wet_connector_is_conservative(connector, domain):
+                    if not _wet_connector_is_conservative(
+                        connector,
+                        domain,
+                        buffered_domain_cover=connector_domain_cover,
+                        sample_domain_cover=connector_sample_cover,
+                    ):
                         continue
                     raw_candidates.append(
                         {
@@ -1977,7 +1987,12 @@ def _inventory_narrow_passages(
             if not (1.0 < width <= max_width):
                 continue
             connector = LineString([point_a, point_b])
-            if not _wet_connector_is_conservative(connector, domain):
+            if not _wet_connector_is_conservative(
+                connector,
+                domain,
+                buffered_domain_cover=connector_domain_cover,
+                sample_domain_cover=connector_sample_cover,
+            ):
                 continue
             raw_candidates.append(
                 {
@@ -2150,6 +2165,7 @@ def _inventory_narrow_passages(
                 else None
             ),
             "component_pair_index_policy": "expanded_envelope_broad_phase_then_exact_distance_and_wet_connector",
+            "wet_connector_domain_buffer_policy": "exact_domain_buffers_prepared_once_per_inventory",
             "all_component_pair_count": int(all_component_pair_count),
             "spatially_indexed_component_pair_count": int(indexed_component_pair_count),
             "passages": passages,
@@ -2159,14 +2175,21 @@ def _inventory_narrow_passages(
     )
 
 
-def _wet_connector_is_conservative(connector: LineString, domain: Polygon) -> bool:
+def _wet_connector_is_conservative(
+    connector: LineString,
+    domain: Polygon,
+    *,
+    buffered_domain_cover=None,
+    sample_domain_cover=None,
+) -> bool:
     if connector.is_empty or connector.length <= 1.0:
         return False
-    buffered = domain.buffer(2.0)
-    if not buffered.covers(connector):
+    buffered_cover = buffered_domain_cover or prep(domain.buffer(2.0))
+    if not buffered_cover.covers(connector):
         return False
+    sample_cover = sample_domain_cover or prep(domain.buffer(0.25))
     for fraction in np.linspace(0.1, 0.9, 9):
-        if not domain.buffer(0.25).covers(connector.interpolate(float(fraction), normalized=True)):
+        if not sample_cover.covers(connector.interpolate(float(fraction), normalized=True)):
             return False
     return True
 

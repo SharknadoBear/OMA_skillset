@@ -1412,6 +1412,9 @@ def test_v2_passage_inventory_uses_conservative_sparse_broad_phase() -> None:
     assert report["component_pair_index_policy"] == (
         "expanded_envelope_broad_phase_then_exact_distance_and_wet_connector"
     )
+    assert report["wet_connector_domain_buffer_policy"] == (
+        "exact_domain_buffers_prepared_once_per_inventory"
+    )
     assert report["all_component_pair_count"] == 300
     assert report["spatially_indexed_component_pair_count"] == 0
     assert report["passage_count"] == 0
