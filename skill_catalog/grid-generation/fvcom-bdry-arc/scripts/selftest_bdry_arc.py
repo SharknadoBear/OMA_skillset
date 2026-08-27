@@ -33,6 +33,7 @@ from fvcom_bdry_arc.boundary_resolution import (  # noqa: E402
     _inventory_narrow_passages,
     _normalize_open_chain_endpoints_on_exterior,
     _passage_gate_taxonomy,
+    _sample_closed_open_loop_v2,
     _sample_landward_v2,
     _sample_open_arc_v2,
 )
@@ -1374,6 +1375,40 @@ def test_v2_feature_anchors_and_junction_spacing() -> None:
     assert any(Point(node).distance(Point(3000.0, 0.0)) <= 1.0e-8 for node in land_nodes)
 
 
+def test_closed_open_loop_sampling_refines_land_crossing_shortcuts() -> None:
+    line = LineString(
+        [
+            (-10.0, -10.0),
+            (10.0, -10.0),
+            (10.0, 10.0),
+            (-10.0, 10.0),
+            (-10.0, -10.0),
+        ]
+    )
+    land = box(-1.0, -1.0, 1.0, 1.0)
+    config = BoundaryResolutionV2Config(
+        open_anchor_spacing_m=1000.0,
+        open_central_spacing_m=1000.0,
+        sharp_turn_threshold_deg=181.0,
+        spit_turn_threshold_deg=181.0,
+        anchor_chord_error_fraction=100.0,
+    )
+    unguarded, _, _, _ = _sample_closed_open_loop_v2(line, config)
+    guarded, _, metadata, report = _sample_closed_open_loop_v2(
+        line,
+        config,
+        land_union=land,
+    )
+    assert LineString(unguarded).intersection(land).length > 0.0
+    assert LineString(guarded).intersection(land).length <= 1.0e-6
+    safety = report["land_safety_refinement"]
+    assert safety["added_node_count"] >= 2
+    assert safety["remaining_unsafe_chord_count"] == 0
+    assert safety["remaining_land_intersection_m"] <= 1.0e-6
+    anchor_types = {item["anchor_type"] for item in metadata if item["is_hard_anchor"]}
+    assert {"open_loop_seam", "open_loop_balance"}.issubset(anchor_types)
+
+
 def test_v2_passage_inventory_harmonizes_or_gates_without_closure() -> None:
     projection = local_utm_projection((-75.1, 38.9, -74.9, 39.1))
     origin = project_geometry(Point(-75.0, 39.0), projection)
@@ -1639,6 +1674,7 @@ def main() -> int:
     test_adaptive_boundary_resolution_package()
     test_adaptive_uses_exact_delivered_obc_not_proximity_tails()
     test_v2_feature_anchors_and_junction_spacing()
+    test_closed_open_loop_sampling_refines_land_crossing_shortcuts()
     test_v2_passage_inventory_harmonizes_or_gates_without_closure()
     test_v2_passage_inventory_uses_conservative_sparse_broad_phase()
     test_coastal_obc_scoring_is_compact_not_bpoly_containment_driven()

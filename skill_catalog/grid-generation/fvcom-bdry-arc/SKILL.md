@@ -68,7 +68,8 @@ Coastal OBCs:
 2. Repair and sample every OBC independently.
 3. Require exactly two physical hard landfall anchors per `obc_id`.
 4. Equidistribute `integral(ds/h)` between landfalls and stable sharp-turn/spit-tip anchors, avoiding isolated short remainders.
-5. Share the same target at each land/OBC junction and grade into the complementary landward chain.
+5. Bisect any sampled chord whose non-landfall interior shortcuts through physical land, inserting each new point on the exact accepted source OBC until the delivered sampled chain is land-free.
+6. Share the same target at each land/OBC junction and grade into the complementary landward chain.
 
 Multiple OBCs:
 
@@ -86,7 +87,8 @@ Island and archipelago OBCs:
    intended short circular longitude interval.
 3. Place the deterministic seam at minimum projected x, using projected y and then source order as tie-breakers.
 4. Add one half-perimeter balance anchor.
-5. Require exactly one seam anchor, one balance anchor, complete exterior overlap, and no land intersection.
+5. Apply the physical-land chord guard with no endpoint exception, because a closed offshore loop has no landfalls.
+6. Require exactly one seam anchor, one balance anchor, complete exterior overlap, and no land intersection.
 
 Island topology and passage safeguards:
 

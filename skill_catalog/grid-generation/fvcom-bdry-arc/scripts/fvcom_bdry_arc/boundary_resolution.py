@@ -430,9 +430,17 @@ def build_boundary_resolution(
         line = part["geometry"]
         if part["boundary_kind"] == "open":
             if part.get("is_closed"):
-                nodes, targets, metadata, sampling = _sample_closed_open_loop_v2(line, config)
+                nodes, targets, metadata, sampling = _sample_closed_open_loop_v2(
+                    line,
+                    config,
+                    land_union=land_union,
+                )
             else:
-                nodes, targets, metadata, sampling = _sample_open_arc_v2(line, config)
+                nodes, targets, metadata, sampling = _sample_open_arc_v2(
+                    line,
+                    config,
+                    land_union=land_union,
+                )
             obc_id = int(part["obc_id"])
             for item in metadata:
                 item["obc_id"] = obc_id
@@ -2219,6 +2227,8 @@ def _line_tangent_at(line: LineString, position: float, scale: float) -> np.ndar
 def _sample_open_arc_v2(
     line: LineString,
     config: BoundaryResolutionConfig,
+    *,
+    land_union=None,
 ) -> tuple[list[tuple[float, float]], list[float], list[dict[str, Any]], dict[str, Any]]:
     """Sample one OBC chain while retaining stable source-feature vertices exactly."""
     length = float(line.length)
@@ -2246,13 +2256,21 @@ def _sample_open_arc_v2(
         if not added:
             break
         positions = sorted(set(positions + added))
+    positions, land_safety = _refine_sampling_positions_for_land_safety(
+        line,
+        positions,
+        land_union,
+        is_closed=False,
+        endpoint_exclusion_m=max(2.0 * config.repair_sample_spacing_m, 500.0),
+    )
     coords, sizes, metadata = _sample_records(line, positions, anchors, target, "open")
     return coords, sizes, metadata, {
-        "method": "anchor_interval_metric_equidistribution_with_chord_guard",
+        "method": "anchor_interval_metric_equidistribution_with_chord_and_land_safety_guards",
         "source_length_m": length,
         "node_count": len(coords),
         "feature_anchor_count": int(sum(item["anchor_type"] != "open_landfall" for item in anchors)),
         "hard_anchor_count": int(len(anchors)),
+        "land_safety_refinement": land_safety,
         "anchors": anchors,
     }
 
@@ -2260,6 +2278,8 @@ def _sample_open_arc_v2(
 def _sample_closed_open_loop_v2(
     line: LineString,
     config: BoundaryResolutionConfig,
+    *,
+    land_union=None,
 ) -> tuple[list[tuple[float, float]], list[float], list[dict[str, Any]], dict[str, Any]]:
     """Sample a cyclic island/archipelago OBC with deterministic numerical anchors."""
     if not line.is_ring:
@@ -2322,9 +2342,16 @@ def _sample_closed_open_loop_v2(
         if not added:
             break
         positions = sorted(set(positions + added))
+    positions, land_safety = _refine_sampling_positions_for_land_safety(
+        line,
+        positions,
+        land_union,
+        is_closed=True,
+        endpoint_exclusion_m=0.0,
+    )
     coords, sizes, metadata = _sample_records(line, positions, anchors, target, "open_loop")
     return coords, sizes, metadata, {
-        "method": "cyclic_seam_balance_metric_equidistribution_with_chord_guard",
+        "method": "cyclic_seam_balance_metric_equidistribution_with_chord_and_land_safety_guards",
         "source_length_m": length,
         "node_count_including_periodic_closure": len(coords),
         "hard_anchor_count": 2,
@@ -2333,7 +2360,83 @@ def _sample_closed_open_loop_v2(
         "open_loop_balance_hard_anchor_count": 1,
         "canonical_seam_xy": list(coords[0]),
         "balance_position_m": balance_m,
+        "land_safety_refinement": land_safety,
         "anchors": anchors,
+    }
+
+
+def _refine_sampling_positions_for_land_safety(
+    line: LineString,
+    positions: list[float],
+    land_union,
+    *,
+    is_closed: bool,
+    endpoint_exclusion_m: float,
+    maximum_iterations: int = 24,
+) -> tuple[list[float], dict[str, Any]]:
+    """Bisect only sampled chords that shortcut through physical land.
+
+    The accepted source OBC remains authoritative.  Refinement inserts points
+    interpolated on that exact source chain until every delivered chord is
+    land-free.  Coastal landfall neighborhoods use the same exclusion radius
+    as the downstream nonendpoint-land QA; closed offshore loops have no such
+    exception.
+    """
+    ordered = sorted(set(float(value) for value in positions))
+    initial_count = len(ordered)
+    if land_union is None or land_union.is_empty or len(ordered) < 2:
+        return ordered, {
+            "applied": False,
+            "iteration_count": 0,
+            "added_node_count": 0,
+            "remaining_unsafe_chord_count": 0,
+            "remaining_land_intersection_m": 0.0,
+            "endpoint_exclusion_m": float(0.0 if is_closed else endpoint_exclusion_m),
+        }
+
+    endpoint_mask = None
+    if not is_closed and endpoint_exclusion_m > 0.0:
+        endpoint_mask = Point(line.coords[0]).buffer(float(endpoint_exclusion_m)).union(
+            Point(line.coords[-1]).buffer(float(endpoint_exclusion_m))
+        )
+    prepared_land = prep(land_union)
+
+    def unsafe_intervals(values: list[float]) -> tuple[list[float], float, int]:
+        additions: list[float] = []
+        intersection_length = 0.0
+        unresolved = 0
+        for start, end in zip(values[:-1], values[1:]):
+            chord = LineString([line.interpolate(start), line.interpolate(end)])
+            interior = chord if endpoint_mask is None else chord.difference(endpoint_mask)
+            if interior.is_empty or not prepared_land.intersects(interior):
+                continue
+            overlap = float(interior.intersection(land_union).length)
+            if overlap <= 1.0e-6:
+                continue
+            intersection_length += overlap
+            midpoint = 0.5 * (float(start) + float(end))
+            if end - start > 1.0e-6 and midpoint not in values:
+                additions.append(midpoint)
+            else:
+                unresolved += 1
+        return additions, float(intersection_length), int(unresolved)
+
+    iteration_count = 0
+    for iteration in range(int(maximum_iterations)):
+        additions, _intersection_length, _unresolved = unsafe_intervals(ordered)
+        if not additions:
+            break
+        ordered = sorted(set(ordered + additions))
+        iteration_count = iteration + 1
+    remaining, remaining_length, unresolved = unsafe_intervals(ordered)
+    return ordered, {
+        "applied": True,
+        "iteration_count": int(iteration_count),
+        "added_node_count": int(len(ordered) - initial_count),
+        "remaining_unsafe_chord_count": int(len(remaining) + unresolved),
+        "remaining_land_intersection_m": float(remaining_length),
+        "endpoint_exclusion_m": float(0.0 if is_closed else endpoint_exclusion_m),
+        "maximum_iterations": int(maximum_iterations),
     }
 
 
