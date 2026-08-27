@@ -651,10 +651,16 @@ def _prepare_outer_boundary_parts(
     prepared: list[dict[str, Any]] = []
     for fallback_id, item in enumerate(source_chains):
         obc_id = int(item.get("obc_id", fallback_id))
+        normalized, endpoint_snap = _normalize_open_chain_endpoints_on_exterior(
+            item["geometry"],
+            exterior,
+            max(tolerance_m, float(config.repair_sample_spacing_m)),
+        )
         oriented, start_m, end_m, overlap, reversed_from_source = _orient_open_chain_on_exterior(
-            item["geometry"], exterior, tolerance_m
+            normalized, exterior, tolerance_m
         )
         repaired, report = _repair_open_arc(oriented, domain, land_union, config)
+        report["delivered_endpoint_normalization"] = endpoint_snap
         prepared.append(
             {
                 "boundary_kind": "open",
@@ -798,6 +804,47 @@ def _orient_open_chain_on_exterior(
     if forward_match >= reverse_match:
         return line, start_m, end_m, overlap, False
     return LineString(list(line.coords)[::-1]), end_m, start_m, overlap, True
+
+
+def _normalize_open_chain_endpoints_on_exterior(
+    line: LineString,
+    exterior: LineString,
+    snap_limit_m: float,
+) -> tuple[LineString, dict[str, Any]]:
+    """Snap only QA-bounded OBC endpoints to the canonical model exterior.
+
+    The open-exterior contract permits a physical landfall endpoint to be a
+    small distance from the polygonized model exterior. Adaptive v2 samples
+    the canonical exterior, so normalize those endpoint-only offsets before
+    enforcing complete-chain overlap. Interior deviations remain untouched
+    and are still rejected by ``_orient_open_chain_on_exterior``.
+    """
+    if not isinstance(line, LineString) or line.is_empty or len(line.coords) < 2:
+        raise ValueError("A delivered OBC requires at least two coordinates")
+    coordinates = [(float(x), float(y)) for x, y in line.coords]
+    distances = [
+        float(Point(coordinates[0]).distance(exterior)),
+        float(Point(coordinates[-1]).distance(exterior)),
+    ]
+    limit = max(0.0, float(snap_limit_m))
+    if max(distances) > limit + 1.0e-9:
+        raise ValueError(
+            "Delivered OBC endpoint is too far from the model exterior: "
+            f"maximum {max(distances):.3f} m exceeds {limit:.3f} m"
+        )
+    for index in (0, -1):
+        point = Point(coordinates[index])
+        projected = exterior.interpolate(exterior.project(point))
+        coordinates[index] = (float(projected.x), float(projected.y))
+    normalized = LineString(coordinates)
+    return normalized, {
+        "method": "bounded_endpoint_projection_to_model_exterior",
+        "endpoint_snap_distance_m": distances,
+        "maximum_endpoint_snap_distance_m": float(max(distances)),
+        "endpoint_snap_limit_m": limit,
+        "normalized": bool(max(distances) > 1.0e-8),
+        "interior_coordinates_changed": False,
+    }
 
 
 def _rotate_ring_to_canonical_seam(line: LineString) -> LineString:

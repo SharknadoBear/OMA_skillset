@@ -26,6 +26,7 @@ from fvcom_bdry_arc import (  # noqa: E402
 )
 from fvcom_bdry_arc.boundary_resolution import (  # noqa: E402
     _inventory_narrow_passages,
+    _normalize_open_chain_endpoints_on_exterior,
     _passage_gate_taxonomy,
     _sample_landward_v2,
     _sample_open_arc_v2,
@@ -386,6 +387,31 @@ def test_two_independent_coastal_obcs_preserve_ids_and_anchors() -> None:
         )
         assert list(resolved.sort_values("obc_id")["obc_id"]) == [0, 1]
         assert len(resolved) == 2
+
+
+def test_v2_open_endpoint_normalization_is_bounded() -> None:
+    exterior = LineString(box(0.0, 0.0, 1000.0, 1000.0).exterior.coords)
+    delivered = LineString([(1000.0, 100.0), (1000.0, 500.0), (925.0, 800.0)])
+    normalized, report = _normalize_open_chain_endpoints_on_exterior(
+        delivered,
+        exterior,
+        250.0,
+    )
+    assert report["normalized"] is True
+    assert report["endpoint_snap_distance_m"] == [0.0, 75.0]
+    assert Point(normalized.coords[0]).distance(exterior) <= 1.0e-8
+    assert Point(normalized.coords[-1]).distance(exterior) <= 1.0e-8
+    assert list(normalized.coords)[1] == list(delivered.coords)[1]
+    try:
+        _normalize_open_chain_endpoints_on_exterior(
+            LineString([(1000.0, 100.0), (500.0, 500.0)]),
+            exterior,
+            250.0,
+        )
+    except ValueError as exc:
+        assert "too far from the model exterior" in str(exc)
+    else:
+        raise AssertionError("An out-of-contract OBC endpoint was normalized")
 
 
 def test_closed_island_obc_uses_seam_and_balance_without_landfalls() -> None:
@@ -1313,6 +1339,7 @@ def test_open_exterior_reader_drops_empty_geometry_placeholders() -> None:
 def main() -> int:
     test_boundary_resolution_profile_is_v2_only()
     test_two_independent_coastal_obcs_preserve_ids_and_anchors()
+    test_v2_open_endpoint_normalization_is_bounded()
     test_closed_island_obc_uses_seam_and_balance_without_landfalls()
     test_antimeridian_closed_obc_uses_compact_projection()
     test_synthetic_package()

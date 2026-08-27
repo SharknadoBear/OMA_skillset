@@ -8,6 +8,9 @@ import tempfile
 from pathlib import Path
 
 import geopandas as gpd
+import matplotlib
+
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 import numpy as np
 from shapely.geometry import LineString
@@ -491,6 +494,11 @@ def main() -> None:
             "RegionBPoly to define an appropriate model region."
         )
         assert extract_named_region_query(galveston_prompt) == "Galveston Bay"
+        compound_galveston_prompt = (
+            "I am developing an FVCOM model of Galveston and Trinity Bays to simulate "
+            "tidal circulation, salinity intrusion, and estuarine mixing."
+        )
+        assert extract_named_region_query(compound_galveston_prompt) == "Galveston and Trinity Bays"
         synthetic_result = {
             "display_name": "Galveston Bay, Chambers County, Texas, United States",
             "category": "natural",
@@ -512,6 +520,50 @@ def main() -> None:
         assert discovered_bbox[2] - discovered_bbox[0] > 1.0, discovered_bbox
         assert discovered_bbox[3] - discovered_bbox[1] > 1.0, discovered_bbox
         assert discovery["requires_visual_offshore_side_confirmation"] is True
+
+        trinity_result = {
+            **synthetic_result,
+            "display_name": "Trinity Bay, Chambers County, Texas, United States",
+            "type": "bay",
+            "boundingbox": ["29.6823977", "29.6824977", "-94.7919155", "-94.7918155"],
+            "osm_id": 2,
+        }
+        distant_trinity_result = {
+            **synthetic_result,
+            "display_name": "Trinity Bay, Newfoundland and Labrador, Canada",
+            "type": "bay",
+            "importance": 0.9,
+            "boundingbox": ["47.5137014", "48.5471167", "-53.9864918", "-52.9423490"],
+            "osm_id": 3,
+        }
+        compound_results = {
+            "Galveston and Trinity Bays": [],
+            "Galveston Bay": [synthetic_result],
+            "Trinity Bay": [distant_trinity_result, trinity_result],
+        }
+
+        def compound_search(query, _timeout_s, _cache_dir=None):
+            return compound_results[query], {"cache_hit": True, "cache_path": None}
+
+        with patch.object(discovery_module, "_nominatim_search", side_effect=compound_search):
+            compound_features, compound_discovery = discover_named_region_features(
+                compound_galveston_prompt,
+                "coastal",
+            )
+        assert compound_discovery["selection_method"] == "component_query_union_after_compound_no_bbox"
+        assert compound_discovery["component_queries"] == ["Galveston Bay", "Trinity Bay"]
+        assert len(compound_discovery["selected_components"]) == 2
+        assert compound_discovery["selected_type"] == "multi_feature_extent"
+        assert "Texas" in compound_discovery["selected_components"][1]["display_name"]
+        assert compound_discovery["component_compactness_max_center_distance_km"] < 100.0
+        compound_bbox = compound_features["features"][0]["geometry"]
+        assert compound_bbox[2] - compound_bbox[0] > 1.0, compound_bbox
+        assert compound_bbox[3] - compound_bbox[1] > 1.0, compound_bbox
+
+        deep_cache = Path("C:/") / ("nested_case_" * 20) / "place-discovery"
+        shortened_cache_path = discovery_module._cache_path(deep_cache, "compound waterbody query")
+        assert shortened_cache_path.name.startswith("nom_")
+        assert len(shortened_cache_path.name) < len("nominatim_" + "0" * 64 + ".json")
 
         galveston_dir = run_dir / "galveston_discovered_seed"
         run(

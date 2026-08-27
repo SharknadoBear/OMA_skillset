@@ -5,6 +5,9 @@ import math
 import shutil
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 
 from region_bbox.delivery import write_standard_delivery

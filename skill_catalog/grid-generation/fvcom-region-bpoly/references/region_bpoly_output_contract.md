@@ -48,6 +48,13 @@ Catalog and discovered boxes are initial heuristic support, not authoritative
 geographic truth. Required-feature coverage and the existing visual gates
 remain responsible for acceptance.
 
+For compound named-place discovery, `region_place_discovery.json` records the
+original concise query, every component query, candidate/usable counts,
+selected components, raw component bboxes, and the union selection method.
+Every required component must resolve; partial unions are not publishable
+seeds. Scientific-purpose text after clauses such as `to simulate`, `to study`,
+or `for investigating` is excluded from the geographic query.
+
 ## Readiness semantics
 
 `output_package.package_state` and the manifest distinguish:

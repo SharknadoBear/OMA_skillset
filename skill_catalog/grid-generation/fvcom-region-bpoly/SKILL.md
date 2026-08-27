@@ -31,9 +31,10 @@ Run:
 For a forward test, use a new UTC-stamped directory under Workspace/Preprocessing/fvcom-region-bpoly/runs/; do not reuse earlier case artifacts. Use --mode test --heuristic-mode memory --basemap-provider auto when complete visual evidence must be retained.
 
 - --heuristic-mode auto uses catalog memory in execute mode and bypasses it in test mode.
-- With no explicit or catalog geometry, --place-discovery auto performs one cached named-place lookup and uses the result only as an initial visual seed.
+- With no explicit or catalog geometry, `--place-discovery auto` performs one cached discovery operation and uses the result only as an initial visual seed. Extract the geographic target before scientific-purpose clauses such as `to simulate` or `to study`. If a compound waterbody name has no combined result, expand shared plural types (for example, `A and B Bays`) into component queries, require every component to resolve, union their raw extents, and record all attempts and selected components.
 - If lookup is unavailable or ambiguous, research or infer an initial frame and provide --discovery-bbox WEST SOUTH EAST NORTH with --discovery-label.
 - --basemap-provider auto is the normal policy. none/off still requires a real offline coastline.
+- CLI map generation is noninteractive and must force Matplotlib's `Agg` backend before importing `pyplot`; online-tile work must not create Tk objects or GUI-thread cleanup failures.
 - Unknown named regions enter discovery; they never fall back to Delaware or another unrelated box.
 
 A coastal run produces final_status: review_pending with a hash-bound region_bpoly_scientific_review_request_v1. Never stop at review_pending, repair_required, or needs_review. Continue scientific review and any useful repair. Once valid geometry exists, finish with final_status: pass, either as a scientifically accepted delivery or accepted_best_effort with explicit warnings.

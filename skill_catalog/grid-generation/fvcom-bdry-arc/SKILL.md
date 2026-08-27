@@ -51,6 +51,7 @@ changing topology, arc repair, island filtering, or passage rules.
 - Preserve protected islands, mission water bodies, river context, and narrow passages. Never close a channel automatically.
 - If a coastal OBC crosses blocking land away from its physical endpoints, detour around the blocking polygon in projected coordinates. Select only a simple branch that keeps the blocker inside the seeded frame, preserves the seed component, clears that blocker, and retains the full open chain; record the before/after land intersection and routing lineage.
 - Scale the physical landfall/source-coastline comparison tolerance with the requested boundary target as `max(25 m, min(250 m, 0.5 h))`; this gate accommodates source/projection discretization but does not permit nonendpoint land crossing.
+- After the hash-bound open-exterior contract passes, Adaptive v2 may project an endpoint-only delivered-OBC offset onto the canonical model exterior when it is no larger than one recorded repair-sampling interval. Record both endpoint distances and the limit, leave every interior coordinate unchanged, and reject larger offsets or any remaining interior exterior-overlap defect.
 - Keep the aggregate edge/target limit at 1.55, enforce gradation and topology-area gates, and keep protected-passage underresolution as a hard review condition.
 
 ## Domain-Aware Adaptive v2

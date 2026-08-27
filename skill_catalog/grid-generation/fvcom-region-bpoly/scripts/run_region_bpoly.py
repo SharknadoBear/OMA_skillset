@@ -68,6 +68,8 @@ def _default_place_cache_dir(case_dir: Path) -> Path:
     for parent in [case_dir, *case_dir.parents]:
         if parent.name.casefold() == "fvcom-region-bpoly":
             return parent / "cache" / "place-discovery"
+        if parent.name.casefold() == "workspace":
+            return parent / "Preprocessing" / "fvcom-region-bpoly" / "cache" / "place-discovery"
     return case_dir.parent / ".place-discovery-cache"
 
 
