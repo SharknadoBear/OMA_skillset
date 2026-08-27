@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import heapq
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -91,6 +92,26 @@ _PROGRESS_PHASE_RANGES: dict[str, tuple[float, float]] = {
     "quality_gates": (96.0, 99.0),
     "complete": (100.0, 100.0),
 }
+
+
+def _replace_progress_state(temporary: Path, target: Path, attempts: int = 8) -> bool:
+    """Replace a progress snapshot without letting a sync-client lock abort science.
+
+    OneDrive and antivirus scanners can briefly open the existing JSON without
+    delete sharing on Windows.  The append-only JSONL remains authoritative if
+    the bounded retry window is exhausted, so telemetry never terminates the
+    boundary-resolution computation.
+    """
+    retries = max(1, int(attempts))
+    for attempt in range(retries):
+        try:
+            os.replace(temporary, target)
+            return True
+        except PermissionError:
+            if attempt + 1 >= retries:
+                return False
+            time.sleep(min(0.05 * (2**attempt), 0.5))
+    return False
 
 
 class _BoundaryResolutionProgress:
@@ -174,7 +195,11 @@ class _BoundaryResolutionProgress:
         }
         temporary = self.state_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        temporary.replace(self.state_path)
+        state_replaced = _replace_progress_state(temporary, self.state_path)
+        if not state_replaced:
+            record["details"]["progress_state_write_warning"] = (
+                "atomic_replace_permission_denied; append-only JSONL remains authoritative"
+            )
         self.last_write_monotonic = now_monotonic
         self.last_overall_percent = overall
         self.last_record = record

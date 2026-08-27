@@ -16,6 +16,8 @@ from shapely.ops import unary_union
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import fvcom_bdry_arc.boundary_resolution as boundary_resolution_module  # noqa: E402
+
 from fvcom_bdry_arc import (  # noqa: E402
     BdryArcConfig,
     BoundaryResolutionConfig,
@@ -387,6 +389,32 @@ def test_boundary_resolution_progress_records_cancellation() -> None:
         assert records[-1]["processed_count"] == 3
         progress._record_process_exit()
         assert len(progress.jsonl_path.read_text(encoding="utf-8").splitlines()) == len(records)
+
+
+def test_boundary_resolution_progress_retries_transient_windows_lock() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        real_replace = boundary_resolution_module.os.replace
+        calls = 0
+
+        def flaky_replace(source: str | Path, target: str | Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                raise PermissionError(5, "synthetic sync-client lock", str(target))
+            real_replace(source, target)
+
+        boundary_resolution_module.os.replace = flaky_replace
+        try:
+            progress = _BoundaryResolutionProgress(root, interval_s=0.0)
+            progress.emit("start", "start", 0, 1, force=True)
+        finally:
+            boundary_resolution_module.os.replace = real_replace
+        assert calls == 3
+        state = json.loads(progress.state_path.read_text(encoding="utf-8"))
+        assert state["current_phase"] == "start"
+        assert state["current_message"] == "start"
+        progress._record_process_exit()
 
 
 def test_boundary_resolution_progress_records_unhandled_failure() -> None:
