@@ -303,7 +303,18 @@ def validate_grid_boundary_gate(
                 arc_path.parent,
             )
             if recorded is not None and recorded != resolution_path:
-                failures.append("reviewed_boundary_resolution_lineage_mismatch")
+                if (
+                    not recorded.is_file()
+                    or sha256_file(recorded) != sha256_file(resolution_path)
+                ):
+                    failures.append("reviewed_boundary_resolution_lineage_mismatch")
+                else:
+                    artifacts["boundary_resolution_lineage"] = {
+                        "mode": "sha256_identical_relocation",
+                        "recorded_path": str(recorded),
+                        "selected_path": str(resolution_path),
+                        "sha256": sha256_file(resolution_path),
+                    }
             artifacts["bdry_arc_manifest"] = {
                 "path": str(arc_path),
                 "sha256": sha256_file(arc_path),

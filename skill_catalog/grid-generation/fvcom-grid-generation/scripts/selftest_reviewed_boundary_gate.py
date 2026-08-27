@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import sys
 import tempfile
 
@@ -118,6 +119,36 @@ def test_reviewed_policy_rejects_mismatched_arc_lineage() -> None:
         )
 
 
+def test_reviewed_policy_accepts_hash_identical_relocated_arc_lineage() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        recorded = resolution_fixture(root / "recorded")
+        selected_dir = root / "selected"
+        selected_dir.mkdir()
+        selected = selected_dir / "boundary_resolution_manifest.json"
+        shutil.copy2(recorded, selected)
+        arc = root / "bdry_arc_manifest.json"
+        arc.write_text(
+            json.dumps(
+                {"outputs": {"boundary_resolution_manifest": str(recorded)}}
+            ),
+            encoding="utf-8",
+        )
+        report = validate_grid_boundary_gate(
+            arc,
+            selected,
+            policy="reviewed-adaptive-v2",
+        )
+        assert report["passed"] is True, report
+        lineage = report["boundary_resolution"]["artifacts"][
+            "boundary_resolution_lineage"
+        ]
+        assert lineage["mode"] == "sha256_identical_relocation"
+        assert lineage["recorded_path"] == str(recorded.resolve())
+        assert lineage["selected_path"] == str(selected.resolve())
+        assert lineage["sha256"]
+
+
 def test_gmsh_preflight_consumes_reviewed_policy() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -153,6 +184,7 @@ def main() -> int:
         test_reviewed_policy_accepts_exact_passing_adaptive_v2,
         test_reviewed_policy_cannot_waive_resolved_land_crossing,
         test_reviewed_policy_rejects_mismatched_arc_lineage,
+        test_reviewed_policy_accepts_hash_identical_relocated_arc_lineage,
         test_gmsh_preflight_consumes_reviewed_policy,
     ]
     for test in tests:

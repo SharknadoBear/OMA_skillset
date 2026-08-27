@@ -90,7 +90,10 @@ For an explicitly reviewed retained arc, add
 `--open-exterior-gate-policy reviewed-adaptive-v2`. Use the same policy plus
 `--boundary-resolution-source` when publishing the standardized project. Both
 steps recompute the exact manifest/package hashes; a stale or structurally
-failed Adaptive-v2 package remains blocking.
+failed Adaptive-v2 package remains blocking. A retained manifest copied to a
+shorter case path may satisfy S2 lineage only when the S2-recorded original is
+still readable and has the exact same SHA-256; path relocation alone is never
+treated as changed scientific evidence.
 
 For the operational Gmsh-6 route, set
 `boundary.open_exterior_gate_policy: reviewed-adaptive-v2` and optionally
