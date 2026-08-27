@@ -1462,28 +1462,59 @@ def check_case_readiness(
     warnings: list[str] = []
     geometry_report: dict[str, Any] | None = None
     bathy_report: dict[str, Any] | None = None
+    grid_boundary_gate: dict[str, Any] | None = None
     paths: dict[str, Path] = {"case_manifest": manifest_path}
-    from .open_exterior import validate_open_exterior_contract
-    boundary_doc = manifest.get("boundary") or {}
-    lineage_source = (
-        boundary_doc.get("open_exterior_contract")
-        or boundary_doc.get("resolution_manifest")
-        or boundary_doc.get("model_boundary_loop_manifest")
+    from .open_exterior import (
+        validate_grid_boundary_gate,
+        validate_open_exterior_contract,
     )
-    coastal_required = bool(boundary_doc.get("open_exterior_contract_required", False))
-    if lineage_source:
-        lineage_path = resolve_input_path(lineage_source, workspace)
-        if lineage_path and lineage_path.is_file():
-            open_audit = validate_open_exterior_contract(
-                lineage_path,
-                required=coastal_required,
-            )
-            if not open_audit["passed"]:
-                blockers.extend(open_audit["failure_taxonomy"])
+    boundary_doc = manifest.get("boundary") or {}
+    gate_policy = boundary_doc.get("open_exterior_gate_policy")
+    if gate_policy:
+        arc_source = resolve_input_path(
+            boundary_doc.get("bdry_arc_manifest")
+            or boundary_doc.get("open_exterior_contract"),
+            workspace,
+        )
+        resolution_source = resolve_input_path(
+            boundary_doc.get("resolution_manifest"),
+            workspace,
+        )
+        grid_boundary_gate = validate_grid_boundary_gate(
+            arc_source,
+            resolution_source,
+            policy=str(gate_policy),
+            strict_contract_required=True,
+        )
+        if arc_source and arc_source.is_file():
+            paths["bdry_arc_manifest"] = arc_source
+        if resolution_source and resolution_source.is_file():
+            paths["boundary_resolution_manifest"] = resolution_source
+        if not grid_boundary_gate["passed"]:
+            blockers.extend(grid_boundary_gate["failure_taxonomy"])
+        warnings.extend(grid_boundary_gate.get("advisory_taxonomy") or [])
+    else:
+        lineage_source = (
+            boundary_doc.get("open_exterior_contract")
+            or boundary_doc.get("resolution_manifest")
+            or boundary_doc.get("model_boundary_loop_manifest")
+        )
+        coastal_required = bool(
+            boundary_doc.get("open_exterior_contract_required", False)
+        )
+        if lineage_source:
+            lineage_path = resolve_input_path(lineage_source, workspace)
+            if lineage_path and lineage_path.is_file():
+                open_audit = validate_open_exterior_contract(
+                    lineage_path,
+                    required=coastal_required,
+                )
+                if not open_audit["passed"]:
+                    blockers.extend(open_audit["failure_taxonomy"])
+            elif coastal_required:
+                blockers.append("open_exterior_contract_missing")
         elif coastal_required:
             blockers.append("open_exterior_contract_missing")
-    elif coastal_required:
-        blockers.append("open_exterior_contract_missing")
     try:
         _reject_negative_fixture_selection(manifest, workspace)
         if manifest["boundary"]["input_kind"] == "adaptive_v2":
@@ -1592,6 +1623,7 @@ def check_case_readiness(
         "warnings": warnings,
         "geometry": geometry_report,
         "bathymetry": bathy_report,
+        "grid_boundary_gate": grid_boundary_gate,
         "readiness_validation": readiness_validation,
         "input_hashes": input_hashes,
     }

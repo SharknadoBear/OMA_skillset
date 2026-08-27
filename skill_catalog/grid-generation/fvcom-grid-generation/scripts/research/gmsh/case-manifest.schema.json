@@ -186,6 +186,21 @@
         "model_boundary_loop_manifest": {
           "$ref": "#/$defs/pathOrNull"
         },
+        "bdry_arc_manifest": {
+          "$ref": "#/$defs/pathOrNull"
+        },
+        "open_exterior_contract": {
+          "$ref": "#/$defs/pathOrNull"
+        },
+        "open_exterior_contract_required": {
+          "type": "boolean"
+        },
+        "open_exterior_gate_policy": {
+          "enum": [
+            "strict",
+            "reviewed-adaptive-v2"
+          ]
+        },
         "expected_open_boundary_count": {
           "type": "integer",
           "minimum": 0

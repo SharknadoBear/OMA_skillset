@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fvcom_grid_generation.open_exterior import (  # noqa: E402
     validate_grid_boundary_gate,
 )
+from fvcom_grid_generation.gmsh_experiment import check_case_readiness  # noqa: E402
 
 
 def resolution_fixture(root: Path, **qa_overrides: object) -> Path:
@@ -117,12 +118,42 @@ def test_reviewed_policy_rejects_mismatched_arc_lineage() -> None:
         )
 
 
+def test_gmsh_preflight_consumes_reviewed_policy() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        resolution = resolution_fixture(root / "boundary")
+        case = root / "case.json"
+        case.write_text(
+            json.dumps(
+                {
+                    "schema_version": "gmsh_fvcom_case_v1",
+                    "case_id": "reviewed_gate_fixture",
+                    "boundary": {
+                        "input_kind": "adaptive_v2",
+                        "resolution_manifest": str(resolution),
+                        "open_exterior_gate_policy": "reviewed-adaptive-v2",
+                    },
+                    "bathymetry": {"netcdf": None},
+                }
+            ),
+            encoding="utf-8",
+        )
+        readiness = check_case_readiness(case, root)
+        assert readiness["grid_boundary_gate"]["passed"] is True
+        assert (
+            "upstream_open_exterior:open_exterior_contract_missing"
+            in readiness["warnings"]
+        )
+        assert "boundary_resolution_manifest" in readiness["input_hashes"]
+
+
 def main() -> int:
     tests = [
         test_strict_policy_still_requires_open_exterior_contract,
         test_reviewed_policy_accepts_exact_passing_adaptive_v2,
         test_reviewed_policy_cannot_waive_resolved_land_crossing,
         test_reviewed_policy_rejects_mismatched_arc_lineage,
+        test_gmsh_preflight_consumes_reviewed_policy,
     ]
     for test in tests:
         test()

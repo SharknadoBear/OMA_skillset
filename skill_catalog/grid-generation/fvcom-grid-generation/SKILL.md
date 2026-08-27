@@ -92,6 +92,12 @@ For an explicitly reviewed retained arc, add
 steps recompute the exact manifest/package hashes; a stale or structurally
 failed Adaptive-v2 package remains blocking.
 
+For the operational Gmsh-6 route, set
+`boundary.open_exterior_gate_policy: reviewed-adaptive-v2` and optionally
+`boundary.bdry_arc_manifest` in the case manifest. Portfolio readiness invokes
+the same grid-only gate before building the immutable input bundle and binds
+the selected manifest/package/source-loop hashes into its readiness report.
+
 Use this command only for test-mode mesh-intent/smoke evidence. Full clean-room
 execution requires the explicit `--allow-clean-room-execute` research override
 and is ineligible for standardized operational publication. A new grid without
