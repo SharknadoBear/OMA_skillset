@@ -151,3 +151,8 @@ Prepare the exact buffered-domain cover predicates once per passage inventory
 and reuse them for all connector samples. Reconstructing an unchanged
 many-island domain buffer per sample changes no decision and is prohibitively
 expensive for archipelagos.
+
+Enforce delivered cyclic boundary target gradation with an exact
+anchor-preserving shortest-path Lipschitz projection. Do not use a bounded
+number of local pairwise sweeps: long closed loops can remain above the same
+gradation limit solely because iteration stopped.

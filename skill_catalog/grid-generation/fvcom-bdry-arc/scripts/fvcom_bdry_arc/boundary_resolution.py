@@ -10,9 +10,11 @@ import atexit
 from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import heapq
 import json
 import math
 from pathlib import Path
+import sys
 import time
 from typing import Any, Callable, Iterable
 
@@ -181,15 +183,26 @@ class _BoundaryResolutionProgress:
             atexit.unregister(self._exit_handler)
 
     def _record_process_exit(self) -> None:
-        """Write one terminal cancellation event when a run exits unfinished."""
+        """Write one terminal failure/cancellation event when a run exits unfinished."""
         if self.closed or self.last_record is None:
             return
         previous = self.last_record
         details = dict(previous.get("details") or {})
-        details["cancellation_reason"] = "process_exit_before_completion"
+        last_exception = getattr(sys, "last_exc", None)
+        if last_exception is not None and not isinstance(last_exception, (KeyboardInterrupt, SystemExit)):
+            message = "failed"
+            details["failure_reason"] = "unhandled_exception"
+            details["exception_type"] = type(last_exception).__name__
+            details["exception_message"] = str(last_exception)
+        else:
+            message = "cancelled"
+            details["cancellation_reason"] = (
+                "keyboard_interrupt" if isinstance(last_exception, KeyboardInterrupt)
+                else "process_exit_before_completion"
+            )
         self.emit(
             str(previous["phase"]),
-            "cancelled",
+            message,
             int(previous["processed_count"]),
             int(previous["total_count"]),
             details,
@@ -2710,42 +2723,78 @@ def _enforce_delivered_target_gradation(
     entries: list[dict[str, Any]],
     gradation: float,
 ) -> dict[str, Any]:
-    """Project targets onto the actual chord-length Lipschitz constraints."""
+    """Project targets exactly onto cyclic chord-length Lipschitz constraints."""
     if len(entries) < 2 or gradation <= 0.0:
         return {"adjusted_node_count": 0, "iteration_count": 0, "maximum_gradient": 0.0}
     points = np.asarray([item["xy"] for item in entries], dtype=float)
     raw = np.asarray([item["target_spacing_m"] for item in entries], dtype=float)
-    target = raw.copy()
     effective_gradation = float(gradation) * (1.0 - 1.0e-4)
     fixed = np.asarray(
         [item.get("anchor_type") in {"open_landfall", "open_loop_seam", "open_loop_balance"} for item in entries],
         dtype=bool,
     )
-    lengths = np.linalg.norm(np.roll(points, -1, axis=0) - points, axis=1)
-    iteration_count = 0
-    for iteration_count in range(1, 1001):
-        changed = False
-        for index in range(len(entries)):
-            following = (index + 1) % len(entries)
-            limit = effective_gradation * max(float(lengths[index]), 1.0)
-            difference = float(target[following] - target[index])
-            if abs(difference) <= limit + 1.0e-10:
+    lengths = np.maximum(
+        np.linalg.norm(np.roll(points, -1, axis=0) - points, axis=1),
+        1.0,
+    )
+    edge_costs = effective_gradation * lengths
+    count = len(entries)
+
+    # Fixed-anchor cones provide exact feasible lower/upper bounds on a cycle.
+    # Clipping raw targets to those bounds prevents the shortest-path closure
+    # below from moving a hard anchor. Incompatible fixed anchors are detected
+    # directly instead of being hidden by an iteration limit.
+    lower = np.full(count, 1.0, dtype=float)
+    upper = np.full(count, np.inf, dtype=float)
+    positions = np.concatenate(([0.0], np.cumsum(lengths[:-1])))
+    perimeter = float(np.sum(lengths))
+    fixed_indices = np.flatnonzero(fixed)
+    for anchor_index in fixed_indices:
+        delta = np.abs(positions - positions[int(anchor_index)])
+        cycle_distance = np.minimum(delta, perimeter - delta)
+        lower = np.maximum(
+            lower,
+            float(raw[int(anchor_index)]) - effective_gradation * cycle_distance,
+        )
+        upper = np.minimum(
+            upper,
+            float(raw[int(anchor_index)]) + effective_gradation * cycle_distance,
+        )
+    if np.any(lower > upper + 1.0e-8):
+        raise ValueError("Fixed Adaptive v2 anchors cannot satisfy delivered boundary gradation")
+
+    target = np.maximum(np.minimum(raw, upper), lower)
+    target[fixed] = raw[fixed]
+
+    # Multi-source Dijkstra computes min_j(target_j + g*d_cycle(i,j)), the
+    # greatest graph-Lipschitz minorant of the clipped targets. This is exact
+    # for the cyclic boundary graph and converges independently of node count.
+    queue = [(float(value), int(index)) for index, value in enumerate(target)]
+    heapq.heapify(queue)
+    relaxation_count = 0
+    while queue:
+        value, index = heapq.heappop(queue)
+        if value > float(target[index]) + 1.0e-10:
+            continue
+        neighbors = (
+            ((index - 1) % count, float(edge_costs[(index - 1) % count])),
+            ((index + 1) % count, float(edge_costs[index])),
+        )
+        for neighbor, cost in neighbors:
+            candidate = value + cost
+            if candidate >= float(target[neighbor]) - 1.0e-10:
                 continue
-            sign = 1.0 if difference > 0.0 else -1.0
-            if fixed[index] and fixed[following]:
-                raise ValueError("Fixed Adaptive v2 anchors cannot satisfy delivered boundary gradation")
-            if fixed[index]:
-                target[following] = target[index] + sign * limit
-            elif fixed[following]:
-                target[index] = target[following] - sign * limit
-            else:
-                midpoint = 0.5 * (target[index] + target[following])
-                target[index] = midpoint - 0.5 * sign * limit
-                target[following] = midpoint + 0.5 * sign * limit
-            changed = True
-        if not changed:
-            break
-    gradients = np.abs(np.roll(target, -1) - target) / np.maximum(lengths, 1.0)
+            if fixed[neighbor]:
+                if candidate < float(raw[neighbor]) - 1.0e-8:
+                    raise ValueError("Fixed Adaptive v2 anchors cannot satisfy delivered boundary gradation")
+                continue
+            target[neighbor] = candidate
+            relaxation_count += 1
+            heapq.heappush(queue, (candidate, neighbor))
+
+    if np.any(np.abs(target[fixed] - raw[fixed]) > 1.0e-8):
+        raise ValueError("Adaptive v2 target-gradation projection moved a fixed anchor")
+    gradients = np.abs(np.roll(target, -1) - target) / lengths
     maximum = float(np.max(gradients))
     if maximum > float(gradation) + 1.0e-8:
         raise ValueError(
@@ -2756,13 +2805,14 @@ def _enforce_delivered_target_gradation(
         item["target_spacing_m"] = float(max(value, 1.0))
     adjusted = np.abs(target - raw) > 1.0e-9
     return {
-        "method": "anchor_preserving_actual_chord_lipschitz_projection",
+        "method": "anchor_preserving_cycle_shortest_path_lipschitz_projection",
         "requested_gradation": float(gradation),
         "effective_projection_gradation": effective_gradation,
         "fixed_anchor_count": int(np.count_nonzero(fixed)),
         "adjusted_node_count": int(np.count_nonzero(adjusted)),
         "maximum_adjustment_m": float(np.max(np.abs(target - raw))),
-        "iteration_count": int(iteration_count),
+        "iteration_count": 1,
+        "relaxation_count": int(relaxation_count),
         "maximum_gradient": maximum,
     }
 
