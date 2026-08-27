@@ -109,6 +109,16 @@ simple line and retain its OBC ID and absorbed-segment provenance. Rebuild the
 model loop, open-exterior QA, and Adaptive v2 package from the role-resolved
 GeoPackage rather than reusing candidate frame-length gates.
 
+A visually reviewed residual that continues an existing primary OBC is not a
+secondary tidal boundary. Permit the explicit `primary_obc_extension` role only
+when its nearest endpoint gap is at most two local target spacings, the direct
+connector has zero nonendpoint land intersection, the joined line is simple,
+and the wet component remains one. Absorb it into the nearest existing
+`obc_id`, keep requested/delivered OBC counts unchanged, and retain the
+connector, gap, and absorbed segment in provenance. NOAA station screening
+remains mandatory for new secondary OBC chains but is not relevant to this
+same-chain extension.
+
 For a closed island/archipelago OBC, do not use landfall repair. Require the
 delivered loop to equal the exterior. Densify sparse geographic edges along
 their shortest circular longitude interval, then project the original native

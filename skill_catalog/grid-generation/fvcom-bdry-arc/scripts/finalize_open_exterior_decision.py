@@ -37,6 +37,7 @@ DECISION_FAILURES = {
 
 RESIDUAL_ROLES = {
     "solid_lagoon_closure",
+    "primary_obc_extension",
     "secondary_tidal_obc",
     "invalid_geometry",
 }
@@ -129,10 +130,12 @@ def _apply_residual_roles(
     expected_obc = int(contract.get("obc_geometry", {}).get("expected_count", 0) or 0)
     source_delivered_obc = int(contract.get("obc_geometry", {}).get("delivered_count", 0) or 0)
     assigned_solid = 0.0
+    assigned_primary_extension = 0.0
     assigned_secondary = 0.0
     pending = 0
     invalid = 0
     secondary_count = 0
+    primary_extension_count = 0
     for component in components:
         if component.get("classification") == "intentional_open_boundary":
             continue
@@ -147,7 +150,15 @@ def _apply_residual_roles(
             pending += 1
             continue
         station = None
-        if role == "secondary_tidal_obc":
+        if role == "primary_obc_extension":
+            extension = component.get("primary_obc_extension_geometry", {})
+            if extension.get("eligible") is not True and decision == "pass":
+                raise ValueError(
+                    f"Residual segment {segment_id} is not geometrically eligible to extend an existing primary OBC"
+                )
+            primary_extension_count += 1
+            assigned_primary_extension += float(component.get("length_m", 0.0) or 0.0)
+        elif role == "secondary_tidal_obc":
             station = _eligible_station_for_segment(screen, segment_id)
             if station is None and decision == "pass":
                 raise ValueError(f"Residual segment {segment_id} has no eligible, hydraulically connected NOAA CO-OPS station")
@@ -176,7 +187,16 @@ def _apply_residual_roles(
                 "eligibility_only": True,
             }
             if station
-            else None
+            else (
+                {
+                    "source": "existing_primary_obc_chain",
+                    "obc_id": component.get("primary_obc_extension_geometry", {}).get("nearest_obc_id"),
+                    "creates_new_obc": False,
+                    "noaa_secondary_station_screen_required": False,
+                }
+                if role == "primary_obc_extension"
+                else None
+            )
         )
     unassigned_length = float(
         sum(
@@ -211,10 +231,12 @@ def _apply_residual_roles(
     contract["residual_role_summary"] = {
         "pending_count": pending,
         "solid_lagoon_closure_count": int(sum(item.get("assigned_role") == "solid_lagoon_closure" for item in components)),
+        "primary_obc_extension_count": primary_extension_count,
         "secondary_tidal_obc_count": secondary_count,
         "invalid_geometry_count": invalid,
         "unassigned_residual_length_m": unassigned_length,
         "assigned_solid_length_m": assigned_solid,
+        "assigned_primary_obc_extension_length_m": assigned_primary_extension,
         "assigned_secondary_obc_length_m": assigned_secondary,
     }
     contract["obc_geometry"]["source_delivered_count"] = source_delivered_obc
@@ -402,6 +424,7 @@ def _materialize_finalized_package(manifest: dict, contract: dict, run_dir: Path
         key=lambda item: int(item.get("segment_id", -1)),
     )
     intentional_absorbed: list[int] = []
+    primary_extension_absorbed: list[int] = []
     join_tolerance_m = max(
         250.0,
         float(contract.get("hard_metrics", {}).get("absolute_limit_m", 250.0) or 250.0),
@@ -436,7 +459,11 @@ def _materialize_finalized_package(manifest: dict, contract: dict, run_dir: Path
         intentional_absorbed.append(segment_id)
     for component in components:
         role = component.get("assigned_role")
-        if role not in {"secondary_tidal_obc", "solid_lagoon_closure"}:
+        if role not in {
+            "primary_obc_extension",
+            "secondary_tidal_obc",
+            "solid_lagoon_closure",
+        }:
             continue
         segment_id = int(component.get("segment_id", -1))
         coords = component.get("geometry_lonlat") or []
@@ -444,7 +471,30 @@ def _materialize_finalized_package(manifest: dict, contract: dict, run_dir: Path
             raise ValueError(f"accepted residual segment {segment_id} has no materializable geometry")
         geometry = LineString([(float(x), float(y)) for x, y in coords])
         remove_segments.add(segment_id)
-        if role == "secondary_tidal_obc":
+        if role == "primary_obc_extension":
+            extension = component.get("primary_obc_extension_geometry", {})
+            nearest_index = int(extension.get("nearest_obc_id", -1))
+            if nearest_index < 0 or nearest_index >= len(open_layer):
+                nearest_index = min(
+                    range(len(open_layer)),
+                    key=lambda index: min(
+                        _endpoint_distance_m(tuple(open_layer.iloc[index].geometry.coords[0]), tuple(geometry.coords[0])),
+                        _endpoint_distance_m(tuple(open_layer.iloc[index].geometry.coords[0]), tuple(geometry.coords[-1])),
+                        _endpoint_distance_m(tuple(open_layer.iloc[index].geometry.coords[-1]), tuple(geometry.coords[0])),
+                        _endpoint_distance_m(tuple(open_layer.iloc[index].geometry.coords[-1]), tuple(geometry.coords[-1])),
+                    ),
+                )
+            open_layer.at[nearest_index, "geometry"] = _join_open_lines(
+                open_layer.iloc[nearest_index].geometry,
+                geometry,
+                float(extension.get("connection_limit_m", join_tolerance_m)),
+            )
+            prior = str(open_layer.at[nearest_index, "absorbed_segment_ids"] or "")
+            open_layer.at[nearest_index, "absorbed_segment_ids"] = ",".join(
+                item for item in (prior, str(segment_id)) if item
+            )
+            primary_extension_absorbed.append(segment_id)
+        elif role == "secondary_tidal_obc":
             secondary_rows.append(
                 {
                     "segment_class": "open_boundary",
@@ -506,6 +556,8 @@ def _materialize_finalized_package(manifest: dict, contract: dict, run_dir: Path
         "chains": chains,
         "solid_component_count": int(len(solid_rows)),
         "secondary_obc_count": int(len(secondary_rows)),
+        "primary_obc_extension_count": int(len(primary_extension_absorbed)),
+        "primary_obc_extension_segment_ids": primary_extension_absorbed,
         "intentional_open_fragment_count": int(len(intentional_absorbed)),
         "intentional_open_fragment_segment_ids": intentional_absorbed,
     }

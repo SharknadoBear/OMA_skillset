@@ -121,6 +121,15 @@ A simple shoreline-bracketed solid closure is eligible only when it creates no
 artificial bar, crosses no unrelated land, preserves the wet component, and
 conflicts with no protected feature.
 
+When a reviewed residual is physically a continuation of an existing primary
+OBC, assign `primary_obc_extension` instead of creating a second OBC. The
+nearest residual/OBC endpoints must be separated by no more than two local
+target spacings, the explicit connector must be land-free, the joined chain
+must remain simple, and the wet component must be preserved. Materialization
+absorbs the fragment into the existing `obc_id`, records the segment and gap,
+and leaves the requested/delivered OBC count unchanged. This role reuses the
+primary forcing chain and does not invoke the secondary-OBC station screen.
+
 Before assigning any `secondary_tidal_obc`, invoke `$noaa-coops-tides` and
 require a fresh, hydraulically connected station screen for that component.
 Station proximity is eligibility evidence only; never exceed the requested OBC
@@ -131,6 +140,9 @@ python C:\Users\huan111\.codex\skills\noaa-coops-tides\scripts\screen_tidal_stat
 python scripts/finalize_open_exterior_decision.py --bdry-arc-manifest runs/case/bdry_arc_manifest.json --station-screen-json runs/case/open_exterior/coops_screen/noaa_coops_tidal_station_screen_v1.json --decision pass --rationale "Inspected whole-domain and component maps; accepted roles preserve physical exchange and create no artificial bar." --resume-adaptive
 ```
 
+For a reviewed primary-chain continuation, omit the NOAA screen and pass, for
+example, `--residual-role 0=primary_obc_extension`.
+
 Keep `bdry_arc_package.gpkg` immutable as candidate evidence. A passing
 hash-bound decision creates `bdry_arc_package_final.gpkg`, promotes accepted
 secondary OBCs after the primary in residual-segment order, moves accepted
@@ -138,7 +150,9 @@ solid closures into the landward boundary with provenance, and removes those
 components from the frame layer. Absorb any already-classified intentional-open
 fragment into the nearest existing OBC endpoint only within the recorded hard
 distance limit; keep its `obc_id`, require a simple joined line, and record the
-absorbed residual segment IDs. The final package becomes canonical while the
+absorbed residual segment IDs. Apply the same materialized-chain provenance to
+an agent-accepted `primary_obc_extension`, using its explicit two-target-spacing
+connector gate rather than the intentional-overlap classification. The final package becomes canonical while the
 candidate path and hash remain recorded. Rebuild model loops, final
 open-exterior QA, and Adaptive v2 resolution from the finalized package. When
 a later resolution attempt reaches a terminal state, replace any stale derived

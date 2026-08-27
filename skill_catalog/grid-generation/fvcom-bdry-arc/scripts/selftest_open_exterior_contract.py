@@ -8,11 +8,14 @@ import sys
 import tempfile
 
 import geopandas as gpd
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Polygon, box
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fvcom_bdry_arc.open_exterior import evaluate_open_exterior_metrics
+from fvcom_bdry_arc.open_exterior import (
+    _primary_obc_extension_geometry,
+    evaluate_open_exterior_metrics,
+)
 from fvcom_bdry_arc.workflow import BdryArcConfig
 import finalize_open_exterior_decision as finalizer
 
@@ -232,10 +235,118 @@ def _test_latest_resolution_status_replaces_stale_parent_failures() -> None:
     assert review == ["unrelated_failure", "adaptive_boundary_resolution_needs_review"]
 
 
+def _test_primary_obc_extension_is_bounded_and_preserves_count() -> None:
+    primary = LineString([(0.0, 0.0), (1000.0, 0.0)])
+    fragment = LineString([(1400.0, 0.0), (2400.0, 0.0)])
+    geometry = _primary_obc_extension_geometry(
+        fragment,
+        [primary],
+        box(10_000.0, 10_000.0, 11_000.0, 11_000.0),
+        connection_limit_m=500.0,
+        base_geometry_eligible=True,
+    )
+    assert geometry["eligible"] is True
+    assert geometry["nearest_obc_id"] == 0
+    assert geometry["connection_gap_m"] == 400.0
+    blocked = _primary_obc_extension_geometry(
+        fragment,
+        [primary],
+        box(1150.0, -50.0, 1250.0, 50.0),
+        connection_limit_m=500.0,
+        base_geometry_eligible=True,
+    )
+    assert blocked["eligible"] is False
+    assert blocked["connector_land_intersection_m"] > 0.0
+
+    contract = {
+        "obc_geometry": {"expected_count": 1, "delivered_count": 1},
+        "boundary_lengths": {
+            "outer_boundary_length_m": 10_000.0,
+            "landward_boundary_length_m": 9_000.0,
+        },
+        "hard_metrics": {
+            "absolute_limit_m": 250.0,
+            "fraction_limit": 0.001,
+            "coverage_minimum": 0.999,
+            "coastline_source_coverage_gate_pass": True,
+        },
+        "residual_components": [
+            {
+                "segment_id": 7,
+                "classification": "unintended_frame_clip",
+                "length_m": 1000.0,
+                "solid_role_geometry": {"eligible": True},
+                "primary_obc_extension_geometry": geometry,
+            }
+        ],
+    }
+    assert finalizer._apply_residual_roles(
+        contract,
+        assessed_contract_sha256="synthetic-contract-sha256",
+        decision="pass",
+        requested_roles={7: "primary_obc_extension"},
+        station_screen_path=None,
+    )
+    assert contract["obc_geometry"]["delivered_count"] == 1
+    assert contract["residual_role_summary"]["primary_obc_extension_count"] == 1
+    forcing = contract["residual_components"][0]["forcing_eligibility"]
+    assert forcing["creates_new_obc"] is False
+    assert forcing["noaa_secondary_station_screen_required"] is False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        candidate = root / "bdry_arc_package.gpkg"
+        gpd.GeoDataFrame(
+            [{"geometry": Polygon([(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)])}],
+            geometry="geometry",
+            crs="EPSG:4326",
+        ).to_file(candidate, layer="wet_domain", driver="GPKG")
+        gpd.GeoDataFrame(
+            [{"obc_id": 0, "geometry": LineString([(4.0, 0.0), (4.0, 4.0)])}],
+            geometry="geometry",
+            crs="EPSG:4326",
+        ).to_file(candidate, layer="open_boundary_arc", driver="GPKG")
+        gpd.GeoDataFrame(
+            [{"segment_id": 7, "geometry": LineString([(3.9999, 4.0), (3.0, 4.0)])}],
+            geometry="geometry",
+            crs="EPSG:4326",
+        ).to_file(candidate, layer="frame_clip_boundary_arcs", driver="GPKG")
+        material_contract = {
+            "obc_geometry": {"expected_count": 1, "delivered_count": 1},
+            "hard_metrics": {"absolute_limit_m": 250.0},
+            "residual_components": [
+                {
+                    "segment_id": 7,
+                    "assigned_role": "primary_obc_extension",
+                    "primary_obc_extension_geometry": {
+                        "nearest_obc_id": 0,
+                        "connection_limit_m": 250.0,
+                    },
+                    "geometry_lonlat": [[3.9999, 4.0], [3.0, 4.0]],
+                }
+            ],
+        }
+        package = finalizer._materialize_finalized_package(
+            {"outputs": {"bdry_arc_package_gpkg": str(candidate)}},
+            material_contract,
+            root,
+        )
+        final_open = gpd.read_file(
+            package["bdry_arc_package_final_gpkg"],
+            layer="open_boundary_arc",
+        )
+        assert len(final_open) == 1
+        assert int(final_open.iloc[0].obc_id) == 0
+        assert final_open.iloc[0].absorbed_segment_ids == "7"
+        assert package["primary_obc_extension_count"] == 1
+        assert package["primary_obc_extension_segment_ids"] == [7]
+
+
 def main() -> None:
     _test_materialized_residual_roles()
     _test_secondary_obc_requires_fresh_noaa_evidence()
     _test_latest_resolution_status_replaces_stale_parent_failures()
+    _test_primary_obc_extension_is_bounded_and_preserves_count()
     # Tampa-style northern/western bars fail every metric.
     tampa = evaluate_open_exterior_metrics(111_193.677, 903_200.0, 916_100.0, 250.0)
     assert not tampa["passed"]

@@ -25,9 +25,80 @@ RESIDUAL_LOOP_FAILURES = {
 
 RESIDUAL_BOUNDARY_ROLES = {
     "solid_lagoon_closure",
+    "primary_obc_extension",
     "secondary_tidal_obc",
     "invalid_geometry",
 }
+
+
+def _primary_obc_extension_geometry(
+    fragment: LineString,
+    open_chains: list[LineString],
+    land_union,
+    *,
+    connection_limit_m: float,
+    base_geometry_eligible: bool,
+) -> dict[str, Any]:
+    """Audit whether a residual fragment can extend one existing OBC chain."""
+    report = {
+        "nearest_obc_id": None,
+        "connection_gap_m": None,
+        "connection_limit_m": float(connection_limit_m),
+        "connection_limit_target_spacing_count": 2.0,
+        "connector_land_intersection_m": None,
+        "connector_land_intersection_limit_m": 1.0e-6,
+        "joined_simple_nonbranching": False,
+        "base_geometry_eligible": bool(base_geometry_eligible),
+        "wet_component_preserved": None,
+        "eligible": False,
+    }
+    if fragment.is_empty or not open_chains:
+        return report
+
+    fragment_coords = list(fragment.coords)
+    alternatives: list[tuple[float, int, list, list]] = []
+    for obc_id, chain in enumerate(open_chains):
+        if chain.is_empty:
+            continue
+        chain_coords = list(chain.coords)
+        alternatives.extend(
+            [
+                (Point(chain_coords[-1]).distance(Point(fragment_coords[0])), obc_id, chain_coords, fragment_coords),
+                (Point(chain_coords[-1]).distance(Point(fragment_coords[-1])), obc_id, chain_coords, list(reversed(fragment_coords))),
+                (Point(chain_coords[0]).distance(Point(fragment_coords[-1])), obc_id, fragment_coords, chain_coords),
+                (Point(chain_coords[0]).distance(Point(fragment_coords[0])), obc_id, list(reversed(fragment_coords)), chain_coords),
+            ]
+        )
+    if not alternatives:
+        return report
+    gap_m, obc_id, first, second = min(alternatives, key=lambda item: (item[0], item[1]))
+    connector = LineString([first[-1], second[0]])
+    connector_endpoint_mask = Point(connector.coords[0]).buffer(10.0).union(
+        Point(connector.coords[-1]).buffer(10.0)
+    )
+    connector_interior = connector.difference(connector_endpoint_mask)
+    connector_land_intersection_m = float(
+        connector_interior.intersection(land_union).length
+        if land_union is not None and not land_union.is_empty and not connector_interior.is_empty
+        else 0.0
+    )
+    joined = LineString(first + second)
+    report.update(
+        {
+            "nearest_obc_id": int(obc_id),
+            "connection_gap_m": float(gap_m),
+            "connector_land_intersection_m": connector_land_intersection_m,
+            "joined_simple_nonbranching": bool(not joined.is_empty and joined.is_simple),
+            "eligible": bool(
+                base_geometry_eligible
+                and gap_m <= float(connection_limit_m)
+                and connector_land_intersection_m <= 1.0e-6
+                and not joined.is_empty
+                and joined.is_simple
+            ),
+        }
+    )
+    return report
 
 def evaluate_open_exterior_metrics(
     unintended_length_m: float,
@@ -129,6 +200,7 @@ def build_open_exterior_contract(
         else max(250.0, 0.05 * target_resolution_m)
     )
     endpoint_tolerance_m = max(2.0 * tolerance_m, 0.10 * target_resolution_m)
+    primary_extension_limit_m = max(tolerance_m, 2.0 * target_resolution_m)
 
     records: list[dict[str, Any]] = []
     geo_records: list[dict[str, Any]] = []
@@ -176,6 +248,13 @@ def build_open_exterior_contract(
             )
             and nonendpoint_land_crossing_m <= nonendpoint_land_crossing_limit_m
         )
+        primary_extension_geometry = _primary_obc_extension_geometry(
+            line,
+            open_xy,
+            land_union_for_contract,
+            connection_limit_m=primary_extension_limit_m,
+            base_geometry_eligible=deterministic_solid_eligible,
+        )
         record = {
             "segment_id": int(segment_id),
             "side_index": int(side_index),
@@ -202,6 +281,7 @@ def build_open_exterior_contract(
                 "wet_component_preserved": None,
                 "eligible": deterministic_solid_eligible,
             },
+            "primary_obc_extension_geometry": primary_extension_geometry,
             "geometry_lonlat": [[float(x), float(y)] for x, y in line_lonlat.coords],
         }
         records.append(record)
@@ -209,7 +289,11 @@ def build_open_exterior_contract(
             **{
                 key: value
                 for key, value in record.items()
-                if key not in {"geometry_lonlat", "solid_role_geometry"}
+                if key not in {
+                    "geometry_lonlat",
+                    "solid_role_geometry",
+                    "primary_obc_extension_geometry",
+                }
             },
             "geometry": line_lonlat,
         })
@@ -241,6 +325,9 @@ def build_open_exterior_contract(
         geometry = item["solid_role_geometry"]
         geometry["wet_component_preserved"] = wet_component_count == 1
         geometry["eligible"] = bool(geometry["eligible"] and wet_component_count == 1)
+        extension = item["primary_obc_extension_geometry"]
+        extension["wet_component_preserved"] = wet_component_count == 1
+        extension["eligible"] = bool(extension["eligible"] and wet_component_count == 1)
     expected_obc_count = int(
         expected_obc_count
         if expected_obc_count is not None
@@ -402,6 +489,9 @@ def build_open_exterior_contract(
             "default_role": "solid_lagoon_closure" if role_contract_enabled else None,
             "station_is_eligibility_not_automatic_obc": True,
             "requested_obc_count_controls_secondary_obc": True,
+            "primary_extension_preserves_obc_count": True,
+            "primary_extension_connection_limit_m": float(primary_extension_limit_m),
+            "primary_extension_connection_limit_target_spacing_count": 2.0,
             "allowed_roles": sorted(RESIDUAL_BOUNDARY_ROLES),
         },
         "raw_residual_metrics": {
@@ -441,10 +531,12 @@ def build_open_exterior_contract(
         "residual_role_summary": {
             "pending_count": int(len(unintended)) if role_contract_enabled else 0,
             "solid_lagoon_closure_count": 0,
+            "primary_obc_extension_count": 0,
             "secondary_tidal_obc_count": 0,
             "invalid_geometry_count": 0,
             "unassigned_residual_length_m": unintended_length_m if role_contract_enabled else 0.0,
             "assigned_solid_length_m": 0.0,
+            "assigned_primary_obc_extension_length_m": 0.0,
             "assigned_secondary_obc_length_m": 0.0,
         },
         "coastline_source_coverage_required": coastline_coverage_required,
