@@ -155,7 +155,9 @@ Long Adaptive v2 runs also write
 file for live audit and the append-only JSONL for provenance. They report the
 current scientific phase, completed/total island or component counts, phase
 percentage, monotonic overall percentage, elapsed time, and heartbeat sequence.
-Progress never substitutes for the final scientific manifest.
+An interrupted process appends one terminal `cancelled` event with the last
+completed counts instead of leaving the live state labeled `running`. Progress
+never substitutes for the final scientific manifest.
 
 ## Standalone Tools
 

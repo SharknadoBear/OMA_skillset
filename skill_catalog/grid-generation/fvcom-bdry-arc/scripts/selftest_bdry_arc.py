@@ -26,6 +26,7 @@ from fvcom_bdry_arc import (  # noqa: E402
     run_bdry_arc,
 )
 from fvcom_bdry_arc.boundary_resolution import (  # noqa: E402
+    _BoundaryResolutionProgress,
     _inventory_narrow_passages,
     _normalize_open_chain_endpoints_on_exterior,
     _passage_gate_taxonomy,
@@ -350,6 +351,38 @@ def test_boundary_resolution_profile_is_v2_only() -> None:
             assert "only supports adaptive-coastal-v2" in str(exc)
         else:
             raise AssertionError(f"removed generation profile was accepted: {removed}")
+
+
+def test_boundary_resolution_progress_records_cancellation() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        progress = _BoundaryResolutionProgress(root, interval_s=0.0)
+        progress.emit("start", "start", 0, 1, force=True)
+        progress.emit(
+            "source_island_metrics",
+            "running",
+            3,
+            10,
+            {"island_id": 2},
+            force=True,
+        )
+        progress._record_process_exit()
+        state = json.loads(progress.state_path.read_text(encoding="utf-8"))
+        assert state["current_phase"] == "source_island_metrics"
+        assert state["current_message"] == "cancelled"
+        assert state["processed_count"] == 3
+        assert state["total_count"] == 10
+        assert state["phase_percent"] == 30.0
+        assert state["last_details"]["cancellation_reason"] == "process_exit_before_completion"
+        records = [
+            json.loads(line)
+            for line in progress.jsonl_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert records[-1]["message"] == "cancelled"
+        assert records[-1]["processed_count"] == 3
+        progress._record_process_exit()
+        assert len(progress.jsonl_path.read_text(encoding="utf-8").splitlines()) == len(records)
 
 
 def test_two_independent_coastal_obcs_preserve_ids_and_anchors() -> None:
@@ -1471,6 +1504,7 @@ def test_open_exterior_reader_drops_empty_geometry_placeholders() -> None:
 
 def main() -> int:
     test_boundary_resolution_profile_is_v2_only()
+    test_boundary_resolution_progress_records_cancellation()
     test_two_independent_coastal_obcs_preserve_ids_and_anchors()
     test_v2_open_endpoint_normalization_is_bounded()
     test_closed_island_obc_uses_seam_and_balance_without_landfalls()

@@ -6,6 +6,7 @@ separate resolved wet-domain polygon plus explicit ordered constraints.
 
 from __future__ import annotations
 
+import atexit
 from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -104,6 +105,10 @@ class _BoundaryResolutionProgress:
         self.last_write_monotonic = float("-inf")
         self.last_overall_percent = 0.0
         self.heartbeat_count = 0
+        self.last_record: dict[str, Any] | None = None
+        self.closed = False
+        self._exit_handler = self._record_process_exit
+        atexit.register(self._exit_handler)
 
     def emit(
         self,
@@ -170,6 +175,26 @@ class _BoundaryResolutionProgress:
         temporary.replace(self.state_path)
         self.last_write_monotonic = now_monotonic
         self.last_overall_percent = overall
+        self.last_record = record
+        if message in {"complete", "failed", "cancelled"}:
+            self.closed = True
+            atexit.unregister(self._exit_handler)
+
+    def _record_process_exit(self) -> None:
+        """Write one terminal cancellation event when a run exits unfinished."""
+        if self.closed or self.last_record is None:
+            return
+        previous = self.last_record
+        details = dict(previous.get("details") or {})
+        details["cancellation_reason"] = "process_exit_before_completion"
+        self.emit(
+            str(previous["phase"]),
+            "cancelled",
+            int(previous["processed_count"]),
+            int(previous["total_count"]),
+            details,
+            force=True,
+        )
 
     def callback(self, phase: str) -> ProgressCallback:
         def report(processed: int, total: int, details: dict[str, Any] | None = None) -> None:
