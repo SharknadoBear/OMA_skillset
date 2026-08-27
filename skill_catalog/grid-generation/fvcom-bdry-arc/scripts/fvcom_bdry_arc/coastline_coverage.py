@@ -10,9 +10,9 @@ from typing import Any
 import geopandas as gpd
 import matplotlib.pyplot as plt
 from shapely.geometry import GeometryCollection, LineString, Point, Polygon
-from shapely.ops import nearest_points, unary_union
+from shapely.ops import nearest_points, snap, unary_union
 
-from .projection import LocalProjection, project_geometry, unproject_geometry, unwrap_geometry_longitudes
+from .projection import LocalProjection, project_geometry, project_geometry_densified
 
 
 MIN_COVERAGE_FACTOR = 2.0
@@ -61,11 +61,15 @@ def _project_union(gdf: gpd.GeoDataFrame, projection: LocalProjection):
     for geometry in gdf.geometry:
         if geometry is None or geometry.is_empty:
             continue
-        unwrapped = unwrap_geometry_longitudes(geometry, float(projection.longitude_origin or 0.0))
-        projected = project_geometry(unwrapped, projection)
+        projected = project_geometry(geometry, projection)
         if not projected.is_empty:
             geometries.append(projected)
-    return unary_union(geometries) if geometries else GeometryCollection()
+    if not geometries:
+        return GeometryCollection()
+    merged = geometries[0]
+    for geometry in geometries[1:]:
+        merged = unary_union([merged, snap(geometry, merged, 0.01)])
+    return merged
 
 
 def _span(bounds: tuple[float, float, float, float]) -> tuple[float, float]:
@@ -107,9 +111,9 @@ def audit_coastline_source_coverage(
     if frame_layer.empty and not source_layer.empty:
         frame_layer = gpd.GeoDataFrame(geometry=source_layer.geometry.boundary, crs="EPSG:4326")
 
-    region_xy = project_geometry(region_polygon_lonlat, projection)
+    region_xy = project_geometry_densified(region_polygon_lonlat, projection)
     source_xy = _project_union(source_layer, projection)
-    frame_xy = _project_union(frame_layer, projection)
+    frame_xy = source_xy.boundary if not source_xy.is_empty else _project_union(frame_layer, projection)
     declared_model_xy = _project_union(model_layer, projection)
     model_xy = declared_model_xy if not declared_model_xy.is_empty else region_xy.envelope
     source_width, source_height = _span(source_xy.bounds) if not source_xy.is_empty else (0.0, 0.0)
@@ -185,9 +189,10 @@ def audit_coastline_source_coverage(
             zoom_map,
             name,
             source_layer,
-            frame_layer,
-            model_layer,
-            region_polygon_lonlat,
+            source_xy,
+            frame_xy,
+            model_xy,
+            region_xy,
             physical_coastline_xy,
             projection,
             anchors,
@@ -214,6 +219,9 @@ def audit_coastline_source_coverage(
         "region_bpoly_covered": region_contained,
         "source_frame_dependency_length_m": float(source_dependency),
         "source_frame_dependency_limit_m": SOURCE_FRAME_LENGTH_TOLERANCE_M,
+        "source_frame_metric_policy": "boundary_of_projected_source_footprint_union",
+        "coordinate_policy": "native_longitudes_transformed_directly_without_longitude_warping",
+        "projection_crs": projection.crs.to_string(),
         "anchor_to_source_frame_distance_m": anchor_frame_distances,
         "anchor_to_physical_coastline_distance_m": anchor_coast_distances,
         "physical_landfall_tolerance_m": float(physical_landfall_tolerance_m),
@@ -247,66 +255,66 @@ def _plot_coverage(
     zoom_path: Path,
     name: str,
     source_layer: gpd.GeoDataFrame,
-    frame_layer: gpd.GeoDataFrame,
-    model_layer: gpd.GeoDataFrame,
-    region: Polygon,
+    source_xy,
+    frame_xy,
+    model_xy,
+    region_xy: Polygon,
     physical_coastline_xy,
     projection: LocalProjection,
     anchors: list[Point],
     delivered_boundary_xy,
     failures: list[str],
 ) -> None:
-    physical = unproject_geometry(physical_coastline_xy, projection) if physical_coastline_xy is not None and not physical_coastline_xy.is_empty else GeometryCollection()
-    delivered = unproject_geometry(delivered_boundary_xy, projection) if delivered_boundary_xy is not None and not delivered_boundary_xy.is_empty else GeometryCollection()
-    anchor_lonlat = [unproject_geometry(point, projection) for point in anchors]
+    physical = physical_coastline_xy if physical_coastline_xy is not None else GeometryCollection()
+    delivered = delivered_boundary_xy if delivered_boundary_xy is not None else GeometryCollection()
+    display_crs = projection.crs
 
     fig, ax = plt.subplots(figsize=(11, 9))
-    if not source_layer.empty:
-        source_layer.plot(ax=ax, facecolor="#dbeafe", edgecolor="#dc2626", linewidth=1.2, alpha=0.18, label="GSHHS source footprint")
-    if not frame_layer.empty:
-        frame_layer.plot(ax=ax, color="#dc2626", linewidth=1.4, linestyle="--", label="source frame")
-    if not model_layer.empty:
-        model_layer.boundary.plot(ax=ax, color="#2563eb", linewidth=1.5, linestyle="-.", label="declared model bbox")
-    gpd.GeoSeries([region], crs="EPSG:4326").boundary.plot(ax=ax, color="#111827", linewidth=2.0, label="RegionBPoly")
+    if not source_xy.is_empty:
+        gpd.GeoSeries([source_xy], crs=display_crs).plot(ax=ax, facecolor="#dbeafe", edgecolor="#dc2626", linewidth=1.2, alpha=0.18, label="GSHHS source footprint")
+    if not frame_xy.is_empty:
+        gpd.GeoSeries([frame_xy], crs=display_crs).plot(ax=ax, color="#dc2626", linewidth=1.4, linestyle="--", label="source frame")
+    if not model_xy.is_empty:
+        gpd.GeoSeries([model_xy], crs=display_crs).boundary.plot(ax=ax, color="#2563eb", linewidth=1.5, linestyle="-.", label="declared model bbox")
+    gpd.GeoSeries([region_xy], crs=display_crs).boundary.plot(ax=ax, color="#111827", linewidth=2.0, label="RegionBPoly")
     if not physical.is_empty:
-        gpd.GeoSeries([physical], crs="EPSG:4326").plot(ax=ax, color="#166534", linewidth=0.8, label="physical GSHHS coastline")
+        gpd.GeoSeries([physical], crs=display_crs).plot(ax=ax, color="#166534", linewidth=0.8, label="physical GSHHS coastline")
     if not delivered.is_empty:
-        gpd.GeoSeries([delivered], crs="EPSG:4326").plot(ax=ax, color="#f97316", linewidth=2.0, label="delivered exterior")
-    if anchor_lonlat:
-        gpd.GeoSeries(anchor_lonlat, crs="EPSG:4326").plot(ax=ax, color="#7c3aed", markersize=45, label="landfall anchors")
+        gpd.GeoSeries([delivered], crs=display_crs).plot(ax=ax, color="#f97316", linewidth=2.0, label="delivered exterior")
+    if anchors:
+        gpd.GeoSeries(anchors, crs=display_crs).plot(ax=ax, color="#7c3aed", markersize=45, label="landfall anchors")
     ax.set_title(f"{name} coastline source coverage | {'PASS' if not failures else 'NEEDS REVIEW'}")
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
+    ax.set_xlabel("Projected easting (m)")
+    ax.set_ylabel("Projected northing (m)")
     ax.set_aspect("equal", adjustable="box")
     ax.legend(loc="best")
     fig.tight_layout()
     fig.savefig(whole_path, dpi=180)
     plt.close(fig)
 
-    focus = delivered if not delivered.is_empty else region.boundary
-    frame_geom = unary_union(frame_layer.geometry) if not frame_layer.empty else GeometryCollection()
+    focus = delivered if not delivered.is_empty else region_xy.boundary
     try:
-        p_focus, p_frame = nearest_points(focus, frame_geom)
+        p_focus, p_frame = nearest_points(focus, frame_xy)
         minx, miny = min(p_focus.x, p_frame.x), min(p_focus.y, p_frame.y)
         maxx, maxy = max(p_focus.x, p_frame.x), max(p_focus.y, p_frame.y)
     except Exception:
-        minx, miny, maxx, maxy = region.bounds
-    pad = max(0.02, 0.10 * max(maxx - minx, maxy - miny, 0.01))
+        minx, miny, maxx, maxy = region_xy.bounds
+    pad = max(1000.0, 0.10 * max(maxx - minx, maxy - miny, 1.0))
     fig, ax = plt.subplots(figsize=(10, 8))
-    if not source_layer.empty:
-        source_layer.plot(ax=ax, facecolor="#dbeafe", edgecolor="#dc2626", linewidth=1.2, alpha=0.18)
-    if not frame_layer.empty:
-        frame_layer.plot(ax=ax, color="#dc2626", linewidth=2.0, linestyle="--")
-    gpd.GeoSeries([region], crs="EPSG:4326").boundary.plot(ax=ax, color="#111827", linewidth=1.8)
+    if not source_xy.is_empty:
+        gpd.GeoSeries([source_xy], crs=display_crs).plot(ax=ax, facecolor="#dbeafe", edgecolor="#dc2626", linewidth=1.2, alpha=0.18)
+    if not frame_xy.is_empty:
+        gpd.GeoSeries([frame_xy], crs=display_crs).plot(ax=ax, color="#dc2626", linewidth=2.0, linestyle="--")
+    gpd.GeoSeries([region_xy], crs=display_crs).boundary.plot(ax=ax, color="#111827", linewidth=1.8)
     if not physical.is_empty:
-        gpd.GeoSeries([physical], crs="EPSG:4326").plot(ax=ax, color="#166534", linewidth=0.9)
+        gpd.GeoSeries([physical], crs=display_crs).plot(ax=ax, color="#166534", linewidth=0.9)
     if not delivered.is_empty:
-        gpd.GeoSeries([delivered], crs="EPSG:4326").plot(ax=ax, color="#f97316", linewidth=2.2)
+        gpd.GeoSeries([delivered], crs=display_crs).plot(ax=ax, color="#f97316", linewidth=2.2)
     ax.set_xlim(minx - pad, maxx + pad)
     ax.set_ylim(miny - pad, maxy + pad)
     ax.set_title(f"{name} closest approach to GSHHS source frame")
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
+    ax.set_xlabel("Projected easting (m)")
+    ax.set_ylabel("Projected northing (m)")
     ax.set_aspect("equal", adjustable="datalim")
     fig.tight_layout()
     fig.savefig(zoom_path, dpi=180)

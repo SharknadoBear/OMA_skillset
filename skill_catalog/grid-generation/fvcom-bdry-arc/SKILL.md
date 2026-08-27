@@ -73,7 +73,11 @@ Multiple OBCs:
 Island and archipelago OBCs:
 
 1. Require one land-free closed exterior loop and zero landfall anchors.
-2. Work in the compact antimeridian-safe longitude frame.
+2. Project native longitude/latitude coordinates directly into a compact
+   antimeridian-safe metric CRS. Never translate, wrap, or otherwise rewrite
+   longitudes to make the geometry appear contiguous. Densify sparse
+   geographic edges before projection so the projected path follows the
+   intended short circular longitude interval.
 3. Place the deterministic seam at minimum projected x, using projected y and then source order as tie-breakers.
 4. Add one half-perimeter balance anchor.
 5. Require exactly one seam anchor, one balance anchor, complete exterior overlap, and no land intersection.
@@ -81,6 +85,8 @@ Island and archipelago OBCs:
 Island topology and passage safeguards:
 
 - Compute area, perimeter, equivalent diameter, compactness, complexity, aspect, solidity, wet gap, and scale stability.
+- Classify land roles with the same numerical clearance used by the loop: a required fragment whose full-clearance neighborhood connects to already external land is not an independently retainable island and inherits that external role. Propagate this relation to a fixed point and record the gaps, rounds, and affected components.
+- When independently protected components are outside the seeded loop, construct their shortest projected wet-support corridors together, subtract the full land-clearance union once, and accept the result only when every protected component is enclosed, the seeded exterior stays valid, and land intersection remains zero. Use sequential fixed-point reconstruction only as a validated fallback.
 - Protect mission-region islands and gaps plus the configured buffer. Preserve protected geometry exactly and require spacing no larger than one quarter of a protected gap.
 - Outside protected regions, merge/drop only subgrid candidates within the 0.5% cumulative absolute island-area budget; guard validity, centroid, Hausdorff distance, area, orientation, and mission gaps.
 - Inventory conservative paired-bank wet passages. Harmonize both banks from passage width and required elements across. An explicit spacing floor that underresolves a protected passage is a hard `needs_review`; unresolved unprotected passages are advisories.
@@ -142,6 +148,14 @@ The resolution GeoPackage includes separate resolved-open rows by `obc_id`,
 boundary nodes with OBC/land IDs and anchors, resolved domain/islands, and
 passage diagnostics when present. Keep all evidence and return `needs_review`
 when any hard scientific gate fails; do not tune geometry silently.
+
+Long Adaptive v2 runs also write
+`boundary_resolution/boundary_resolution_progress.jsonl` and
+`boundary_resolution/boundary_resolution_progress_state.json`. Use the state
+file for live audit and the append-only JSONL for provenance. They report the
+current scientific phase, completed/total island or component counts, phase
+percentage, monotonic overall percentage, elapsed time, and heartbeat sequence.
+Progress never substitutes for the final scientific manifest.
 
 ## Standalone Tools
 

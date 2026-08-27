@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
-from typing import Any, Iterable
+import time
+from typing import Any, Callable, Iterable
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
@@ -25,8 +26,9 @@ from shapely.prepared import prep
 from .projection import (
     local_utm_projection,
     project_geometry,
+    project_geometry_densified,
+    projection_from_manifest,
     unproject_geometry,
-    unwrap_geometry_longitudes,
 )
 
 
@@ -64,9 +66,124 @@ class BoundaryResolutionConfig:
     passage_max_width_m: float = 5000.0
     passage_min_along_separation_m: float = 1500.0
     passage_min_spacing_m: float | None = None
+    progress_interval_s: float = 5.0
 
 
 BoundaryResolutionV2Config = BoundaryResolutionConfig
+
+
+ProgressCallback = Callable[[int, int, dict[str, Any] | None], None]
+
+
+_PROGRESS_PHASE_RANGES: dict[str, tuple[float, float]] = {
+    "start": (0.0, 1.0),
+    "load_inputs": (1.0, 8.0),
+    "outer_boundary": (8.0, 12.0),
+    "source_island_metrics": (12.0, 30.0),
+    "subgrid_topology": (30.0, 50.0),
+    "island_generalization": (50.0, 65.0),
+    "passage_inventory": (65.0, 80.0),
+    "boundary_sampling": (80.0, 92.0),
+    "write_outputs": (92.0, 96.0),
+    "quality_gates": (96.0, 99.0),
+    "complete": (100.0, 100.0),
+}
+
+
+class _BoundaryResolutionProgress:
+    """Persist auditable, monotonic Adaptive v2 progress and item counts."""
+
+    def __init__(self, run_dir: Path, interval_s: float) -> None:
+        self.run_dir = Path(run_dir)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.jsonl_path = self.run_dir / "boundary_resolution_progress.jsonl"
+        self.state_path = self.run_dir / "boundary_resolution_progress_state.json"
+        self.started_utc = datetime.now(timezone.utc)
+        self.started_monotonic = time.monotonic()
+        self.interval_s = max(0.0, float(interval_s))
+        self.last_write_monotonic = float("-inf")
+        self.last_overall_percent = 0.0
+        self.heartbeat_count = 0
+
+    def emit(
+        self,
+        phase: str,
+        message: str,
+        processed_count: int = 0,
+        total_count: int = 0,
+        details: dict[str, Any] | None = None,
+        *,
+        force: bool = False,
+    ) -> None:
+        now_monotonic = time.monotonic()
+        processed = max(0, int(processed_count))
+        total = max(0, int(total_count))
+        if total > 0:
+            processed = min(processed, total)
+            fraction = float(processed / total)
+        else:
+            fraction = 1.0 if message in {"done", "complete"} else 0.0
+        start, end = _PROGRESS_PHASE_RANGES.get(phase, (0.0, 99.0))
+        overall = float(start + (end - start) * fraction)
+        overall = max(self.last_overall_percent, min(100.0, overall))
+        terminal = message in {"start", "done", "complete", "failed", "cancelled"}
+        if not force and not terminal and now_monotonic - self.last_write_monotonic < self.interval_s:
+            return
+        self.heartbeat_count += 1
+        now_utc = datetime.now(timezone.utc)
+        elapsed = max(0.0, now_monotonic - self.started_monotonic)
+        record = {
+            "schema_version": "fvcom_boundary_resolution_progress_v1",
+            "sequence": int(self.heartbeat_count),
+            "time_utc": now_utc.isoformat(timespec="seconds"),
+            "elapsed_seconds": float(elapsed),
+            "phase": str(phase),
+            "message": str(message),
+            "processed_count": processed,
+            "total_count": total,
+            "phase_percent": float(100.0 * fraction),
+            "overall_percent": overall,
+            "details": _json_safe(details or {}),
+        }
+        with self.jsonl_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+        state = {
+            "schema_version": "fvcom_boundary_resolution_progress_state_v1",
+            "started_utc": self.started_utc.isoformat(timespec="seconds"),
+            "updated_utc": record["time_utc"],
+            "elapsed_seconds": record["elapsed_seconds"],
+            "current_phase": record["phase"],
+            "current_message": record["message"],
+            "processed_count": processed,
+            "total_count": total,
+            "phase_percent": record["phase_percent"],
+            "overall_percent": overall,
+            "heartbeat_count": int(self.heartbeat_count),
+            "last_details": record["details"],
+            "health_policy": (
+                "Counts report completed topology items; percentage is monotonic across weighted scientific phases. "
+                "Do not infer geometry acceptance until the resolution manifest is written."
+            ),
+        }
+        temporary = self.state_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        temporary.replace(self.state_path)
+        self.last_write_monotonic = now_monotonic
+        self.last_overall_percent = overall
+
+    def callback(self, phase: str) -> ProgressCallback:
+        def report(processed: int, total: int, details: dict[str, Any] | None = None) -> None:
+            done = total >= 0 and processed >= total
+            self.emit(
+                phase,
+                "done" if done else "running",
+                processed,
+                total,
+                details,
+                force=done,
+            )
+
+        return report
 
 
 def boundary_resolution_config(profile: str | None = None) -> BoundaryResolutionConfig:
@@ -134,14 +251,35 @@ def build_boundary_resolution(
         raise ValueError("Boundary resolution only supports adaptive-coastal-v2")
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    progress = _BoundaryResolutionProgress(run_dir, config.progress_interval_s)
+    progress.emit("start", "start", 0, 1, {"name": name, "profile": config.profile}, force=True)
     source_path = Path(model_boundary_loops_gpkg)
-    package = _load_loop_package(source_path)
+    progress.emit("load_inputs", "start", 0, 3, {"source": str(source_path)}, force=True)
+    package = _load_loop_package(source_path, model_boundary_loop_manifest)
+    progress.emit(
+        "load_inputs",
+        "running",
+        1,
+        3,
+        {"source_island_count": len(package["islands_xy"])},
+        force=True,
+    )
     projection = package["projection"]
     source_domain: Polygon = package["domain_xy"]
     islands_xy: list[Polygon] = package["islands_xy"]
     mission_xy = _mission_geometry(region_bpoly_json, projection, config.mission_buffer_m)
+    progress.emit("load_inputs", "running", 2, 3, {"mission_geometry_loaded": mission_xy is not None}, force=True)
     land_union = _load_land_union(coastline_gpkg, projection)
+    progress.emit(
+        "load_inputs",
+        "done",
+        3,
+        3,
+        {"land_union_loaded": land_union is not None and not land_union.is_empty},
+        force=True,
+    )
 
+    progress.emit("outer_boundary", "start", 0, 1, force=True)
     boundary_parts, open_lineage, repair_report, shell_polygon = _prepare_outer_boundary_parts(
         package["segments_xy"],
         source_domain,
@@ -150,17 +288,63 @@ def build_boundary_resolution(
         land_union,
         config,
     )
+    progress.emit(
+        "outer_boundary",
+        "done",
+        1,
+        1,
+        {"boundary_part_count": len(boundary_parts), "land_free": repair_report.get("land_free")},
+        force=True,
+    )
     open_parts = [item for item in boundary_parts if item["boundary_kind"] == "open"]
     land_parts = [item for item in boundary_parts if item["boundary_kind"] == "land"]
-    source_metrics = _island_metrics(islands_xy, source_domain, mission_xy, config)
+    progress.emit(
+        "source_island_metrics",
+        "start",
+        0,
+        len(islands_xy),
+        {"island_count": len(islands_xy)},
+        force=True,
+    )
+    source_metrics = _island_metrics(
+        islands_xy,
+        source_domain,
+        mission_xy,
+        config,
+        progress=progress.callback("source_island_metrics"),
+    )
+    subgrid_count = int(sum(item["shape_class"] == "subgrid_fragment" for item in source_metrics))
+    progress.emit(
+        "subgrid_topology",
+        "start",
+        0,
+        subgrid_count,
+        {"candidate_count": subgrid_count},
+        force=True,
+    )
     topologized, action_report = _apply_subgrid_actions(
         shell_polygon,
         islands_xy,
         source_metrics,
         mission_xy,
         config,
+        progress=progress.callback("subgrid_topology"),
     )
-    resolved_islands, resolved_records = _generalize_islands(topologized, mission_xy, config)
+    generalization_count = len(topologized.interiors)
+    progress.emit(
+        "island_generalization",
+        "start",
+        0,
+        generalization_count,
+        {"island_count": generalization_count},
+        force=True,
+    )
+    resolved_islands, resolved_records = _generalize_islands(
+        topologized,
+        mission_xy,
+        config,
+        progress=progress.callback("island_generalization"),
+    )
 
     passage_report = {
         "policy": "conservative_inventory_harmonize_only_no_topology_closure",
@@ -173,6 +357,14 @@ def build_boundary_resolution(
     land_controls: list[dict[str, Any]] = []
     island_target_overrides: dict[int, float] = {}
     passage_domain = Polygon(shell_polygon.exterior.coords, holes=[list(poly.exterior.coords) for poly in resolved_islands])
+    progress.emit(
+        "passage_inventory",
+        "start",
+        0,
+        len(land_parts) + len(resolved_islands),
+        {"land_component_count": len(land_parts), "island_component_count": len(resolved_islands)},
+        force=True,
+    )
     passage_report, land_controls, island_target_overrides = _inventory_narrow_passages(
         [item["geometry"] for item in land_parts],
         resolved_islands,
@@ -180,11 +372,22 @@ def build_boundary_resolution(
         mission_xy,
         config,
         projection,
+        progress=progress.callback("passage_inventory"),
     )
     outer_entries: list[dict[str, Any]] = []
     open_sampling: list[dict[str, Any]] = []
     land_sampling: list[dict[str, Any]] = []
     sampled_open_chains: list[dict[str, Any]] = []
+    sampling_total = len(boundary_parts) + len(resolved_islands)
+    sampling_processed = 0
+    progress.emit(
+        "boundary_sampling",
+        "start",
+        0,
+        sampling_total,
+        {"outer_part_count": len(boundary_parts), "island_count": len(resolved_islands)},
+        force=True,
+    )
     for part in boundary_parts:
         line = part["geometry"]
         if part["boundary_kind"] == "open":
@@ -232,6 +435,14 @@ def build_boundary_resolution(
             for xy, h, meta in zip(nodes, targets, metadata)
         ]
         outer_entries.extend(entries)
+        sampling_processed += 1
+        progress.emit(
+            "boundary_sampling",
+            "running",
+            sampling_processed,
+            sampling_total,
+            {"substage": "outer_boundary", "boundary_kind": str(part["boundary_kind"])},
+        )
     outer_entries = _deduplicate_node_entries(outer_entries)
     target_gradation_conditioning = _enforce_delivered_target_gradation(
         outer_entries,
@@ -272,6 +483,15 @@ def build_boundary_resolution(
         record["resolved_area_m2"] = float(candidate.area)
         island_chains.append(chain)
         island_targets.append(float(target))
+        sampling_processed += 1
+        progress.emit(
+            "boundary_sampling",
+            "done" if sampling_processed >= sampling_total else "running",
+            sampling_processed,
+            sampling_total,
+            {"substage": "island", "island_index": int(resolved_index)},
+            force=sampling_processed >= sampling_total,
+        )
 
     resolved_domain = Polygon(outer_nodes, holes=island_chains)
     if not resolved_domain.is_valid:
@@ -321,6 +541,7 @@ def build_boundary_resolution(
             projection,
         )
 
+    progress.emit("write_outputs", "start", 0, 4, force=True)
     gpkg = run_dir / "boundary_resolution.gpkg"
     if gpkg.exists():
         gpkg.unlink()
@@ -340,6 +561,7 @@ def build_boundary_resolution(
         config.profile,
         passage_report.get("passages", []),
     )
+    progress.emit("write_outputs", "running", 1, 4, {"artifact": str(gpkg)}, force=True)
     diagnostics_path = run_dir / "boundary_resolution_diagnostics.json"
     node_geojson_path = run_dir / "boundary_resolution_nodes.geojson"
     review_map = run_dir / "boundary_resolution_review_map.png"
@@ -365,9 +587,13 @@ def build_boundary_resolution(
     }
     diagnostics["channel_passages"] = passage_report
     diagnostics_path.write_text(json.dumps(_json_safe(diagnostics), indent=2), encoding="utf-8")
+    progress.emit("write_outputs", "running", 2, 4, {"artifact": str(diagnostics_path)}, force=True)
     node_geojson_path.write_text(json.dumps(_node_geojson(node_records), indent=2), encoding="utf-8")
+    progress.emit("write_outputs", "running", 3, 4, {"artifact": str(node_geojson_path)}, force=True)
     _plot_review(review_map, source_domain, resolved_domain, [item["geometry"] for item in open_parts], mission_xy, projection, source_metrics)
+    progress.emit("write_outputs", "done", 4, 4, {"artifact": str(review_map)}, force=True)
 
+    progress.emit("quality_gates", "start", 0, 1, force=True)
     open_count = int(sum(item["boundary_kind"] == "open" for item in node_records))
     island_count = int(sum(item["boundary_kind"] == "island" for item in node_records))
     topology_area_fraction = float(action_report["cumulative_absolute_area_change_m2"] / max(action_report["source_island_area_m2"], 1.0))
@@ -439,6 +665,12 @@ def build_boundary_resolution(
             "coastline_gpkg": str(coastline_gpkg) if coastline_gpkg else None,
         },
         "settings": _json_safe(config.__dict__),
+        "projection": {
+            "crs": projection.crs.to_string(),
+            "epsg": projection.epsg,
+            "longitude_origin": projection.longitude_origin,
+            "coordinate_policy": "native_longitudes_transformed_directly_without_longitude_warping",
+        },
         "qa": {
             "open_boundary_node_count": open_count,
             "expected_obc_count": expected_obc_count,
@@ -489,20 +721,51 @@ def build_boundary_resolution(
             "boundary_resolution_nodes_geojson": str(node_geojson_path),
             "boundary_resolution_review_map": str(review_map),
             "boundary_resolution_manifest": str(run_dir / "boundary_resolution_manifest.json"),
+            "boundary_resolution_progress_jsonl": str(progress.jsonl_path),
+            "boundary_resolution_progress_state": str(progress.state_path),
         },
     }
     manifest_path = run_dir / "boundary_resolution_manifest.json"
     manifest_path.write_text(json.dumps(_json_safe(manifest), indent=2), encoding="utf-8")
+    progress.emit(
+        "quality_gates",
+        "done",
+        1,
+        1,
+        {"final_status": manifest["final_status"], "failure_count": len(failures)},
+        force=True,
+    )
+    progress.emit(
+        "complete",
+        "complete",
+        1,
+        1,
+        {"final_status": manifest["final_status"], "manifest": str(manifest_path)},
+        force=True,
+    )
     return manifest
 
 
-def _load_loop_package(path: Path) -> dict[str, Any]:
+def _load_loop_package(
+    path: Path,
+    manifest_path: str | Path | None = None,
+) -> dict[str, Any]:
     layers = set(gpd.list_layers(path)["name"])
     domain_gdf = gpd.read_file(path, layer="model_domain_polygon")
     domain_lonlat = next(geom for geom in domain_gdf.geometry if isinstance(geom, Polygon) and not geom.is_empty)
     if domain_gdf.crs is not None:
         domain_lonlat = gpd.GeoSeries([domain_lonlat], crs=domain_gdf.crs).to_crs("EPSG:4326").iloc[0]
-    projection = _compact_projection(domain_lonlat)
+    manifest_file = Path(manifest_path) if manifest_path else path.with_name("model_boundary_loop_manifest.json")
+    manifest = (
+        json.loads(manifest_file.read_text(encoding="utf-8-sig"))
+        if manifest_file.is_file()
+        else {}
+    )
+    fallback_projection = _compact_projection(domain_lonlat)
+    projection = projection_from_manifest(
+        manifest,
+        _compact_bbox(domain_lonlat),
+    ) if manifest.get("projection") else fallback_projection
     domain_xy = _project_compact(domain_lonlat, projection).buffer(0)
     segments = gpd.read_file(path, layer="model_outer_boundary_segments").to_crs("EPSG:4326")
     segment_records = []
@@ -535,11 +798,15 @@ def _load_loop_package(path: Path) -> dict[str, Any]:
                 if not isinstance(part, LineString) or part.is_empty:
                     continue
                 obc_id = base_obc_id if len(parts) == 1 else base_obc_id + offset
+                projected_part = _project_compact(part, projection)
                 delivered_open_chains_xy.append(
                     {
                         "obc_id": int(obc_id),
-                        "geometry": _project_compact(part, projection),
-                        "is_closed": bool(getattr(part, "is_ring", False)),
+                        "geometry": projected_part,
+                        "is_closed": bool(
+                            projected_part.is_ring
+                            or Point(projected_part.coords[0]).distance(Point(projected_part.coords[-1])) <= 1.0
+                        ),
                     }
                 )
             next_obc_id = max(next_obc_id, base_obc_id + max(1, len(parts)))
@@ -568,6 +835,7 @@ def _compact_projection(domain_lonlat: Polygon):
         raise ValueError("Model domain has no usable exterior coordinates")
     if len(longitudes) == 1:
         origin = ((longitudes[0] + 180.0) % 360.0) - 180.0
+        span = 0.0
     else:
         gaps = [
             (
@@ -580,13 +848,29 @@ def _compact_projection(domain_lonlat: Polygon):
         start = longitudes[(gap_index + 1) % len(longitudes)]
         span = (longitudes[gap_index] - start) % 360.0
         origin = ((start + 0.5 * span + 180.0) % 360.0) - 180.0
-    compact = unwrap_geometry_longitudes(domain_lonlat, origin)
-    return local_utm_projection(tuple(float(value) for value in compact.bounds))
+    lats = [float(lat) for _lon, lat in domain_lonlat.exterior.coords]
+    west = _wrap_lon(origin - 0.5 * span)
+    east = _wrap_lon(origin + 0.5 * span)
+    return local_utm_projection((west, min(lats), east, max(lats)))
+
+
+def _compact_bbox(domain_lonlat: Polygon) -> tuple[float, float, float, float]:
+    projection = _compact_projection(domain_lonlat)
+    origin = float(projection.longitude_origin or 0.0)
+    longitudes = [float(lon) for lon, _lat in domain_lonlat.exterior.coords[:-1]]
+    circular = [((lon - origin + 180.0) % 360.0) - 180.0 for lon in longitudes]
+    lats = [float(lat) for _lon, lat in domain_lonlat.exterior.coords]
+    west = _wrap_lon(origin + min(circular))
+    east = _wrap_lon(origin + max(circular))
+    return west, min(lats), east, max(lats)
+
+
+def _wrap_lon(value: float) -> float:
+    return ((float(value) + 180.0) % 360.0) - 180.0
 
 
 def _project_compact(geometry, projection):
-    origin = float(projection.longitude_origin or 0.0)
-    return project_geometry(unwrap_geometry_longitudes(geometry, origin), projection)
+    return project_geometry(geometry, projection)
 
 
 def _prepare_outer_boundary_parts(
@@ -899,10 +1183,10 @@ def _mission_geometry(region_bpoly_json: str | Path | None, projection, buffer_m
             continue
         geometry = item.get("geometry")
         if isinstance(geometry, dict) and geometry.get("type") == "Polygon":
-            polygons.append(_project_compact(Polygon(geometry["coordinates"][0]), projection))
+            polygons.append(project_geometry_densified(Polygon(geometry["coordinates"][0]), projection))
         elif isinstance(geometry, (list, tuple)) and len(geometry) == 4:
             poly = box(*map(float, geometry))
-            polygons.append(_project_compact(poly, projection))
+            polygons.append(project_geometry_densified(poly, projection))
     return unary_union(polygons).buffer(float(buffer_m)) if polygons else GeometryCollection()
 
 
@@ -1183,7 +1467,14 @@ def _compose_shell(open_line: LineString, landward: LineString, source_domain: P
     return [(float(x), float(y)) for x, y in reversed_coords]
 
 
-def _island_metrics(islands: list[Polygon], domain: Polygon, mission, config: BoundaryResolutionConfig) -> list[dict[str, Any]]:
+def _island_metrics(
+    islands: list[Polygon],
+    domain: Polygon,
+    mission,
+    config: BoundaryResolutionConfig,
+    *,
+    progress: ProgressCallback | None = None,
+) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     outer = LineString(domain.exterior.coords)
     cleaned_islands = [polygon.buffer(0) for polygon in islands]
@@ -1245,10 +1536,26 @@ def _island_metrics(islands: list[Polygon], domain: Polygon, mission, config: Bo
                 "reason": "resolved_or_protected",
             }
         )
+        if progress is not None:
+            progress(
+                idx + 1,
+                len(cleaned_islands),
+                {"island_id": int(idx), "shape_class": shape_class},
+            )
+    if progress is not None and not cleaned_islands:
+        progress(0, 0, {"island_count": 0})
     return results
 
 
-def _apply_subgrid_actions(shell: Polygon, islands: list[Polygon], metrics: list[dict[str, Any]], mission, config: BoundaryResolutionConfig) -> tuple[Polygon, dict[str, Any]]:
+def _apply_subgrid_actions(
+    shell: Polygon,
+    islands: list[Polygon],
+    metrics: list[dict[str, Any]],
+    mission,
+    config: BoundaryResolutionConfig,
+    *,
+    progress: ProgressCallback | None = None,
+) -> tuple[Polygon, dict[str, Any]]:
     source_area = float(sum(poly.area for poly in islands))
     budget = float(config.area_budget_fraction * source_area)
     dropped: set[int] = set()
@@ -1260,8 +1567,14 @@ def _apply_subgrid_actions(shell: Polygon, islands: list[Polygon], metrics: list
     current_water = Polygon(shell.exterior.coords, holes=[list(poly.exterior.coords) for poly in islands])
     merge_targets: set[int] = set()
     candidates = sorted((item for item in metrics if item["shape_class"] == "subgrid_fragment"), key=lambda item: (item["area_m2"], item["island_id"]))
-    for item in candidates:
+    for candidate_position, item in enumerate(candidates):
         idx = int(item["island_id"])
+        if progress is not None:
+            progress(
+                candidate_position,
+                len(candidates),
+                {"next_island_id": idx, "accepted_action_count": len(actions)},
+            )
         polygon = islands[idx]
         if item["protected_mission"]:
             item["action"] = "retain_protected"
@@ -1348,6 +1661,13 @@ def _apply_subgrid_actions(shell: Polygon, islands: list[Polygon], metrics: list
         current_water = trial_water
         actions.append({"island_id": idx, "action": action, "area_change_m2": delta, "nearest_gap_m": gap, "merge_target_island_id": nearest_id})
 
+    if progress is not None:
+        progress(
+            len(candidates),
+            len(candidates),
+            {"accepted_action_count": len(actions)},
+        )
+
     return current_water, {
         "policy": "balanced_protected_auto_merge_drop",
         "source_island_area_m2": source_area,
@@ -1361,7 +1681,13 @@ def _apply_subgrid_actions(shell: Polygon, islands: list[Polygon], metrics: list
     }
 
 
-def _generalize_islands(domain: Polygon, mission, config: BoundaryResolutionConfig) -> tuple[list[Polygon], list[dict[str, Any]]]:
+def _generalize_islands(
+    domain: Polygon,
+    mission,
+    config: BoundaryResolutionConfig,
+    *,
+    progress: ProgressCallback | None = None,
+) -> tuple[list[Polygon], list[dict[str, Any]]]:
     islands = [Polygon(ring).buffer(0) for ring in domain.interiors]
     island_tree = STRtree(islands) if islands else None
     resolved: list[Polygon] = []
@@ -1442,6 +1768,14 @@ def _generalize_islands(domain: Polygon, mission, config: BoundaryResolutionConf
                 "accepted_simplification_tolerance_m": float(tolerance),
             }
         )
+        if progress is not None:
+            progress(
+                idx + 1,
+                len(islands),
+                {"island_id": int(idx), "protected_mission": protected},
+            )
+    if progress is not None and not islands:
+        progress(0, 0, {"island_count": 0})
     return resolved, records
 
 
@@ -1515,6 +1849,8 @@ def _inventory_narrow_passages(
     mission,
     config: BoundaryResolutionConfig,
     projection,
+    *,
+    progress: ProgressCallback | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[int, float]]:
     """Conservatively inventory wet connectors between nonlocal boundary banks.
 
@@ -1586,6 +1922,12 @@ def _inventory_narrow_passages(
     component_tree = STRtree(component_geometries)
     indexed_component_pair_count = 0
     all_component_pair_count = len(components) * max(0, len(components) - 1) // 2
+    if progress is not None:
+        progress(
+            0,
+            len(component_geometries),
+            {"substage": "cross_component", "raw_candidate_count": len(raw_candidates)},
+        )
     for first, geometry_a in enumerate(component_geometries):
         nearby = component_tree.query(geometry_a, predicate="dwithin", distance=max_width)
         for second in sorted(int(value) for value in nearby if int(value) > first):
@@ -1612,6 +1954,16 @@ def _inventory_narrow_passages(
                     "width_m": width,
                     "connector": connector,
                 }
+            )
+        if progress is not None:
+            progress(
+                first + 1,
+                len(component_geometries),
+                {
+                    "substage": "cross_component",
+                    "indexed_component_pair_count": indexed_component_pair_count,
+                    "raw_candidate_count": len(raw_candidates),
+                },
             )
 
     # Keep one narrow representative per local bank-pair neighborhood.
@@ -2532,18 +2884,26 @@ def _node_geojson(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _plot_review(path, source_domain, resolved_domain, open_lines, mission, projection, metrics) -> None:
+    native_source = unproject_geometry(source_domain, projection)
+    minx, _miny, maxx, _maxy = native_source.bounds
+    projected_display = float(maxx - minx) > 180.0
+    display_crs = projection.crs if projected_display else "EPSG:4326"
+    source_display = source_domain if projected_display else native_source
+    resolved_display = resolved_domain if projected_display else unproject_geometry(resolved_domain, projection)
     fig, ax = plt.subplots(figsize=(10, 9), constrained_layout=True)
-    gpd.GeoSeries([unproject_geometry(source_domain, projection)], crs="EPSG:4326").boundary.plot(ax=ax, color="#9aa0a6", linewidth=0.5, label="base")
-    gpd.GeoSeries([unproject_geometry(resolved_domain, projection)], crs="EPSG:4326").boundary.plot(ax=ax, color="#16537e", linewidth=0.8, label="resolved")
+    gpd.GeoSeries([source_display], crs=display_crs).boundary.plot(ax=ax, color="#9aa0a6", linewidth=0.5, label="base")
+    gpd.GeoSeries([resolved_display], crs=display_crs).boundary.plot(ax=ax, color="#16537e", linewidth=0.8, label="resolved")
     if open_lines:
         gpd.GeoSeries(
-            [unproject_geometry(line, projection) for line in open_lines], crs="EPSG:4326"
+            open_lines if projected_display else [unproject_geometry(line, projection) for line in open_lines],
+            crs=display_crs,
         ).plot(ax=ax, color="#d00000", linewidth=2.0, label="resolved OBC")
     if mission is not None and not mission.is_empty:
-        gpd.GeoSeries([unproject_geometry(mission, projection)], crs="EPSG:4326").boundary.plot(ax=ax, color="#7b2cbf", linewidth=0.8, linestyle="--", label="protected mission")
+        mission_display = mission if projected_display else unproject_geometry(mission, projection)
+        gpd.GeoSeries([mission_display], crs=display_crs).boundary.plot(ax=ax, color="#7b2cbf", linewidth=0.8, linestyle="--", label="protected mission")
     ax.set_title(f"Adaptive coastal boundary resolution: {len(metrics)} source islands")
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
+    ax.set_xlabel("Projected easting (m)" if projected_display else "Longitude")
+    ax.set_ylabel("Projected northing (m)" if projected_display else "Latitude")
     ax.legend(loc="best")
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=180)

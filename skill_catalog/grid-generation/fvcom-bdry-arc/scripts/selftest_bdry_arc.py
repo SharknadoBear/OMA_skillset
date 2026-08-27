@@ -10,6 +10,7 @@ import sys
 
 import geopandas as gpd
 from shapely.geometry import LineString, MultiLineString, Point, Polygon, box
+from shapely.ops import unary_union
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -32,7 +33,12 @@ from fvcom_bdry_arc.boundary_resolution import (  # noqa: E402
     _sample_open_arc_v2,
 )
 from fvcom_bdry_arc.open_exterior import _read_layer as _read_open_exterior_layer  # noqa: E402
-from fvcom_bdry_arc.projection import local_utm_projection, project_geometry  # noqa: E402
+from fvcom_bdry_arc.projection import (  # noqa: E402
+    densify_native_geographic_geometry,
+    local_utm_projection,
+    project_geometry,
+    project_geometry_densified,
+)
 from fvcom_bdry_arc.workflow import (  # noqa: E402
     _classify_relevant_lines,
     _coastline_bpoly_anchor_points,
@@ -43,6 +49,7 @@ from fvcom_bdry_arc.workflow import (  # noqa: E402
     _promote_delivered_open_arc_landfalls,
     _raster_connectivity_fill,
     _reroute_open_arc_around_blocking_land,
+    _route_closed_island_loop_clear_of_land,
     _uses_island_loop_branch,
     extract_gshhs_vector_wet_domain,
     repair_coastline_graph,
@@ -645,6 +652,109 @@ def test_antimeridian_projection_uses_compact_longitude_frame() -> None:
     assert projection.longitude_origin > 150.0 or projection.longitude_origin < -150.0
 
 
+def test_antimeridian_sparse_edges_are_densified_without_longitude_warping() -> None:
+    projection = local_utm_projection((172.0, 51.0, -158.0, 55.5))
+    native = Polygon(
+        [(172.0, 51.0), (-158.0, 51.0), (-158.0, 55.5), (172.0, 55.5), (172.0, 51.0)]
+    )
+    densified = densify_native_geographic_geometry(native, maximum_segment_degrees=0.25)
+    native_longitudes = [float(lon) for lon, _lat in densified.exterior.coords]
+    assert min(native_longitudes) >= -180.0
+    assert max(native_longitudes) <= 180.0
+    projected = project_geometry_densified(native, projection)
+    north_outside = project_geometry(Point(-160.25, 55.68), projection)
+    assert projected.is_valid
+    assert not projected.covers(north_outside)
+    assert north_outside.distance(projected) > 10_000.0
+
+
+def test_closed_island_loop_routing_preserves_protected_land_and_excludes_mainland() -> None:
+    mission = box(0.0, 0.0, 10_000.0, 10_000.0)
+    protected_island = box(9_000.0, 4_000.0, 10_500.0, 5_500.0)
+    detached_protected_island = box(13_000.0, 7_500.0, 13_500.0, 8_300.0)
+    external_mainland = box(-2_000.0, 3_000.0, 1_000.0, 7_000.0)
+    nearby_external_island = box(13_000.0, 8_400.0, 13_500.0, 8_800.0)
+    land = [protected_island, detached_protected_island, external_mainland, nearby_external_island]
+    land_union = unary_union(land).buffer(0)
+    source_loop = LineString(mission.exterior.coords)
+    routed, report = _route_closed_island_loop_clear_of_land(
+        source_loop,
+        land,
+        land_union,
+        mission,
+        Point(5_000.0, 5_000.0),
+        250.0,
+        protected_island_regions_xy=[
+            box(8_500.0, 3_500.0, 11_000.0, 6_000.0),
+            box(12_500.0, 7_000.0, 14_000.0, 8_350.0),
+        ],
+    )
+    frame = Polygon(routed.coords)
+    assert routed.is_ring and routed.is_simple
+    assert report["land_free"] is True
+    assert report["seed_preserved"] is True
+    assert report["retained_inside_component_fraction"] == 1.0
+    assert frame.buffer(5.0).covers(protected_island)
+    assert frame.buffer(5.0).covers(detached_protected_island)
+    assert any(action["accepted"] for action in report["protected_component_connection_actions"])
+    assert not frame.covers(external_mainland.representative_point())
+    assert routed.intersection(land_union).length <= 1.0e-6
+
+
+def test_closed_island_loop_batch_connects_intervening_protected_components() -> None:
+    mission = box(0.0, 0.0, 10_000.0, 10_000.0)
+    outer_protected = box(13_000.0, 4_500.0, 15_000.0, 6_500.0)
+    intervening_protected = box(11_500.0, 3_500.0, 12_000.0, 7_500.0)
+    external_mainland = box(-2_000.0, 3_000.0, 1_000.0, 7_000.0)
+    land = [outer_protected, intervening_protected, external_mainland]
+    land_union = unary_union(land).buffer(0)
+    routed, report = _route_closed_island_loop_clear_of_land(
+        LineString(mission.exterior.coords),
+        land,
+        land_union,
+        mission,
+        Point(5_000.0, 5_000.0),
+        250.0,
+        protected_island_regions_xy=[
+            box(12_500.0, 4_000.0, 15_500.0, 7_000.0),
+            box(11_000.0, 3_000.0, 12_500.0, 8_000.0),
+        ],
+    )
+    frame = Polygon(routed.coords)
+    assert report["land_free"] is True
+    assert report["retained_inside_component_fraction"] == 1.0
+    assert report["protected_component_batch_connection_report"]["accepted"] is True
+    assert report["protected_component_connection_pass_count"] == 0
+    assert report["protected_component_unresolved_ids"] == []
+    assert frame.covers(outer_protected)
+    assert frame.covers(intervening_protected)
+    assert routed.intersection(land_union).length <= 1.0e-6
+
+
+def test_clearance_connected_required_fragment_inherits_external_land_role() -> None:
+    mission = box(0.0, 0.0, 10_000.0, 10_000.0)
+    required_fragment = box(10_006.0, 4_000.0, 10_500.0, 4_500.0)
+    external_mainland = box(10_506.0, 1_000.0, 20_000.0, 9_000.0)
+    land = [required_fragment, external_mainland]
+    land_union = unary_union(land).buffer(0)
+    routed, report = _route_closed_island_loop_clear_of_land(
+        LineString(mission.exterior.coords),
+        land,
+        land_union,
+        mission,
+        Point(5_000.0, 5_000.0),
+        250.0,
+        protected_island_regions_xy=[box(10_000.0, 3_500.0, 10_505.0, 5_000.0)],
+    )
+    role_report = report["clearance_connected_land_role_report"]
+    assert role_report["reclassified_component_count"] == 1
+    assert role_report["reclassified_components"][0]["gap_to_external_land_m"] == 6.0
+    assert report["retained_inside_component_count"] == 0
+    assert report["retained_inside_component_fraction"] == 1.0
+    assert report["land_free"] is True
+    assert routed.intersection(land_union).length <= 1.0e-6
+
+
 def test_lake_closed_boundary_no_false_open_arc() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -1026,7 +1136,7 @@ def test_adaptive_boundary_resolution_package() -> None:
             coast,
             root / "resolution",
             "synthetic_adaptive",
-            BoundaryResolutionConfig(),
+            BoundaryResolutionConfig(progress_interval_s=0.0),
         )
         assert manifest["profile"] == "adaptive-coastal-v2"
         assert manifest["final_status"] == "pass"
@@ -1042,6 +1152,29 @@ def test_adaptive_boundary_resolution_package() -> None:
         assert all(item["target_spacing_m"] <= 150.0 for item in protected)
         layers = set(gpd.list_layers(manifest["outputs"]["boundary_resolution_gpkg"])["name"])
         assert {"resolved_domain_polygon", "resolved_open_boundary", "resolved_island_polygons", "boundary_nodes", "island_diagnostics"}.issubset(layers)
+
+        progress_state = json.loads(
+            Path(manifest["outputs"]["boundary_resolution_progress_state"]).read_text(encoding="utf-8")
+        )
+        assert progress_state["current_phase"] == "complete"
+        assert progress_state["current_message"] == "complete"
+        assert progress_state["overall_percent"] == 100.0
+        progress_records = [
+            json.loads(line)
+            for line in Path(manifest["outputs"]["boundary_resolution_progress_jsonl"])
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
+        overall = [float(item["overall_percent"]) for item in progress_records]
+        assert overall == sorted(overall)
+        island_metric_records = [
+            item for item in progress_records if item["phase"] == "source_island_metrics"
+        ]
+        assert island_metric_records[0]["processed_count"] == 0
+        assert island_metric_records[0]["total_count"] == 2
+        assert [item["processed_count"] for item in island_metric_records[-2:]] == [1, 2]
+        assert island_metric_records[-1]["phase_percent"] == 100.0
 
         assert manifest["qa"]["open_landfall_hard_anchor_count"] == 2
         node_doc = json.loads(Path(manifest["outputs"]["boundary_resolution_nodes_geojson"]).read_text(encoding="utf-8"))
@@ -1348,6 +1481,10 @@ def main() -> int:
     test_gshhs_resolution_policy_no_silent_downgrade()
     test_memory_off_disables_canonical_only_island_routing()
     test_antimeridian_projection_uses_compact_longitude_frame()
+    test_antimeridian_sparse_edges_are_densified_without_longitude_warping()
+    test_closed_island_loop_routing_preserves_protected_land_and_excludes_mainland()
+    test_closed_island_loop_batch_connects_intervening_protected_components()
+    test_clearance_connected_required_fragment_inherits_external_land_role()
     test_lake_closed_boundary_no_false_open_arc()
     test_upstream_review_status_is_nonblocking()
     test_coastline_anchor_seaward_chain_closes_boundary()

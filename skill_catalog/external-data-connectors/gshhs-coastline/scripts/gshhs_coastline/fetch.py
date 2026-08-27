@@ -7,9 +7,10 @@ from typing import Any
 
 import geopandas as gpd
 import pandas as pd
+from pyproj import CRS
 from shapely import make_valid
 from shapely.geometry import box
-from shapely.ops import unary_union
+from shapely.ops import snap, unary_union
 from shapely.validation import explain_validity
 
 from .plot import plot_gshhs_map
@@ -204,6 +205,39 @@ def _frame_gdf(bbox_parts: list[tuple[float, float, float, float]]) -> gpd.GeoDa
     )
 
 
+def _compact_metric_crs(bbox: tuple[float, float, float, float]) -> CRS:
+    """Return a local metric CRS without changing any native longitude values."""
+    west, south, east, north = map(float, bbox)
+    east_for_center = east
+    while east_for_center <= west:
+        east_for_center += 360.0
+    longitude_origin = ((0.5 * (west + east_for_center) + 180.0) % 360.0) - 180.0
+    latitude_origin = max(-89.0, min(89.0, 0.5 * (south + north)))
+    return CRS.from_proj4(
+        f"+proj=aeqd +lat_0={latitude_origin:.12f} +lon_0={longitude_origin:.12f} "
+        "+datum=WGS84 +units=m +no_defs"
+    )
+
+
+def _projected_union(gdf: gpd.GeoDataFrame, crs: CRS, snap_tolerance_m: float = 0.01):
+    """Project native coordinates directly and dissolve coincident split seams."""
+    if gdf.empty:
+        return None
+    geometries = [
+        geometry
+        for geometry in gdf.to_crs(crs).geometry
+        if geometry is not None and not geometry.is_empty
+    ]
+    if not geometries:
+        return None
+    if all(geometry.geom_type in {"LineString", "MultiLineString"} for geometry in geometries):
+        return unary_union(geometries)
+    merged = geometries[0]
+    for geometry in geometries[1:]:
+        merged = unary_union([merged, snap(geometry, merged, float(snap_tolerance_m))])
+    return merged
+
+
 def _write_shapefiles(run_dir: Path, name: str, land_gdf: gpd.GeoDataFrame, coastline_gdf: gpd.GeoDataFrame) -> dict[str, str]:
     out_dir = run_dir / f"{name}_gshhs_shapefiles"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -293,6 +327,11 @@ def fetch_gshhs_bbox(
     bbox_layer = _bbox_gdf(bbox_parts)
     source_footprint = bbox_layer.copy()
     source_frame = _frame_gdf(bbox_parts)
+    metric_crs = _compact_metric_crs(tuple(float(x) for x in (model_bbox or request_bbox)))
+    source_footprint_xy = _projected_union(source_footprint, metric_crs)
+    canonical_source_frame_xy = (
+        source_footprint_xy.boundary if source_footprint_xy is not None else None
+    )
     model_bbox_layer = None
     if model_bbox is not None:
         model_parts, model_bbox_metadata = split_bbox_antimeridian(tuple(float(x) for x in model_bbox))
@@ -301,14 +340,21 @@ def fetch_gshhs_bbox(
         topology_coverage["source_bbox_handling"] = bbox_metadata
         topology_coverage["source_component_sha256"] = source_component_hashes
         coastline_frame_overlap_m = 0.0
-        if not coastline_gdf.empty:
+        if not coastline_gdf.empty and canonical_source_frame_xy is not None:
+            coastline_xy = _projected_union(coastline_gdf, metric_crs)
             coastline_frame_overlap_m = float(
-                unary_union(coastline_gdf.to_crs(3857).geometry).intersection(
-                    unary_union(source_frame.to_crs(3857).geometry)
-                ).length
+                coastline_xy.intersection(canonical_source_frame_xy).length
+                if coastline_xy is not None
+                else 0.0
             )
         topology_coverage["physical_coastline_source_frame_overlap_m"] = coastline_frame_overlap_m
         topology_coverage["source_frame_overlap_tolerance_m"] = 1.0
+        topology_coverage["source_frame_metric_policy"] = "boundary_of_projected_source_footprint_union"
+        topology_coverage["source_frame_metric_crs"] = metric_crs.to_string()
+        topology_coverage["coordinate_policy"] = "native_longitudes_transformed_directly_without_longitude_warping"
+        topology_coverage["internal_antimeridian_seam_excluded"] = bool(
+            bbox_metadata.get("antimeridian_split")
+        )
         topology_coverage["downstream_topology_eligible"] = bool(
             topology_coverage.get("downstream_topology_eligible")
             and coastline_frame_overlap_m <= 1.0
@@ -342,13 +388,31 @@ def fetch_gshhs_bbox(
 
     plot_warnings: list[str] = []
     if make_plot:
+        projected_plot = bool(bbox_metadata.get("antimeridian_split"))
+        plot_bbox = (
+            gpd.GeoDataFrame(geometry=[source_footprint_xy], crs=metric_crs)
+            if projected_plot and source_footprint_xy is not None
+            else bbox_layer
+        )
+        plot_source_frame = (
+            gpd.GeoDataFrame(geometry=[canonical_source_frame_xy], crs=metric_crs)
+            if projected_plot and canonical_source_frame_xy is not None
+            else source_frame
+        )
+        model_bbox_xy = _projected_union(model_bbox_layer, metric_crs) if model_bbox_layer is not None else None
+        plot_model_bbox = (
+            gpd.GeoDataFrame(geometry=[model_bbox_xy], crs=metric_crs)
+            if projected_plot and model_bbox_xy is not None
+            else model_bbox_layer
+        )
         map_path, plot_warnings = plot_gshhs_map(
             land_gdf,
             coastline_gdf,
-            bbox_layer,
+            plot_bbox,
             run_path / f"{name}_gshhs_map.png",
-            model_bbox_gdf=model_bbox_layer,
-            source_frame_gdf=source_frame,
+            model_bbox_gdf=plot_model_bbox,
+            source_frame_gdf=plot_source_frame,
+            plot_crs=metric_crs if projected_plot else None,
             title=f"{name} GSHHS {selected_resolution} L{','.join(str(x) for x in level_list)}",
             allow_no_basemap=allow_no_basemap,
         )

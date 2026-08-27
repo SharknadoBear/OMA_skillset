@@ -27,12 +27,13 @@ from scipy import ndimage
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, Point, Polygon, box, mapping, shape
 from shapely.prepared import prep
 from shapely.ops import linemerge, nearest_points, polygonize, substring, unary_union
+from shapely.strtree import STRtree
 
 from .boundary_loops import build_model_boundary_loops
 from .boundary_resolution import boundary_resolution_config, build_boundary_resolution
 from .coastline_coverage import audit_coastline_source_coverage
 from .open_exterior import build_open_exterior_contract, file_sha256
-from .projection import LocalProjection, local_utm_projection, project_geometry, unproject_geometry, unwrap_geometry_longitudes, unwrap_longitude
+from .projection import LocalProjection, local_utm_projection, project_geometry, project_geometry_densified, unproject_geometry
 
 
 @dataclass(frozen=True)
@@ -155,9 +156,9 @@ def run_bdry_arc(
     bbox_wsen = tuple(float(v) for v in region.get("envelope_bbox") or bpoly_lonlat_raw.bounds)
     buffered_bbox = _buffer_bbox_lonlat(bbox_wsen, config.coastline_buffer_km)
     projection = local_utm_projection(buffered_bbox)
-    longitude_origin = float(projection.longitude_origin or 0.0)
-    bpoly_lonlat = unwrap_geometry_longitudes(bpoly_lonlat_raw, longitude_origin)
-    bpoly_xy = project_geometry(bpoly_lonlat, projection).buffer(0)
+    bpoly_lonlat = bpoly_lonlat_raw
+    bpoly_xy = project_geometry_densified(bpoly_lonlat, projection).buffer(0)
+    bpoly_logical_sides_xy = _project_bpoly_logical_sides(bpoly_lonlat_raw, projection)
 
     fetch_metadata: dict[str, Any] = {}
     if config.fetch_coastline:
@@ -195,10 +196,8 @@ def run_bdry_arc(
         coastline_load_meta["fetch"] = fetch_metadata
     _write_progress(run_dir, "load-coastline", "done", {"feature_count": int(len(coastline_raw)), **coastline_load_meta})
     _write_progress(run_dir, "project-coastline", "start", {"target_crs": str(projection.crs)})
-    coastline_raw = _unwrap_gdf_longitudes(coastline_raw, longitude_origin)
-    land_polygons_raw = _unwrap_gdf_longitudes(land_polygons_raw, longitude_origin)
-    coastline_xy = coastline_raw.to_crs(projection.crs) if not coastline_raw.empty else coastline_raw
-    land_polygons_xy_gdf = land_polygons_raw.to_crs(projection.crs) if not land_polygons_raw.empty else land_polygons_raw
+    coastline_xy = _project_gdf_densified(coastline_raw, projection)
+    land_polygons_xy_gdf = _project_gdf_densified(land_polygons_raw, projection)
     raw_lines_xy = _flatten_lines(coastline_xy.geometry)
     land_polygons_xy = _flatten_polygons(land_polygons_xy_gdf.geometry)
     _write_progress(run_dir, "project-coastline", "done", {"line_count": int(len(raw_lines_xy))})
@@ -212,8 +211,8 @@ def run_bdry_arc(
     physical_coastline_boundary_xy = unary_union(repaired_lines_xy) if repaired_lines_xy else GeometryCollection()
     _write_progress(run_dir, "repair", "done", repair_meta)
 
-    selected_side = unwrap_geometry_longitudes(_selected_side_line(offshore, region), longitude_origin)
-    selected_side_xy = project_geometry(selected_side, projection)
+    selected_side = _selected_side_line(offshore, region)
+    selected_side_xy = project_geometry_densified(selected_side, projection)
     offshore_unit = _offshore_unit_vector(offshore, selected_side_xy)
     seed_xy, seed_meta = _resolve_seed(region, config, projection, bpoly_xy)
     forbidden_regions_lonlat: list[dict[str, Any]] = []
@@ -222,9 +221,19 @@ def run_bdry_arc(
     island_loop_branch = False if lake_closed_branch else _uses_island_loop_branch(region, offshore, config, place_memory_enabled)
 
     if lake_closed_branch:
-        anchors = _lake_closed_boundary_reference_points(bpoly_xy, selected_side_xy, config.target_resolution_m)
+        anchors = _lake_closed_boundary_reference_points(
+            bpoly_xy,
+            selected_side_xy,
+            config.target_resolution_m,
+            logical_sides_xy=bpoly_logical_sides_xy,
+        )
     elif island_loop_branch:
-        anchors = _island_loop_reference_points(selected_side_xy, bpoly_xy, config.target_resolution_m)
+        anchors = _island_loop_reference_points(
+            selected_side_xy,
+            bpoly_xy,
+            config.target_resolution_m,
+            logical_sides_xy=bpoly_logical_sides_xy,
+        )
     elif config.topology_mode == "gshhs-vector":
         land_boundary_xy = physical_coastline_boundary_xy
         anchors = _coastline_bpoly_anchor_points(
@@ -232,6 +241,7 @@ def run_bdry_arc(
             selected_side_xy,
             bpoly_xy,
             config.target_resolution_m,
+            logical_sides_xy=bpoly_logical_sides_xy,
         )
     else:
         anchors = _select_anchor_points(repaired_lines_xy, selected_side_xy, bpoly_xy, config.target_resolution_m)
@@ -292,6 +302,7 @@ def run_bdry_arc(
             config.target_resolution_m,
             run_dir=run_dir,
             topology_time_budget_s=config.topology_time_budget_s,
+            protected_island_regions_xy=_required_island_regions_xy(region, projection),
         )
         scored = topology_selection["scored"]
         wet_result = topology_selection["wet_result"]
@@ -436,11 +447,12 @@ def run_bdry_arc(
             candidates_gdf,
             selected_arc_lonlat,
             final_status,
+            projection,
         )
         if config.topology_mode == "gshhs-vector":
-            _write_gshhs_review_maps(visual_dir, name, layers, bpoly_lonlat, final_status)
+            _write_gshhs_review_maps(visual_dir, name, layers, bpoly_lonlat, final_status, projection)
     final_map = run_dir / "bdry_arc_review_map.png"
-    _plot_final_map(final_map, layers, bpoly_lonlat, final_status)
+    _plot_final_map(final_map, layers, bpoly_lonlat, final_status, projection)
 
     manifest = {
         "schema_version": "fvcom_bdry_arc_manifest_v1",
@@ -1284,6 +1296,7 @@ def select_island_loop_topology(
     target_resolution_m: float,
     run_dir: Path | None = None,
     topology_time_budget_s: float | None = None,
+    protected_island_regions_xy: list[Polygon] | None = None,
 ) -> dict[str, Any]:
     """Select a closed island/archipelago offshore loop and water component."""
     evaluated: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -1302,9 +1315,18 @@ def select_island_loop_topology(
                 "candidate-start",
                 {"candidate_id": candidate.get("candidate_id"), "candidate_index": idx, "candidate_count": len(scored["candidates"])},
             )
+        routed_loop, routing_report = _route_closed_island_loop_clear_of_land(
+            candidate["geometry"],
+            land_polygons_xy,
+            land_union_xy,
+            bpoly_xy,
+            seed_xy,
+            target_resolution_m,
+            protected_island_regions_xy=protected_island_regions_xy,
+        )
         result = extract_island_loop_wet_domain(
             land_polygons_xy,
-            candidate["geometry"],
+            routed_loop,
             bpoly_xy,
             seed_xy,
             target_resolution_m,
@@ -1318,6 +1340,13 @@ def select_island_loop_topology(
                 "open_arc_boundary_overlap_fraction": metadata.get("open_arc_boundary_overlap_fraction", 0.0),
                 "land_patch_boundary_length_m": metadata.get("land_patch_boundary_length_m", 0.0),
                 "frame_area_m2": metadata.get("deformed_frame_area_m2", 0.0),
+                "structural_topology_pass": bool(
+                    routing_report["land_free"]
+                    and routing_report["seed_preserved"]
+                    and routing_report["retained_inside_component_fraction"] >= 1.0 - 1.0e-12
+                    and float(metadata.get("open_arc_boundary_overlap_fraction", 0.0)) >= 1.0 - 1.0e-9
+                    and metadata.get("deformed_frame_valid")
+                ),
             }
         )
         topology_score = float(candidate.get("score", 0.0))
@@ -1331,9 +1360,11 @@ def select_island_loop_topology(
         if metadata.get("gshhs_missing_land_polygons"):
             topology_score -= 120.0
         item = dict(candidate)
+        item["geometry"] = routed_loop
         item["metrics"] = metrics
         item["score"] = float(topology_score)
         result["metadata"]["candidate_id"] = candidate.get("candidate_id")
+        result["metadata"]["closed_loop_land_routing"] = routing_report
         evaluated.append((item, result))
         if run_dir is not None:
             _write_progress(
@@ -1346,9 +1377,24 @@ def select_island_loop_topology(
                     "candidate_count": len(scored["candidates"]),
                     "open_arc_boundary_overlap_fraction": metadata.get("open_arc_boundary_overlap_fraction", 0.0),
                     "land_patch_boundary_length_m": metadata.get("land_patch_boundary_length_m", 0.0),
+                    "land_free": routing_report.get("land_free"),
+                    "retained_inside_component_fraction": routing_report.get("retained_inside_component_fraction"),
                     "seed_inside": metadata.get("seed_inside"),
                 },
             )
+        if metrics.get("structural_topology_pass"):
+            if run_dir is not None:
+                _write_progress(
+                    run_dir,
+                    "island-loop",
+                    "hard-pass-selected",
+                    {
+                        "candidate_id": candidate.get("candidate_id"),
+                        "evaluated_candidate_count": len(evaluated),
+                        "reason": "first deterministic land-free closed loop satisfying all topology gates",
+                    },
+                )
+            break
         if topology_time_budget_s and topology_time_budget_s > 0 and time.monotonic() - start_time > topology_time_budget_s and evaluated:
             budget_exceeded = True
             if run_dir is not None:
@@ -1363,13 +1409,515 @@ def select_island_loop_topology(
                     },
                 )
             break
-    evaluated.sort(key=lambda pair: pair[0]["score"], reverse=True)
+    evaluated.sort(
+        key=lambda pair: (
+            bool(pair[0]["metrics"].get("structural_topology_pass")),
+            bool(pair[1]["metadata"].get("seed_inside")),
+            -float(pair[1]["metadata"].get("arc_land_intersection_length_m", 0.0)),
+            float(pair[0]["metrics"].get("open_arc_boundary_overlap_fraction", 0.0)),
+            float(pair[0]["score"]),
+            str(pair[0].get("candidate_id", "")),
+        ),
+        reverse=True,
+    )
     selected, wet_result = evaluated[0]
     if budget_exceeded:
         wet_result["metadata"]["topology_budget_exceeded"] = True
         wet_result["metadata"]["topology_time_budget_s"] = float(topology_time_budget_s or 0.0)
     candidates = [item for item, _result in evaluated]
     return {"scored": {"selected": selected, "candidates": candidates}, "wet_result": wet_result}
+
+
+def _route_closed_island_loop_clear_of_land(
+    source_loop: LineString,
+    land_polygons_xy: list[Polygon],
+    land_union,
+    mission_frame_xy: Polygon,
+    seed_xy: Point,
+    target_resolution_m: float,
+    *,
+    protected_island_regions_xy: list[Polygon] | None = None,
+) -> tuple[LineString, dict[str, Any]]:
+    """Route a closed offshore loop around land while preserving mission topology."""
+    loop = _ensure_closed_line(source_loop)
+    source_frame = Polygon(loop.coords).buffer(0)
+    if not isinstance(source_frame, Polygon) or source_frame.is_empty:
+        source_frame = mission_frame_xy.buffer(0)
+    clearance_m = max(25.0, min(250.0, 0.5 * float(target_resolution_m)))
+    tolerance_m = max(2.0, 0.02 * float(target_resolution_m))
+    polygon_parts = (
+        _polygon_parts(land_union.buffer(0))
+        if land_union is not None and not land_union.is_empty
+        else [
+            part
+            for geometry in land_polygons_xy
+            for part in _polygon_parts(geometry)
+            if not part.is_empty
+        ]
+    )
+    retained_inside: list[Polygon] = []
+    external_land: list[Polygon] = []
+    protected_union = (
+        unary_union(protected_island_regions_xy)
+        if protected_island_regions_xy
+        else GeometryCollection()
+    )
+    protected_cover = (
+        prep(protected_union.buffer(tolerance_m))
+        if not protected_union.is_empty
+        else None
+    )
+    for part in polygon_parts:
+        overlap_fraction = float(
+            part.intersection(mission_frame_xy).area / max(part.area, 1.0)
+        )
+        if protected_cover is not None:
+            keep_inside = bool(protected_cover.covers(part))
+        else:
+            keep_inside = bool(
+                overlap_fraction >= 1.0 - 1.0e-9
+                and mission_frame_xy.buffer(tolerance_m).covers(part)
+            )
+        (retained_inside if keep_inside else external_land).append(part)
+    retained_inside, external_land, clearance_role_report = _group_clearance_connected_land_roles(
+        retained_inside,
+        external_land,
+        clearance_distance_m=4.0 * tolerance_m,
+    )
+    initial_land_intersection_m = float(
+        getattr(loop.intersection(land_union.buffer(tolerance_m)), "length", 0.0)
+        if land_union is not None and not land_union.is_empty
+        else 0.0
+    )
+    actions: list[dict[str, Any]] = []
+    protected_connection_actions: list[dict[str, Any]] = []
+    maximum_iterations = 3
+    frame = source_frame
+    external_union = unary_union(external_land) if external_land else GeometryCollection()
+    numerical_land_buffer = (
+        land_union.buffer(2.0 * tolerance_m)
+        if land_union is not None and not land_union.is_empty
+        else GeometryCollection()
+    )
+    if initial_land_intersection_m > 1.0e-6:
+        inside_union = unary_union(retained_inside) if retained_inside else GeometryCollection()
+        for iteration in range(1, maximum_iterations + 1):
+            trial_clearance = clearance_m * float(iteration)
+            support = mission_frame_xy.buffer(0)
+            if not inside_union.is_empty:
+                support = support.union(inside_union.buffer(2.0 * trial_clearance)).buffer(0)
+            routed_support = (
+                support.difference(external_union.buffer(trial_clearance)).buffer(0)
+                if not external_union.is_empty
+                else support
+            )
+            if not numerical_land_buffer.is_empty:
+                routed_support = routed_support.difference(numerical_land_buffer).buffer(0)
+            selected = _choose_seed_component(routed_support, seed_xy)
+            if selected is None or selected.is_empty:
+                actions.append(
+                    {
+                        "iteration": iteration,
+                        "clearance_m": float(trial_clearance),
+                        "accepted": False,
+                        "reason": "no_updated_component_preserved_seed",
+                    }
+                )
+                continue
+            candidate = Polygon(selected.exterior.coords).buffer(0)
+            if not isinstance(candidate, Polygon) or candidate.is_empty or not candidate.is_valid:
+                actions.append(
+                    {
+                        "iteration": iteration,
+                        "clearance_m": float(trial_clearance),
+                        "accepted": False,
+                        "reason": "updated_frame_invalid",
+                    }
+                )
+                continue
+            candidate_loop = LineString(candidate.exterior.coords)
+            candidate_land_intersection_m = float(
+                getattr(candidate_loop.intersection(land_union), "length", 0.0)
+                if land_union is not None and not land_union.is_empty
+                else 0.0
+            )
+            candidate_cover = prep(candidate.buffer(tolerance_m))
+            retained_geometry_count = sum(candidate_cover.covers(part) for part in retained_inside)
+            retained_geometry_fraction = (
+                float(retained_geometry_count / len(retained_inside))
+                if retained_inside
+                else 1.0
+            )
+            actions.append(
+                {
+                    "iteration": iteration,
+                    "clearance_m": float(trial_clearance),
+                    "included_component_count": len(retained_inside),
+                    "excluded_component_count": len(external_land),
+                    "method": "protected_support_minus_external_clearance_and_full_land_numerical_buffer",
+                    "accepted": bool(
+                        candidate_land_intersection_m <= 1.0e-6
+                        and retained_geometry_fraction >= 1.0 - 1.0e-12
+                    ),
+                    "area_m2": float(candidate.area),
+                    "land_intersection_m": candidate_land_intersection_m,
+                    "retained_inside_geometry_fraction": retained_geometry_fraction,
+                }
+            )
+            frame = candidate
+            if candidate_land_intersection_m <= 1.0e-6:
+                actions[-1]["land_clearance_satisfied"] = True
+                actions[-1]["retention_completed_by_connector_stage"] = bool(
+                    retained_geometry_fraction < 1.0 - 1.0e-12
+                )
+                break
+
+    missing_before_connections = [
+        part for part in retained_inside if not frame.buffer(tolerance_m).covers(part)
+    ]
+    missing_before_connections.sort(key=lambda part: float(part.area), reverse=True)
+    batch_connection_report: dict[str, Any] = {
+        "attempted": bool(missing_before_connections),
+        "component_count": int(len(missing_before_connections)),
+        "accepted": False,
+    }
+    if missing_before_connections:
+        batch_supports: list[Any] = [frame]
+        batch_connector_lengths: list[float] = []
+        for part in missing_before_connections:
+            frame_point, protected_point = nearest_points(frame, part)
+            connector = LineString([frame_point.coords[0], protected_point.coords[0]])
+            batch_connector_lengths.append(float(connector.length))
+            batch_supports.extend(
+                [
+                    connector.buffer(2.0 * clearance_m, cap_style=3),
+                    part.buffer(2.0 * clearance_m),
+                ]
+            )
+        batch_expanded = unary_union(batch_supports).buffer(0)
+        if not numerical_land_buffer.is_empty:
+            batch_expanded = batch_expanded.difference(numerical_land_buffer).buffer(0)
+        batch_selected = _choose_seed_component(batch_expanded, seed_xy)
+        batch_candidate = (
+            Polygon(batch_selected.exterior.coords).buffer(0)
+            if batch_selected is not None and not batch_selected.is_empty
+            else GeometryCollection()
+        )
+        batch_land_intersection_m = float(
+            getattr(LineString(batch_candidate.exterior.coords).intersection(land_union), "length", 0.0)
+            if isinstance(batch_candidate, Polygon)
+            and not batch_candidate.is_empty
+            and land_union is not None
+            and not land_union.is_empty
+            else 0.0
+        )
+        batch_cover = (
+            prep(batch_candidate.buffer(tolerance_m))
+            if isinstance(batch_candidate, Polygon) and not batch_candidate.is_empty
+            else None
+        )
+        batch_enclosed_count = sum(
+            bool(batch_cover is not None and batch_cover.covers(part))
+            for part in missing_before_connections
+        )
+        batch_accepted = bool(
+            isinstance(batch_candidate, Polygon)
+            and not batch_candidate.is_empty
+            and batch_candidate.is_valid
+            and batch_land_intersection_m <= 1.0e-6
+            and batch_enclosed_count == len(missing_before_connections)
+        )
+        batch_connection_report.update(
+            {
+                "accepted": batch_accepted,
+                "connector_lengths_m": batch_connector_lengths,
+                "enclosed_component_count": int(batch_enclosed_count),
+                "land_intersection_m": float(batch_land_intersection_m),
+                "method": "single_union_of_all_protected_support_corridors_then_full_land_numerical_clearance",
+            }
+        )
+        if batch_accepted:
+            frame = batch_candidate
+            for component_id, (part, connector_length_m) in enumerate(
+                zip(missing_before_connections, batch_connector_lengths),
+                start=1,
+            ):
+                protected_connection_actions.append(
+                    {
+                        "connection_id": component_id,
+                        "component_id": component_id,
+                        "connection_pass": 0,
+                        "method": "batch_protected_support_corridor",
+                        "connector_length_m": connector_length_m,
+                        "connector_width_m": float(4.0 * clearance_m),
+                        "protected_component_area_m2": float(part.area),
+                        "protected_component_enclosed": True,
+                        "land_intersection_m": float(batch_land_intersection_m),
+                        "accepted": True,
+                    }
+                )
+
+    pending_connections = (
+        []
+        if batch_connection_report["accepted"]
+        else list(enumerate(missing_before_connections, start=1))
+    )
+    connection_id = 0
+    connection_pass = 0
+    while pending_connections:
+        connection_pass += 1
+        next_pending: list[tuple[int, Polygon]] = []
+        pass_progress = False
+        for component_id, part in pending_connections:
+            if prep(frame.buffer(tolerance_m)).covers(part):
+                protected_connection_actions.append(
+                    {
+                        "connection_id": connection_id + 1,
+                        "component_id": component_id,
+                        "connection_pass": connection_pass,
+                        "accepted": True,
+                        "method": "enclosed_by_prior_connector",
+                    }
+                )
+                connection_id += 1
+                continue
+            connection_id += 1
+            frame_point, protected_point = nearest_points(frame, part)
+            connector = LineString([frame_point.coords[0], protected_point.coords[0]])
+            expanded = unary_union(
+                [
+                    frame,
+                    connector.buffer(2.0 * clearance_m, cap_style=3),
+                    part.buffer(2.0 * clearance_m),
+                ]
+            ).buffer(0)
+            if not numerical_land_buffer.is_empty:
+                expanded = expanded.difference(numerical_land_buffer).buffer(0)
+            selected = _choose_seed_component(expanded, seed_xy)
+            if selected is None or selected.is_empty:
+                protected_connection_actions.append(
+                    {
+                        "connection_id": connection_id,
+                        "component_id": component_id,
+                        "connection_pass": connection_pass,
+                        "connector_length_m": float(connector.length),
+                        "accepted": False,
+                        "reason": "no_connected_component_preserved_seed",
+                    }
+                )
+                next_pending.append((component_id, part))
+                continue
+            candidate = Polygon(selected.exterior.coords).buffer(0)
+            candidate_loop = LineString(candidate.exterior.coords)
+            candidate_land_intersection_m = float(
+                getattr(candidate_loop.intersection(land_union), "length", 0.0)
+                if land_union is not None and not land_union.is_empty
+                else 0.0
+            )
+            protected_enclosed = bool(prep(candidate.buffer(tolerance_m)).covers(part))
+            accepted = bool(
+                isinstance(candidate, Polygon)
+                and not candidate.is_empty
+                and candidate.is_valid
+                and protected_enclosed
+                and candidate_land_intersection_m <= 1.0e-6
+            )
+            protected_connection_actions.append(
+                {
+                    "connection_id": connection_id,
+                    "component_id": component_id,
+                    "connection_pass": connection_pass,
+                    "connector_length_m": float(connector.length),
+                    "connector_width_m": float(4.0 * clearance_m),
+                    "protected_component_area_m2": float(part.area),
+                    "protected_component_enclosed": protected_enclosed,
+                    "land_intersection_m": candidate_land_intersection_m,
+                    "accepted": accepted,
+                }
+            )
+            if accepted:
+                frame = candidate
+                pass_progress = True
+            else:
+                next_pending.append((component_id, part))
+        if not next_pending or not pass_progress:
+            pending_connections = next_pending
+            break
+        pending_connections = next_pending
+
+    routed = LineString(frame.exterior.coords)
+    final_land_intersection_m = float(
+        getattr(routed.intersection(land_union), "length", 0.0)
+        if land_union is not None and not land_union.is_empty
+        else 0.0
+    )
+    final_cover = prep(frame.buffer(tolerance_m))
+    retained_count = sum(final_cover.covers(part) for part in retained_inside)
+    missing_retained = [
+        part for part in retained_inside if not final_cover.covers(part)
+    ]
+    missing_retained.sort(key=lambda part: float(part.area), reverse=True)
+    retained_fraction = (
+        float(retained_count / len(retained_inside))
+        if retained_inside
+        else 1.0
+    )
+    report = {
+        "policy": "projected_closed_loop_include_internal_land_exclude_external_mainland",
+        "construction": "expand_support_around_protected_land_subtract_external_clearance_then_full_land_numerical_buffer_select_seed_exterior",
+        "source_candidate_policy": (
+            "retained_when_already_land_free"
+            if initial_land_intersection_m <= 1.0e-6
+            else "mission_frame_exterior_topologically_redrawn"
+        ),
+        "coordinate_policy": "native_longitudes_transformed_directly_without_longitude_warping",
+        "clearance_m": float(clearance_m),
+        "intersection_tolerance_m": float(tolerance_m),
+        "initial_land_intersection_m": initial_land_intersection_m,
+        "final_land_intersection_m": final_land_intersection_m,
+        "land_free": bool(final_land_intersection_m <= 1.0e-6),
+        "seed_preserved": bool(frame.buffer(tolerance_m).contains(seed_xy)),
+        "retained_inside_component_count": int(len(retained_inside)),
+        "retained_inside_component_preserved_count": int(retained_count),
+        "retained_inside_component_fraction": retained_fraction,
+        "missing_retained_component_summaries": [
+            {
+                "area_m2": float(part.area),
+                "bounds_xy": [float(value) for value in part.bounds],
+                "representative_point_xy": [
+                    float(part.representative_point().x),
+                    float(part.representative_point().y),
+                ],
+                "area_outside_final_frame_m2": float(
+                    part.difference(frame.buffer(tolerance_m)).area
+                ),
+                "distance_to_final_frame_m": float(part.distance(frame)),
+            }
+            for part in missing_retained[:10]
+        ],
+        "iteration_count": int(len(actions)),
+        "maximum_iterations": maximum_iterations,
+        "protected_island_region_count": int(len(protected_island_regions_xy or [])),
+        "retention_source": (
+            "required_island_archipelago_feature_regions"
+            if protected_island_regions_xy
+            else "complete_land_components_covered_by_mission_frame"
+        ),
+        "land_role_component_policy": "connected_components_of_dissolved_projected_land_union",
+        "clearance_connected_land_role_policy": "required fragments inseparable from external land at the full numerical-clearance diameter inherit the external land role",
+        "clearance_connected_land_role_report": clearance_role_report,
+        "protected_component_connector_policy": "shortest_projected_wet_support_corridor_with_full_land_numerical_clearance",
+        "protected_component_batch_connection_report": batch_connection_report,
+        "protected_component_connection_pass_count": int(connection_pass),
+        "protected_component_unresolved_ids": [int(component_id) for component_id, _part in pending_connections],
+        "protected_component_connection_actions": protected_connection_actions,
+        "actions": actions,
+    }
+    return routed, report
+
+
+def _group_clearance_connected_land_roles(
+    retained_inside: list[Polygon],
+    external_land: list[Polygon],
+    *,
+    clearance_distance_m: float,
+) -> tuple[list[Polygon], list[Polygon], dict[str, Any]]:
+    """Propagate external role across land gaps smaller than OBC clearance permits."""
+    retained = list(retained_inside)
+    external = list(external_land)
+    reclassified: list[dict[str, Any]] = []
+    rounds: list[dict[str, Any]] = []
+    round_id = 0
+    while retained and external:
+        round_id += 1
+        tree = STRtree(external)
+        next_retained: list[Polygon] = []
+        moved: list[Polygon] = []
+        for part in retained:
+            hits = tree.query(
+                part,
+                predicate="dwithin",
+                distance=float(clearance_distance_m),
+            )
+            if len(hits) == 0:
+                next_retained.append(part)
+                continue
+            nearest_index = int(tree.nearest(part))
+            nearest_external = external[nearest_index]
+            gap_m = float(part.distance(nearest_external))
+            moved.append(part)
+            reclassified.append(
+                {
+                    "round": round_id,
+                    "area_m2": float(part.area),
+                    "gap_to_external_land_m": gap_m,
+                    "bounds_xy": [float(value) for value in part.bounds],
+                    "representative_point_xy": [
+                        float(part.representative_point().x),
+                        float(part.representative_point().y),
+                    ],
+                }
+            )
+        rounds.append(
+            {
+                "round": round_id,
+                "retained_before_count": int(len(retained)),
+                "reclassified_count": int(len(moved)),
+                "retained_after_count": int(len(next_retained)),
+            }
+        )
+        if not moved:
+            retained = next_retained
+            break
+        external.extend(moved)
+        retained = next_retained
+    return retained, external, {
+        "clearance_distance_m": float(clearance_distance_m),
+        "initial_retained_component_count": int(len(retained_inside)),
+        "initial_external_component_count": int(len(external_land)),
+        "reclassified_component_count": int(len(reclassified)),
+        "final_retained_component_count": int(len(retained)),
+        "final_external_component_count": int(len(external)),
+        "rounds": rounds,
+        "reclassified_components": reclassified,
+    }
+
+
+def _required_island_regions_xy(
+    region: dict[str, Any],
+    projection: LocalProjection,
+) -> list[Polygon]:
+    """Project explicit required archipelago feature regions without longitude rewriting."""
+    features = (region.get("target_region_features") or {}).get("features", [])
+    regions: list[Polygon] = []
+    for feature in features:
+        if not feature.get("required", False):
+            continue
+        if str(feature.get("category", "")) != "island_archipelago_completeness" and str(
+            feature.get("role", "")
+        ) != "required_geospatial_extent":
+            continue
+        geometry = feature.get("geometry")
+        if feature.get("type") == "bbox" and isinstance(geometry, (list, tuple)) and len(geometry) == 4:
+            west, south, east, north = map(float, geometry)
+            native = Polygon(
+                [
+                    (west, south),
+                    (east, south),
+                    (east, north),
+                    (west, north),
+                    (west, south),
+                ]
+            )
+            projected = project_geometry_densified(native, projection).buffer(0)
+            if isinstance(projected, Polygon) and not projected.is_empty:
+                regions.append(projected)
+        elif isinstance(geometry, dict) and geometry.get("type") == "Polygon":
+            native = Polygon(geometry["coordinates"][0])
+            projected = project_geometry_densified(native, projection).buffer(0)
+            if isinstance(projected, Polygon) and not projected.is_empty:
+                regions.append(projected)
+    return regions
 
 
 def extract_lake_closed_wet_domain(
@@ -2096,14 +2644,25 @@ def _boundary_records_with_anchors(
         ("start_anchor", "start_adjacent_side_index", "start_xy"),
         ("end_anchor", "end_adjacent_side_index", "end_xy"),
     ):
-        side_idx = anchors.get(side_key)
-        if side_idx is None:
+        logical_side_idx = anchors.get(side_key)
+        if logical_side_idx is None:
             continue
-        side_idx = int(side_idx) % n
         xy = tuple(float(v) for v in anchors[xy_key])
+        anchor_pt = Point(xy)
+        side_idx = min(
+            range(n),
+            key=lambda idx: LineString([coords[idx], coords[(idx + 1) % n]]).distance(anchor_pt),
+        )
         seg = LineString([coords[side_idx], coords[(side_idx + 1) % n]])
         fraction = float(seg.project(Point(xy)) / max(seg.length, 1.0))
-        inserts.setdefault(side_idx, []).append({"label": label, "coord": xy, "fraction": fraction})
+        inserts.setdefault(side_idx, []).append(
+            {
+                "label": label,
+                "coord": xy,
+                "fraction": fraction,
+                "logical_side_index": int(logical_side_idx),
+            }
+        )
 
     records: list[dict[str, Any]] = []
     for idx, coord in enumerate(coords):
@@ -3289,15 +3848,6 @@ def _wrap_lon(lon: float) -> float:
     return x
 
 
-def _unwrap_gdf_longitudes(gdf: gpd.GeoDataFrame, origin: float) -> gpd.GeoDataFrame:
-    if gdf.empty:
-        return gdf
-    out = gdf.copy()
-    out = out.to_crs("EPSG:4326") if out.crs is not None else out.set_crs("EPSG:4326")
-    out["geometry"] = [unwrap_geometry_longitudes(geom, origin) if geom is not None and not geom.is_empty else geom for geom in out.geometry]
-    return out.set_crs("EPSG:4326", allow_override=True)
-
-
 def _discover_gshhs_manifest(path: Path) -> Path | None:
     candidates = sorted(path.parent.glob("*_gshhs_manifest.json"))
     return candidates[0] if candidates else None
@@ -3376,6 +3926,21 @@ def _selected_side_line(offshore: dict[str, Any], region: dict[str, Any]) -> Lin
     if not coords or idx >= len(coords) - 1:
         raise ValueError("Could not resolve selected offshore side from artifacts")
     return LineString([coords[idx], coords[idx + 1]])
+
+
+def _project_bpoly_logical_sides(bpoly_lonlat: Polygon, projection: LocalProjection) -> list[LineString]:
+    """Project each source RegionBPoly side without losing its logical identity."""
+    coords = [(float(x), float(y)) for x, y in list(bpoly_lonlat.exterior.coords)[:-1]]
+    if len(coords) < 3:
+        raise ValueError("Region bpoly must contain at least three unique vertices")
+    sides: list[LineString] = []
+    for idx, start in enumerate(coords):
+        source_side = LineString([start, coords[(idx + 1) % len(coords)]])
+        projected = project_geometry_densified(source_side, projection)
+        if not isinstance(projected, LineString) or projected.is_empty:
+            raise ValueError(f"Could not project RegionBPoly logical side {idx}")
+        sides.append(projected)
+    return sides
 
 
 def _offshore_unit_vector(offshore: dict[str, Any], selected_side_xy: LineString) -> np.ndarray:
@@ -3542,13 +4107,18 @@ def _uses_island_loop_branch(region: dict[str, Any], offshore: dict[str, Any], c
     )
 
 
-def _lake_closed_boundary_reference_points(bpoly_xy: Polygon, selected_side_xy: LineString, target_resolution_m: float) -> dict[str, Any]:
+def _lake_closed_boundary_reference_points(
+    bpoly_xy: Polygon,
+    selected_side_xy: LineString,
+    target_resolution_m: float,
+    logical_sides_xy: list[LineString] | None = None,
+) -> dict[str, Any]:
     coords = list(selected_side_xy.coords)
     if len(coords) < 2:
         coords = list(bpoly_xy.exterior.coords)[:2]
     start = (float(coords[0][0]), float(coords[0][1]))
     end = (float(coords[-1][0]), float(coords[-1][1]))
-    context = _selected_side_context(bpoly_xy, selected_side_xy)
+    context = _selected_side_context(bpoly_xy, selected_side_xy, logical_sides_xy=logical_sides_xy)
     return {
         "source": "lake_closed_boundary_no_open_arc",
         "start_role": "lake_boundary_reference_start",
@@ -3578,11 +4148,16 @@ def _lake_closed_boundary_reference_points(bpoly_xy: Polygon, selected_side_xy: 
     }
 
 
-def _island_loop_reference_points(selected_side_xy: LineString, bpoly_xy: Polygon, target_resolution_m: float) -> dict[str, Any]:
+def _island_loop_reference_points(
+    selected_side_xy: LineString,
+    bpoly_xy: Polygon,
+    target_resolution_m: float,
+    logical_sides_xy: list[LineString] | None = None,
+) -> dict[str, Any]:
     coords = list(selected_side_xy.coords)
     start = (float(coords[0][0]), float(coords[0][1]))
     end = (float(coords[-1][0]), float(coords[-1][1]))
-    context = _selected_side_context(bpoly_xy, selected_side_xy)
+    context = _selected_side_context(bpoly_xy, selected_side_xy, logical_sides_xy=logical_sides_xy)
     return {
         "source": "offshore_loop_no_land_anchors",
         "start_role": "island_loop_reference_start",
@@ -3616,9 +4191,10 @@ def _coastline_bpoly_anchor_points(
     selected_side_xy: LineString,
     bpoly_xy: Polygon,
     target_resolution_m: float,
+    logical_sides_xy: list[LineString] | None = None,
 ) -> dict[str, Any]:
     """Find open-boundary anchors where coastline intersects the two adjacent bpoly sides."""
-    context = _selected_side_context(bpoly_xy, selected_side_xy)
+    context = _selected_side_context(bpoly_xy, selected_side_xy, logical_sides_xy=logical_sides_xy)
     tolerance = max(float(target_resolution_m), 250.0)
     start_anchor = _find_side_coastline_anchor(
         context["start_adjacent_side_xy"],
@@ -3665,22 +4241,32 @@ def _coastline_bpoly_anchor_points(
     }
 
 
-def _selected_side_context(bpoly_xy: Polygon, selected_side_xy: LineString) -> dict[str, Any]:
-    coords = [(float(x), float(y)) for x, y in list(bpoly_xy.exterior.coords)[:-1]]
-    if len(coords) < 3:
+def _selected_side_context(
+    bpoly_xy: Polygon,
+    selected_side_xy: LineString,
+    logical_sides_xy: list[LineString] | None = None,
+) -> dict[str, Any]:
+    if logical_sides_xy is None:
+        coords = [(float(x), float(y)) for x, y in list(bpoly_xy.exterior.coords)[:-1]]
+        logical_sides_xy = [
+            LineString([coords[idx], coords[(idx + 1) % len(coords)]])
+            for idx in range(len(coords))
+        ]
+    if len(logical_sides_xy) < 3:
         raise ValueError("Region bpoly must contain at least three unique vertices")
     selected_coords = list(selected_side_xy.coords)
     start = (float(selected_coords[0][0]), float(selected_coords[0][1]))
     end = (float(selected_coords[-1][0]), float(selected_coords[-1][1]))
     start_pt = Point(start)
     end_pt = Point(end)
-    n = len(coords)
+    n = len(logical_sides_xy)
     best_idx = 0
     best_distance = float("inf")
     best_reversed = False
     for idx in range(n):
-        a = Point(coords[idx])
-        b = Point(coords[(idx + 1) % n])
+        side_coords = list(logical_sides_xy[idx].coords)
+        a = Point(side_coords[0])
+        b = Point(side_coords[-1])
         forward = a.distance(start_pt) + b.distance(end_pt)
         reverse = a.distance(end_pt) + b.distance(start_pt)
         if min(forward, reverse) < best_distance:
@@ -3704,8 +4290,8 @@ def _selected_side_context(bpoly_xy: Polygon, selected_side_xy: LineString) -> d
         "selected_side_ring_end_index": ring_end_idx,
         "start_adjacent_side_index": start_adjacent_idx,
         "end_adjacent_side_index": end_adjacent_idx,
-        "start_adjacent_side_xy": LineString([coords[start_adjacent_idx], coords[(start_adjacent_idx + 1) % n]]),
-        "end_adjacent_side_xy": LineString([coords[end_adjacent_idx], coords[(end_adjacent_idx + 1) % n]]),
+        "start_adjacent_side_xy": logical_sides_xy[start_adjacent_idx],
+        "end_adjacent_side_xy": logical_sides_xy[end_adjacent_idx],
         "selected_side_match_distance_m": float(best_distance),
     }
 
@@ -3971,12 +4557,21 @@ def _build_output_layers(
             crs="EPSG:4326",
         )
     else:
+        projected_open = wet_result.get("open_arc_xy")
+        projected_closed = bool(
+            projected_open is not None
+            and not projected_open.is_empty
+            and (
+                projected_open.is_ring
+                or Point(projected_open.coords[0]).distance(Point(projected_open.coords[-1])) <= 1.0
+            )
+        )
         open_gdf = gpd.GeoDataFrame(
             [
                 {
                     "segment_class": "open_boundary",
                     "obc_id": 0,
-                    "is_closed": bool(selected_arc_lonlat.is_ring),
+                    "is_closed": projected_closed,
                     "geometry": selected_arc_lonlat,
                 }
             ],
@@ -4126,21 +4721,29 @@ def _write_review_maps(
     candidates_gdf: gpd.GeoDataFrame,
     selected_arc_lonlat: LineString,
     final_status: str,
+    projection: LocalProjection,
 ) -> None:
     preliminary_path = visual_dir / "preliminary_arc_map.png"
-    _plot_final_map(preliminary_path, layers, bpoly_lonlat, final_status)
+    _plot_final_map(preliminary_path, layers, bpoly_lonlat, final_status, projection)
+    projected_display = _requires_projected_display(bpoly_lonlat)
+    display_candidates = _display_gdf(candidates_gdf, projection, projected_display)
+    display_coast = _display_gdf(layers["coastline_repaired"], projection, projected_display)
+    display_anchors = _display_gdf(layers["anchor_points"], projection, projected_display)
+    display_bpoly = project_geometry(bpoly_lonlat, projection) if projected_display else bpoly_lonlat
+    display_arc = project_geometry(selected_arc_lonlat, projection) if projected_display else selected_arc_lonlat
+    display_crs = projection.crs if projected_display else "EPSG:4326"
     fig, ax = plt.subplots(figsize=(11, 9))
-    _plot_sampled(layers["coastline_repaired"], ax, color="#59636e", linewidth=0.35, alpha=0.7)
-    if not candidates_gdf.empty:
-        candidates_gdf.plot(ax=ax, color="#9c7a00", linewidth=0.8, alpha=0.35)
-        candidates_gdf[candidates_gdf["selected"] == True].plot(ax=ax, color="#c81d25", linewidth=2.0)
-    gpd.GeoSeries([bpoly_lonlat], crs="EPSG:4326").boundary.plot(ax=ax, color="#111111", linewidth=1.4, linestyle="--")
-    if selected_arc_lonlat is not None and not selected_arc_lonlat.is_empty:
-        gpd.GeoSeries([selected_arc_lonlat], crs="EPSG:4326").plot(ax=ax, color="#c81d25", linewidth=2.2)
-    layers["anchor_points"].plot(ax=ax, color="#ffdd57", edgecolor="#111111", markersize=36)
+    _plot_sampled(display_coast, ax, color="#59636e", linewidth=0.35, alpha=0.7)
+    if not display_candidates.empty:
+        display_candidates.plot(ax=ax, color="#9c7a00", linewidth=0.8, alpha=0.35)
+        display_candidates[display_candidates["selected"] == True].plot(ax=ax, color="#c81d25", linewidth=2.0)
+    gpd.GeoSeries([display_bpoly], crs=display_crs).boundary.plot(ax=ax, color="#111111", linewidth=1.4, linestyle="--")
+    if display_arc is not None and not display_arc.is_empty:
+        gpd.GeoSeries([display_arc], crs=display_crs).plot(ax=ax, color="#c81d25", linewidth=2.2)
+    display_anchors.plot(ax=ax, color="#ffdd57", edgecolor="#111111", markersize=36)
     ax.set_title(f"{name} arc candidate contact sheet")
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
+    ax.set_xlabel("Projected easting (m)" if projected_display else "Longitude")
+    ax.set_ylabel("Projected northing (m)" if projected_display else "Latitude")
     ax.set_aspect("equal", adjustable="datalim")
     fig.tight_layout()
     fig.savefig(visual_dir / "arc_candidate_contact_sheet.png", dpi=180)
@@ -4153,62 +4756,124 @@ def _write_gshhs_review_maps(
     layers: dict[str, gpd.GeoDataFrame],
     bpoly_lonlat: Polygon,
     final_status: str,
+    projection: LocalProjection,
 ) -> None:
+    projected_display = _requires_projected_display(bpoly_lonlat)
+    display = {
+        key: _display_gdf(value, projection, projected_display)
+        for key, value in layers.items()
+    }
+    display_bpoly = project_geometry(bpoly_lonlat, projection) if projected_display else bpoly_lonlat
+    display_crs = projection.crs if projected_display else "EPSG:4326"
     fig, ax = plt.subplots(figsize=(11, 9))
-    if not layers["wet_domain"].empty:
-        layers["wet_domain"].plot(ax=ax, facecolor="#7cc6fe", edgecolor="#0b4f6c", linewidth=1.1, alpha=0.28)
-    _plot_sampled(layers["coastline_raw"], ax, color="#4d4d4d", linewidth=0.35, alpha=0.65)
-    gpd.GeoSeries([bpoly_lonlat], crs="EPSG:4326").boundary.plot(ax=ax, color="#111111", linewidth=1.2, linestyle="--")
-    if not layers["open_boundary_arc"].empty:
-        layers["open_boundary_arc"].plot(ax=ax, color="#d00000", linewidth=2.2)
-    if "land_patch_boundary_arcs" in layers and not layers["land_patch_boundary_arcs"].empty:
-        layers["land_patch_boundary_arcs"].plot(ax=ax, color="#005ea8", linewidth=2.0, linestyle="--")
-    layers["anchor_points"].plot(ax=ax, color="#ffdd57", edgecolor="#111111", markersize=40)
+    if not display["wet_domain"].empty:
+        display["wet_domain"].plot(ax=ax, facecolor="#7cc6fe", edgecolor="#0b4f6c", linewidth=1.1, alpha=0.28)
+    _plot_sampled(display["coastline_raw"], ax, color="#4d4d4d", linewidth=0.35, alpha=0.65)
+    gpd.GeoSeries([display_bpoly], crs=display_crs).boundary.plot(ax=ax, color="#111111", linewidth=1.2, linestyle="--")
+    if not display["open_boundary_arc"].empty:
+        display["open_boundary_arc"].plot(ax=ax, color="#d00000", linewidth=2.2)
+    if "land_patch_boundary_arcs" in display and not display["land_patch_boundary_arcs"].empty:
+        display["land_patch_boundary_arcs"].plot(ax=ax, color="#005ea8", linewidth=2.0, linestyle="--")
+    display["anchor_points"].plot(ax=ax, color="#ffdd57", edgecolor="#111111", markersize=40)
     ax.set_title(f"{name} GSHHS polygon topology - {final_status}")
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
+    ax.set_xlabel("Projected easting (m)" if projected_display else "Longitude")
+    ax.set_ylabel("Projected northing (m)" if projected_display else "Latitude")
     ax.set_aspect("equal", adjustable="datalim")
     fig.tight_layout()
     fig.savefig(visual_dir / "gshhs_polygon_topology_map.png", dpi=180)
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(11, 9))
-    _plot_sampled(layers["coastline_repaired"], ax, color="#202020", linewidth=0.45, alpha=0.75)
-    if not layers["open_boundary_arc"].empty:
-        layers["open_boundary_arc"].plot(ax=ax, color="#d00000", linewidth=2.2)
-    if "land_patch_boundary_arcs" in layers and not layers["land_patch_boundary_arcs"].empty:
-        layers["land_patch_boundary_arcs"].plot(ax=ax, color="#005ea8", linewidth=2.0, linestyle="--")
-    layers["anchor_points"].plot(ax=ax, color="#ffdd57", edgecolor="#111111", markersize=52)
-    gpd.GeoSeries([bpoly_lonlat], crs="EPSG:4326").boundary.plot(ax=ax, color="#111111", linewidth=1.2, linestyle="--")
+    _plot_sampled(display["coastline_repaired"], ax, color="#202020", linewidth=0.45, alpha=0.75)
+    if not display["open_boundary_arc"].empty:
+        display["open_boundary_arc"].plot(ax=ax, color="#d00000", linewidth=2.2)
+    if "land_patch_boundary_arcs" in display and not display["land_patch_boundary_arcs"].empty:
+        display["land_patch_boundary_arcs"].plot(ax=ax, color="#005ea8", linewidth=2.0, linestyle="--")
+    display["anchor_points"].plot(ax=ax, color="#ffdd57", edgecolor="#111111", markersize=52)
+    gpd.GeoSeries([display_bpoly], crs=display_crs).boundary.plot(ax=ax, color="#111111", linewidth=1.2, linestyle="--")
     ax.set_title(f"{name} GSHHS anchors and offshore arc")
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
+    ax.set_xlabel("Projected easting (m)" if projected_display else "Longitude")
+    ax.set_ylabel("Projected northing (m)" if projected_display else "Latitude")
     ax.set_aspect("equal", adjustable="datalim")
     fig.tight_layout()
     fig.savefig(visual_dir / "gshhs_anchor_arc_map.png", dpi=180)
     plt.close(fig)
 
 
-def _plot_final_map(path: Path, layers: dict[str, gpd.GeoDataFrame], bpoly_lonlat: Polygon, final_status: str) -> None:
+def _plot_final_map(
+    path: Path,
+    layers: dict[str, gpd.GeoDataFrame],
+    bpoly_lonlat: Polygon,
+    final_status: str,
+    projection: LocalProjection,
+) -> None:
+    projected_display = _requires_projected_display(bpoly_lonlat)
+    display = {
+        key: _display_gdf(value, projection, projected_display)
+        for key, value in layers.items()
+    }
+    display_bpoly = project_geometry(bpoly_lonlat, projection) if projected_display else bpoly_lonlat
+    display_crs = projection.crs if projected_display else "EPSG:4326"
     fig, ax = plt.subplots(figsize=(11, 9))
-    if not layers["wet_domain"].empty:
-        layers["wet_domain"].plot(ax=ax, facecolor="#7cc6fe", edgecolor="#0b4f6c", linewidth=1.2, alpha=0.28)
-    _plot_sampled(layers["coastline_raw"], ax, color="#4d4d4d", linewidth=0.25, alpha=0.45)
-    _plot_sampled(layers["coastline_repaired"], ax, color="#202020", linewidth=0.45, alpha=0.8)
-    gpd.GeoSeries([bpoly_lonlat], crs="EPSG:4326").boundary.plot(ax=ax, color="#111111", linewidth=1.2, linestyle="--")
-    if not layers["open_boundary_arc"].empty:
-        layers["open_boundary_arc"].plot(ax=ax, color="#d00000", linewidth=2.2)
-    if "land_patch_boundary_arcs" in layers and not layers["land_patch_boundary_arcs"].empty:
-        layers["land_patch_boundary_arcs"].plot(ax=ax, color="#005ea8", linewidth=2.0, linestyle="--")
-    layers["anchor_points"].plot(ax=ax, color="#ffdd57", edgecolor="#111111", markersize=40)
+    if not display["wet_domain"].empty:
+        display["wet_domain"].plot(ax=ax, facecolor="#7cc6fe", edgecolor="#0b4f6c", linewidth=1.2, alpha=0.28)
+    _plot_sampled(display["coastline_raw"], ax, color="#4d4d4d", linewidth=0.25, alpha=0.45)
+    _plot_sampled(display["coastline_repaired"], ax, color="#202020", linewidth=0.45, alpha=0.8)
+    gpd.GeoSeries([display_bpoly], crs=display_crs).boundary.plot(ax=ax, color="#111111", linewidth=1.2, linestyle="--")
+    if not display["open_boundary_arc"].empty:
+        display["open_boundary_arc"].plot(ax=ax, color="#d00000", linewidth=2.2)
+    if "land_patch_boundary_arcs" in display and not display["land_patch_boundary_arcs"].empty:
+        display["land_patch_boundary_arcs"].plot(ax=ax, color="#005ea8", linewidth=2.0, linestyle="--")
+    display["anchor_points"].plot(ax=ax, color="#ffdd57", edgecolor="#111111", markersize=40)
     ax.set_title(f"fvcom-bdry-arc review map - {final_status}")
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
+    ax.set_xlabel("Projected easting (m)" if projected_display else "Longitude")
+    ax.set_ylabel("Projected northing (m)" if projected_display else "Latitude")
     ax.set_aspect("equal", adjustable="datalim")
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=180)
     plt.close(fig)
+
+
+def _requires_projected_display(geometry) -> bool:
+    """Return true when native plotting would draw an artificial dateline chord."""
+    if geometry is None or geometry.is_empty:
+        return False
+    minx, _miny, maxx, _maxy = geometry.bounds
+    return float(maxx - minx) > 180.0
+
+
+def _display_gdf(
+    gdf: gpd.GeoDataFrame,
+    projection: LocalProjection,
+    projected_display: bool,
+) -> gpd.GeoDataFrame:
+    if not projected_display or gdf.empty:
+        return gdf
+    source = gdf if gdf.crs is not None else gdf.set_crs("EPSG:4326")
+    return source.to_crs(projection.crs)
+
+
+def _project_gdf_densified(
+    gdf: gpd.GeoDataFrame,
+    projection: LocalProjection,
+) -> gpd.GeoDataFrame:
+    if gdf.empty:
+        return gpd.GeoDataFrame(
+            gdf.drop(columns="geometry", errors="ignore"),
+            geometry=[],
+            crs=projection.crs,
+        )
+    source = gdf if gdf.crs is not None else gdf.set_crs("EPSG:4326")
+    source = source.to_crs("EPSG:4326")
+    attributes = source.drop(columns="geometry", errors="ignore").copy()
+    geometries = [
+        project_geometry_densified(geometry, projection)
+        if geometry is not None and not geometry.is_empty
+        else geometry
+        for geometry in source.geometry
+    ]
+    return gpd.GeoDataFrame(attributes, geometry=geometries, crs=projection.crs)
 
 
 def _plot_preliminary_arc_map(

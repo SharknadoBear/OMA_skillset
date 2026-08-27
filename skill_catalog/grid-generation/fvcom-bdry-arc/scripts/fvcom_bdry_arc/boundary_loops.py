@@ -14,7 +14,7 @@ import numpy as np
 from shapely.geometry import GeometryCollection, LineString, Point, Polygon, mapping
 from shapely.ops import unary_union
 
-from .projection import local_utm_projection, project_geometry, unproject_geometry
+from .projection import project_geometry, projection_from_manifest, unproject_geometry
 
 
 def build_model_boundary_loops(
@@ -45,12 +45,12 @@ def build_model_boundary_loops(
     wet_gdf = _read_layer(bdry_arc_gpkg, "wet_domain")
     if wet_gdf.empty:
         raise ValueError("bdry_arc_package.gpkg does not contain a non-empty wet_domain layer")
-    domain_lonlat = _largest_polygon(wet_gdf.geometry)
-    bbox = tuple(float(v) for v in domain_lonlat.bounds)
-    projection = local_utm_projection(bbox)
-    domain_xy = project_geometry(domain_lonlat, projection).buffer(0)
+    fallback_bbox = _projection_fallback_bbox(source_manifest, wet_gdf)
+    projection = projection_from_manifest(source_manifest, fallback_bbox)
+    domain_xy = _largest_projected_polygon(wet_gdf.geometry, projection)
     if not isinstance(domain_xy, Polygon) or domain_xy.is_empty:
         raise ValueError("wet_domain layer does not contain a valid Polygon")
+    domain_lonlat = unproject_geometry(domain_xy, projection)
 
     open_gdf = _read_layer(bdry_arc_gpkg, "open_boundary_arc")
     land_gdf = _read_layer(bdry_arc_gpkg, "land_boundary_arcs")
@@ -142,7 +142,16 @@ def build_model_boundary_loops(
     )
     outputs = _write_outputs(run_dir, layers, name)
     map_path = run_dir / "model_boundary_colored_map.png"
-    _plot_boundary_map(map_path, layers, coast_gdf, domain_lonlat, final_status, len(island_polygons_xy))
+    _plot_boundary_map(
+        map_path,
+        layers,
+        coast_gdf,
+        domain_lonlat,
+        final_status,
+        len(island_polygons_xy),
+        projection,
+        _uses_antimeridian_frame(source_manifest, domain_lonlat),
+    )
 
     manifest = {
         "schema_version": "fvcom_model_boundary_loops_v1",
@@ -171,6 +180,12 @@ def build_model_boundary_loops(
             "frame_clip_fraction_threshold": 0.001,
             "intended_exterior_coverage_threshold": 0.999,
             "frame_clip_gate_enabled": bool(frame_gate_enabled),
+        },
+        "projection": {
+            "crs": projection.crs.to_string(),
+            "epsg": projection.epsg,
+            "longitude_origin": projection.longitude_origin,
+            "coordinate_policy": "native_longitudes_transformed_directly_without_longitude_warping",
         },
         "qa": {
             "outer_boundary_closed": outer_closed,
@@ -270,6 +285,44 @@ def _largest_polygon(geometries) -> Polygon:
     return max(polygons, key=lambda poly: poly.area)
 
 
+def _largest_projected_polygon(geometries, projection) -> Polygon:
+    polygons: list[Polygon] = []
+    for geom in geometries:
+        if geom is None or geom.is_empty:
+            continue
+        projected = project_geometry(geom, projection)
+        if isinstance(projected, Polygon):
+            polygons.append(projected.buffer(0))
+        elif hasattr(projected, "geoms"):
+            polygons.extend(
+                part.buffer(0)
+                for part in projected.geoms
+                if isinstance(part, Polygon) and not part.is_empty
+            )
+    polygons = [poly for poly in polygons if isinstance(poly, Polygon) and not poly.is_empty]
+    if not polygons:
+        raise ValueError("No projected Polygon geometry found")
+    return max(polygons, key=lambda poly: poly.area)
+
+
+def _projection_fallback_bbox(
+    source_manifest: dict[str, Any],
+    wet_gdf: gpd.GeoDataFrame,
+) -> tuple[float, float, float, float]:
+    recorded = source_manifest.get("region_bpoly", {}).get("envelope_bbox")
+    if isinstance(recorded, (list, tuple)) and len(recorded) == 4:
+        return tuple(float(value) for value in recorded)
+    return tuple(float(value) for value in wet_gdf.total_bounds)
+
+
+def _uses_antimeridian_frame(source_manifest: dict[str, Any], domain_lonlat: Polygon) -> bool:
+    bbox = source_manifest.get("region_bpoly", {}).get("envelope_bbox")
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+        return float(bbox[2]) < float(bbox[0])
+    minx, _miny, maxx, _maxy = domain_lonlat.bounds
+    return float(maxx - minx) > 180.0
+
+
 def _line_union_xy(gdf: gpd.GeoDataFrame, projection):
     if gdf.empty:
         return GeometryCollection()
@@ -297,11 +350,15 @@ def _open_records_xy(gdf: gpd.GeoDataFrame, projection) -> list[dict[str, Any]]:
         for offset, part in enumerate(parts):
             if not isinstance(part, LineString) or part.is_empty:
                 continue
+            projected_part = project_geometry(part, projection)
             records.append(
                 {
                     "obc_id": int(base_id + offset),
-                    "is_closed": bool(part.is_ring),
-                    "geometry": project_geometry(part, projection),
+                    "is_closed": bool(
+                        projected_part.is_ring
+                        or Point(projected_part.coords[0]).distance(Point(projected_part.coords[-1])) <= 1.0
+                    ),
+                    "geometry": projected_part,
                 }
             )
         next_id = max(next_id, base_id + max(1, len(parts)))
@@ -533,26 +590,35 @@ def _plot_boundary_map(
     domain_lonlat: Polygon,
     final_status: str,
     island_count: int,
+    projection,
+    projected_display: bool,
 ) -> None:
+    display_layers = {
+        key: (value.to_crs(projection.crs) if projected_display and not value.empty else value)
+        for key, value in layers.items()
+    }
+    display_coast = coast_gdf.to_crs(projection.crs) if projected_display and not coast_gdf.empty else coast_gdf
+    display_domain = project_geometry(domain_lonlat, projection) if projected_display else domain_lonlat
+    display_crs = projection.crs if projected_display else "EPSG:4326"
     fig, ax = plt.subplots(figsize=(11, 9))
-    layers["model_domain_polygon"].plot(ax=ax, facecolor="#7cc6fe", edgecolor="none", alpha=0.25)
-    if not coast_gdf.empty:
-        sample = coast_gdf.iloc[:: max(1, int(math.ceil(len(coast_gdf) / 12_000)))]
+    display_layers["model_domain_polygon"].plot(ax=ax, facecolor="#7cc6fe", edgecolor="none", alpha=0.25)
+    if not display_coast.empty:
+        sample = display_coast.iloc[:: max(1, int(math.ceil(len(display_coast) / 12_000)))]
         sample.plot(ax=ax, color="#8a8f98", linewidth=0.25, alpha=0.45)
-    segments = layers["model_outer_boundary_segments"]
+    segments = display_layers["model_outer_boundary_segments"]
     _plot_class(segments, ax, "land_outer_boundary", "#005ea8", linewidth=1.6)
     _plot_class(segments, ax, "land_patch_boundary", "#005ea8", linewidth=1.8, linestyle="--")
     _plot_class(segments, ax, "frame_clip_boundary", "#005ea8", linewidth=1.6, linestyle="--")
     _plot_class(segments, ax, "unclassified_outer_boundary", "#f28e2b", linewidth=1.2, linestyle=":")
     _plot_class(segments, ax, "open_boundary", "#d00000", linewidth=2.4)
-    if not layers["island_boundary_lines"].empty:
-        layers["island_boundary_lines"].plot(ax=ax, color="#1a9850", linewidth=0.8)
-    if not layers["source_open_boundary_arc"].empty:
-        layers["source_open_boundary_arc"].plot(ax=ax, color="#d00000", linewidth=0.9, alpha=0.35, linestyle="--")
-    gpd.GeoSeries([domain_lonlat], crs="EPSG:4326").boundary.plot(ax=ax, color="#0b4f6c", linewidth=0.45, alpha=0.35)
+    if not display_layers["island_boundary_lines"].empty:
+        display_layers["island_boundary_lines"].plot(ax=ax, color="#1a9850", linewidth=0.8)
+    if not display_layers["source_open_boundary_arc"].empty:
+        display_layers["source_open_boundary_arc"].plot(ax=ax, color="#d00000", linewidth=0.9, alpha=0.35, linestyle="--")
+    gpd.GeoSeries([display_domain], crs=display_crs).boundary.plot(ax=ax, color="#0b4f6c", linewidth=0.45, alpha=0.35)
     ax.set_title(f"Model boundary loops - {final_status} - islands: {island_count}")
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
+    ax.set_xlabel("Projected easting (m)" if projected_display else "Longitude")
+    ax.set_ylabel("Projected northing (m)" if projected_display else "Latitude")
     ax.set_aspect("equal", adjustable="datalim")
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)

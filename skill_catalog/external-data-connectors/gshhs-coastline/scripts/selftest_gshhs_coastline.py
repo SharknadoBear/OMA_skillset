@@ -10,11 +10,16 @@ import tempfile
 from pathlib import Path
 
 import geopandas as gpd
-from shapely.geometry import Polygon
+from shapely.geometry import LineString, Polygon, box
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from gshhs_coastline.fetch import _validate_polygonal_source, fetch_gshhs_bbox  # noqa: E402
+from gshhs_coastline.fetch import (  # noqa: E402
+    _compact_metric_crs,
+    _projected_union,
+    _validate_polygonal_source,
+    fetch_gshhs_bbox,
+)
 from gshhs_coastline.quality import summarize_product  # noqa: E402
 from gshhs_coastline.sources import (  # noqa: E402
     expand_centered_topology_bbox,
@@ -137,6 +142,23 @@ def test_antimeridian_split() -> None:
     assert meta["antimeridian_split"] is True
 
 
+def test_antimeridian_source_frame_uses_projected_union_exterior() -> None:
+    bbox = (170.0, 48.0, -156.0, 58.0)
+    source = gpd.GeoDataFrame(
+        geometry=[box(140.0, 38.0, 180.0, 68.0), box(-180.0, 38.0, -126.0, 68.0)],
+        crs="EPSG:4326",
+    )
+    crs = _compact_metric_crs(bbox)
+    projected = _projected_union(source, crs)
+    assert projected is not None
+    assert projected.geom_type == "Polygon"
+    seam = gpd.GeoSeries(
+        [LineString([(180.0, 38.0), (180.0, 68.0)])],
+        crs="EPSG:4326",
+    ).to_crs(crs).iloc[0]
+    assert projected.boundary.intersection(seam).length <= 1.0
+
+
 def test_centered_topology_coverage_contract() -> None:
     source, coverage = expand_centered_topology_bbox(
         (-75.8, 38.1, -74.7, 40.4), coverage_factor=3.0, lookahead_km=0.0
@@ -243,6 +265,7 @@ def main() -> None:
     test_long_island_sound_full_resolution_source_repair()
     test_empty_bbox_behavior()
     test_antimeridian_split()
+    test_antimeridian_source_frame_uses_projected_union_exterior()
     test_centered_topology_coverage_contract()
     test_topology_product_layers_and_physical_coastline()
     test_health_check_script()

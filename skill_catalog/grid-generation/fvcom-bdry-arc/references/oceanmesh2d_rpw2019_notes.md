@@ -66,6 +66,13 @@ Do not apply the coastline-on-bpoly mainland-anchor rule to bpoly products whose
 
 GSHHS full resolution (`f`) is the default topology source for this branch and for the coastal/estuary branch. Lower-resolution GSHHS products should be used only when the prompt or CLI explicitly requests them. Slow vector stages should emit progress/heartbeat artifacts rather than silently downshifting.
 
+Adaptive v2 progress must expose completed and total counts for source-island
+metrics, subgrid actions, island generalization, passage components, and
+boundary sampling. Preserve both an append-only event log and an atomic current
+state with monotonic overall percentage and elapsed time. A progress percentage
+is operational evidence only; scientific acceptance still comes from the final
+resolution manifest and its topology, spacing, and passage gates.
+
 ## CUSP Compatibility
 
 The installed `cusp-coastline` skill writes useful EPSG:4326 `LineString` and `MultiLineString` shoreline vectors, usually in a `coastline` layer. It does not create OceanMesh2D-style `outer/mainland/inner` topology. Keep CUSP as explicit legacy/debug input or future local-detail refinement after the GSHHS topology component is known.
@@ -103,10 +110,26 @@ model loop, open-exterior QA, and Adaptive v2 package from the role-resolved
 GeoPackage rather than reusing candidate frame-length gates.
 
 For a closed island/archipelago OBC, do not use landfall repair. Require the
-delivered loop to equal the exterior, unwrap it in the minimum-span longitude
-frame, rotate it to the minimum projected-x seam (projected y then source order
-as tie-breakers), and add the half-perimeter balance anchor. The loop must have
-zero landfall anchors and remain land-free.
+delivered loop to equal the exterior. Densify sparse geographic edges along
+their shortest circular longitude interval, then project the original native
+coordinates directly into the producer-recorded compact metric CRS; never
+translate or warp longitude values. Rotate the projected loop to the minimum-x
+seam (projected y then source order as tie-breakers), and add the half-perimeter
+balance anchor. The loop must have zero landfall anchors and remain land-free.
+
+Use the loop's numerical land clearance when assigning island/external roles.
+If a nominally required component is connected to already external land within
+the full clearance diameter, the loop cannot physically pass between them; it
+therefore inherits the external role. Propagate that relation to a fixed point
+and retain the component gaps and role lineage in the manifest. This is a
+topological separability test, not an area-based island-removal heuristic.
+
+If independently protected land components remain outside the seeded loop,
+build all shortest projected wet-support corridors simultaneously and subtract
+the complete land-clearance union once. Accept the batch result only when it is
+valid, contains the wet seed, encloses every protected component, and has zero
+land intersection. A sequential fixed-point construction may be used only as a
+fallback subject to the same whole-result gates.
 
 ## Adaptive v2 Anchors and Passage Prevention
 

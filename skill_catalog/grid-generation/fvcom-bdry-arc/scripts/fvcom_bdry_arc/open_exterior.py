@@ -11,10 +11,11 @@ from typing import Any
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
+from shapely import set_precision
 from shapely.geometry import GeometryCollection, LineString, Point, Polygon
 from shapely.ops import unary_union
 
-from .projection import local_utm_projection, project_geometry, unproject_geometry
+from .projection import project_geometry, project_geometry_densified, projection_from_manifest, unproject_geometry
 
 
 RESIDUAL_LOOP_FAILURES = {
@@ -92,8 +93,14 @@ def build_open_exterior_contract(
     loop_manifest = _read_json(loop_path) if loop_path.exists() else {}
     points = _region_points(region)
     polygon_lonlat = Polygon(points)
-    projection = local_utm_projection(tuple(float(v) for v in polygon_lonlat.bounds))
-    polygon_xy = project_geometry(polygon_lonlat, projection)
+    fallback_bbox = source_manifest.get("region_bpoly", {}).get("envelope_bbox")
+    if not isinstance(fallback_bbox, (list, tuple)) or len(fallback_bbox) != 4:
+        fallback_bbox = polygon_lonlat.bounds
+    projection = projection_from_manifest(
+        source_manifest,
+        tuple(float(v) for v in fallback_bbox),
+    )
+    polygon_xy = project_geometry_densified(polygon_lonlat, projection)
     side_lines_xy = _side_lines(polygon_xy)
 
     frame_gdf = _read_layer(package_path, "frame_clip_boundary_arcs")
@@ -321,6 +328,8 @@ def build_open_exterior_contract(
         status,
         coastline_gpkg,
         region,
+        projection,
+        _uses_antimeridian_frame(source_manifest, polygon_lonlat),
     )
     component_maps = _plot_residual_component_maps(
         output_dir,
@@ -557,7 +566,10 @@ def _load_land_union(path: str | Path | None, projection):
         projected = project_geometry(geometry, projection)
         if not projected.is_empty:
             polygons.append(projected)
-    return unary_union(polygons) if polygons else GeometryCollection()
+    if not polygons:
+        return GeometryCollection()
+    precision_aligned = [set_precision(polygon, 0.01) for polygon in polygons]
+    return unary_union(precision_aligned).buffer(0)
 
 
 def _load_physical_coastline_union(path: str | Path | None, projection):
@@ -620,40 +632,59 @@ def _plot_open_exterior(
     status: str,
     coastline_gpkg: str | Path | None,
     region_doc: dict[str, Any],
+    projection,
+    projected_display: bool,
 ) -> dict[str, Any]:
-    fig, ax = plt.subplots(figsize=(11, 9))
     land = _read_layer(Path(coastline_gpkg), "land_polygons") if coastline_gpkg else gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
     coastline = _read_layer(Path(coastline_gpkg), "coastline_lines") if coastline_gpkg else gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
     source_frame = _read_layer(Path(coastline_gpkg), "source_frame") if coastline_gpkg else gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
     source_footprint = _read_layer(Path(coastline_gpkg), "source_footprint") if coastline_gpkg else gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
-    if not source_footprint.empty:
-        source_footprint.plot(
+    display_land = _display_gdf(land, projection, projected_display)
+    display_coastline = _display_gdf(coastline, projection, projected_display)
+    display_source_footprint = _display_gdf(source_footprint, projection, projected_display)
+    display_wet = _display_gdf(wet_gdf, projection, projected_display)
+    display_open = _display_gdf(open_gdf, projection, projected_display)
+    display_frame = _display_gdf(frame_gdf, projection, projected_display)
+    display_region = project_geometry(region, projection) if projected_display else region
+    display_crs = projection.crs if projected_display else "EPSG:4326"
+    canonical_source_frame = (
+        _projected_polygon_union(source_footprint, projection).boundary
+        if projected_display and not source_footprint.empty
+        else GeometryCollection()
+    )
+    fig, ax = plt.subplots(figsize=(11, 9))
+    if not display_source_footprint.empty:
+        display_source_footprint.plot(
             ax=ax,
             facecolor="#dff3ff",
-            edgecolor="none",
+            edgecolor="none" if not projected_display else "#4361ee",
             alpha=0.55,
             label="expanded source water context",
         )
-    if not land.empty:
-        land.plot(ax=ax, facecolor="#d8d1bd", edgecolor="#31572c", linewidth=0.45, alpha=0.75, label="expanded GSHHS land")
-    if not coastline.empty:
-        coastline.plot(ax=ax, color="#31572c", linewidth=0.7, alpha=0.9, label="physical coastline")
-    if not source_frame.empty:
+    if not display_land.empty:
+        display_land.plot(ax=ax, facecolor="#d8d1bd", edgecolor="#31572c", linewidth=0.45, alpha=0.75, label="expanded GSHHS land")
+    if not display_coastline.empty:
+        display_coastline.plot(ax=ax, color="#31572c", linewidth=0.7, alpha=0.9, label="physical coastline")
+    if projected_display and not canonical_source_frame.is_empty:
+        gpd.GeoSeries([canonical_source_frame], crs=projection.crs).plot(
+            ax=ax, color="#4361ee", linewidth=0.8, linestyle=":", label="GSHHS source frame"
+        )
+    elif not source_frame.empty:
         source_frame.plot(ax=ax, color="#4361ee", linewidth=0.8, linestyle=":", label="GSHHS source frame")
-    if not wet_gdf.empty:
-        wet_gdf.plot(ax=ax, facecolor="#7cc6fe", edgecolor="#0b4f6c", linewidth=0.8, alpha=0.25)
-    gpd.GeoSeries([region], crs="EPSG:4326").boundary.plot(ax=ax, color="#111111", linewidth=1.2, linestyle="--")
-    if not open_gdf.empty:
-        open_gdf.plot(ax=ax, color="#d00000", linewidth=2.2, label="open boundary")
-    if not frame_gdf.empty:
-        frame_gdf.plot(ax=ax, color="#ff8c00", linewidth=3.0, label="residual frame clip")
+    if not display_wet.empty:
+        display_wet.plot(ax=ax, facecolor="#7cc6fe", edgecolor="#0b4f6c", linewidth=0.8, alpha=0.25)
+    gpd.GeoSeries([display_region], crs=display_crs).boundary.plot(ax=ax, color="#111111", linewidth=1.2, linestyle="--")
+    if not display_open.empty:
+        display_open.plot(ax=ax, color="#d00000", linewidth=2.2, label="open boundary")
+    if not display_frame.empty:
+        display_frame.plot(ax=ax, color="#ff8c00", linewidth=3.0, label="residual frame clip")
     ax.set_title(f"FVCOM open-exterior review - {status}")
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
+    ax.set_xlabel("Projected easting (m)" if projected_display else "Longitude")
+    ax.set_ylabel("Projected northing (m)" if projected_display else "Latitude")
     ax.set_aspect("equal", adjustable="datalim")
     if not open_gdf.empty or not frame_gdf.empty:
         ax.legend(loc="best")
-    _plot_required_features(ax, region_doc)
+    _plot_required_features(ax, region_doc, projection if projected_display else None)
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -663,10 +694,16 @@ def _plot_open_exterior(
         "land_feature_count": int(len(land)),
         "coastline_feature_count": int(len(coastline)),
         "source_frame_feature_count": int(len(source_frame)),
+        "display_crs": projection.crs.to_string() if projected_display else "EPSG:4326",
+        "coordinate_policy": (
+            "native_longitudes_transformed_directly_without_longitude_warping"
+            if projected_display
+            else "native_geographic_display"
+        ),
     }
 
 
-def _plot_required_features(ax, region_doc: dict[str, Any]) -> None:
+def _plot_required_features(ax, region_doc: dict[str, Any], projection=None) -> None:
     points = []
     labels = []
     for feature in (region_doc.get("target_region_features") or {}).get("features", []):
@@ -679,11 +716,46 @@ def _plot_required_features(ax, region_doc: dict[str, Any]) -> None:
         labels.append(str(feature.get("label") or feature.get("id") or "required feature"))
     if not points:
         return
-    gpd.GeoSeries(points, crs="EPSG:4326").plot(
+    if projection is not None:
+        points = [project_geometry(point, projection) for point in points]
+        feature_crs = projection.crs
+    else:
+        feature_crs = "EPSG:4326"
+    gpd.GeoSeries(points, crs=feature_crs).plot(
         ax=ax, color="#7209b7", marker="*", markersize=55, zorder=7, label="required feature"
     )
     for point, label in zip(points, labels):
         ax.annotate(label, (point.x, point.y), xytext=(3, 3), textcoords="offset points", fontsize=6, color="#4a148c")
+
+
+def _uses_antimeridian_frame(source_manifest: dict[str, Any], polygon_lonlat: Polygon) -> bool:
+    bbox = source_manifest.get("region_bpoly", {}).get("envelope_bbox")
+    if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+        return float(bbox[2]) < float(bbox[0])
+    minx, _miny, maxx, _maxy = polygon_lonlat.bounds
+    return float(maxx - minx) > 180.0
+
+
+def _display_gdf(gdf: gpd.GeoDataFrame, projection, projected_display: bool) -> gpd.GeoDataFrame:
+    if not projected_display or gdf.empty:
+        return gdf
+    source = gdf if gdf.crs is not None else gdf.set_crs("EPSG:4326")
+    return source.to_crs(projection.crs)
+
+
+def _projected_polygon_union(gdf: gpd.GeoDataFrame, projection):
+    polygons = []
+    for geometry in gdf.geometry:
+        if geometry is None or geometry.is_empty:
+            continue
+        projected = project_geometry(geometry, projection)
+        if isinstance(projected, Polygon):
+            polygons.append(projected)
+        elif hasattr(projected, "geoms"):
+            polygons.extend(
+                part for part in projected.geoms if isinstance(part, Polygon) and not part.is_empty
+            )
+    return unary_union(polygons) if polygons else GeometryCollection()
 
 
 def _plot_residual_component_maps(

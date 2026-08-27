@@ -59,6 +59,12 @@ repair remnants, and derive coastline from that validated polygon geometry.
 Never rewrite the cached GSHHG files. Record the original validity reason,
 repair method, and equal-area change so downstream users can audit the repair.
 
+For antimeridian requests, the two native longitude windows share an internal
+dataset seam rather than a physical coast or requested-footprint edge. Preserve
+their native coordinates, project both windows directly into a compact metric
+CRS, snap only numerical projected seams, and dissolve the pieces before
+topology overlap tests. Do not translate or warp longitude coordinates.
+
 ## Local Cache Policy
 
 Search for cache in this order:
