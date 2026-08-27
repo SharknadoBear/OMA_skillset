@@ -13,6 +13,11 @@ from region_bbox.io import canonical_sha256, file_sha256, read_json, utc_now, wr
 
 
 ALLOWED_SIDE_STATUSES = {"pass", "expand_required", "unresolved"}
+CLEARANCE_FINDINGS = {"absent", "present", "unresolved"}
+PASS_PROHIBITIONS = {
+    "mapped_water_crossing_away_from_offshore_vertex",
+    "island_bisection",
+}
 
 
 def _mission_required(candidate: dict) -> bool:
@@ -30,6 +35,21 @@ def _parse_indexed(values: list[str], label: str) -> dict[int, str]:
             raise SystemExit(f"duplicate {label} for side {idx}")
         out[idx] = payload.strip()
     return out
+
+
+def _validate_clearance_findings(
+    findings: dict[int, str],
+    required_sides: set[int],
+    label: str,
+    failures: list[str],
+) -> None:
+    if set(findings) != required_sides:
+        failures.append(f"every required land side must declare {label}")
+    for idx, finding in findings.items():
+        if idx not in required_sides:
+            failures.append(f"side {idx} is not a required land side for {label}")
+        if finding not in CLEARANCE_FINDINGS:
+            failures.append(f"side {idx} has unsupported {label} finding {finding!r}")
 
 
 def _verify_map(binding: dict, label: str, failures: list[str]) -> None:
@@ -76,6 +96,8 @@ def _verify_request(final: dict, request: dict) -> list[str]:
     offshore = int(request.get("offshore_side_index", -1))
     if offshore in {int(i) for i in request.get("required_land_side_indices", [])}:
         failures.append("selected offshore side is incorrectly included in the land-side gate")
+    if set(request.get("pass_prohibitions", [])) != PASS_PROHIBITIONS:
+        failures.append("review request does not bind the required land-side pass prohibitions")
     return failures
 
 
@@ -121,6 +143,18 @@ def main() -> None:
     ap.add_argument("--mission-scope-notes", default="")
     ap.add_argument("--side-status", action="append", default=[], help="SIDE_INDEX:pass|expand_required|unresolved")
     ap.add_argument("--side-note", action="append", default=[], help="SIDE_INDEX:concise geographic evidence")
+    ap.add_argument(
+        "--side-mapped-water-crossing",
+        action="append",
+        default=[],
+        help="SIDE_INDEX:absent|present|unresolved; present only away from the shared offshore vertex",
+    )
+    ap.add_argument(
+        "--side-island-bisection",
+        action="append",
+        default=[],
+        help="SIDE_INDEX:absent|present|unresolved",
+    )
     ap.add_argument("--single-open-boundary-status", choices=["pass", "revise", "not_applicable"], default="not_applicable")
     ap.add_argument("--single-open-boundary-notes", default="")
     ap.add_argument("--notes", default="")
@@ -136,6 +170,8 @@ def main() -> None:
     iteration = int(request.get("iteration", 0))
     statuses = _parse_indexed(args.side_status, "--side-status")
     notes = _parse_indexed(args.side_note, "--side-note")
+    water_crossings = _parse_indexed(args.side_mapped_water_crossing, "--side-mapped-water-crossing")
+    island_bisections = _parse_indexed(args.side_island_bisection, "--side-island-bisection")
     required_sides = {int(idx) for idx in request.get("required_land_side_indices", [])}
     offshore_side = int(request.get("offshore_side_index", -1))
     failures = _verify_request(final, request)
@@ -151,6 +187,18 @@ def main() -> None:
         failures.append("every required land side must have exactly one status")
     if set(notes) != required_sides or any(not value.strip() for value in notes.values()):
         failures.append("every required land side must have concise nonempty geographic evidence")
+    _validate_clearance_findings(
+        water_crossings,
+        required_sides,
+        "mapped-water-crossing clearance",
+        failures,
+    )
+    _validate_clearance_findings(
+        island_bisections,
+        required_sides,
+        "island-bisection clearance",
+        failures,
+    )
     if args.map_visibility_status != "pass":
         failures.append("reviewer did not pass map visibility")
     coverage = final.get("qa", {}).get("ingredient_coverage", {})
@@ -165,14 +213,44 @@ def main() -> None:
     if args.single_open_boundary_status == "revise":
         failures.append("offshore-side selection requires revision")
 
-    nonpass = {idx: status for idx, status in statuses.items() if status != "pass"}
+    effective_statuses = dict(statuses)
+    clearance_corrections: list[dict[str, object]] = []
+    for idx in sorted(required_sides):
+        if statuses.get(idx) != "pass":
+            continue
+        present_findings = []
+        unresolved_findings = []
+        if water_crossings.get(idx) == "present":
+            present_findings.append("mapped water away from the shared offshore vertex")
+        elif water_crossings.get(idx) == "unresolved":
+            unresolved_findings.append("mapped-water crossing")
+        if island_bisections.get(idx) == "present":
+            present_findings.append("an island bisection")
+        elif island_bisections.get(idx) == "unresolved":
+            unresolved_findings.append("island bisection")
+        if present_findings:
+            effective_statuses[idx] = "expand_required"
+            reason = " and ".join(present_findings)
+            failures.append(f"side {idx} cannot pass because it shows {reason}")
+            clearance_corrections.append(
+                {"side_index": idx, "reported_status": "pass", "effective_status": "expand_required", "reason": reason}
+            )
+        elif unresolved_findings:
+            effective_statuses[idx] = "unresolved"
+            reason = " and ".join(unresolved_findings)
+            failures.append(f"side {idx} cannot pass because {reason} is unresolved")
+            clearance_corrections.append(
+                {"side_index": idx, "reported_status": "pass", "effective_status": "unresolved", "reason": reason}
+            )
+
+    nonpass = {idx: status for idx, status in effective_statuses.items() if status != "pass"}
     if args.decision == "pass" and nonpass:
         failures.append("pass decision requires every land side to pass")
-    if args.decision == "revise" and not any(status == "expand_required" for status in statuses.values()):
+    if args.decision == "revise" and not any(status == "expand_required" for status in effective_statuses.values()):
         failures.append("revise decision requires at least one expand_required land side")
-    if args.decision == "fail" and not any(status == "unresolved" for status in statuses.values()):
+    if args.decision == "fail" and not any(status == "unresolved" for status in effective_statuses.values()):
         failures.append("fail decision requires at least one unresolved land side")
-    if len([status for status in statuses.values() if status == "expand_required"]) > 1:
+    if len([status for status in effective_statuses.values() if status == "expand_required"]) > 1:
         failures.append("one repair iteration may expand only one named land side")
 
     exhausted = bool(nonpass) and iteration >= 3
@@ -186,7 +264,7 @@ def main() -> None:
     review_map = run_dir / f"region_bpoly_land_side_review_i{iteration:02d}.png"
     maps_ok = not any("map" in failure.lower() or "geography" in failure.lower() for failure in failures)
     if maps_ok and request:
-        _compact_review_map(review_map, request, statuses, notes)
+        _compact_review_map(review_map, request, effective_statuses, notes)
     review = {
         "schema_version": "region_bpoly_land_side_visual_review_v1",
         "name": name,
@@ -210,9 +288,17 @@ def main() -> None:
         "mission_scope_status": args.mission_scope_status,
         "mission_scope_notes": args.mission_scope_notes,
         "side_reviews": [
-            {"side_index": idx, "status": statuses.get(idx), "geographic_evidence": notes.get(idx, "")}
+            {
+                "side_index": idx,
+                "status": effective_statuses.get(idx),
+                "reported_status": statuses.get(idx),
+                "mapped_water_crossing_away_from_offshore_vertex": water_crossings.get(idx),
+                "island_bisection": island_bisections.get(idx),
+                "geographic_evidence": notes.get(idx, ""),
+            }
             for idx in sorted(required_sides)
         ],
+        "clearance_corrections": clearance_corrections,
         "single_open_boundary_status": args.single_open_boundary_status,
         "single_open_boundary_notes": args.single_open_boundary_notes,
         "review_map_path": str(review_map) if review_map.is_file() else None,
@@ -221,7 +307,7 @@ def main() -> None:
         "notes": args.notes,
     }
     if repair_requested:
-        expand_side = next(idx for idx, status in statuses.items() if status == "expand_required")
+        expand_side = next(idx for idx, status in effective_statuses.items() if status == "expand_required")
         review["next_action"] = {
             "operation": "expand_side",
             "side_index": expand_side,

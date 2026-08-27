@@ -59,16 +59,24 @@ After the candidate maps exist, inspect:
 
 For every required land side, record exactly one status and concise geographic evidence:
 
-- `pass`: connected waterways and mission features continue naturally inside the frame;
-- `expand_required`: the side visibly cuts a river, estuary arm, tidal creek, strait, connected embayment, or other required wet continuation;
+- `pass`: connected waterways and mission features continue naturally inside the frame, the complete side does not cross mapped water away from its shared offshore vertex, and it does not bisect an island;
+- `expand_required`: the side visibly cuts a river, estuary arm, tidal creek, strait, connected embayment, or other required wet continuation, crosses mapped water away from its shared offshore vertex, or bisects an island;
 - `unresolved`: the evidence cannot support an autonomous pass or deterministic one-side repair.
+
+Inspect the complete red side on the whole-domain map as well as its three
+focus views. A land side is prohibited from passing if any portion crosses
+mapped water away from the immediate junction with the selected offshore side,
+or if it bisects any island. For every required side, explicitly record
+`mapped_water_crossing_away_from_offshore_vertex` and `island_bisection` as
+`absent`, `present`, or `unresolved`. A `present` finding requires
+`expand_required`; an `unresolved` finding forbids a clean pass.
 
 The selected offshore side is excluded. It must never request `expand_side`.
 
 Finalize a first-pass candidate with:
 
 ```powershell
-python scripts/review_region_bpoly.py --candidate-json runs/case/region_bpoly.json --decision pass --map-visibility-status pass --side-status 0:pass --side-note "0:..." --side-status 1:pass --side-note "1:..." --side-status 2:pass --side-note "2:..." --mission-scope-status pass --single-open-boundary-status pass
+python scripts/review_region_bpoly.py --candidate-json runs/case/region_bpoly.json --decision pass --map-visibility-status pass --side-status 0:pass --side-note "0:..." --side-mapped-water-crossing 0:absent --side-island-bisection 0:absent --side-status 1:pass --side-note "1:..." --side-mapped-water-crossing 1:absent --side-island-bisection 1:absent --side-status 2:pass --side-note "2:..." --side-mapped-water-crossing 2:absent --side-island-bisection 2:absent --mission-scope-status pass --single-open-boundary-status pass
 ```
 
 Use the actual required side indices from the review request; the example indices are illustrative.

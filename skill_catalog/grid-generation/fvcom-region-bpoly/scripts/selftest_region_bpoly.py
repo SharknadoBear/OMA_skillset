@@ -64,13 +64,30 @@ def load(path: Path) -> dict:
             "pass",
         ]
         for idx in request["required_land_side_indices"]:
-            cmd.extend(["--side-status", f"{idx}:pass", "--side-note", f"{idx}:No waterway is visibly cut at this land-side frame in the synthetic regression review."])
+            cmd.extend(
+                [
+                    "--side-status",
+                    f"{idx}:pass",
+                    "--side-note",
+                    f"{idx}:No waterway is visibly cut at this land-side frame in the synthetic regression review.",
+                    "--side-mapped-water-crossing",
+                    f"{idx}:absent",
+                    "--side-island-bisection",
+                    f"{idx}:absent",
+                ]
+            )
         run(cmd)
         doc = load_raw(path)
     return doc
 
 
-def review_cmd(path: Path, decision: str, statuses: dict[int, str]) -> list[object]:
+def review_cmd(
+    path: Path,
+    decision: str,
+    statuses: dict[int, str],
+    water_crossings: dict[int, str] | None = None,
+    island_bisections: dict[int, str] | None = None,
+) -> list[object]:
     cmd: list[object] = [
         "review_region_bpoly.py",
         "--candidate-json",
@@ -86,8 +103,21 @@ def review_cmd(path: Path, decision: str, statuses: dict[int, str]) -> list[obje
         "--single-open-boundary-status",
         "pass",
     ]
+    water_crossings = water_crossings or {idx: "absent" for idx in statuses}
+    island_bisections = island_bisections or {idx: "absent" for idx in statuses}
     for idx, status in sorted(statuses.items()):
-        cmd.extend(["--side-status", f"{idx}:{status}", "--side-note", f"{idx}:Geographic evidence recorded for side {idx} with status {status}."])
+        cmd.extend(
+            [
+                "--side-status",
+                f"{idx}:{status}",
+                "--side-note",
+                f"{idx}:Geographic evidence recorded for side {idx} with status {status}.",
+                "--side-mapped-water-crossing",
+                f"{idx}:{water_crossings[idx]}",
+                "--side-island-bisection",
+                f"{idx}:{island_bisections[idx]}",
+            ]
+        )
     return cmd
 
 
@@ -431,6 +461,10 @@ def main() -> None:
         assert provisional["status_reasons"] == ["land_side_visual_review_pending"]
         assert provisional["land_side_visual_review"] is None
         assert len(provisional["land_side_visual_review_request"]["required_land_side_indices"]) == 3
+        assert set(provisional["land_side_visual_review_request"]["pass_prohibitions"]) == {
+            "mapped_water_crossing_away_from_offshore_vertex",
+            "island_bisection",
+        }
         final = load(exec_dir / "region_bpoly.json")
         assert final["mode"] == "execute"
         assert final["final_status"] == "pass"
@@ -889,6 +923,53 @@ def main() -> None:
         assert reviewed["final_status"] == "repair_required"
         assert reviewed["output_package"]["delivery_ready"] is False
         assert reviewed["land_side_visual_review"]["next_action"]["side_index"] == expand_side
+
+        # A reported land-side pass is corrected and cannot become a clean
+        # pass when the same review declares mapped water away from the
+        # offshore vertex or an island bisection.
+        clearance_rule_dir = run_dir / "land_side_clearance_rule"
+        run(
+            [
+                "run_region_bpoly.py",
+                "--request-text",
+                "Cook Inlet Alaska tidal circulation and estuarine mixing",
+                "--run-dir",
+                clearance_rule_dir,
+                "--name",
+                "land_side_clearance_rule",
+                "--mode",
+                "test",
+                "--heuristic-mode",
+                "memory",
+                "--basemap-provider",
+                "none",
+            ]
+        )
+        clearance_path = clearance_rule_dir / "region_bpoly.json"
+        clearance_doc = load_raw(clearance_path)
+        clearance_sides = clearance_doc["land_side_visual_review_request"]["required_land_side_indices"]
+        reported_passes = {idx: "pass" for idx in clearance_sides}
+        water_findings = {idx: "absent" for idx in clearance_sides}
+        island_findings = {idx: "absent" for idx in clearance_sides}
+        water_findings[clearance_sides[0]] = "present"
+        island_findings[clearance_sides[1]] = "present"
+        run(
+            review_cmd(
+                clearance_path,
+                "pass",
+                reported_passes,
+                water_crossings=water_findings,
+                island_bisections=island_findings,
+            )
+        )
+        clearance_result = load_raw(clearance_path)
+        clearance_review = clearance_result["land_side_visual_review"]
+        effective = {item["side_index"]: item["status"] for item in clearance_review["side_reviews"]}
+        assert effective[clearance_sides[0]] == "expand_required"
+        assert effective[clearance_sides[1]] == "expand_required"
+        assert clearance_result["qa"]["land_side_visual_gate"]["status"] == "warning"
+        assert clearance_review["clearance_corrections"]
+        assert any("cannot pass" in failure for failure in clearance_review["validation_failures"])
 
         expand_manifest = run_dir / "expand_side_manifest.json"
         expand_manifest.write_text(

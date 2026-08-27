@@ -259,8 +259,18 @@ def _land_side_visual_review_request(
         },
         "side_views": side_views,
         "allowed_statuses": ["pass", "expand_required", "unresolved"],
+        "pass_prohibitions": [
+            "mapped_water_crossing_away_from_offshore_vertex",
+            "island_bisection",
+        ],
+        "required_clearance_findings": {
+            "mapped_water_crossing_away_from_offshore_vertex": ["absent", "present", "unresolved"],
+            "island_bisection": ["absent", "present", "unresolved"],
+        },
         "gate_policy": (
             "Inspect the whole-domain map and start/middle/end maps for every required land side. "
+            "A land side cannot pass if it crosses mapped water away from its shared offshore vertex "
+            "or bisects an island; record both clearance findings explicitly for every land side. "
             "The selected offshore side is excluded and cannot request expansion."
         ),
     }

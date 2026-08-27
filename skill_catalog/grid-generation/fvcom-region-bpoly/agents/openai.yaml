@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM RegionBPoly"
   short_description: "Build and visually refine FVCOM mission envelopes"
-  default_prompt: "Use $fvcom-region-bpoly to build a feature-first RegionBPoly, discover a bounded initial frame when the named region has no catalog geometry, inspect every coastal non-offshore side for waterway truncation, apply only authorized one-side expansion for at most three attempts, and always deliver the latest valid geometry with hash-bound review evidence and explicit warnings."
+  default_prompt: "Use $fvcom-region-bpoly to build a feature-first RegionBPoly, discover a bounded initial frame when the named region has no catalog geometry, inspect every coastal non-offshore side for waterway truncation, mapped-water crossing away from the offshore vertex, and island bisection, apply only authorized one-side expansion for at most three attempts, and always deliver the latest valid geometry with hash-bound review evidence and explicit warnings."
