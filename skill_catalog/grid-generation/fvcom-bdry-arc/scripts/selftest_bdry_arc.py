@@ -1393,18 +1393,26 @@ def test_closed_open_loop_sampling_refines_land_crossing_shortcuts() -> None:
         spit_turn_threshold_deg=181.0,
         anchor_chord_error_fraction=100.0,
     )
-    unguarded, _, _, _ = _sample_closed_open_loop_v2(line, config)
+    unguarded = [
+        tuple(line.interpolate(0.0).coords[0]),
+        tuple(line.interpolate(0.5 * line.length).coords[0]),
+        tuple(line.interpolate(line.length).coords[0]),
+    ]
     guarded, _, metadata, report = _sample_closed_open_loop_v2(
         line,
         config,
         land_union=land,
     )
     assert LineString(unguarded).intersection(land).length > 0.0
+    assert not LineString(unguarded).is_simple
     assert LineString(guarded).intersection(land).length <= 1.0e-6
+    assert LineString(guarded).is_simple
     safety = report["land_safety_refinement"]
     assert safety["added_node_count"] >= 2
     assert safety["remaining_unsafe_chord_count"] == 0
     assert safety["remaining_land_intersection_m"] <= 1.0e-6
+    assert safety["remaining_self_intersection_pair_count"] == 0
+    assert safety["sampled_chain_simple"] is True
     anchor_types = {item["anchor_type"] for item in metadata if item["is_hard_anchor"]}
     assert {"open_loop_seam", "open_loop_balance"}.issubset(anchor_types)
 

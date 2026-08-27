@@ -2374,39 +2374,50 @@ def _refine_sampling_positions_for_land_safety(
     endpoint_exclusion_m: float,
     maximum_iterations: int = 24,
 ) -> tuple[list[float], dict[str, Any]]:
-    """Bisect only sampled chords that shortcut through physical land.
+    """Bisect sampled chords that shortcut through land or each other.
 
     The accepted source OBC remains authoritative.  Refinement inserts points
     interpolated on that exact source chain until every delivered chord is
-    land-free.  Coastal landfall neighborhoods use the same exclusion radius
-    as the downstream nonendpoint-land QA; closed offshore loops have no such
-    exception.
+    land-free and the sampled chain is simple.  Coastal landfall neighborhoods
+    use the same exclusion radius as the downstream nonendpoint-land QA; closed
+    offshore loops have no such exception.  A spatial index limits topology
+    tests to intersecting nonadjacent chord envelopes.
     """
     ordered = sorted(set(float(value) for value in positions))
     initial_count = len(ordered)
-    if land_union is None or land_union.is_empty or len(ordered) < 2:
+    if len(ordered) < 2:
         return ordered, {
             "applied": False,
             "iteration_count": 0,
             "added_node_count": 0,
             "remaining_unsafe_chord_count": 0,
             "remaining_land_intersection_m": 0.0,
+            "remaining_self_intersection_pair_count": 0,
+            "sampled_chain_simple": True,
             "endpoint_exclusion_m": float(0.0 if is_closed else endpoint_exclusion_m),
         }
 
+    land_enabled = bool(land_union is not None and not land_union.is_empty)
     endpoint_mask = None
-    if not is_closed and endpoint_exclusion_m > 0.0:
+    if land_enabled and not is_closed and endpoint_exclusion_m > 0.0:
         endpoint_mask = Point(line.coords[0]).buffer(float(endpoint_exclusion_m)).union(
             Point(line.coords[-1]).buffer(float(endpoint_exclusion_m))
         )
-    prepared_land = prep(land_union)
+    prepared_land = prep(land_union) if land_enabled else None
 
-    def unsafe_intervals(values: list[float]) -> tuple[list[float], float, int]:
-        additions: list[float] = []
+    def unsafe_intervals(
+        values: list[float],
+    ) -> tuple[list[int], float, int, list[tuple[int, int]]]:
+        chords = [
+            LineString([line.interpolate(start), line.interpolate(end)])
+            for start, end in zip(values[:-1], values[1:])
+        ]
+        unsafe_indices: set[int] = set()
         intersection_length = 0.0
         unresolved = 0
-        for start, end in zip(values[:-1], values[1:]):
-            chord = LineString([line.interpolate(start), line.interpolate(end)])
+        for index, chord in enumerate(chords):
+            if not land_enabled:
+                continue
             interior = chord if endpoint_mask is None else chord.difference(endpoint_mask)
             if interior.is_empty or not prepared_land.intersects(interior):
                 continue
@@ -2414,27 +2425,60 @@ def _refine_sampling_positions_for_land_safety(
             if overlap <= 1.0e-6:
                 continue
             intersection_length += overlap
-            midpoint = 0.5 * (float(start) + float(end))
-            if end - start > 1.0e-6 and midpoint not in values:
-                additions.append(midpoint)
+            if values[index + 1] - values[index] > 1.0e-6:
+                unsafe_indices.add(index)
             else:
                 unresolved += 1
-        return additions, float(intersection_length), int(unresolved)
+
+        topology_pairs: list[tuple[int, int]] = []
+        if len(chords) >= 2:
+            tree = STRtree(chords)
+            last_index = len(chords) - 1
+            for first_index, first in enumerate(chords):
+                for second_index_value in tree.query(first, predicate="intersects"):
+                    second_index = int(second_index_value)
+                    if second_index <= first_index:
+                        continue
+                    adjacent = second_index == first_index + 1 or (
+                        is_closed and first_index == 0 and second_index == last_index
+                    )
+                    if adjacent:
+                        continue
+                    if first.intersection(chords[second_index]).is_empty:
+                        continue
+                    topology_pairs.append((int(first_index), int(second_index)))
+                    unsafe_indices.add(first_index)
+                    unsafe_indices.add(second_index)
+        return (
+            sorted(unsafe_indices),
+            float(intersection_length),
+            int(unresolved),
+            topology_pairs,
+        )
 
     iteration_count = 0
     for iteration in range(int(maximum_iterations)):
-        additions, _intersection_length, _unresolved = unsafe_intervals(ordered)
+        indices, _intersection_length, _unresolved, _topology_pairs = unsafe_intervals(ordered)
+        existing = set(ordered)
+        additions = [
+            0.5 * (float(ordered[index]) + float(ordered[index + 1]))
+            for index in indices
+            if ordered[index + 1] - ordered[index] > 1.0e-6
+            and 0.5 * (float(ordered[index]) + float(ordered[index + 1])) not in existing
+        ]
         if not additions:
             break
         ordered = sorted(set(ordered + additions))
         iteration_count = iteration + 1
-    remaining, remaining_length, unresolved = unsafe_intervals(ordered)
+    remaining, remaining_length, unresolved, topology_pairs = unsafe_intervals(ordered)
     return ordered, {
         "applied": True,
         "iteration_count": int(iteration_count),
         "added_node_count": int(len(ordered) - initial_count),
         "remaining_unsafe_chord_count": int(len(remaining) + unresolved),
         "remaining_land_intersection_m": float(remaining_length),
+        "remaining_self_intersection_pair_count": int(len(topology_pairs)),
+        "sampled_chain_simple": bool(not topology_pairs),
         "endpoint_exclusion_m": float(0.0 if is_closed else endpoint_exclusion_m),
         "maximum_iterations": int(maximum_iterations),
     }
