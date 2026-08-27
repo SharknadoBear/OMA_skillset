@@ -140,7 +140,10 @@ fragment into the nearest existing OBC endpoint only within the recorded hard
 distance limit; keep its `obc_id`, require a simple joined line, and record the
 absorbed residual segment IDs. The final package becomes canonical while the
 candidate path and hash remain recorded. Rebuild model loops, final
-open-exterior QA, and Adaptive v2 resolution from the finalized package.
+open-exterior QA, and Adaptive v2 resolution from the finalized package. When
+a later resolution attempt reaches a terminal state, replace any stale derived
+parent-manifest resolution flag with that latest state rather than accumulating
+duplicate review markers.
 
 ## Outputs and Assessment
 

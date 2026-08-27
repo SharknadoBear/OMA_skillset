@@ -41,6 +41,11 @@ RESIDUAL_ROLES = {
     "invalid_geometry",
 }
 
+RESOLUTION_STATUS_FAILURES = {
+    "adaptive_boundary_resolution_needs_review",
+    "adaptive_boundary_resolution_failed",
+}
+
 
 def sha256_file(path: str | Path) -> str:
     digest = hashlib.sha256()
@@ -235,6 +240,14 @@ def _parse_roles(values: list[str]) -> dict[int, str]:
             raise ValueError(f"Duplicate residual role for segment {segment_id}")
         roles[segment_id] = role
     return roles
+
+
+def _reconcile_resolution_failures(failures: list[str], resolution: dict) -> list[str]:
+    """Replace stale derived resolution flags with the latest terminal state."""
+    current = [item for item in failures if item not in RESOLUTION_STATUS_FAILURES]
+    if resolution.get("final_status") != "pass":
+        current.append("adaptive_boundary_resolution_needs_review")
+    return list(dict.fromkeys(current))
 
 
 def _verify_component_maps(contract: dict) -> None:
@@ -776,6 +789,11 @@ def finalize(
     manifest["failure_taxonomy"] = [
         f for f in manifest.get("failure_taxonomy", []) if f not in DECISION_FAILURES
     ]
+    if resolution is not None:
+        manifest["failure_taxonomy"] = _reconcile_resolution_failures(
+            manifest["failure_taxonomy"],
+            resolution,
+        )
     if not eligible:
         if "open_exterior_agent_decision_rejected" not in manifest["failure_taxonomy"]:
             manifest["failure_taxonomy"].append("open_exterior_agent_decision_rejected")
@@ -783,8 +801,6 @@ def finalize(
     elif resolution is not None:
         manifest["boundary_resolution"] = resolution
         manifest["outputs"].update(resolution.get("outputs", {}))
-        if resolution.get("final_status") != "pass":
-            manifest["failure_taxonomy"].append("adaptive_boundary_resolution_needs_review")
     if eligible and not manifest.get("failure_taxonomy"):
         manifest["final_status"] = "pass"
     atomic_json(manifest_path, manifest)

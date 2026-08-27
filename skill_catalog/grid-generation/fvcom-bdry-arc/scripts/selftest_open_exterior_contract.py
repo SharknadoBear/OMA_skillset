@@ -214,9 +214,28 @@ def _test_secondary_obc_requires_fresh_noaa_evidence() -> None:
         assert accepted["residual_components"][0]["forcing_eligibility"]["provider"] == "NOAA CO-OPS"
 
 
+def _test_latest_resolution_status_replaces_stale_parent_failures() -> None:
+    stale = [
+        "adaptive_boundary_resolution_needs_review",
+        "adaptive_boundary_resolution_needs_review",
+        "unrelated_failure",
+    ]
+    passing = finalizer._reconcile_resolution_failures(
+        stale,
+        {"final_status": "pass", "failure_taxonomy": []},
+    )
+    assert passing == ["unrelated_failure"]
+    review = finalizer._reconcile_resolution_failures(
+        stale,
+        {"final_status": "needs_review", "failure_taxonomy": ["sampled_open_boundary_not_on_exterior"]},
+    )
+    assert review == ["unrelated_failure", "adaptive_boundary_resolution_needs_review"]
+
+
 def main() -> None:
     _test_materialized_residual_roles()
     _test_secondary_obc_requires_fresh_noaa_evidence()
+    _test_latest_resolution_status_replaces_stale_parent_failures()
     # Tampa-style northern/western bars fail every metric.
     tampa = evaluate_open_exterior_metrics(111_193.677, 903_200.0, 916_100.0, 250.0)
     assert not tampa["passed"]
