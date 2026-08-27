@@ -52,30 +52,23 @@ def load(path: Path) -> dict:
             "review_region_bpoly.py",
             "--candidate-json",
             path,
-            "--decision",
-            "pass",
+            "--problem-detected",
+            "no",
+            "--problem-description",
+            "The initial synthetic candidate is scientifically suitable.",
+            "--change-required",
+            "no",
+            "--geometry-changed",
+            "no",
+            "--scientifically-useful",
+            "yes",
+            "--scientific-rationale",
+            "Required features, map context, and offshore orientation are suitable.",
             "--map-visibility-status",
             "pass",
             "--map-visibility-notes",
             "All hash-bound maps are readable in the regression fixture.",
-            "--mission-scope-status",
-            "pass",
-            "--single-open-boundary-status",
-            "pass",
         ]
-        for idx in request["required_land_side_indices"]:
-            cmd.extend(
-                [
-                    "--side-status",
-                    f"{idx}:pass",
-                    "--side-note",
-                    f"{idx}:No waterway is visibly cut at this land-side frame in the synthetic regression review.",
-                    "--side-mapped-water-crossing",
-                    f"{idx}:absent",
-                    "--side-island-bisection",
-                    f"{idx}:absent",
-                ]
-            )
         run(cmd)
         doc = load_raw(path)
     return doc
@@ -83,41 +76,44 @@ def load(path: Path) -> dict:
 
 def review_cmd(
     path: Path,
-    decision: str,
-    statuses: dict[int, str],
-    water_crossings: dict[int, str] | None = None,
-    island_bisections: dict[int, str] | None = None,
+    *,
+    problem_detected: bool,
+    scientifically_useful: bool,
+    geometry_changed: bool = False,
+    before_region_json: Path | None = None,
+    no_meaningful_repair_remaining: bool = False,
 ) -> list[object]:
     cmd: list[object] = [
         "review_region_bpoly.py",
         "--candidate-json",
         path,
-        "--decision",
-        decision,
+        "--problem-detected",
+        "yes" if problem_detected else "no",
+        "--problem-description",
+        (
+            "The mapped frame has a meaningful scientific coverage or placement problem."
+            if problem_detected
+            else "The mapped frame has no meaningful scientific coverage or placement problem."
+        ),
+        "--change-required",
+        "yes" if problem_detected else "no",
+        "--geometry-changed",
+        "yes" if geometry_changed else "no",
+        "--change-description",
+        "The agent selected and applied a scientifically motivated geometry change." if geometry_changed else "The agent will choose a scientifically motivated repair.",
+        "--scientifically-useful",
+        "yes" if scientifically_useful else "no",
+        "--scientific-rationale",
+        "The final mapped frame is scientifically useful." if scientifically_useful else "The current mapped frame is not yet scientifically useful.",
         "--map-visibility-status",
         "pass",
         "--map-visibility-notes",
         "Whole-domain and side maps are readable.",
-        "--mission-scope-status",
-        "pass",
-        "--single-open-boundary-status",
-        "pass",
     ]
-    water_crossings = water_crossings or {idx: "absent" for idx in statuses}
-    island_bisections = island_bisections or {idx: "absent" for idx in statuses}
-    for idx, status in sorted(statuses.items()):
-        cmd.extend(
-            [
-                "--side-status",
-                f"{idx}:{status}",
-                "--side-note",
-                f"{idx}:Geographic evidence recorded for side {idx} with status {status}.",
-                "--side-mapped-water-crossing",
-                f"{idx}:{water_crossings[idx]}",
-                "--side-island-bisection",
-                f"{idx}:{island_bisections[idx]}",
-            ]
-        )
+    if before_region_json is not None:
+        cmd.extend(["--before-region-json", before_region_json])
+    if no_meaningful_repair_remaining:
+        cmd.append("--no-meaningful-repair-remaining")
     return cmd
 
 
@@ -458,13 +454,11 @@ def main() -> None:
         )
         provisional = load_raw(exec_dir / "region_bpoly.json")
         assert provisional["final_status"] == "review_pending"
-        assert provisional["status_reasons"] == ["land_side_visual_review_pending"]
+        assert provisional["status_reasons"] == ["scientific_review_pending"]
         assert provisional["land_side_visual_review"] is None
         assert len(provisional["land_side_visual_review_request"]["required_land_side_indices"]) == 3
-        assert set(provisional["land_side_visual_review_request"]["pass_prohibitions"]) == {
-            "mapped_water_crossing_away_from_offshore_vertex",
-            "island_bisection",
-        }
+        assert provisional["scientific_review_request"]["iteration_policy"] == "agent_decided_no_numeric_limit"
+        assert "No operation, side, or iteration count is prescribed" in provisional["scientific_review_request"]["repair_freedom"]
         final = load(exec_dir / "region_bpoly.json")
         assert final["mode"] == "execute"
         assert final["final_status"] == "pass"
@@ -892,8 +886,8 @@ def main() -> None:
         assert adjusted["source_region_bpoly"]["polygon_lonlat"] != adjusted["adjusted_region_bpoly"]["polygon_lonlat"]
         assert adjusted["adjustment_map_basemap"]["enabled"] is True
 
-        # The coastal gate can request one named land-side expansion, and the
-        # resulting geometry must return through a fresh hash-bound visual pass.
+        # The coastal review records only problem awareness, actual change, and
+        # final scientific usefulness. It does not prescribe a side or method.
         repair_dir = run_dir / "land_side_repair"
         run(
             [
@@ -916,92 +910,72 @@ def main() -> None:
         repair = load_raw(repair_path)
         required_sides = repair["land_side_visual_review_request"]["required_land_side_indices"]
         offshore_side = repair["land_side_visual_review_request"]["offshore_side_index"]
-        expand_side = required_sides[0]
-        statuses = {idx: ("expand_required" if idx == expand_side else "pass") for idx in required_sides}
-        run(review_cmd(repair_path, "revise", statuses))
+        run(
+            review_cmd(
+                repair_path,
+                problem_detected=True,
+                scientifically_useful=False,
+            )
+        )
         reviewed = load_raw(repair_path)
         assert reviewed["final_status"] == "repair_required"
         assert reviewed["output_package"]["delivery_ready"] is False
-        assert reviewed["land_side_visual_review"]["next_action"]["side_index"] == expand_side
+        assert reviewed["scientific_review"]["problem_detected"] is True
+        assert reviewed["scientific_review"]["next_action"]["operation"] == "agent_selected_repair"
+        assert "side_index" not in reviewed["scientific_review"]["next_action"]
 
-        # A reported land-side pass is corrected and cannot become a clean
-        # pass when the same review declares mapped water away from the
-        # offshore vertex or an island bisection.
-        clearance_rule_dir = run_dir / "land_side_clearance_rule"
-        run(
-            [
-                "run_region_bpoly.py",
-                "--request-text",
-                "Cook Inlet Alaska tidal circulation and estuarine mixing",
-                "--run-dir",
-                clearance_rule_dir,
-                "--name",
-                "land_side_clearance_rule",
-                "--mode",
-                "test",
-                "--heuristic-mode",
-                "memory",
-                "--basemap-provider",
-                "none",
-            ]
-        )
-        clearance_path = clearance_rule_dir / "region_bpoly.json"
-        clearance_doc = load_raw(clearance_path)
-        clearance_sides = clearance_doc["land_side_visual_review_request"]["required_land_side_indices"]
-        reported_passes = {idx: "pass" for idx in clearance_sides}
-        water_findings = {idx: "absent" for idx in clearance_sides}
-        island_findings = {idx: "absent" for idx in clearance_sides}
-        water_findings[clearance_sides[0]] = "present"
-        island_findings[clearance_sides[1]] = "present"
-        run(
-            review_cmd(
-                clearance_path,
-                "pass",
-                reported_passes,
-                water_crossings=water_findings,
-                island_bisections=island_findings,
-            )
-        )
-        clearance_result = load_raw(clearance_path)
-        clearance_review = clearance_result["land_side_visual_review"]
-        effective = {item["side_index"]: item["status"] for item in clearance_review["side_reviews"]}
-        assert effective[clearance_sides[0]] == "expand_required"
-        assert effective[clearance_sides[1]] == "expand_required"
-        assert clearance_result["qa"]["land_side_visual_gate"]["status"] == "warning"
-        assert clearance_review["clearance_corrections"]
-        assert any("cannot pass" in failure for failure in clearance_review["validation_failures"])
-
-        expand_manifest = run_dir / "expand_side_manifest.json"
-        expand_manifest.write_text(
-            json.dumps({"operation": "expand_side", "side_index": expand_side, "distance_km": 10.0}),
+        # A repair cycle accepts multiple sides and arbitrary combinations of
+        # rotate, contract/scale, reshape, and offshore-side movement.
+        multi_manifest = run_dir / "multi_operation_repair.json"
+        multi_manifest.write_text(
+            json.dumps(
+                {
+                    "operations": [
+                        {"operation": "rotate", "angle_deg": 1.0},
+                        {"operation": "scale", "along_factor": 1.03, "across_factor": 0.98},
+                        {"operation": "reshape", "vertex_delta_km": {"0": [-1.0, 1.0], "2": [1.0, -1.0]}},
+                        {"operation": "expand_side", "side_index": required_sides[0], "distance_km": 2.0},
+                        {
+                            "operation": "expand_side",
+                            "side_index": offshore_side,
+                            "distance_km": 2.0,
+                            "offshore_azimuth_deg": 95.0,
+                        },
+                    ]
+                }
+            ),
             encoding="utf-8",
         )
-        expanded_json = run_dir / "expanded_land_side.json"
+        repaired_json = run_dir / "agent_repaired_region.json"
         run(
             [
                 "adjust_region_bpoly.py",
                 "--input-json",
                 repair_path,
                 "--adjustment-manifest",
-                expand_manifest,
+                multi_manifest,
                 "--output-json",
-                expanded_json,
+                repaired_json,
                 "--map-path",
-                run_dir / "expanded_land_side_map.png",
+                run_dir / "agent_repair_map.png",
                 "--basemap-provider",
                 "none",
-                "--truncation-loop",
+                "--repair-cycle",
             ]
         )
-        expanded = load_raw(expanded_json)
-        before = expanded["source_region_bpoly"]["polygon_lonlat"][:4]
-        after = expanded["adjusted_region_bpoly"]["polygon_lonlat"][:4]
-        changed = {idx for idx, (old, new) in enumerate(zip(before, after)) if old != new}
-        assert changed == {expand_side, (expand_side + 1) % 4}
-        assert expanded["adjustment_history"][0]["operation"] == "expand_side"
+        repaired = load_raw(repaired_json)
+        assert [item["operation"] for item in repaired["adjustment_history"]] == [
+            "rotate",
+            "scale",
+            "reshape",
+            "expand_side",
+            "expand_side",
+        ]
+        assert repaired["repair_cycle"] is True
+        assert repaired["source_region_bpoly"]["polygon_lonlat"] != repaired["adjusted_region_bpoly"]["polygon_lonlat"]
 
-        # Rotation/global scaling are forbidden inside the truncation loop.
-        rotate_manifest = run_dir / "rotate_in_loop.json"
+        # The legacy flag remains a nonrestricting compatibility alias.
+        rotate_manifest = run_dir / "rotate_legacy_loop.json"
         rotate_manifest.write_text(json.dumps({"operation": "rotate", "angle_deg": 2.0}), encoding="utf-8")
         run(
             [
@@ -1011,46 +985,30 @@ def main() -> None:
                 "--adjustment-manifest",
                 rotate_manifest,
                 "--output-json",
-                run_dir / "forbidden_rotate.json",
+                run_dir / "legacy_loop_rotate.json",
+                "--map-path",
+                run_dir / "legacy_loop_rotate.png",
+                "--basemap-provider",
+                "none",
                 "--truncation-loop",
-            ],
-            expect_ok=False,
+            ]
         )
 
-        # The selected offshore side cannot request expansion, even as an
-        # explicit edit outside the loop.
-        offshore_manifest = run_dir / "offshore_expand.json"
-        offshore_manifest.write_text(
-            json.dumps({"operation": "expand_side", "side_index": offshore_side, "distance_km": 5.0}),
-            encoding="utf-8",
-        )
-        run(
-            [
-                "adjust_region_bpoly.py",
-                "--input-json",
-                repair_path,
-                "--adjustment-manifest",
-                offshore_manifest,
-                "--output-json",
-                run_dir / "forbidden_offshore.json",
-            ],
-            expect_ok=False,
-        )
-
-        iteration2_dir = run_dir / "land_side_repair_iteration2"
+        # There is no numeric repair-cycle cap.
+        iteration_dir = run_dir / "agent_repair_iteration12"
         run(
             [
                 "run_region_bpoly.py",
                 "--request-text",
                 "Delaware River and Delaware Bay with one Atlantic-facing offshore side",
                 "--input-region-json",
-                expanded_json,
-                "--land-side-review-iteration",
-                "2",
+                repaired_json,
+                "--review-iteration",
+                "12",
                 "--run-dir",
-                iteration2_dir,
+                iteration_dir,
                 "--name",
-                "land_side_repair_iteration2",
+                "agent_repair_iteration12",
                 "--mode",
                 "test",
                 "--heuristic-mode",
@@ -1059,17 +1017,66 @@ def main() -> None:
                 "none",
             ]
         )
-        iteration2_path = iteration2_dir / "region_bpoly.json"
-        iteration2 = load_raw(iteration2_path)
-        assert iteration2["land_side_visual_review_request"]["iteration"] == 2
-        assert iteration2["final_status"] == "review_pending"
-        iteration2_passed = load(iteration2_path)
-        assert iteration2_passed["final_status"] == "pass"
-        assert iteration2_passed["qa"]["land_side_visual_gate"]["iteration"] == 2
-        assert (iteration2_dir / "region_bpoly_land_side_review.json").exists()
-        assert (iteration2_dir / "region_bpoly_land_side_review.png").exists()
+        iteration_path = iteration_dir / "region_bpoly.json"
+        iteration_doc = load_raw(iteration_path)
+        assert iteration_doc["scientific_review_request"]["iteration"] == 12
+        assert iteration_doc["final_status"] == "review_pending"
+        run(
+            review_cmd(
+                iteration_path,
+                problem_detected=True,
+                scientifically_useful=True,
+                geometry_changed=True,
+                before_region_json=repair_path,
+            )
+        )
+        accepted = load_raw(iteration_path)
+        assert accepted["final_status"] == "pass"
+        assert accepted["scientific_review"]["geometry_change_verified"] is True
+        assert accepted["scientific_review"]["effective_scientifically_useful"] is True
+        assert accepted["qa"]["scientific_review"]["iteration"] == 12
+        assert (iteration_dir / "region_bpoly_land_side_review.json").exists()
+        assert (iteration_dir / "region_bpoly_land_side_review.png").exists()
 
-        # Stale or unusable maps cannot earn a clean visual pass, but the
+        # A later cycle may regenerate a fresh candidate without an adjustment
+        # input, which is also how an agent can rebuild from a revised seed.
+        regenerated_dir = run_dir / "regenerated_iteration21"
+        run(
+            [
+                "run_region_bpoly.py",
+                "--request-text",
+                "Delaware River and Delaware Bay with one Atlantic-facing offshore side",
+                "--review-iteration",
+                "21",
+                "--run-dir",
+                regenerated_dir,
+                "--name",
+                "regenerated_iteration21",
+                "--mode",
+                "test",
+                "--heuristic-mode",
+                "memory",
+                "--basemap-provider",
+                "none",
+            ]
+        )
+        regenerated = load_raw(regenerated_dir / "region_bpoly.json")
+        assert regenerated["scientific_review_request"]["iteration"] == 21
+        assert regenerated["final_status"] == "review_pending"
+        regenerated_path = regenerated_dir / "region_bpoly.json"
+        run(
+            review_cmd(
+                regenerated_path,
+                problem_detected=True,
+                scientifically_useful=True,
+            )
+        )
+        unverified = load_raw(regenerated_path)
+        assert unverified["final_status"] == "pass"
+        assert unverified["qa"]["scientific_review"]["status"] == "warning"
+        assert any("verified geometry change" in item for item in unverified["scientific_review"]["validation_failures"])
+
+        # Stale maps cannot earn a clean scientific pass, but the
         # latest valid geometry is still accepted with explicit warnings.
         stale_dir = run_dir / "stale_map_gate"
         run(
@@ -1091,26 +1098,33 @@ def main() -> None:
         )
         stale_path = stale_dir / "region_bpoly.json"
         stale_doc = load_raw(stale_path)
-        stale_statuses = {idx: "pass" for idx in stale_doc["land_side_visual_review_request"]["required_land_side_indices"]}
         whole_map = Path(stale_doc["land_side_visual_review_request"]["whole_domain_map"]["map_path"])
         whole_map.write_bytes(whole_map.read_bytes() + b"stale")
-        run(review_cmd(stale_path, "pass", stale_statuses))
+        run(
+            review_cmd(
+                stale_path,
+                problem_detected=False,
+                scientifically_useful=True,
+            )
+        )
         stale_result = load_raw(stale_path)
         assert stale_result["final_status"] == "pass"
-        assert stale_result["qa"]["land_side_visual_gate"]["status"] == "warning"
+        assert stale_result["qa"]["scientific_review"]["status"] == "warning"
+        assert stale_result["qa"]["scientific_review"]["scientifically_useful"] is False
         assert stale_result["output_package"]["package_state"] == "accepted_delivery"
         assert stale_result["output_package"]["delivery_ready"] is True
 
-        unusable_dir = run_dir / "unusable_map_gate"
+        # An honest impasse has no numeric trigger and never becomes needs_review.
+        impasse_dir = run_dir / "agent_impasse"
         run(
             [
                 "run_region_bpoly.py",
                 "--request-text",
                 "Delaware River and Delaware Bay",
                 "--run-dir",
-                unusable_dir,
+                impasse_dir,
                 "--name",
-                "unusable_map_gate",
+                "agent_impasse",
                 "--mode",
                 "test",
                 "--heuristic-mode",
@@ -1119,55 +1133,72 @@ def main() -> None:
                 "none",
             ]
         )
-        unusable_path = unusable_dir / "region_bpoly.json"
-        unusable = load_raw(unusable_path)
-        unusable["land_side_visual_review_request"]["whole_domain_map"]["geography_usable"] = False
-        unusable_path.write_text(json.dumps(unusable, indent=2), encoding="utf-8")
-        unusable_statuses = {idx: "pass" for idx in unusable["land_side_visual_review_request"]["required_land_side_indices"]}
-        run(review_cmd(unusable_path, "pass", unusable_statuses))
-        unusable_result = load_raw(unusable_path)
-        assert unusable_result["final_status"] == "pass"
-        assert unusable_result["qa"]["land_side_visual_gate"]["status"] == "warning"
-        assert unusable_result["output_package"]["delivery_ready"] is True
-
-        # A nonpass third review accepts the latest valid geometry with
-        # warnings; iteration four remains rejected at invocation.
-        exhausted = load_raw(repair_path)
-        exhausted["land_side_visual_review_request"]["iteration"] = 3
-        exhausted_dir = run_dir / "exhausted_gate"
-        exhausted_dir.mkdir()
-        for artifact_name in (
-            "target_region_features.json",
-            "region_bpoly_final_map.png",
-            "offshore_boundary_artifacts.json",
-        ):
-            shutil.copyfile(repair_dir / artifact_name, exhausted_dir / artifact_name)
-        exhausted["offshore_boundary_artifacts_path"] = str(exhausted_dir / "offshore_boundary_artifacts.json")
-        exhausted_path = exhausted_dir / "region_bpoly.json"
-        exhausted_path.write_text(json.dumps(exhausted, indent=2), encoding="utf-8")
-        run(review_cmd(exhausted_path, "revise", statuses))
-        exhausted_result = load_raw(exhausted_path)
-        assert exhausted_result["final_status"] == "pass"
-        assert exhausted_result["status_reasons"] == ["land_side_visual_review_accepted_best_effort"]
-        assert exhausted_result["qa"]["land_side_visual_gate"]["status"] == "warning"
-        assert exhausted_result["output_package"]["package_state"] == "accepted_delivery"
-        assert exhausted_result["output_package"]["delivery_ready"] is True
+        impasse_path = impasse_dir / "region_bpoly.json"
         run(
-            [
-                "run_region_bpoly.py",
-                "--request-text",
-                "Delaware River and Delaware Bay",
-                "--input-region-json",
-                expanded_json,
-                "--land-side-review-iteration",
-                "4",
-                "--run-dir",
-                run_dir / "fourth_attempt",
-                "--name",
-                "fourth_attempt",
-            ],
-            expect_ok=False,
+            review_cmd(
+                impasse_path,
+                problem_detected=True,
+                scientifically_useful=False,
+                no_meaningful_repair_remaining=True,
+            )
         )
+        impasse = load_raw(impasse_path)
+        assert impasse["final_status"] == "pass"
+        assert impasse["status_reasons"] == ["scientific_review_accepted_best_effort"]
+        assert impasse["scientific_review"]["effective_decision"] == "accepted_best_effort"
+        assert impasse["scientific_review"]["effective_scientifically_useful"] is False
+        assert "needs_review" not in json.dumps(impasse["status_reasons"])
+
+        # The same free adjustment path is available to lake and island
+        # candidates even though they do not require the coastal finalizer.
+        for label, source_path, request_text, expected_type, cycle in (
+            ("lake_refinement", lake_dir / "region_bpoly.json", "Lake Superior circulation and exchange model", "lake", 8),
+            ("island_refinement", hawaii_state_dir / "region_bpoly.json", "Hawaii State island group OTEC ocean model domain", "island", 9),
+        ):
+            refined_json = run_dir / f"{label}_adjusted.json"
+            run(
+                [
+                    "adjust_region_bpoly.py",
+                    "--input-json",
+                    source_path,
+                    "--adjustment-manifest",
+                    rotate_manifest,
+                    "--output-json",
+                    refined_json,
+                    "--map-path",
+                    run_dir / f"{label}_adjustment.png",
+                    "--basemap-provider",
+                    "none",
+                    "--repair-cycle",
+                ]
+            )
+            refined_dir = run_dir / label
+            run(
+                [
+                    "run_region_bpoly.py",
+                    "--request-text",
+                    request_text,
+                    "--input-region-json",
+                    refined_json,
+                    "--review-iteration",
+                    str(cycle),
+                    "--run-dir",
+                    refined_dir,
+                    "--name",
+                    label,
+                    "--mode",
+                    "test",
+                    "--heuristic-mode",
+                    "memory",
+                    "--basemap-provider",
+                    "none",
+                ]
+            )
+            refined = load_raw(refined_dir / "region_bpoly.json")
+            assert refined["domain_type"] == expected_type
+            assert refined["final_status"] == "pass"
+            assert refined["polygon_lonlat"] != load_raw(source_path)["polygon_lonlat"]
+
         assert not (ROOT / "apply_arc_feedback.py").exists()
 
     print("fvcom-region-bpoly selftest passed")

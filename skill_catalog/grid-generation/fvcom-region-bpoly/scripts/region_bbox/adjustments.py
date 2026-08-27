@@ -103,13 +103,11 @@ def _expand_side_xy(
     xy: list[tuple[float, float]],
     op: dict[str, Any],
 ) -> tuple[list[tuple[float, float]], dict[str, Any]]:
-    """Move exactly one complete land side outward in the local projected frame."""
+    """Move one selected side outward in the local projected frame."""
     side_index = int(op.get("side_index", -1))
     if side_index not in range(4):
         raise ValueError("expand_side requires side_index in 0..3")
     offshore_side_index = region.offshore_side_index()
-    if side_index == offshore_side_index:
-        raise ValueError("expand_side cannot move the selected offshore side")
     distance_km = float(op.get("distance_km", 0.0))
     if not math.isfinite(distance_km) or distance_km <= 0.0:
         raise ValueError("expand_side requires a positive finite distance_km")

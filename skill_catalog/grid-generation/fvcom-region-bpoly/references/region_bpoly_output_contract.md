@@ -17,7 +17,10 @@ Every run that reaches packaging writes these root-level files:
   SHA-256 hashes.
 
 A finalized coastal delivery also retains
-`region_bpoly_land_side_review.json`. A clean visual pass additionally requires
+`region_bpoly_land_side_review.json`. Its `region_bpoly_scientific_review_v1`
+content records only problem awareness, whether a required geometry change was
+verified by hashes, and final scientific usefulness. It does not grade the
+chosen operation, side, distance, orientation, or number of cycles. A clean visual pass additionally requires
 `region_bpoly_land_side_review.png`; when source maps are stale or unusable,
 the missing compact map is recorded as a warning rather than blocking the
 usable geometry. A named-place discovery run additionally retains
@@ -56,5 +59,6 @@ remain responsible for acceptance.
 `package_complete` reports completeness of the usable geometry package for the
 current state. `delivery_ready` is true for a complete accepted delivery.
 Downstream consumers preserve all review provenance but must not reject usable
-RegionBPoly geometry because of review, package-state, or readiness labels.
+RegionBPoly geometry because of review, package-state, scientific-usefulness,
+or readiness labels.
 These are W12 packaging results, not a new RegionBPoly decision gate.

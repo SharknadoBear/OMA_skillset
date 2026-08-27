@@ -22,7 +22,7 @@ def _load_ingredients(path: Path | None) -> list[dict]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Apply explicit RegionBPoly edits, including deterministic single-land-side expansion.")
+    ap = argparse.ArgumentParser(description="Apply one or more agent-selected RegionBPoly geometry edits.")
     ap.add_argument("--input-json", required=True, help="Input region_bpoly.json, candidate JSON, or raw RegionBPoly JSON.")
     ap.add_argument("--adjustment-manifest", required=True, help="JSON manifest with one operation or an operations list.")
     ap.add_argument("--output-json", help="Adjusted RegionBPoly JSON path.")
@@ -30,9 +30,14 @@ def main() -> None:
     ap.add_argument("--features-json", help="Optional target_region_features.json to overlay feature boxes.")
     ap.add_argument("--basemap-provider", default="topo", help="topo/street/satellite/offline provider.")
     ap.add_argument(
+        "--repair-cycle",
+        action="store_true",
+        help="Mark this edit as part of an agent-directed scientific repair cycle; no operation is prescribed.",
+    )
+    ap.add_argument(
         "--truncation-loop",
         action="store_true",
-        help="Enforce the strict repair-loop contract: one review-authorized expand_side operation only.",
+        help="Deprecated compatibility alias for --repair-cycle; it no longer restricts operations or sides.",
     )
     args = ap.parse_args()
 
@@ -43,16 +48,6 @@ def main() -> None:
 
     original, source_doc = _load_region(input_path)
     manifest = read_json(manifest_path)
-    operations = manifest.get("operations", [manifest])
-    if args.truncation_loop:
-        if len(operations) != 1 or str(operations[0].get("operation", operations[0].get("type", ""))).lower() != "expand_side":
-            raise SystemExit("The truncation loop permits exactly one expand_side operation; rotate, scale, and reshape are explicit-edit operations only")
-        review = source_doc.get("land_side_visual_review") or {}
-        next_action = review.get("next_action") or {}
-        if review.get("decision") != "revise" or next_action.get("operation") != "expand_side":
-            raise SystemExit("The truncation-loop input lacks a current expand_required review decision")
-        if int(operations[0].get("side_index", -1)) != int(next_action.get("side_index", -2)):
-            raise SystemExit("expand_side does not match the land side authorized by the current visual review")
     adjusted, history = apply_adjustment_manifest(original, manifest)
     ingredients = _load_ingredients(Path(args.features_json) if args.features_json else None)
     basemap = plot_region_map(
@@ -80,10 +75,13 @@ def main() -> None:
         "source_document_name": source_doc.get("name"),
         "source_land_side_visual_review": source_doc.get("land_side_visual_review"),
         "source_land_side_visual_review_request": source_doc.get("land_side_visual_review_request"),
+        "source_scientific_review": source_doc.get("scientific_review") or source_doc.get("land_side_visual_review"),
+        "source_scientific_review_request": source_doc.get("scientific_review_request") or source_doc.get("land_side_visual_review_request"),
         "target_region_features": source_doc.get("target_region_features"),
         "domain_type": source_doc.get("domain_type"),
         "boundary_policy": source_doc.get("boundary_policy"),
         "open_boundary_reference": source_doc.get("open_boundary_reference"),
+        "repair_cycle": bool(args.repair_cycle or args.truncation_loop),
         "truncation_loop": bool(args.truncation_loop),
     }
     out = write_json(output_json, payload)

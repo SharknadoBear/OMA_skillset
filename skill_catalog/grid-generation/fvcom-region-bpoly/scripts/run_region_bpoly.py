@@ -215,7 +215,7 @@ def write_intermediate(
     return candidate
 
 
-def _land_side_visual_review_request(
+def _scientific_review_request(
     *,
     candidate: dict,
     candidate_json: Path,
@@ -243,9 +243,9 @@ def _land_side_visual_review_request(
             )
         side_views[str(idx)] = records
     return {
-        "schema_version": "region_bpoly_land_side_visual_review_request_v1",
+        "schema_version": "region_bpoly_scientific_review_request_v1",
         "iteration": iteration,
-        "maximum_iterations": 3,
+        "iteration_policy": "agent_decided_no_numeric_limit",
         "candidate_json": str(candidate_json),
         "candidate_json_sha256": file_sha256(candidate_json),
         "region_bpoly_sha256": canonical_sha256(bpoly.to_dict()),
@@ -258,20 +258,21 @@ def _land_side_visual_review_request(
             "geography_usable": bool(final_map_basemap.get("geography_usable", False)),
         },
         "side_views": side_views,
-        "allowed_statuses": ["pass", "expand_required", "unresolved"],
-        "pass_prohibitions": [
-            "mapped_water_crossing_away_from_offshore_vertex",
-            "island_bisection",
+        "review_questions": [
+            "Did the agent recognize a meaningful scientific problem, or explicitly find none?",
+            "If a problem required repair, did the geometry actually change?",
+            "Is the current RegionBPoly scientifically useful for the stated objective?",
         ],
-        "required_clearance_findings": {
-            "mapped_water_crossing_away_from_offshore_vertex": ["absent", "present", "unresolved"],
-            "island_bisection": ["absent", "present", "unresolved"],
-        },
-        "gate_policy": (
-            "Inspect the whole-domain map and start/middle/end maps for every required land side. "
-            "A land side cannot pass if it crosses mapped water away from its shared offshore vertex "
-            "or bisects an island; record both clearance findings explicitly for every land side. "
-            "The selected offshore side is excluded and cannot request expansion."
+        "scientific_considerations": [
+            "mission feature coverage and waterway completeness",
+            "land-side crossings of mapped water in their geographic context",
+            "island bisection or incomplete island-chain scope",
+            "offshore orientation and ocean exchange appropriate to the objective",
+        ],
+        "repair_freedom": (
+            "The reviewer may choose any scientifically defensible repair, including rotation, resizing, "
+            "contraction, vertex reshape, multiple-side edits, offshore-orientation changes, combined "
+            "operations, or complete candidate regeneration. No operation, side, or iteration count is prescribed."
         ),
     }
 
@@ -477,8 +478,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Run the streamlined RegionBPoly workflow.")
     ap.add_argument("--request-json")
     ap.add_argument("--request-text")
-    ap.add_argument("--input-region-json", help="Adjusted RegionBPoly input for a land-side repair iteration.")
-    ap.add_argument("--land-side-review-iteration", type=int, choices=[1, 2, 3], default=1)
+    ap.add_argument("--input-region-json", help="Adjusted or regenerated RegionBPoly input for an agent-directed repair cycle.")
+    ap.add_argument(
+        "--review-iteration",
+        "--land-side-review-iteration",
+        dest="review_iteration",
+        type=int,
+        default=1,
+        help="Positive descriptive cycle number; there is no numeric repair limit.",
+    )
     ap.add_argument("--run-dir", required=True, help="Final case output folder.")
     ap.add_argument("--name", required=True)
     ap.add_argument("--mode", choices=["execute", "test"], default="execute")
@@ -496,6 +504,8 @@ def main() -> None:
     ap.add_argument("--basemap-provider", default="auto", help="auto/topo/road/street/satellite/offline provider; none/off still uses the required offline background fallback.")
     ap.add_argument("--full-side-review", action="store_true")
     args = ap.parse_args()
+    if args.review_iteration < 1:
+        raise SystemExit("--review-iteration must be a positive integer")
 
     case_dir = Path(args.run_dir)
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -541,17 +551,7 @@ def main() -> None:
     if args.input_region_json:
         adjusted_source = read_json(args.input_region_json)
         bpoly = RegionBPoly.from_dict(adjusted_source)
-        deformation_notes.append(f"Started land-side review iteration {args.land_side_review_iteration} from {args.input_region_json}.")
-        if args.land_side_review_iteration == 1:
-            raise SystemExit("--input-region-json is only valid for land-side review iterations 2 or 3")
-        prior_review = adjusted_source.get("source_land_side_visual_review") or adjusted_source.get("land_side_visual_review")
-        prior_iteration = int((prior_review or {}).get("iteration", 0))
-        if prior_iteration != args.land_side_review_iteration - 1:
-            raise SystemExit("Adjusted input is not bound to the immediately preceding land-side review iteration")
-        if (prior_review or {}).get("decision") != "revise":
-            raise SystemExit("Adjusted input does not follow an expand_required review decision")
-    elif args.land_side_review_iteration != 1:
-        raise SystemExit("Review iterations 2 and 3 require --input-region-json")
+        deformation_notes.append(f"Started agent-directed review cycle {args.review_iteration} from {args.input_region_json}.")
     elif place_memory_enabled:
         try:
             bpoly, deformation_notes = deform_bpoly(RegionBPoly.from_region_box(guess_region_box(effective_request)), effective_request)
@@ -714,9 +714,8 @@ def main() -> None:
     if unusable_maps:
         delivery_warnings.append("background geography unavailable in review maps: " + ", ".join(unusable_maps))
 
-    # Coastal review is an iterative refinement state, not a terminal failure
-    # state.  The finalizer either requests one deterministic side expansion or
-    # accepts the latest valid geometry with explicit review warnings.
+    # Coastal scientific review is an iterative refinement state, not a
+    # terminal failure state. The agent chooses whether and how to repair.
     final_status = "review_pending" if domain_type == "coastal" else "pass"
     retained_intermediate = args.mode == "test"
     offshore_artifacts_path = case_dir / "offshore_boundary_artifacts.json"
@@ -732,15 +731,15 @@ def main() -> None:
         quality_score,
     )
     candidate_json = intermediate / "visual_review" / f"{args.name}_region_bpoly_candidate.json"
-    land_side_review_request = None
+    scientific_review_request = None
     if domain_type == "coastal":
-        land_side_review_request = _land_side_visual_review_request(
+        scientific_review_request = _scientific_review_request(
             candidate=candidate,
             candidate_json=candidate_json,
             final_map=final_map,
             final_map_basemap=basemap,
             bpoly=bpoly,
-            iteration=args.land_side_review_iteration,
+            iteration=args.review_iteration,
         )
 
     final = {
@@ -754,7 +753,7 @@ def main() -> None:
         "place_discovery": place_discovery,
         "place_discovery_path": str(place_discovery_path) if place_discovery_path else None,
         "final_status": final_status,
-        "status_reasons": (["land_side_visual_review_pending"] if domain_type == "coastal" else []),
+        "status_reasons": (["scientific_review_pending"] if domain_type == "coastal" else []),
         "delivery_warnings": delivery_warnings,
         "region_bpoly": bpoly.to_dict(),
         "polygon_lonlat": bpoly.polygon_lonlat(),
@@ -765,7 +764,9 @@ def main() -> None:
         "boundary_policy": POLICY[domain_type],
         "open_boundary_reference": open_ref,
         "offshore_boundary_artifacts_path": str(offshore_artifacts_path),
-        "land_side_visual_review_request": land_side_review_request,
+        "scientific_review_request": scientific_review_request,
+        "land_side_visual_review_request": scientific_review_request,
+        "scientific_review": None,
         "land_side_visual_review": None,
         "final_map_path": str(final_map),
         "final_map_basemap": basemap,
@@ -795,7 +796,7 @@ def main() -> None:
             "side_focus_count": candidate.get("side_focus_count"),
             "initial_guess_artifacts": initial_guess_artifacts if retained_intermediate else {"retained": False},
             "delivery_policy": (
-                "coastal_land_side_visual_review_refines_then_accepts_best_effort"
+                "coastal_agent_directed_scientific_review_refines_then_accepts_best_effort"
                 if domain_type == "coastal"
                 else "resolved_region_bpoly_qa_is_nonblocking"
             ),
@@ -826,7 +827,7 @@ def main() -> None:
         shutil.rmtree(intermediate)
     print(f"Wrote final RegionBPoly: {out}")
     if final_status == "review_pending":
-        print("Coastal review pending: inspect the hash-bound maps, repair one named land side when useful, then finalize the latest valid geometry.")
+        print("Coastal review pending: inspect the hash-bound maps, choose any scientifically useful repair when needed, then finalize the latest valid geometry.")
     if delivery_warnings:
         print("Delivered resolved RegionBPoly with QA warnings: " + "; ".join(delivery_warnings))
 
