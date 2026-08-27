@@ -11,12 +11,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sys
 
+import geopandas as gpd
+import pandas as pd
+from shapely.geometry import LineString
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from fvcom_bdry_arc.boundary_loops import build_model_boundary_loops  # noqa: E402
 from fvcom_bdry_arc.boundary_resolution import (  # noqa: E402
     boundary_resolution_config,
     build_boundary_resolution,
 )
+from fvcom_bdry_arc.open_exterior import build_open_exterior_contract  # noqa: E402
 
 
 DECISION_FAILURES = {
@@ -294,6 +300,207 @@ def _bind_resolution_contract(resolution: dict, contract_path: Path) -> None:
         atomic_json(output, resolution)
 
 
+def _write_layer(path: Path, layer: str, frame: gpd.GeoDataFrame) -> None:
+    if frame.empty:
+        return
+    if frame.crs is None:
+        frame = frame.set_crs("EPSG:4326")
+    frame.to_file(path, layer=layer, driver="GPKG")
+
+
+def _append_lines(
+    base: gpd.GeoDataFrame,
+    additions: list[dict],
+) -> gpd.GeoDataFrame:
+    if not additions:
+        return base
+    extra = gpd.GeoDataFrame(additions, geometry="geometry", crs="EPSG:4326")
+    if base.empty:
+        return extra
+    columns = sorted(set(base.columns) | set(extra.columns))
+    for column in columns:
+        if column not in base.columns:
+            base[column] = None
+        if column not in extra.columns:
+            extra[column] = None
+    return gpd.GeoDataFrame(
+        pd.concat([base[columns], extra[columns]], ignore_index=True),
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+
+
+def _materialize_finalized_package(manifest: dict, contract: dict, run_dir: Path) -> dict:
+    """Create a role-resolved package while preserving the candidate GeoPackage."""
+    candidate = Path(manifest.get("outputs", {}).get("bdry_arc_package_gpkg", ""))
+    if not candidate.is_file():
+        raise ValueError("candidate boundary-arc GeoPackage is missing")
+    layer_names = list(gpd.list_layers(candidate)["name"])
+    layers = {name: gpd.read_file(candidate, layer=name).to_crs("EPSG:4326") for name in layer_names}
+    open_layer = layers.get("open_boundary_arc", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")).copy()
+    if "obc_id" not in open_layer.columns:
+        open_layer["obc_id"] = list(range(len(open_layer)))
+    if "is_closed" not in open_layer.columns:
+        open_layer["is_closed"] = [bool(getattr(geom, "is_ring", False)) for geom in open_layer.geometry]
+    open_layer = open_layer.sort_values("obc_id").reset_index(drop=True)
+    open_layer["obc_id"] = list(range(len(open_layer)))
+    open_layer["residual_role"] = "primary_delivered_obc"
+
+    frame_layer = layers.get("frame_clip_boundary_arcs", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")).copy()
+    frame_layer = frame_layer.reset_index(drop=True)
+    land_layer = layers.get("land_patch_boundary_arcs", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")).copy()
+    remove_segments: set[int] = set()
+    secondary_rows: list[dict] = []
+    solid_rows: list[dict] = []
+    next_obc_id = len(open_layer)
+    components = sorted(
+        contract.get("residual_components", []),
+        key=lambda item: int(item.get("segment_id", -1)),
+    )
+    for component in components:
+        role = component.get("assigned_role")
+        if role not in {"secondary_tidal_obc", "solid_lagoon_closure"}:
+            continue
+        segment_id = int(component.get("segment_id", -1))
+        coords = component.get("geometry_lonlat") or []
+        if len(coords) < 2:
+            raise ValueError(f"accepted residual segment {segment_id} has no materializable geometry")
+        geometry = LineString([(float(x), float(y)) for x, y in coords])
+        remove_segments.add(segment_id)
+        if role == "secondary_tidal_obc":
+            secondary_rows.append(
+                {
+                    "segment_class": "open_boundary",
+                    "obc_id": int(next_obc_id),
+                    "is_closed": False,
+                    "residual_role": role,
+                    "source_segment_id": segment_id,
+                    "geometry": geometry,
+                }
+            )
+            next_obc_id += 1
+        else:
+            solid_rows.append(
+                {
+                    "segment_class": "land_patch_boundary",
+                    "residual_role": role,
+                    "source_segment_id": segment_id,
+                    "geometry": geometry,
+                }
+            )
+    open_layer = _append_lines(open_layer, secondary_rows)
+    land_layer = _append_lines(land_layer, solid_rows)
+    if remove_segments and not frame_layer.empty:
+        segment_column = next(
+            (name for name in ("segment_id", "source_segment_id") if name in frame_layer.columns),
+            None,
+        )
+        if segment_column:
+            keep = [int(value) not in remove_segments for value in frame_layer[segment_column]]
+        else:
+            keep = [index not in remove_segments for index in range(len(frame_layer))]
+        frame_layer = frame_layer.loc[keep].reset_index(drop=True)
+    layers["open_boundary_arc"] = open_layer
+    layers["land_patch_boundary_arcs"] = land_layer
+    layers["frame_clip_boundary_arcs"] = frame_layer
+
+    final_path = run_dir / "bdry_arc_package_final.gpkg"
+    if final_path.exists():
+        final_path.unlink()
+    for layer_name, frame in layers.items():
+        _write_layer(final_path, layer_name, frame)
+    chains = [
+        {
+            "obc_id": int(row.obc_id),
+            "is_closed": bool(row.is_closed),
+            "length_deg": float(row.geometry.length),
+            "residual_role": str(getattr(row, "residual_role", "")),
+        }
+        for _, row in open_layer.sort_values("obc_id").iterrows()
+    ]
+    expected = int(contract.get("obc_geometry", {}).get("expected_count", 0))
+    if len(chains) != expected:
+        raise ValueError(f"finalized OBC count {len(chains)} does not equal requested count {expected}")
+    return {
+        "candidate_bdry_arc_package_gpkg": str(candidate),
+        "bdry_arc_package_final_gpkg": str(final_path),
+        "sha256": sha256_file(final_path),
+        "delivered_obc_count": int(len(chains)),
+        "chains": chains,
+        "solid_component_count": int(len(solid_rows)),
+        "secondary_obc_count": int(len(secondary_rows)),
+    }
+
+
+def _rebuild_final_loops(manifest: dict, package: dict, manifest_path: Path) -> dict:
+    source = dict(manifest)
+    source["final_status"] = "pass"
+    source["failure_taxonomy"] = [
+        item for item in source.get("failure_taxonomy", []) if item not in DECISION_FAILURES
+    ]
+    source.setdefault("outputs", {})["bdry_arc_package_gpkg"] = package["bdry_arc_package_final_gpkg"]
+    source_path = manifest_path.parent / "bdry_arc_finalization_source.json"
+    atomic_json(source_path, source)
+    loop_dir = manifest_path.parent / "model_boundary_loops_final"
+    loop = build_model_boundary_loops(
+        package["bdry_arc_package_final_gpkg"],
+        source_path,
+        loop_dir,
+        str(manifest.get("name", "fvcom_boundary")),
+        target_resolution_m=float(manifest.get("settings", {}).get("target_resolution_m", 250.0)),
+        min_island_area_m2=0.0,
+        mode=str(manifest.get("settings", {}).get("mode", "test")),
+    )
+    if loop.get("final_status") != "pass":
+        raise ValueError(
+            "finalized model-boundary loops did not pass: "
+            + ", ".join(loop.get("failure_taxonomy", []))
+        )
+    return loop
+
+
+def _rebuild_final_open_exterior(
+    manifest: dict,
+    package: dict,
+    final_loop: dict,
+    manifest_path: Path,
+) -> dict:
+    """Re-audit the role-resolved package before v2 resolution is rebuilt."""
+    inputs = manifest.get("inputs", {})
+    loop_manifest = final_loop.get("outputs", {}).get("model_boundary_loop_manifest")
+    if not loop_manifest:
+        loop_manifest = manifest_path.parent / "model_boundary_loops_final" / "model_boundary_loop_manifest.json"
+    final_qa = build_open_exterior_contract(
+        inputs.get("region_bpoly_json"),
+        inputs.get("offshore_artifacts_json"),
+        package["bdry_arc_package_final_gpkg"],
+        inputs.get("coastline_gpkg"),
+        loop_manifest,
+        manifest_path.parent / "open_exterior_final",
+        manifest,
+        frame_clip_policy=str(manifest.get("settings", {}).get("frame_clip_policy", "reject-unintended")),
+        residual_boundary_policy="solid-default",
+        frame_clip_tolerance_m=manifest.get("settings", {}).get("frame_clip_tolerance_m"),
+        adaptive_status="pending",
+        expected_obc_count=int(manifest.get("settings", {}).get("expected_obc_count", 1)),
+    )
+    hard = final_qa.get("hard_metrics", {})
+    unexpected = [
+        item
+        for item in final_qa.get("failure_taxonomy", [])
+        if item not in DECISION_FAILURES
+    ]
+    if unexpected or not hard.get("all_independent_metric_gates_pass"):
+        raise ValueError(
+            "finalized open-exterior QA did not pass: "
+            + ", ".join(unexpected or ["independent_metric_gate_failed"])
+        )
+    obc = final_qa.get("obc_geometry", {})
+    if int(obc.get("delivered_count", -1)) != int(obc.get("expected_count", -2)):
+        raise ValueError("finalized open-exterior QA did not preserve the requested OBC count")
+    return final_qa
+
+
 def finalize(
     manifest_path: Path,
     decision: str,
@@ -383,25 +590,85 @@ def finalize(
         and source_coverage_pass
         and not contract.get("report_only")
     )
-    # Adaptive construction can be expensive.  Finish or recover it before
-    # publishing the decision/contract so interruption never leaves a passing
-    # child contract under a needs-review parent manifest.
+    # Materialize accepted roles and rebuild all downstream geometry before
+    # publishing a passing decision.
     resolution = None
-    if eligible and resume_adaptive:
-        profile = str(manifest.get("settings", {}).get("boundary_resolution_profile", "legacy"))
-        if profile in {"adaptive-coastal-v1", "adaptive-coastal-v2"}:
-            resolution = _existing_adaptive_resolution(manifest_path.parent, profile)
-            if resolution is None:
-                outputs = manifest.get("outputs", {})
-                resolution = build_boundary_resolution(
-                    outputs["model_boundary_loops_gpkg"],
-                    outputs["model_boundary_loop_manifest"],
-                    manifest["inputs"]["region_bpoly_json"],
-                    manifest["inputs"]["coastline_gpkg"],
-                    manifest_path.parent / "boundary_resolution",
-                    str(manifest.get("name", "fvcom_boundary")),
-                    boundary_resolution_config(profile),
-                )
+    finalized_package = None
+    final_loop = None
+    if eligible:
+        profile = str(
+            manifest.get("settings", {}).get("boundary_resolution_profile", "adaptive-coastal-v2")
+        )
+        if profile != "adaptive-coastal-v2":
+            raise ValueError("Open-exterior finalization only supports adaptive-coastal-v2")
+        finalized_package = _materialize_finalized_package(manifest, contract, manifest_path.parent)
+        final_loop = _rebuild_final_loops(manifest, finalized_package, manifest_path)
+        final_open_exterior = _rebuild_final_open_exterior(
+            manifest,
+            finalized_package,
+            final_loop,
+            manifest_path,
+        )
+        loop_outputs = dict(final_loop.get("outputs", {}))
+        loop_outputs["model_boundary_loop_manifest"] = str(
+            manifest_path.parent / "model_boundary_loops_final" / "model_boundary_loop_manifest.json"
+        )
+        manifest.setdefault("outputs", {})["candidate_bdry_arc_package_gpkg"] = finalized_package[
+            "candidate_bdry_arc_package_gpkg"
+        ]
+        manifest["outputs"]["bdry_arc_package_final_gpkg"] = finalized_package[
+            "bdry_arc_package_final_gpkg"
+        ]
+        manifest["outputs"]["bdry_arc_package_gpkg"] = finalized_package[
+            "bdry_arc_package_final_gpkg"
+        ]
+        manifest["outputs"].update(loop_outputs)
+        manifest["model_boundary_loops"] = {
+            "final_status": final_loop.get("final_status"),
+            "failure_taxonomy": final_loop.get("failure_taxonomy", []),
+            "qa": final_loop.get("qa", {}),
+            "outputs": loop_outputs,
+        }
+        contract["finalized_geometry"] = finalized_package
+        contract.setdefault("source_hashes", {})["candidate_bdry_arc_gpkg"] = contract.get(
+            "source_hashes", {}
+        ).get("bdry_arc_gpkg")
+        contract["finalized_source_hashes"] = {
+            "bdry_arc_gpkg": finalized_package["sha256"],
+            "model_boundary_loops_gpkg": sha256_file(loop_outputs["model_boundary_loops_gpkg"]),
+            "model_boundary_loop_manifest": sha256_file(loop_outputs["model_boundary_loop_manifest"]),
+            "open_exterior_contract": sha256_file(
+                final_open_exterior["outputs"]["open_exterior_contract"]
+            ),
+        }
+        contract["finalized_open_exterior_qa"] = {
+            "path": final_open_exterior["outputs"]["open_exterior_contract"],
+            "review_map": final_open_exterior["outputs"]["open_exterior_review_map"],
+            "schema_version": final_open_exterior.get("schema_version"),
+            "hard_metrics": final_open_exterior.get("hard_metrics", {}),
+            "obc_geometry": final_open_exterior.get("obc_geometry", {}),
+            "failure_taxonomy": final_open_exterior.get("failure_taxonomy", []),
+        }
+        manifest["outputs"]["finalized_open_exterior_contract"] = final_open_exterior[
+            "outputs"
+        ]["open_exterior_contract"]
+        manifest["outputs"]["finalized_open_exterior_review_map"] = final_open_exterior[
+            "outputs"
+        ]["open_exterior_review_map"]
+        contract.setdefault("obc_geometry", {})["delivered_count"] = finalized_package[
+            "delivered_obc_count"
+        ]
+        contract["obc_geometry"]["chains"] = finalized_package["chains"]
+        if resume_adaptive:
+            resolution = build_boundary_resolution(
+                loop_outputs["model_boundary_loops_gpkg"],
+                loop_outputs["model_boundary_loop_manifest"],
+                manifest["inputs"]["region_bpoly_json"],
+                manifest["inputs"]["coastline_gpkg"],
+                manifest_path.parent / "boundary_resolution",
+                str(manifest.get("name", "fvcom_boundary")),
+                boundary_resolution_config(),
+            )
 
     atomic_json(decision_path, decision_doc)
     decision_hash = sha256_file(decision_path)
@@ -422,8 +689,6 @@ def finalize(
     contract["failure_taxonomy"] = failures
     atomic_json(contract_path, contract)
 
-    if eligible:
-        _clear_loop_role_failures(manifest)
     if resolution is not None:
         _bind_resolution_contract(resolution, contract_path)
 

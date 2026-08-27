@@ -77,6 +77,7 @@ def build_open_exterior_contract(
     frame_clip_tolerance_m: float | None,
     adaptive_status: str = "pending",
     adaptive_failures: list[str] | None = None,
+    expected_obc_count: int | None = None,
 ) -> dict[str, Any]:
     """Write a non-mutating v1/v2 open-exterior contract and review maps."""
     region_path = Path(region_bpoly_json)
@@ -234,7 +235,15 @@ def build_open_exterior_contract(
         geometry["wet_component_preserved"] = wet_component_count == 1
         geometry["eligible"] = bool(geometry["eligible"] and wet_component_count == 1)
     expected_obc_count = int(
-        region.get("expected_obc_count", offshore.get("expected_obc_count", 0 if region.get("boundary_policy") == "no_open_boundary" else 1))
+        expected_obc_count
+        if expected_obc_count is not None
+        else region.get(
+            "expected_obc_count",
+            offshore.get(
+                "expected_obc_count",
+                0 if region.get("boundary_policy") == "no_open_boundary" else 1,
+            ),
+        )
     )
     delivered_obc_count = sum(1 for geom in open_gdf.geometry if geom is not None and not geom.is_empty)
     domain_type = str(region.get("domain_type", "")).lower()

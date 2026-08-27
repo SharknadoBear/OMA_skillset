@@ -1,7 +1,8 @@
 # Adaptive Coastal v2 Boundary–Size–Thin Contract
 
-Use this reference with `adaptive-coastal-v2`.  The profile is opt-in; legacy
-and `adaptive-coastal-v1` behavior remain compatibility paths.
+Use this reference with `adaptive-coastal-v2`, the sole active boundary
+resolution implementation. Archived legacy/v1 products are read-only evidence,
+not generation paths.
 
 ## Contents
 

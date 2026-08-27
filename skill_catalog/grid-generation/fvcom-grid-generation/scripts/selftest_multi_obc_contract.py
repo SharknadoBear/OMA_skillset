@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fvcom_grid_generation.boundary import (  # noqa: E402
     BoundaryNodes,
     OpenBoundaryChain,
+    _manifest_open_boundary_chains,
     evaluate_boundary_contract_v2,
 )
 from fvcom_grid_generation.metrics import (  # noqa: E402
@@ -25,6 +26,7 @@ from fvcom_grid_generation.mesh import MeshConfig, generate_mesh  # noqa: E402
 from fvcom_grid_generation.projection import local_utm_projection  # noqa: E402
 from fvcom_grid_generation.quality import evaluate_mesh_quality  # noqa: E402
 from fvcom_grid_generation.sms_2dm import read_2dm, write_2dm  # noqa: E402
+from fvcom_grid_generation.workflow import GridConfig  # noqa: E402
 
 
 def _square_mesh() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -391,6 +393,33 @@ def test_boundary_contract_exact_counts_and_cyclic_policy() -> None:
     assert "open_boundary_landfall_anchor_missing" not in cyclic["failure_taxonomy"]
 
 
+def test_v2_manifest_chains_are_consumed_without_concatenation() -> None:
+    assert GridConfig().boundary_resolution_profile == "adaptive-coastal-v2"
+    manifest = {
+        "profile": "adaptive-coastal-v2",
+        "open_boundary_chains": [
+            {
+                "obc_id": 8,
+                "is_closed": False,
+                "node_sequence_zero_based": [50, 40],
+            },
+            {
+                "obc_id": 3,
+                "is_closed": False,
+                "node_sequence_zero_based": [10, 20],
+            },
+        ],
+    }
+    chains = _manifest_open_boundary_chains(
+        manifest,
+        {10: 0, 20: 1, 30: 2, 40: 3, 50: 4},
+        ["open", "open", "land", "open", "open"],
+    )
+    assert [chain.chain_id for chain in chains] == ["obc_003", "obc_008"]
+    assert [chain.node_indices for chain in chains] == [(0, 1), (4, 3)]
+    assert all(chain.orientation == "source" for chain in chains)
+
+
 def main() -> int:
     tests = [
         test_legacy_single_nodestring_roundtrip,
@@ -402,6 +431,7 @@ def main() -> int:
         test_interior_edge_cannot_be_an_open_boundary,
         test_target_size_p95_and_maximum_gates,
         test_boundary_contract_exact_counts_and_cyclic_policy,
+        test_v2_manifest_chains_are_consumed_without_concatenation,
     ]
     for test in tests:
         test()

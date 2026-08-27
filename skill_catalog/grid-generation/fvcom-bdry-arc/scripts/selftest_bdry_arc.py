@@ -18,6 +18,7 @@ from fvcom_bdry_arc import (  # noqa: E402
     BoundaryResolutionConfig,
     BoundaryResolutionV2Config,
     analyze_boundary_resolution,
+    boundary_resolution_config,
     build_boundary_resolution,
     build_model_boundary_loops,
     build_open_exterior_contract,
@@ -260,6 +261,208 @@ def _synthetic_loop_package(root: Path, include_boundary_refs: bool = True) -> t
         },
     )
     return gpkg, manifest
+
+
+def _resolution_loop_case(
+    root: Path,
+    exterior: list[tuple[float, float]],
+    open_chains: list[LineString],
+    expected_obc_count: int,
+    *,
+    closed: bool = False,
+) -> tuple[Path, Path]:
+    loops = root / "resolution_loops.gpkg"
+    domain = Polygon(exterior)
+    gpd.GeoDataFrame(
+        [{"geometry": domain}], geometry="geometry", crs="EPSG:4326"
+    ).to_file(loops, layer="model_domain_polygon", driver="GPKG")
+    segment_rows = [
+        {
+            "sequence_id": index,
+            "segment_class": "open_boundary" if closed else "land_outer_boundary",
+            "geometry": LineString([start, end]),
+        }
+        for index, (start, end) in enumerate(zip(exterior[:-1], exterior[1:]))
+    ]
+    gpd.GeoDataFrame(segment_rows, geometry="geometry", crs="EPSG:4326").to_file(
+        loops, layer="model_outer_boundary_segments", driver="GPKG"
+    )
+    gpd.GeoDataFrame(
+        [
+            {
+                "obc_id": index,
+                "is_closed": bool(closed),
+                "segment_class": "delivered_open_boundary_arc",
+                "geometry": chain,
+            }
+            for index, chain in enumerate(open_chains)
+        ],
+        geometry="geometry",
+        crs="EPSG:4326",
+    ).to_file(loops, layer="delivered_open_boundary_arc", driver="GPKG")
+    manifest = root / "model_boundary_loop_manifest.json"
+    _write_json(
+        manifest,
+        {
+            "final_status": "pass",
+            "qa": {
+                "expected_obc_count": int(expected_obc_count),
+                "delivered_obc_count": int(len(open_chains)),
+            },
+        },
+    )
+    return loops, manifest
+
+
+def _coarse_v2_config() -> BoundaryResolutionConfig:
+    return BoundaryResolutionConfig(
+        land_spacing_m=5000.0,
+        mission_spacing_m=5000.0,
+        open_anchor_spacing_m=5000.0,
+        open_central_spacing_m=20_000.0,
+        compact_spacing_m=5000.0,
+        irregular_spacing_m=5000.0,
+        elongated_spacing_m=5000.0,
+        complex_spacing_m=5000.0,
+        passage_search_spacing_m=5000.0,
+        passage_max_width_m=100.0,
+    )
+
+
+def test_boundary_resolution_profile_is_v2_only() -> None:
+    assert BdryArcConfig().boundary_resolution_profile == "adaptive-coastal-v2"
+    assert boundary_resolution_config().profile == "adaptive-coastal-v2"
+    assert boundary_resolution_config("adaptive-coastal-v2").profile == "adaptive-coastal-v2"
+    for removed in ("legacy", "adaptive-coastal-v1"):
+        try:
+            boundary_resolution_config(removed)
+        except ValueError as exc:
+            assert "only supports adaptive-coastal-v2" in str(exc)
+        else:
+            raise AssertionError(f"removed generation profile was accepted: {removed}")
+
+
+def test_two_independent_coastal_obcs_preserve_ids_and_anchors() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        exterior = [
+            (-75.0, 39.0),
+            (-74.9, 39.0),
+            (-74.9, 39.1),
+            (-75.0, 39.1),
+            (-75.0, 39.0),
+        ]
+        open_chains = [
+            LineString([(-74.9, 39.02), (-74.9, 39.04)]),
+            LineString([(-75.0, 39.08), (-75.0, 39.06)]),
+        ]
+        loops, loop_manifest = _resolution_loop_case(root, exterior, open_chains, 2)
+        manifest = build_boundary_resolution(
+            loops,
+            loop_manifest,
+            None,
+            None,
+            root / "resolution",
+            "two_obc",
+            _coarse_v2_config(),
+        )
+        assert manifest["final_status"] == "pass", manifest["failure_taxonomy"]
+        assert manifest["qa"]["expected_obc_count"] == 2
+        assert manifest["qa"]["delivered_obc_count"] == 2
+        chains = manifest["open_boundary_chains"]
+        assert [item["obc_id"] for item in chains] == [0, 1]
+        assert all(item["is_closed"] is False for item in chains)
+        assert all(item["open_landfall_hard_anchor_count"] == 2 for item in chains)
+        assert all(item["exterior_overlap_fraction"] >= 1.0 - 1.0e-9 for item in chains)
+        assert all(item["nonendpoint_land_intersection_m"] <= 1.0e-6 for item in chains)
+        assert set(chains[0]["node_sequence_zero_based"]).isdisjoint(
+            chains[1]["node_sequence_zero_based"]
+        )
+        resolved = gpd.read_file(
+            manifest["outputs"]["boundary_resolution_gpkg"],
+            layer="resolved_open_boundary",
+        )
+        assert list(resolved.sort_values("obc_id")["obc_id"]) == [0, 1]
+        assert len(resolved) == 2
+
+
+def test_closed_island_obc_uses_seam_and_balance_without_landfalls() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        exterior = [
+            (-160.2, 20.8),
+            (-159.8, 20.8),
+            (-159.8, 21.2),
+            (-160.2, 21.2),
+            (-160.2, 20.8),
+        ]
+        loops, loop_manifest = _resolution_loop_case(
+            root,
+            exterior,
+            [LineString(exterior)],
+            1,
+            closed=True,
+        )
+        manifest = build_boundary_resolution(
+            loops,
+            loop_manifest,
+            None,
+            None,
+            root / "resolution",
+            "closed_island",
+            _coarse_v2_config(),
+        )
+        assert manifest["final_status"] == "pass", manifest["failure_taxonomy"]
+        chain = manifest["open_boundary_chains"][0]
+        assert chain["is_closed"] is True
+        assert chain["open_landfall_hard_anchor_count"] == 0
+        assert chain["open_loop_seam_hard_anchor_count"] == 1
+        assert chain["open_loop_balance_hard_anchor_count"] == 1
+        assert chain["exterior_overlap_fraction"] >= 1.0 - 1.0e-9
+        assert chain["nonendpoint_land_intersection_m"] <= 1.0e-6
+
+
+def test_antimeridian_closed_obc_uses_compact_projection() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        exterior = [
+            (179.0, 50.0),
+            (-179.0, 50.0),
+            (-179.0, 52.0),
+            (179.0, 52.0),
+            (179.0, 50.0),
+        ]
+        loops, loop_manifest = _resolution_loop_case(
+            root,
+            exterior,
+            [LineString(exterior)],
+            1,
+            closed=True,
+        )
+        config = BoundaryResolutionConfig(
+            **{
+                **_coarse_v2_config().__dict__,
+                "land_spacing_m": 25_000.0,
+                "open_anchor_spacing_m": 25_000.0,
+                "open_central_spacing_m": 50_000.0,
+            }
+        )
+        manifest = build_boundary_resolution(
+            loops,
+            loop_manifest,
+            None,
+            None,
+            root / "resolution",
+            "antimeridian_loop",
+            config,
+        )
+        assert manifest["final_status"] == "pass", manifest["failure_taxonomy"]
+        chain = manifest["open_boundary_chains"][0]
+        assert chain["is_closed"] is True
+        assert chain["open_landfall_hard_anchor_count"] == 0
+        assert chain["open_loop_seam_hard_anchor_count"] == 1
+        assert chain["open_loop_balance_hard_anchor_count"] == 1
+        assert chain["source_length_m"] < 1_000_000.0
 
 
 def test_synthetic_package() -> None:
@@ -767,7 +970,7 @@ def test_adaptive_boundary_resolution_package() -> None:
             "synthetic_adaptive",
             BoundaryResolutionConfig(),
         )
-        assert manifest["profile"] == "adaptive-coastal-v1"
+        assert manifest["profile"] == "adaptive-coastal-v2"
         assert manifest["final_status"] == "pass"
         assert manifest["qa"]["open_boundary_node_count"] >= 2
         assert manifest["qa"]["open_arc_land_intersection_m"] <= 1.0e-6
@@ -782,21 +985,8 @@ def test_adaptive_boundary_resolution_package() -> None:
         layers = set(gpd.list_layers(manifest["outputs"]["boundary_resolution_gpkg"])["name"])
         assert {"resolved_domain_polygon", "resolved_open_boundary", "resolved_island_polygons", "boundary_nodes", "island_diagnostics"}.issubset(layers)
 
-        v2_manifest = build_boundary_resolution(
-            loops,
-            None,
-            region,
-            coast,
-            root / "resolution_v2",
-            "synthetic_adaptive_v2",
-            BoundaryResolutionV2Config(passage_max_width_m=100.0),
-            reuse_boundary_resolution_manifest=manifest["outputs"]["boundary_resolution_manifest"],
-        )
-        assert v2_manifest["profile"] == "adaptive-coastal-v2"
-        assert v2_manifest["final_status"] == "pass"
-        assert v2_manifest["inputs"]["reused_boundary_resolution_manifest"] == manifest["outputs"]["boundary_resolution_manifest"]
-        assert v2_manifest["qa"]["open_landfall_hard_anchor_count"] == 2
-        node_doc = json.loads(Path(v2_manifest["outputs"]["boundary_resolution_nodes_geojson"]).read_text(encoding="utf-8"))
+        assert manifest["qa"]["open_landfall_hard_anchor_count"] == 2
+        node_doc = json.loads(Path(manifest["outputs"]["boundary_resolution_nodes_geojson"]).read_text(encoding="utf-8"))
         landfalls = [
             feature
             for feature in node_doc["features"]
@@ -805,7 +995,7 @@ def test_adaptive_boundary_resolution_package() -> None:
         assert len(landfalls) == 2
         assert all(feature["properties"]["is_hard_anchor"] for feature in landfalls)
         v2_diagnostics = json.loads(
-            Path(v2_manifest["outputs"]["boundary_resolution_diagnostics_json"]).read_text(encoding="utf-8")
+            Path(manifest["outputs"]["boundary_resolution_diagnostics_json"]).read_text(encoding="utf-8")
         )
         assert len(v2_diagnostics["boundary_sampling"]["junctions"]) == 2
         assert all(item["hard_anchor"] for item in v2_diagnostics["boundary_sampling"]["junctions"])
@@ -1089,6 +1279,10 @@ def test_open_exterior_reader_drops_empty_geometry_placeholders() -> None:
 
 
 def main() -> int:
+    test_boundary_resolution_profile_is_v2_only()
+    test_two_independent_coastal_obcs_preserve_ids_and_anchors()
+    test_closed_island_obc_uses_seam_and_balance_without_landfalls()
+    test_antimeridian_closed_obc_uses_compact_projection()
     test_synthetic_package()
     test_gshhs_vector_package_prefers_coastline_lines()
     test_island_loop_branch_avoids_coastline_anchor_failures()

@@ -108,8 +108,12 @@ def main() -> int:
     parser.add_argument("--size-field-max-cells", type=int, default=1_500_000)
     parser.add_argument(
         "--boundary-resolution-profile",
-        choices=("legacy", "adaptive-coastal-v1", "adaptive-coastal-v2"),
-        default="legacy",
+        choices=("adaptive-coastal-v2",),
+        default="adaptive-coastal-v2",
+        help=(
+            "Deprecated compatibility selector. Boundary generation now always "
+            "uses adaptive-coastal-v2."
+        ),
     )
     parser.add_argument("--regional-spring-relaxation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--spring-relax-iterations", type=int, default=20)

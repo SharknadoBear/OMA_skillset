@@ -61,7 +61,8 @@ class BdryArcConfig:
     progress_interval_s: float = 30.0
     heuristic_mode: str = "auto"
     topology_time_budget_s: float = 900.0
-    boundary_resolution_profile: str = "legacy"
+    boundary_resolution_profile: str = "adaptive-coastal-v2"
+    expected_obc_count: int | None = None
     frame_clip_policy: str = "reject-unintended"
     residual_boundary_policy: str = "solid-default"
     frame_clip_tolerance_m: float | None = None
@@ -98,8 +99,10 @@ def run_bdry_arc(
         raise ValueError("--topology-mode must be gshhs-vector, island-loop, iterative-raster, or vector-only")
     if config.heuristic_mode not in {"auto", "memory", "unknown"}:
         raise ValueError("--heuristic-mode must be auto, memory, or unknown")
-    if config.boundary_resolution_profile not in {"legacy", "adaptive-coastal-v1", "adaptive-coastal-v2"}:
-        raise ValueError("--boundary-resolution-profile must be legacy, adaptive-coastal-v1, or adaptive-coastal-v2")
+    if config.boundary_resolution_profile != "adaptive-coastal-v2":
+        raise ValueError("--boundary-resolution-profile only accepts adaptive-coastal-v2")
+    if config.expected_obc_count is not None and config.expected_obc_count < 0:
+        raise ValueError("--expected-obc-count must be nonnegative")
     if config.frame_clip_policy not in {"reject-unintended", "report-only"}:
         raise ValueError("--frame-clip-policy must be reject-unintended or report-only")
     if config.residual_boundary_policy not in {"solid-default", "strict-reject"}:
@@ -128,6 +131,7 @@ def run_bdry_arc(
             "heuristic_mode": resolved_heuristic_mode,
             "resolution_policy": "use requested GSHHS resolution only; do not downshift unless explicitly requested",
             "boundary_resolution_profile": config.boundary_resolution_profile,
+            "expected_obc_count": config.expected_obc_count,
             "frame_clip_policy": config.frame_clip_policy,
             "residual_boundary_policy": config.residual_boundary_policy,
             "obc_placement_policy": config.obc_placement_policy,
@@ -476,6 +480,17 @@ def run_bdry_arc(
             "progress_interval_s": float(config.progress_interval_s),
             "topology_time_budget_s": float(config.topology_time_budget_s),
             "boundary_resolution_profile": config.boundary_resolution_profile,
+            "expected_obc_count": int(
+                config.expected_obc_count
+                if config.expected_obc_count is not None
+                else region.get(
+                    "expected_obc_count",
+                    offshore.get(
+                        "expected_obc_count",
+                        0 if str(region.get("domain_type", "")).lower() == "lake" else 1,
+                    ),
+                )
+            ),
             "frame_clip_policy": config.frame_clip_policy,
             "residual_boundary_policy": config.residual_boundary_policy,
             "obc_placement_policy": config.obc_placement_policy,
@@ -635,7 +650,8 @@ def run_bdry_arc(
             frame_clip_policy=config.frame_clip_policy,
             residual_boundary_policy=config.residual_boundary_policy,
             frame_clip_tolerance_m=config.frame_clip_tolerance_m,
-            adaptive_status=("disabled" if config.boundary_resolution_profile == "legacy" else "pending"),
+            adaptive_status="pending",
+            expected_obc_count=manifest["settings"]["expected_obc_count"],
         )
     except Exception as exc:
         open_contract_failed = True
@@ -664,10 +680,8 @@ def run_bdry_arc(
         if "open_exterior_contract_build_failed" not in manifest["failure_taxonomy"]:
             manifest["failure_taxonomy"].append("open_exterior_contract_build_failed")
 
-    adaptive_requested = config.boundary_resolution_profile in {"adaptive-coastal-v1", "adaptive-coastal-v2"}
     adaptive_can_run = bool(
-        adaptive_requested
-        and loop_outputs.get("model_boundary_loops_gpkg")
+        loop_outputs.get("model_boundary_loops_gpkg")
         and loop_manifest.get("final_status") == "pass"
         and not frame_gate_blocked
         and not open_contract_failed
@@ -683,7 +697,7 @@ def run_bdry_arc(
                 coastline_gpkg,
                 resolution_dir,
                 name,
-                boundary_resolution_config(config.boundary_resolution_profile),
+                boundary_resolution_config(),
             )
             manifest["boundary_resolution"] = resolution_manifest
             manifest["outputs"].update(resolution_manifest.get("outputs", {}))
@@ -694,12 +708,8 @@ def run_bdry_arc(
             _write_progress(run_dir, "boundary-resolution", "done", {"final_status": resolution_manifest.get("final_status")})
         except Exception as exc:
             manifest["boundary_resolution"] = {
-                "schema_version": (
-                    "fvcom_boundary_resolution_manifest_v2"
-                    if config.boundary_resolution_profile == "adaptive-coastal-v2"
-                    else "fvcom_boundary_resolution_manifest_v1"
-                ),
-                "profile": config.boundary_resolution_profile,
+                "schema_version": "fvcom_boundary_resolution_manifest_v2",
+                "profile": "adaptive-coastal-v2",
                 "final_status": "needs_review",
                 "failure_taxonomy": ["adaptive_boundary_resolution_failed"],
                 "error": str(exc),
@@ -709,7 +719,7 @@ def run_bdry_arc(
             if "adaptive_boundary_resolution_failed" not in manifest["failure_taxonomy"]:
                 manifest["failure_taxonomy"].append("adaptive_boundary_resolution_failed")
             _write_progress(run_dir, "boundary-resolution", "failed", {"error": str(exc)})
-    elif adaptive_requested and frame_gate_blocked:
+    elif frame_gate_blocked:
         manifest["boundary_resolution"] = {
             "profile": config.boundary_resolution_profile,
             "enabled": False,
@@ -725,19 +735,13 @@ def run_bdry_arc(
         if "blocked_by_open_exterior_contract" not in manifest["failure_taxonomy"]:
             manifest["failure_taxonomy"].append("blocked_by_open_exterior_contract")
         _write_progress(run_dir, "boundary-resolution", "blocked", {"reason": "open_exterior_contract"})
-    elif adaptive_requested:
+    else:
         manifest["boundary_resolution"] = {
             "profile": config.boundary_resolution_profile,
             "enabled": False,
             "final_status": "needs_review",
             "failure_taxonomy": ["adaptive_boundary_resolution_prerequisite_failed"],
             "outputs": {},
-        }
-    else:
-        manifest["boundary_resolution"] = {
-            "profile": "legacy",
-            "enabled": False,
-            "reason": "legacy_profile_preserves_existing_boundary_workflow",
         }
 
     manifest_path.write_text(json.dumps(_json_safe(manifest), indent=2), encoding="utf-8")
@@ -3721,10 +3725,21 @@ def _build_output_layers(
         crs="EPSG:4326",
     )
     if selected_arc_lonlat is None or selected_arc_lonlat.is_empty:
-        open_gdf = gpd.GeoDataFrame({"segment_class": []}, geometry=[], crs="EPSG:4326")
+        open_gdf = gpd.GeoDataFrame(
+            {"segment_class": [], "obc_id": [], "is_closed": []},
+            geometry=[],
+            crs="EPSG:4326",
+        )
     else:
         open_gdf = gpd.GeoDataFrame(
-            [{"segment_class": "open_boundary", "geometry": selected_arc_lonlat}],
+            [
+                {
+                    "segment_class": "open_boundary",
+                    "obc_id": 0,
+                    "is_closed": bool(selected_arc_lonlat.is_ring),
+                    "geometry": selected_arc_lonlat,
+                }
+            ],
             geometry="geometry",
             crs="EPSG:4326",
         )

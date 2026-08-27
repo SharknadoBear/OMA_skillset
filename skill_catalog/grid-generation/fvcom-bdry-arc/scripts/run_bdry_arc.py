@@ -44,8 +44,14 @@ def main() -> int:
     parser.add_argument("--topology-time-budget-s", type=float, default=900.0, help="Maximum seconds to spend evaluating full-resolution topology candidates before returning needs_review.")
     parser.add_argument(
         "--boundary-resolution-profile",
-        default="legacy",
-        choices=("legacy", "adaptive-coastal-v1", "adaptive-coastal-v2"),
+        default="adaptive-coastal-v2",
+        choices=("adaptive-coastal-v2",),
+        help="Deprecated compatibility selector; Adaptive v2 is the sole active profile.",
+    )
+    parser.add_argument(
+        "--expected-obc-count",
+        type=int,
+        help="Requested delivered OBC-chain count; defaults to the RegionBPoly/offshore contract.",
     )
     parser.add_argument(
         "--obc-placement-policy",
@@ -96,6 +102,7 @@ def main() -> int:
         heuristic_mode=args.heuristic_mode,
         topology_time_budget_s=args.topology_time_budget_s,
         boundary_resolution_profile=args.boundary_resolution_profile,
+        expected_obc_count=args.expected_obc_count,
         frame_clip_policy=args.frame_clip_policy,
         residual_boundary_policy=args.residual_boundary_policy,
         frame_clip_tolerance_m=args.frame_clip_tolerance_m,

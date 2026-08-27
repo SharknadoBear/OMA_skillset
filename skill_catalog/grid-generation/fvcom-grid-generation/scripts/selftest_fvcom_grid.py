@@ -108,40 +108,85 @@ def _simple_synthetic_boundary_package(path: Path) -> Path:
     return path
 
 
-def _synthetic_resolution_package(root: Path, loops: Path) -> Path:
+def _synthetic_resolution_package(
+    root: Path,
+    loops: Path,
+    *,
+    profile: str = "adaptive-coastal-v2",
+    spacing_m: float = 1000.0,
+) -> Path:
     package = load_boundary_package(loops)
-    nodes = prepare_boundary_nodes(package, BoundaryConfig(land_spacing_m=700.0, open_spacing_m=2500.0, island_spacing_m=700.0))
-    gpkg = root / "boundary_resolution.gpkg"
-    gpd.GeoDataFrame([{"profile": "adaptive-coastal-v1", "geometry": package.domain_polygon_lonlat}], crs="EPSG:4326").to_file(gpkg, layer="resolved_domain_polygon", driver="GPKG")
-    gpd.GeoDataFrame([{"segment_class": "open_boundary", "geometry": package.open_boundary_lonlat}], crs="EPSG:4326").to_file(gpkg, layer="resolved_open_boundary", driver="GPKG")
+    nodes = prepare_boundary_nodes(
+        package,
+        BoundaryConfig(
+            land_spacing_m=float(min(spacing_m, 1000.0)),
+            open_spacing_m=float(spacing_m),
+            island_spacing_m=float(min(spacing_m, 1000.0)),
+        ),
+    )
+    suffix = "v2" if profile == "adaptive-coastal-v2" else "archived_v1"
+    gpkg = root / f"boundary_resolution_{suffix}.gpkg"
+    gpd.GeoDataFrame([{"profile": profile, "geometry": package.domain_polygon_lonlat}], crs="EPSG:4326").to_file(gpkg, layer="resolved_domain_polygon", driver="GPKG")
+    gpd.GeoDataFrame(
+        [{"segment_class": "open_boundary", "obc_id": 0, "is_closed": False, "geometry": package.open_boundary_lonlat}],
+        crs="EPSG:4326",
+    ).to_file(gpkg, layer="resolved_open_boundary", driver="GPKG")
     if package.island_polygons_lonlat:
         gpd.GeoDataFrame([{"resolved_island_id": i, "geometry": polygon} for i, polygon in enumerate(package.island_polygons_lonlat)], crs="EPSG:4326").to_file(gpkg, layer="resolved_island_polygons", driver="GPKG")
     rows = []
+    node_obc_id = {
+        int(node): int(obc_id)
+        for obc_id, chain in enumerate(nodes.open_boundaries or [])
+        for node in chain.node_indices
+    }
     for chain_id, chain in enumerate(nodes.constraint_chains):
         for position, node in enumerate(chain):
             lon, lat = nodes.lonlat[node]
-            target = 2500.0 if nodes.kinds[node] == "open" else 700.0
             rows.append(
                 {
                     "node_index_zero_based": int(node),
                     "chain_id": int(chain_id),
                     "chain_position": int(position),
                     "boundary_kind": nodes.kinds[node],
-                    "target_spacing_m": target,
-                    "is_hard_anchor": False,
+                    "target_spacing_m": float(spacing_m),
+                    "is_hard_anchor": bool(nodes.hard_anchor_mask[node]),
+                    "obc_id": node_obc_id.get(int(node)),
                     "geometry": Point(float(lon), float(lat)),
                 }
             )
     gpd.GeoDataFrame(rows, crs="EPSG:4326").to_file(gpkg, layer="boundary_nodes", driver="GPKG")
-    manifest = root / "boundary_resolution_manifest.json"
+    manifest = root / f"boundary_resolution_manifest_{suffix}.json"
     manifest.write_text(
         json.dumps(
             {
-                "schema_version": "fvcom_boundary_resolution_manifest_v1",
-                "profile": "adaptive-coastal-v1",
+                "schema_version": (
+                    "fvcom_boundary_resolution_manifest_v2"
+                    if profile == "adaptive-coastal-v2"
+                    else "fvcom_boundary_resolution_manifest_v1"
+                ),
+                "profile": profile,
                 "final_status": "pass",
+                "failure_taxonomy": [],
                 "inputs": {"model_boundary_loops_gpkg": str(loops)},
                 "outputs": {"boundary_resolution_gpkg": str(gpkg)},
+                "qa": {
+                    "expected_obc_count": 1,
+                    "delivered_obc_count": 1,
+                },
+                "open_boundary_chains": (
+                    [
+                        {
+                            "obc_id": int(obc_id),
+                            "is_closed": bool(chain.cyclic),
+                            "node_sequence_zero_based": [
+                                int(value) for value in chain.node_indices
+                            ],
+                        }
+                        for obc_id, chain in enumerate(nodes.open_boundaries or [])
+                    ]
+                    if profile == "adaptive-coastal-v2"
+                    else []
+                ),
             },
             indent=2,
         ),
@@ -661,6 +706,7 @@ def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         gpkg = _synthetic_boundary_package(root / "loops.gpkg")
+        resolution = _synthetic_resolution_package(root, gpkg)
         bathy = write_synthetic_bathymetry(root / "bathy.nc", (-75.11, 38.99, -74.89, 39.17), nx=45, ny=45)
         manifest = run_fvcom_grid(
             root / "run",
@@ -674,6 +720,7 @@ def test_full_synthetic_workflow_and_2dm_roundtrip() -> None:
                 smooth_iterations=2,
             ),
             boundary_loops_gpkg=gpkg,
+            boundary_resolution_manifest=resolution,
             bathy_nc=bathy,
         )
         outputs = manifest["outputs"]
@@ -779,6 +826,7 @@ def test_full_synthetic_systematic_v6_workflow() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         gpkg = _simple_synthetic_boundary_package(root / "loops.gpkg")
+        resolution = _synthetic_resolution_package(root, gpkg, spacing_m=10_000.0)
         bathy = write_synthetic_bathymetry(
             root / "bathy.nc",
             (-75.11, 38.99, -74.89, 39.17),
@@ -810,6 +858,7 @@ def test_full_synthetic_systematic_v6_workflow() -> None:
                 systematic_v6_passage_removal=False,
             ),
             boundary_loops_gpkg=gpkg,
+            boundary_resolution_manifest=resolution,
             bathy_nc=bathy,
         )
         conditioning = manifest["mesh"]["conditioning"]
@@ -849,7 +898,7 @@ def test_adaptive_resolution_workflow_and_quadtree_seed() -> None:
         resolution = _synthetic_resolution_package(root, loops)
         package, nodes, document = load_boundary_resolution(resolution)
         assert nodes.adaptive_resolution is True
-        assert document["profile"] == "adaptive-coastal-v1"
+        assert document["profile"] == "adaptive-coastal-v2"
         bathy = write_synthetic_bathymetry(root / "bathy.nc", (-75.11, 38.99, -74.89, 39.17), nx=45, ny=45)
         manifest = run_fvcom_grid(
             root / "run",
@@ -861,7 +910,6 @@ def test_adaptive_resolution_workflow_and_quadtree_seed() -> None:
                 max_interior_points=5000,
                 refine_iterations=1,
                 smooth_iterations=1,
-                boundary_resolution_profile="adaptive-coastal-v1",
                 postprocess_profile="none",
             ),
             boundary_loops_gpkg=loops,
@@ -890,6 +938,33 @@ def test_adaptive_resolution_workflow_and_quadtree_seed() -> None:
         assert manifest["quality"]["constraint_integrity"]["all_protected_edges_present"] is True
         assert manifest["postprocess"]["enabled"] is False
         assert read_2dm(manifest["outputs"]["fvcom_grid_2dm"]).triangles.size > 0
+
+
+def test_archived_v1_resolution_is_readable_but_not_generatable() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        loops = _synthetic_boundary_package(root / "loops.gpkg")
+        archived = _synthetic_resolution_package(
+            root,
+            loops,
+            profile="adaptive-coastal-v1",
+        )
+        _package, nodes, document = load_boundary_resolution(archived)
+        assert nodes.adaptive_resolution is True
+        assert document["profile"] == "adaptive-coastal-v1"
+        try:
+            run_fvcom_grid(
+                root / "rejected_generation",
+                "archived_v1",
+                config=GridConfig(boundary_resolution_profile="adaptive-coastal-v1"),
+                boundary_loops_gpkg=loops,
+                boundary_resolution_manifest=archived,
+                bathy_nc=root / "unused.nc",
+            )
+        except ValueError as exc:
+            assert "must be adaptive-coastal-v2" in str(exc)
+        else:
+            raise AssertionError("new grid generation accepted removed Adaptive v1")
 
 
 def test_manifest_output_resolution_is_cwd_independent() -> None:
@@ -960,6 +1035,7 @@ def main() -> int:
     test_full_synthetic_workflow_and_2dm_roundtrip()
     test_full_synthetic_systematic_v6_workflow()
     test_adaptive_resolution_workflow_and_quadtree_seed()
+    test_archived_v1_resolution_is_readable_but_not_generatable()
     test_q_l3_sigma_target_is_regional_refinement_debt()
     print("fvcom-grid-generation selftests passed")
     return 0

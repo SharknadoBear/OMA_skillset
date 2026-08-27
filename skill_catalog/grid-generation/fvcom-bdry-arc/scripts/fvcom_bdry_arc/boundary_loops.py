@@ -60,7 +60,8 @@ def build_model_boundary_loops(
     if coast_gdf.empty:
         coast_gdf = _read_layer(bdry_arc_gpkg, "coastline_raw")
 
-    open_xy = _line_union_xy(open_gdf, projection)
+    open_records_xy = _open_records_xy(open_gdf, projection)
+    open_xy = unary_union([item["geometry"] for item in open_records_xy]) if open_records_xy else GeometryCollection()
     land_xy = _line_union_xy(land_gdf, projection)
     frame_xy = _line_union_xy(frame_gdf, projection)
     land_patch_xy = _line_union_xy(land_patch_gdf, projection)
@@ -135,7 +136,7 @@ def build_model_boundary_loops(
         segments_xy,
         island_polygons_xy,
         island_lines_xy,
-        open_xy,
+        open_records_xy,
         projection,
         final_status,
     )
@@ -183,6 +184,10 @@ def build_model_boundary_loops(
             "unintended_frame_clip_fraction": float(unintended_frame_clip_fraction),
             "intended_exterior_coverage_fraction": float(intended_exterior_coverage_fraction),
             "open_boundary_length_m": float(class_lengths.get("open_boundary", 0.0)),
+            "expected_obc_count": int(
+                source_manifest.get("settings", {}).get("expected_obc_count", len(open_records_xy))
+            ),
+            "delivered_obc_count": int(len(open_records_xy)),
             "unclassified_outer_boundary_length_m": float(class_lengths.get("unclassified_outer_boundary", 0.0)),
             "island_count": int(len(island_polygons_xy)),
             "largest_island_area_m2": float(max((poly.area for poly in island_polygons_xy), default=0.0)),
@@ -212,6 +217,18 @@ def build_model_boundary_loops(
             "discarded_source_open_arc_length_m": source_manifest.get("wet_domain", {}).get(
                 "discarded_source_open_arc_length_m"
             ),
+            "expected_obc_count": int(
+                source_manifest.get("settings", {}).get("expected_obc_count", len(open_records_xy))
+            ),
+            "delivered_obc_count": int(len(open_records_xy)),
+            "obc_chains": [
+                {
+                    "obc_id": int(item["obc_id"]),
+                    "is_closed": bool(item["is_closed"]),
+                    "length_m": float(item["geometry"].length),
+                }
+                for item in open_records_xy
+            ],
         },
         "outputs": {
             **outputs,
@@ -265,6 +282,33 @@ def _line_union_xy(gdf: gpd.GeoDataFrame, projection):
             continue
         lines.append(xy)
     return unary_union(lines) if lines else GeometryCollection()
+
+
+def _open_records_xy(gdf: gpd.GeoDataFrame, projection) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if gdf.empty:
+        return records
+    ordered = gdf.sort_values("obc_id") if "obc_id" in gdf.columns else gdf
+    next_id = 0
+    for _, row in ordered.iterrows():
+        geom = row.geometry
+        parts = list(geom.geoms) if hasattr(geom, "geoms") else [geom]
+        base_id = int(row.obc_id) if "obc_id" in ordered.columns else next_id
+        for offset, part in enumerate(parts):
+            if not isinstance(part, LineString) or part.is_empty:
+                continue
+            records.append(
+                {
+                    "obc_id": int(base_id + offset),
+                    "is_closed": bool(part.is_ring),
+                    "geometry": project_geometry(part, projection),
+                }
+            )
+        next_id = max(next_id, base_id + max(1, len(parts)))
+    records.sort(key=lambda item: int(item["obc_id"]))
+    for obc_id, item in enumerate(records):
+        item["obc_id"] = int(obc_id)
+    return records
 
 
 def _classify_exterior_segments(
@@ -344,7 +388,7 @@ def _build_layers(
     segments_xy: list[dict[str, Any]],
     island_polygons_xy: list[Polygon],
     island_lines_xy: list[LineString],
-    open_xy,
+    open_records_xy: list[dict[str, Any]],
     projection,
     final_status: str,
 ) -> dict[str, gpd.GeoDataFrame]:
@@ -386,8 +430,8 @@ def _build_layers(
         }
         for idx, line in enumerate(island_lines_xy)
     ]
-    delivered_open = _geometry_gdf(open_xy, projection, "delivered_open_boundary_arc")
-    source_open = _geometry_gdf(open_xy, projection, "source_open_boundary_arc")
+    delivered_open = _open_geometry_gdf(open_records_xy, projection, "delivered_open_boundary_arc")
+    source_open = _open_geometry_gdf(open_records_xy, projection, "source_open_boundary_arc")
     if island_poly_records:
         island_polygons = gpd.GeoDataFrame(island_poly_records, geometry="geometry", crs="EPSG:4326")
     else:
@@ -423,6 +467,25 @@ def _geometry_gdf(geom, projection, segment_class: str) -> gpd.GeoDataFrame:
         {"segment_class": segment_class, "geometry": unproject_geometry(part, projection)}
         for part in parts
         if part is not None and not part.is_empty
+    ]
+    return gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
+
+
+def _open_geometry_gdf(records_xy: list[dict[str, Any]], projection, segment_class: str) -> gpd.GeoDataFrame:
+    if not records_xy:
+        return gpd.GeoDataFrame(
+            {"segment_class": [], "obc_id": [], "is_closed": []},
+            geometry=[],
+            crs="EPSG:4326",
+        )
+    records = [
+        {
+            "segment_class": segment_class,
+            "obc_id": int(item["obc_id"]),
+            "is_closed": bool(item["is_closed"]),
+            "geometry": unproject_geometry(item["geometry"], projection),
+        }
+        for item in records_xy
     ]
     return gpd.GeoDataFrame(records, geometry="geometry", crs="EPSG:4326")
 

@@ -88,7 +88,7 @@ class GridConfig:
     bathy_fetch_halo_m: float = 2000.0
     progress_interval_s: float = 10.0
     size_field_max_cells: int = 1_500_000
-    boundary_resolution_profile: str = "legacy"
+    boundary_resolution_profile: str = "adaptive-coastal-v2"
     regional_spring_relaxation: bool = True
     spring_relax_iterations: int = 20
     spring_relax_quality_threshold: float = 0.40
@@ -152,8 +152,8 @@ def run_fvcom_grid(
     config = config or GridConfig()
     if str(config.postprocess_profile) != "none":
         raise ValueError("Integrated post-generation cleanup is disabled; run postprocess_fvcom_mesh.py explicitly on the finished .2dm")
-    if config.boundary_resolution_profile not in {"legacy", "adaptive-coastal-v1", "adaptive-coastal-v2"}:
-        raise ValueError("boundary_resolution_profile must be legacy, adaptive-coastal-v1, or adaptive-coastal-v2")
+    if config.boundary_resolution_profile != "adaptive-coastal-v2":
+        raise ValueError("boundary_resolution_profile must be adaptive-coastal-v2")
     if not np.isfinite(float(config.gradation)) or float(config.gradation) < 0.0:
         raise ValueError("gradation must be nonnegative")
     if not np.isfinite(float(config.slope_elements)) or float(config.slope_elements) <= 0.0:
@@ -248,23 +248,20 @@ def run_fvcom_grid(
                 "strict open-exterior contract failed: "
                 + ", ".join(open_exterior_audit["failure_taxonomy"])
             )
-    if config.boundary_resolution_profile in {"adaptive-coastal-v1", "adaptive-coastal-v2"} and not boundary_resolution_manifest:
+    if not boundary_resolution_manifest:
         raise ValueError(
-            f"{config.boundary_resolution_profile} requires --boundary-resolution-manifest or an upstream adaptive boundary run"
+            "adaptive-coastal-v2 requires --boundary-resolution-manifest or an upstream boundary run"
         )
 
     if boundary_resolution_manifest:
         progress.update("load_boundary_resolution", 18.0, message="Loading explicit adaptive boundary chains.", artifact=boundary_resolution_manifest)
         boundary_package, boundary_nodes, resolution_doc = load_boundary_resolution(boundary_resolution_manifest)
-        if config.boundary_resolution_profile != "legacy" and resolution_doc.get("profile") != config.boundary_resolution_profile:
+        if resolution_doc.get("profile") != config.boundary_resolution_profile:
             raise ValueError(
                 "Requested boundary-resolution profile does not match the supplied manifest: "
                 f"{config.boundary_resolution_profile} != {resolution_doc.get('profile')}"
             )
-        if (
-            config.boundary_resolution_profile == "adaptive-coastal-v2"
-            and str(resolution_doc.get("final_status", "needs_review")) != "pass"
-        ):
+        if str(resolution_doc.get("final_status", "needs_review")) != "pass":
             failures = list(resolution_doc.get("failure_taxonomy", []))
             raise ValueError(
                 "adaptive-coastal-v2 boundary package requires scientific review before gridding: "
@@ -282,22 +279,27 @@ def run_fvcom_grid(
     boundary_nodes_path = run_dir / "boundary_nodes.geojson"
     boundary_nodes_path.write_text(json.dumps(boundary_nodes_geojson(boundary_nodes), indent=2), encoding="utf-8")
     boundary_contract_path = None
-    if config.boundary_resolution_profile == "adaptive-coastal-v2":
-        boundary_contract = evaluate_boundary_contract_v2(boundary_nodes, gradation=float(config.gradation))
-        boundary_contract_path = run_dir / "boundary_contract_v2.json"
-        boundary_contract_path.write_text(json.dumps(_json_safe(boundary_contract), indent=2), encoding="utf-8")
-        progress.update(
-            "boundary_contract_v2",
-            24.0,
-            message="Auditing adaptive-v2 anchors, spacing, and gradation before bathymetry work.",
-            artifact=boundary_contract_path,
-            extra={"passed": bool(boundary_contract["passed"]), "failures": boundary_contract["failure_taxonomy"]},
+    boundary_contract = evaluate_boundary_contract_v2(
+        boundary_nodes,
+        gradation=float(config.gradation),
+        expected_open_boundary_count=int(
+            (resolution_doc or {}).get("qa", {}).get("expected_obc_count", 1)
+        ),
+    )
+    boundary_contract_path = run_dir / "boundary_contract_v2.json"
+    boundary_contract_path.write_text(json.dumps(_json_safe(boundary_contract), indent=2), encoding="utf-8")
+    progress.update(
+        "boundary_contract_v2",
+        24.0,
+        message="Auditing adaptive-v2 anchors, spacing, gradation, and per-OBC chains before bathymetry work.",
+        artifact=boundary_contract_path,
+        extra={"passed": bool(boundary_contract["passed"]), "failures": boundary_contract["failure_taxonomy"]},
+    )
+    if not boundary_contract["passed"]:
+        raise ValueError(
+            "adaptive-coastal-v2 boundary contract failed: "
+            + ", ".join(boundary_contract["failure_taxonomy"])
         )
-        if not boundary_contract["passed"]:
-            raise ValueError(
-                "adaptive-coastal-v2 boundary contract failed: "
-                + ", ".join(boundary_contract["failure_taxonomy"])
-            )
 
     progress.update("load_bathymetry", 28.0, message="Loading positive-down bathymetry grid.", artifact=bathy_nc)
     bathy = load_bathymetry(bathy_nc)
@@ -371,7 +373,7 @@ def run_fvcom_grid(
     )
     boundary_front_count = int(boundary_front_report.get("accepted_count", 0))
     estimated_total = int(interior_estimate + len(boundary_nodes.xy) + boundary_front_count)
-    enforce_node_budget = config.boundary_resolution_profile == "adaptive-coastal-v2"
+    enforce_node_budget = True
     node_budget = {
         "schema_version": "fvcom_node_budget_preflight_v3",
         "size_field_schema_version": str(
@@ -980,8 +982,6 @@ def _resolve_upstream_artifacts(
                 str(max(land_spacing, 250.0)),
                 "--gshhs-resolution",
                 "f",
-                "--boundary-resolution-profile",
-                str(config.boundary_resolution_profile),
             ],
             progress=progress,
             stage="run_bdry_arc",
@@ -990,8 +990,8 @@ def _resolve_upstream_artifacts(
     bdry_doc = json.loads(Path(bdry_arc_manifest).read_text(encoding="utf-8-sig"))
     boundary_loops_gpkg = Path(boundary_loops_gpkg or bdry_doc["outputs"]["model_boundary_loops_gpkg"])
     boundary_resolution_manifest = boundary_resolution_manifest or bdry_doc.get("outputs", {}).get("boundary_resolution_manifest")
-    if config.boundary_resolution_profile in {"adaptive-coastal-v1", "adaptive-coastal-v2"} and not boundary_resolution_manifest:
-        raise ValueError(f"{config.boundary_resolution_profile} requires a passing boundary_resolution_manifest")
+    if not boundary_resolution_manifest:
+        raise ValueError("adaptive-coastal-v2 requires a passing boundary_resolution_manifest")
 
     if bathy_nc is None:
         bathy_info = _fetch_bathy_sources(cudem_skill, Path(boundary_loops_gpkg), bathy_dir, name, config, progress)

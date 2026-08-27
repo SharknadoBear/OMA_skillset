@@ -60,9 +60,11 @@ The installed `cusp-coastline` skill writes useful EPSG:4326 `LineString` and `M
 
 For Delaware River / Delaware Bay cases, use GSHHS land polygons to make Delaware/Chesapeake separation a land/topology question rather than a fragmented-line connectivity question. The seed should be in the intended Delaware wet component; CUSP should not decide broad-region connectivity in this workflow.
 
-## Adaptive Coastal Resolution Contract
+## Mandatory Adaptive v2 Topology Foundation
 
-Keep the legacy boundary workflow unchanged unless `adaptive-coastal-v1` is explicit. Write adaptive products separately from legacy layers.
+Adaptive v2 is the sole active boundary-resolution workflow. Preserve the core
+arc/model-loop artifacts as source evidence and write the resolved products
+separately; they are v2 foundations, not selectable legacy/v1 profiles.
 
 Use dimensionless shape and mesh-relative measures rather than raw perimeter/area alone: equivalent diameter, compactness, normalized complexity, minimum-rectangle width and aspect, solidity, and nearest wet gap divided by local target spacing.
 
@@ -70,10 +72,25 @@ Protect mission-region islands and gaps. Preserve protected polygon geometry exa
 
 Repair a coastal OBC against GSHHS land with fixed anchors before assigning nodes. Grade target spacing by arclength and build one continuous chain rather than sampling each source segment independently. Split a graded interval when its chord deviates from the repaired polyline by more than ten percent of local target size. Validate anchor equality, land avoidance for repaired and sampled paths, measured exterior overlap, chain order, and local `L/h` before downstream meshing.
 
-Carry the exact delivered OBC and landfall lineage into adaptive processing. Resolution-scaled proximity classification may label the model exterior for maps and audits, but it must never expand the adaptive OBC or restore discarded source/coastal tails. Derive the adaptive landward chain as the complementary exterior interval between the exact delivered landfalls.
+Carry every exact delivered OBC and its `obc_id`/landfall lineage into v2.
+Resolution-scaled proximity classification may label the model exterior for
+maps and audits, but it must never expand an OBC or restore discarded
+source/coastal tails. Derive each intervening landward chain as the
+complementary exterior interval between exact delivered chains, preserving one
+continuous exterior polygon ring.
 
-## Adaptive Coastal V2 Prevention Extension
+For a closed island/archipelago OBC, do not use landfall repair. Require the
+delivered loop to equal the exterior, unwrap it in the minimum-span longitude
+frame, rotate it to the minimum projected-x seam (projected y then source order
+as tie-breakers), and add the half-perimeter balance anchor. The loop must have
+zero landfall anchors and remain land-free.
 
-The v2 sampler is an opt-in clean-room extension; it does not change legacy or v1 behavior. Preserve both coastline/OBC landfalls as explicit hard anchors. Detect additional sharp-turn and spit-tip anchors from local and wider-scale turn evidence, suppress nearby duplicate candidates, and equidistribute `integral(ds/h)` independently between retained anchors.
+## Adaptive v2 Anchors and Passage Prevention
 
-Use the same target spacing on both sides of each land/OBC junction and grade toward the land-boundary target. Inventory only conservative connectors whose interiors are covered by the accepted wet domain and whose bank tangents are compatible. A passage may lower targets on both banks, but this boundary-stage tool must not close the passage. By default, derive the permitted minimum passage spacing from the minimum protected passage width divided by the protected element count; record the controlling passage and apply the resulting targets locally on both banks. Do not substitute a fixed regional spacing floor. If an explicit user floor makes a protected passage unresolved, retain the geometry and mark it as a hard review gate. Always preserve downstream node-budget and serialization gates because an exceptionally narrow protected passage can imply expensive local refinement.
+For each coastal `obc_id`, preserve both coastline/OBC landfalls as explicit
+hard anchors. Detect additional sharp-turn and spit-tip anchors from local and
+wider-scale turn evidence, suppress nearby duplicate candidates, and
+equidistribute `integral(ds/h)` independently between retained anchors. Never
+concatenate separate OBCs.
+
+Use the same target spacing on both sides of each land/OBC junction and grade toward the land-boundary target. Inventory only conservative connectors whose interiors are covered by the accepted wet domain and whose bank tangents are compatible. A passage may lower targets on both banks, but this boundary-stage tool must not close the passage. Derive the permitted minimum passage spacing from the minimum protected passage width divided by the protected element count; record the controlling passage and apply the targets locally on both banks. Do not substitute a fixed regional spacing floor. If an explicit user floor makes a protected passage unresolved, retain the geometry and mark it as a hard review gate. Always preserve downstream node-budget and serialization gates because an exceptionally narrow protected passage can imply expensive local refinement.

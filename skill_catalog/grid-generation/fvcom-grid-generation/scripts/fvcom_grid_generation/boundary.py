@@ -218,6 +218,12 @@ def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage
     )
     nodes_gdf = gpd.read_file(gpkg, layer="boundary_nodes").to_crs("EPSG:4326")
     nodes_gdf = nodes_gdf.sort_values(["chain_id", "chain_position"]).reset_index(drop=True)
+    source_node_to_loaded = {
+        int(source): int(loaded)
+        for loaded, source in enumerate(
+            nodes_gdf.get("node_index_zero_based", np.arange(len(nodes_gdf)))
+        )
+    }
     lonlat = np.asarray([[float(point.x), float(point.y)] for point in nodes_gdf.geometry], dtype=float)
     xy = project_points(lonlat, projection)
     kinds = [str(value) for value in nodes_gdf["boundary_kind"]]
@@ -261,6 +267,13 @@ def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage
         chains.append([int(value) for value in group.index])
     exterior = chains[0] if chains else []
     open_indices = [idx for idx in exterior if kinds[idx] == "open"]
+    open_boundaries = _manifest_open_boundary_chains(
+        manifest,
+        source_node_to_loaded,
+        kinds,
+    )
+    if not open_boundaries:
+        open_boundaries = _open_boundary_chains(exterior, kinds)
     domain_xy = project_geometry(domain, projection).buffer(0)
     islands_xy = [project_geometry(poly, projection).buffer(0) for poly in islands]
     nodes = BoundaryNodes(
@@ -282,7 +295,7 @@ def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage
         resolution_profile=profile,
         metadata=metadata,
         passage_diagnostics=passage_diagnostics,
-        open_boundaries=_open_boundary_chains(exterior, kinds),
+        open_boundaries=open_boundaries,
     )
     return package, nodes, manifest
 
@@ -535,6 +548,40 @@ def _open_boundary_chains(exterior: list[int], kinds: list[str]) -> list[OpenBou
         )
         for index, run in enumerate(runs, start=1)
     ]
+
+
+def _manifest_open_boundary_chains(
+    manifest: dict[str, Any],
+    source_node_to_loaded: dict[int, int],
+    kinds: list[str],
+) -> list[OpenBoundaryChain]:
+    """Consume v2's authoritative per-OBC node sequences without concatenation."""
+    records = manifest.get("open_boundary_chains") or []
+    output: list[OpenBoundaryChain] = []
+    for record in sorted(records, key=lambda item: int(item.get("obc_id", 0))):
+        obc_id = int(record.get("obc_id", len(output)))
+        source_values = [int(value) for value in record.get("node_sequence_zero_based", [])]
+        try:
+            values = tuple(source_node_to_loaded[value] for value in source_values)
+        except KeyError as exc:
+            raise ValueError(
+                f"Boundary resolution OBC {obc_id} references a missing boundary node: {exc.args[0]}"
+            ) from exc
+        if not values or any(str(kinds[value]).lower() != "open" for value in values):
+            raise ValueError(f"Boundary resolution OBC {obc_id} has an invalid node sequence")
+        cyclic = bool(record.get("is_closed", False))
+        if cyclic and len(values) > 1 and values[0] == values[-1]:
+            values = values[:-1]
+        output.append(
+            OpenBoundaryChain(
+                chain_id=f"obc_{obc_id:03d}",
+                node_indices=values,
+                kind="cyclic_offshore" if cyclic else "exchange",
+                cyclic=cyclic,
+                orientation="source",
+            )
+        )
+    return output
 
 
 def _sample_segment(seg: LineString, spacing: float, include_end: bool) -> list[tuple[float, float]]:

@@ -10,7 +10,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fvcom_bdry_arc import BoundaryResolutionConfig, analyze_boundary_resolution  # noqa: E402
+from fvcom_bdry_arc import analyze_boundary_resolution, boundary_resolution_config  # noqa: E402
 
 
 def main() -> int:
@@ -22,7 +22,7 @@ def main() -> int:
     report = analyze_boundary_resolution(
         args.model_boundary_loops_gpkg,
         region_bpoly_json=args.region_bpoly_json,
-        config=BoundaryResolutionConfig(),
+        config=boundary_resolution_config(),
     )
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)

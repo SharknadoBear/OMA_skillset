@@ -1,6 +1,6 @@
 ---
 name: fvcom-grid-generation
-description: Generate benchmark-ready SMS 2DM meshes from legacy or adaptive fvcom-bdry-arc packages and CUDEM/NBS/CRM/ETOPO bathymetry using deterministic Gmsh Frontal-Delaunay algorithm 6 by operational default, a generator-neutral mesh-intent contract, geometry-derived sizing, topology-priority conditioning, standardized project delivery, and FVCOM QA. Use when Codex needs explicit boundary-chain ingestion, adaptive nearshore-to-offshore size fields, controlled mesher bakeoffs, variable-density seeding, initial no-conditioning mesh smoke tests, ordered OBC nodestrings, boundary-aware thin-triangle repair, hard valence/superthin closure, regional-refinement debt, or FVCOM grid-project publication.
+description: Generate benchmark-ready SMS 2DM meshes from mandatory Adaptive v2 fvcom-bdry-arc packages and CUDEM/NBS/CRM/ETOPO bathymetry using deterministic Gmsh Frontal-Delaunay algorithm 6 by operational default, exact per-OBC chain ingestion, a generator-neutral mesh-intent contract, geometry-derived sizing, topology-priority conditioning, standardized project delivery, and FVCOM QA. Archived legacy/v1 products remain readable but cannot generate new grids.
 ---
 
 # fvcom-grid-generation
@@ -14,9 +14,9 @@ fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> fvcom-grid-generation
 ## Core Rules
 
 - Reuse upstream domain and boundary artifacts; do not redesign the region here.
-- Prefer an adaptive boundary-resolution manifest when supplied. Otherwise preserve the legacy loop workflow.
+- Require a passing `adaptive-coastal-v2` boundary-resolution manifest for every new grid. Consume its exact per-`obc_id` node sequences without concatenation. Archived legacy/v1 packages remain readable only for provenance and inspection; never use them to generate a new mesh.
 - Use deterministic Gmsh Frontal-Delaunay algorithm 6 for every new operational/full-project raw mesh: one thread, seed 1, first-order triangles, eight native smoothing steps, and no algorithm fallback. The default portfolio executes only this candidate. Keep Gmsh 1/5 and clean-room SciPy-Delaunay available only when explicitly requested as research controls; never silently substitute them after a Gmsh-6 failure.
-- Revalidate active `fvcom_open_exterior_contract_v1|v2` evidence at every coastal entry point. Standardized coastal projects use v2 when residual roles are enabled. Treat approved lagoon closures as fixed solid boundary, require station evidence and requested-count permission for secondary tidal OBCs, and reject unassigned water, missing or stale decisions/maps, invalid physical landfalls or topology, report-only packages, or `downstream_eligible=false` even when an upstream manifest says `pass`. Historical v3 evidence is unsupported and must be rejected.
+- Revalidate the active `fvcom_open_exterior_contract_v2` evidence at every coastal entry point. Treat approved lagoon closures as fixed solid boundary, require station evidence and requested-count permission for secondary tidal OBCs, and reject unassigned water, missing or stale decisions/maps, invalid physical landfalls or topology, report-only packages, or `downstream_eligible=false` even when an upstream manifest says `pass`. Archived v1 is inspection-only and historical v3 is unsupported.
 - Revalidate `fvcom_coastline_source_coverage_v1` with every coastal open-exterior contract. Require at least 2x centered coverage, a physical-coastline-only landfall lineage, zero source-frame dependency, and current whole/zoom map hashes. Historical exact-bbox evidence remains readable but is ineligible for new standardized projects without this proof.
 - Keep full bathymetry for final node sampling and bound only the in-memory size-field grid.
 - For automatic acquisition, derive the bathymetry request bbox from the
@@ -52,13 +52,13 @@ See `references/grid_project_contract.md` for the fixed layout, canonical artifa
 Adaptive package:
 
 ```powershell
-python scripts/run_fvcom_grid.py --bdry-arc-manifest bdry_arc_manifest.json --boundary-loops-gpkg model_boundary_loops.gpkg --boundary-resolution-manifest boundary_resolution_manifest.json --boundary-resolution-profile adaptive-coastal-v2 --bathy-nc bathy.nc --run-dir runs/case --name case --mode test --postprocess-profile none
+python scripts/run_fvcom_grid.py --bdry-arc-manifest bdry_arc_manifest.json --boundary-loops-gpkg model_boundary_loops.gpkg --boundary-resolution-manifest boundary_resolution_manifest.json --bathy-nc bathy.nc --run-dir runs/case --name case --mode test --postprocess-profile none
 ```
 
 Use this command only for test-mode mesh-intent/smoke evidence. Full clean-room
 execution requires the explicit `--allow-clean-room-execute` research override
-and is ineligible for standardized operational publication. Legacy packages
-continue to use `--boundary-loops-gpkg` without a resolution manifest.
+and is ineligible for standardized operational publication. A new grid without
+a passing v2 resolution manifest is rejected.
 
 ## Research Mesher Portfolio
 
@@ -150,8 +150,8 @@ parallel-execution, and promotion rules.
 
 Important controls:
 
-- `--boundary-resolution-profile legacy|adaptive-coastal-v1|adaptive-coastal-v2`, default `legacy`. V2 is opt-in and requires an upstream `pass` manifest before gridding.
-- `--boundary-resolution-manifest`, optional; explicit nodes and chains take precedence over legacy densification.
+- `--boundary-resolution-profile adaptive-coastal-v2`, default `adaptive-coastal-v2`. This is a deprecated compatibility selector; removed values are rejected and normal commands omit it.
+- `--boundary-resolution-manifest`, required for new generation; its explicit per-OBC nodes and chains are authoritative.
 - `--gradation`, default `0.20` in the production generator and `0.10` in `run_mesher_portfolio_case.py`; limits adjacent size growth after all candidates are combined.
 - `--slope-elements 10` and `--coastal-distance-m 25000` control the nearshore bathymetric-slope candidate.
 - `--hydraulic-elements-across-min 3` and `--hydraulic-elements-across-max 8` set the paired-bank cross-corridor element range. Importance increases the requested count continuously between those limits.
@@ -159,15 +159,15 @@ Important controls:
 - `--hydraulic-longitudinal-gradation 0.10` limits size change along the accepted skeleton.
 - `--obc-hold-distance-m 10000` holds the propagated OBC target over the first wet-domain reach. `--obc-transition-distance-m 60000` sets the minimum following quintic log-space transfer length; the workflow extends it to the gradation-required distance when necessary and records the requested, required, effective, and available distances.
 - `--refine-iterations` controls adaptive insertion and `--smooth-iterations` controls the initial, fixed-boundary geometric smoothing that is part of mesh construction. These are distinct from the post-generation conditioning stages below.
-- `--regional-spring-relaxation|--no-regional-spring-relaxation`; `minimal-topology-v1` disables this stage. Explicit legacy profiles retain their prior behavior.
-- `--thin-triangle-repair|--no-thin-triangle-repair`; `minimal-topology-v1` uses only its bounded fixed-boundary topology repair. These switches retain their legacy meaning for explicit legacy profiles.
+- `--regional-spring-relaxation|--no-regional-spring-relaxation`; `minimal-topology-v1` disables this stage. Explicit mesh-conditioning research profiles retain their documented behavior.
+- `--thin-triangle-repair|--no-thin-triangle-repair`; `minimal-topology-v1` uses only its bounded fixed-boundary topology repair. These switches retain their documented meaning for explicit mesh-conditioning research profiles.
 - `--thin-repair-profile guarded-v1|systematic-v2|systematic-v3|systematic-v5|systematic-v6|none`, default `guarded-v1`; `systematic-v2` keeps boundary coordinates fixed, opt-in `systematic-v3` adds source-arc-only welding/sliding/redistribution, research-only `systematic-v5` couples persistent connectivity restriction and complete locked-star reconstruction to fixed-connectivity interaction bursts, and research-only `systematic-v6` adds coupled valence closure plus exact-zero relaxation entry.
 - `--systematic-v3-obc-policy preserve|redistribute`, default `redistribute`; redistribution preserves OBC orientation and hard endpoints but may change its node set, which invalidates existing forcing and is recorded in `obc_remap_manifest.json`.
 - `--systematic-v5-total-iterations`, `--systematic-v5-max-cycles`, `--systematic-v5-max-burst`, `--systematic-v5-thin-trigger`, `--systematic-v5-checkpoint-interval`, and `--systematic-v5-wall-time-s`; defaults are 1,000 iterations, six cycles, 250 iterations per burst, a 25-element thin trigger, 10-iteration checkpoints, and 21,600 seconds. V5 remains opt-in and never changes `auto`.
 - `--systematic-v5-connectivity-restriction|--no-systematic-v5-connectivity-restriction` and `--systematic-v5-max-connectivity-transactions`, default enabled and 32; V5 and V6 use the same lineage-stable allowed-edge policy. Keep the feature research-only until a multi-region full-workflow matrix closes to zero debt under common defaults.
 - `--systematic-v6-gate-policy strict-v6|topology-priority-v1|soft-topology-v1|topology-escrow-v1`, default `strict-v6`; selects one fixed whole-mesh closure policy. The adaptive ladder remains isolated in the research driver and never changes `auto`.
 - `--systematic-v6-passage-removal|--no-systematic-v6-passage-removal`, default disabled; enables an explicitly authorized research-only topology delta. Generic V6 contains no case-specific passage node IDs.
-- `--conditioning-profile auto|minimal-topology-v1|guarded-v1|aggressive-local-v2|none`; `auto` always resolves to `minimal-topology-v1`. Explicit legacy profiles retain their prior behavior.
+- `--conditioning-profile auto|minimal-topology-v1|guarded-v1|aggressive-local-v2|none`; `auto` always resolves to `minimal-topology-v1`. This independent mesh-conditioning selector does not alter the mandatory Adaptive v2 boundary contract.
 - `--minimal-conditioning-wall-time-s`, default 3,600 seconds; bounds the minimal profile per case. The profile also stops after four rounds, zero selected debt, or no accepted improvement.
 - `--aggressive-conditioning-rounds`, `--aggressive-max-prunes-per-round`, and `--aggressive-max-valence-repairs-per-round`; bound repeated local edit/relax transactions.
 - Standalone `repair_high_valence.py` additionally accepts `--max-valence-flip-batch` (default 64), `--max-valence-cluster-merges-per-round` (default 25), `--max-valence-l-over-h-count-increase` (default 0), and repeatable `--only-node-id-1based` targeting. Independent legal flips share one audit; adjacent zipper violations are attempted as one simple interior cavity before sequential single-node work. Keep the (L/h) trade budget at zero unless a documented hard-gate closure justifies it.
@@ -219,7 +219,7 @@ The default `minimal-topology-v1` order after constrained seeding/refinement is:
 3. Repair residual connected superthin debt with protected-edge-safe flips, collapses, or bounded local cavity reconstruction. Never delete a triangle in isolation or remove a wet passage.
 4. Repeat the terminal valence/thin scan for at most four rounds and accept only audited atomic retriangulations. Keep every regional-refinement metric as nonblocking debt. Roll back only structural failure or regression of the ordered valence/superthin debt; serialize every rejected candidate, boundary lineage, quality audit, edit ledger, and rollback manifest. Resample depth from the immutable bathymetry and repeat the complete serialization/quality audit.
 
-The following is the explicit legacy conditioning order used only when a legacy profile is selected:
+The following is the explicit nondefault mesh-conditioning research order. It does not reactivate a removed boundary-resolution profile:
 
 1. Recover all protected land, island, frame, and open-boundary edges.
 2. Apply `spring-relax-v1` once to automatically selected poor-element patches. Keep physical boundary nodes fixed, keep connectivity fixed, and accept only backtracked force steps that preserve positive areas and do not regress controlled quality tails.
