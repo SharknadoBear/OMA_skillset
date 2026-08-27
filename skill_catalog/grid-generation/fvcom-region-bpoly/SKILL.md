@@ -1,6 +1,6 @@
 ---
 name: fvcom-region-bpoly
-description: Create and geometrically adjust map-guided, feature-first four-sided RegionBPoly mission envelopes for FVCOM preprocessing, with a strict hash-bound visual gate that detects and repairs coastal land-side waterway truncation before delivery.
+description: Create and geometrically adjust map-guided, feature-first four-sided RegionBPoly mission envelopes for FVCOM preprocessing, using hash-bound coastal review and bounded land-side repair while always returning the latest valid geometry with explicit warnings.
 ---
 
 # FVCOM RegionBPoly
@@ -36,7 +36,7 @@ Delaware land-side visual-gate campaign, use the directory name
 
 Modes:
 
-- `execute` retains the provisional visual evidence until a coastal decision passes, then keeps the delivered JSON, final map, final review JSON, compact review map, and offshore-side artifact.
+- `execute` retains provisional visual evidence through coastal refinement. A clean pass may discard intermediates; a best-effort acceptance retains them with the review warnings.
 - `test` retains all intermediate maps and evidence.
 - `--heuristic-mode auto` resolves to `memory` in execute mode and `unknown` in test mode. `unknown` bypasses catalog geometry but still permits named-place discovery.
 - `--place-discovery auto` is the default. When no catalog or explicit feature geometry exists, make one cached OpenStreetMap Nominatim lookup for the named geographic target, retain its attribution and selected bbox in `region_place_discovery.json`, and use it only as an initial visual seed.
@@ -44,9 +44,9 @@ Modes:
 - `--basemap-provider auto` is the normal map policy. `none/off` requests a real offline coastline, not a blank positive review.
 - A coastal run always forces full land-side review even if fast review was requested.
 
-The primary runner never autonomously marks a coastal candidate `pass`. It writes `final_status: needs_review` and a `region_bpoly_land_side_visual_review_request_v1` binding the exact serialized RegionBPoly, candidate JSON, whole-domain map, and every required side map by SHA-256.
+The primary runner writes the nonterminal state `final_status: review_pending` and a `region_bpoly_land_side_visual_review_request_v1` binding the exact serialized RegionBPoly, candidate JSON, whole-domain map, and every required side map by SHA-256.
 
-Treat that coastal `needs_review` file only as an internal review state, never as the skill's delivered product. Continue through visual finalization and any authorized repairs. If a valid seed cannot be obtained or a blocking review cannot be resolved within the allowed loop, stop with an explicit failure and do not present an unresolved RegionBPoly as a delivery.
+Never end the skill at `review_pending`, `repair_required`, or `needs_review`. Continue through visual finalization and any authorized repairs. Once a valid four-corner geometry exists, the finalizer always returns it as `final_status: pass`: cleanly when the evidence passes, or as an accepted best-effort delivery with explicit warnings when visual evidence is unresolved, stale, unavailable, or still nonpassing after the repair limit. Only failure to obtain usable polygon geometry may stop without a delivery.
 
 Lake and island branches do not use the coastal land-side gate. Unknown named regions must enter place discovery instead of terminating at G1.
 
@@ -73,9 +73,9 @@ python scripts/review_region_bpoly.py --candidate-json runs/case/region_bpoly.js
 
 Use the actual required side indices from the review request; the example indices are illustrative.
 
-The finalizer verifies current hashes, readable map files, usable geographic backgrounds, exact side coverage, required features, mission scope when applicable, and offshore-side selection. Missing, stale, unusable, or incomplete evidence remains `needs_review`.
+The finalizer verifies current hashes, readable map files, usable geographic backgrounds, exact side coverage, required features, mission scope when applicable, and offshore-side selection. Missing, stale, unusable, or incomplete evidence is retained as a nonblocking delivery warning; it never changes a valid final RegionBPoly to `needs_review`.
 
-A coastal candidate is deliverable only when all required land sides pass.
+A clean coastal review passes only when all required land sides pass. If they cannot all pass autonomously, the latest valid geometry is still deliverable as best effort so downstream processing can apply its own physical gates.
 
 ## Repair Loop
 
@@ -107,7 +107,7 @@ python scripts/run_region_bpoly.py --request-text "..." --input-region-json runs
 
 Inside this loop, rotation, global scaling, and free vertex reshape are forbidden. Those operations remain available only for explicit editing outside the truncation loop.
 
-After any expansion, render fresh whole-domain and start/middle/end maps and return to the same visual gate. A nonpass third attempt, a fourth attempt, or an unusable map returns terminal `needs_review`.
+After any expansion, render fresh whole-domain and start/middle/end maps and return to the same visual review. A nonpass third attempt, unusable or stale evidence, or an unresolved judgment ends the repair loop by accepting the latest valid geometry with warnings. A fourth repair attempt remains forbidden.
 
 ## Feature and Map Policy
 
@@ -123,7 +123,7 @@ For every discovery-seeded coastal case, inspect the initial whole-domain map be
 
 Use road-detail maps for small estuaries and topographic context for regional, lake, island-chain, and archipelago cases. Antimeridian domains require a compact longitude display frame assembled from separate native tile/coastline requests on each side of the dateline. The combined background must cover the complete display frame before it is considered geographically usable.
 
-After the strict coastal land-side gate passes, resolved tightness, obstruction, landing, and similar QA findings remain explicit nonblocking diagnostics unless they violate required-feature coverage or valid four-corner geometry.
+After coastal land-side review, tightness, truncation, obstruction, landing, and similar findings remain explicit nonblocking diagnostics. Invalid or absent four-corner geometry remains an execution error because there is no usable object to deliver.
 
 ## Domain Types
 
@@ -150,10 +150,10 @@ Preserve this operational ordering and loop:
 - W7 render initial/candidate evidence
 - W8 write provisional candidate and hash bindings
 - W9 inspect whole-domain and land-side start/middle/end maps
-- G3 land-side truncation gate
+- G3 land-side truncation review
   - expand: W11 apply one authorized `expand_side`, then return to W9 with fresh maps
   - pass: W10 retain resolved QA, then W12 package standardized final evidence and provenance, then W13 terminal delivery
-  - unresolved or attempt limit: terminal `needs_review`
+  - unresolved, unusable evidence, or attempt limit: W10 retain warning QA, then W12 package the latest valid best-effort geometry, then W13 terminal delivery
 
 The five primary tool nodes are:
 
@@ -174,12 +174,12 @@ The standardized root-level files are:
 - `region_bpoly_final_map.png`
 - `offshore_boundary_artifacts.json`
 - `region_bpoly_manifest.json`
-- `region_bpoly_land_side_review.json` and `.png` for coastal domains
+- `region_bpoly_land_side_review.json` for finalized coastal domains, plus `.png` when the source maps were usable enough to compose it
 - `region_place_discovery.json` when catalog/explicit feature geometry was unavailable
 
 Every feature records its purpose, source kind, source key, and geometry status. The manifest records package state, delivery readiness, file sizes, and SHA-256 hashes. This packaging is part of W12 and does not introduce a new gate.
 
-The final coastal JSON retains the review decision, iteration, side evidence, source hashes, and compact-map path. `final_status: pass` is impossible without this evidence. Consumers use the canonical filenames; `<name>_region_bpoly.json` may remain only as a compatibility alias.
+The final coastal JSON retains the review decision, iteration, side evidence, source hashes, validation findings, and compact-map path when available. A clean review records `qa.land_side_visual_gate.status: pass`; a best-effort delivery records `status: warning`. Both use `final_status: pass`. Consumers must treat review status as provenance rather than an intake gate and use the canonical filenames; `<name>_region_bpoly.json` may remain only as a compatibility alias.
 
 ## Validation
 

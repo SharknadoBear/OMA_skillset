@@ -134,7 +134,7 @@ def main() -> None:
         "created_at_utc": utc_now(),
         "iteration": args.iteration,
         "default_iteration_cap": {"max_iterations": 2, "rule": "one proposal, one revision, then final decision unless required ingredients are missing"},
-        "review_status": "needs_review",
+        "review_status": "review_pending",
         "request_path": str(req_path),
         "region_box": region.to_dict(),
         "ingredient_coverage": coverage,

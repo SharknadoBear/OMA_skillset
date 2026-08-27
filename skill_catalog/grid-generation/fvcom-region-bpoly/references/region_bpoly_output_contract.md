@@ -1,8 +1,8 @@
 # RegionBPoly standardized output contract
 
 Use this contract when emitting or consuming a RegionBPoly run directory. The
-contract standardizes packaging and provenance inside W12; it does not add a
-workflow gate or alter coastal review decisions.
+contract standardizes packaging and provenance inside W12; it does not turn
+coastal review uncertainty into a downstream intake gate.
 
 ## Canonical files
 
@@ -16,11 +16,13 @@ Every run that reaches packaging writes these root-level files:
 - `region_bpoly_manifest.json`: package state, readiness, file sizes, and
   SHA-256 hashes.
 
-A passing coastal delivery also requires
-`region_bpoly_land_side_review.json` and
-`region_bpoly_land_side_review.png`. A named-place discovery run additionally
-retains `region_place_discovery.json`. Test mode may retain extra intermediate
-evidence, but those files are not canonical delivery members.
+A finalized coastal delivery also retains
+`region_bpoly_land_side_review.json`. A clean visual pass additionally requires
+`region_bpoly_land_side_review.png`; when source maps are stale or unusable,
+the missing compact map is recorded as a warning rather than blocking the
+usable geometry. A named-place discovery run additionally retains
+`region_place_discovery.json`. Test mode may retain extra intermediate evidence,
+but those files are not canonical delivery members.
 
 The manifest excludes its own hash to avoid recursive hashing. Compatibility
 aliases such as `<name>_region_bpoly.json` may remain, but consumers must use
@@ -47,11 +49,12 @@ remain responsible for acceptance.
 
 `output_package.package_state` and the manifest distinguish:
 
-- `internal_review`: canonical review-state files exist, but the object is not
-  deliverable;
-- `accepted_delivery`: `final_status` is `pass` and every file required for
-  that domain/state exists.
+- `internal_review`: a nonterminal `review_pending` or `repair_required` state;
+- `accepted_delivery`: the latest valid RegionBPoly has been finalized with
+  `final_status: pass`, either cleanly or with explicit review warnings.
 
-`package_complete` reports file completeness for the current state.
-`delivery_ready` is true only for a complete accepted delivery. These are W12
-packaging results, not a new RegionBPoly decision gate.
+`package_complete` reports completeness of the usable geometry package for the
+current state. `delivery_ready` is true for a complete accepted delivery.
+Downstream consumers preserve all review provenance but must not reject usable
+RegionBPoly geometry because of review, package-state, or readiness labels.
+These are W12 packaging results, not a new RegionBPoly decision gate.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -44,7 +45,7 @@ def load(path: Path) -> dict:
     if (
         request
         and doc.get("domain_type") == "coastal"
-        and doc.get("final_status") == "needs_review"
+        and doc.get("final_status") == "review_pending"
         and not doc.get("land_side_visual_review")
     ):
         cmd: list[object] = [
@@ -426,8 +427,8 @@ def main() -> None:
             ]
         )
         provisional = load_raw(exec_dir / "region_bpoly.json")
-        assert provisional["final_status"] == "needs_review"
-        assert provisional["status_reasons"] == ["land_side_visual_review_required"]
+        assert provisional["final_status"] == "review_pending"
+        assert provisional["status_reasons"] == ["land_side_visual_review_pending"]
         assert provisional["land_side_visual_review"] is None
         assert len(provisional["land_side_visual_review_request"]["required_land_side_indices"]) == 3
         final = load(exec_dir / "region_bpoly.json")
@@ -885,7 +886,8 @@ def main() -> None:
         statuses = {idx: ("expand_required" if idx == expand_side else "pass") for idx in required_sides}
         run(review_cmd(repair_path, "revise", statuses))
         reviewed = load_raw(repair_path)
-        assert reviewed["final_status"] == "needs_review"
+        assert reviewed["final_status"] == "repair_required"
+        assert reviewed["output_package"]["delivery_ready"] is False
         assert reviewed["land_side_visual_review"]["next_action"]["side_index"] == expand_side
 
         expand_manifest = run_dir / "expand_side_manifest.json"
@@ -979,14 +981,15 @@ def main() -> None:
         iteration2_path = iteration2_dir / "region_bpoly.json"
         iteration2 = load_raw(iteration2_path)
         assert iteration2["land_side_visual_review_request"]["iteration"] == 2
-        assert iteration2["final_status"] == "needs_review"
+        assert iteration2["final_status"] == "review_pending"
         iteration2_passed = load(iteration2_path)
         assert iteration2_passed["final_status"] == "pass"
         assert iteration2_passed["qa"]["land_side_visual_gate"]["iteration"] == 2
         assert (iteration2_dir / "region_bpoly_land_side_review.json").exists()
         assert (iteration2_dir / "region_bpoly_land_side_review.png").exists()
 
-        # Stale or unusable maps cannot be passed.
+        # Stale or unusable maps cannot earn a clean visual pass, but the
+        # latest valid geometry is still accepted with explicit warnings.
         stale_dir = run_dir / "stale_map_gate"
         run(
             [
@@ -1010,8 +1013,12 @@ def main() -> None:
         stale_statuses = {idx: "pass" for idx in stale_doc["land_side_visual_review_request"]["required_land_side_indices"]}
         whole_map = Path(stale_doc["land_side_visual_review_request"]["whole_domain_map"]["map_path"])
         whole_map.write_bytes(whole_map.read_bytes() + b"stale")
-        run(review_cmd(stale_path, "pass", stale_statuses), expect_ok=False)
-        assert load_raw(stale_path)["final_status"] == "needs_review"
+        run(review_cmd(stale_path, "pass", stale_statuses))
+        stale_result = load_raw(stale_path)
+        assert stale_result["final_status"] == "pass"
+        assert stale_result["qa"]["land_side_visual_gate"]["status"] == "warning"
+        assert stale_result["output_package"]["package_state"] == "accepted_delivery"
+        assert stale_result["output_package"]["delivery_ready"] is True
 
         unusable_dir = run_dir / "unusable_map_gate"
         run(
@@ -1036,21 +1043,34 @@ def main() -> None:
         unusable["land_side_visual_review_request"]["whole_domain_map"]["geography_usable"] = False
         unusable_path.write_text(json.dumps(unusable, indent=2), encoding="utf-8")
         unusable_statuses = {idx: "pass" for idx in unusable["land_side_visual_review_request"]["required_land_side_indices"]}
-        run(review_cmd(unusable_path, "pass", unusable_statuses), expect_ok=False)
-        assert load_raw(unusable_path)["final_status"] == "needs_review"
+        run(review_cmd(unusable_path, "pass", unusable_statuses))
+        unusable_result = load_raw(unusable_path)
+        assert unusable_result["final_status"] == "pass"
+        assert unusable_result["qa"]["land_side_visual_gate"]["status"] == "warning"
+        assert unusable_result["output_package"]["delivery_ready"] is True
 
-        # A nonpass third review is terminal needs_review; iteration four is
-        # rejected at invocation.
+        # A nonpass third review accepts the latest valid geometry with
+        # warnings; iteration four remains rejected at invocation.
         exhausted = load_raw(repair_path)
         exhausted["land_side_visual_review_request"]["iteration"] = 3
         exhausted_dir = run_dir / "exhausted_gate"
         exhausted_dir.mkdir()
+        for artifact_name in (
+            "target_region_features.json",
+            "region_bpoly_final_map.png",
+            "offshore_boundary_artifacts.json",
+        ):
+            shutil.copyfile(repair_dir / artifact_name, exhausted_dir / artifact_name)
+        exhausted["offshore_boundary_artifacts_path"] = str(exhausted_dir / "offshore_boundary_artifacts.json")
         exhausted_path = exhausted_dir / "region_bpoly.json"
         exhausted_path.write_text(json.dumps(exhausted, indent=2), encoding="utf-8")
-        run(review_cmd(exhausted_path, "revise", statuses), expect_ok=False)
+        run(review_cmd(exhausted_path, "revise", statuses))
         exhausted_result = load_raw(exhausted_path)
-        assert exhausted_result["final_status"] == "needs_review"
-        assert exhausted_result["status_reasons"] == ["land_side_visual_review_unresolved"]
+        assert exhausted_result["final_status"] == "pass"
+        assert exhausted_result["status_reasons"] == ["land_side_visual_review_accepted_best_effort"]
+        assert exhausted_result["qa"]["land_side_visual_gate"]["status"] == "warning"
+        assert exhausted_result["output_package"]["package_state"] == "accepted_delivery"
+        assert exhausted_result["output_package"]["delivery_ready"] is True
         run(
             [
                 "run_region_bpoly.py",

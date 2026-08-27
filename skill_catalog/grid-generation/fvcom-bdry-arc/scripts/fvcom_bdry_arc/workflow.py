@@ -139,17 +139,15 @@ def run_bdry_arc(
 
     region = _read_json(region_bpoly_json)
     offshore = _read_json(offshore_artifacts_json)
-    if _upstream_bpoly_unresolved(region):
-        return _write_unresolved_upstream_manifest(
-            region,
-            offshore,
-            run_dir,
-            name,
-            config,
-            resolved_heuristic_mode,
-            place_memory_enabled,
-        )
     bpoly_lonlat_raw = _load_bpoly_polygon(region)
+    upstream_region_bpoly = {
+        "final_status": region.get("final_status"),
+        "package_state": region.get("output_package", {}).get("package_state"),
+        "delivery_ready": region.get("output_package", {}).get("delivery_ready"),
+        "land_side_visual_gate_status": region.get("qa", {}).get("land_side_visual_gate", {}).get("status"),
+        "status_fields_are_nonblocking": True,
+        "accepted_for_boundary_generation": True,
+    }
     bbox_wsen = tuple(float(v) for v in region.get("envelope_bbox") or bpoly_lonlat_raw.bounds)
     buffered_bbox = _buffer_bbox_lonlat(bbox_wsen, config.coastline_buffer_km)
     projection = local_utm_projection(buffered_bbox)
@@ -384,6 +382,13 @@ def run_bdry_arc(
         failure_taxonomy.extend(coverage_contract.get("failure_taxonomy", []))
         failure_taxonomy = list(dict.fromkeys(failure_taxonomy))
     advisory_taxonomy: list[str] = []
+    if (
+        str(upstream_region_bpoly.get("final_status") or "").lower() not in {"", "pass"}
+        or upstream_region_bpoly.get("delivery_ready") is False
+        or str(upstream_region_bpoly.get("land_side_visual_gate_status") or "").lower()
+        not in {"", "pass"}
+    ):
+        advisory_taxonomy.append("upstream_region_bpoly_review_status_nonblocking")
     if wet_result.get("metadata", {}).get("open_arc_trimmed_to_wet_exterior"):
         advisory_taxonomy.append("source_open_arc_tail_trimmed_to_wet_exterior")
         if scored["selected"].get("metrics", {}).get("extra_coastline_intersection"):
@@ -446,6 +451,7 @@ def run_bdry_arc(
             "coastline_gpkg": str(coastline_gpkg),
             "coastline_source": config.coastline_source,
             "coastline_load": coastline_load_meta,
+            "upstream_region_bpoly": upstream_region_bpoly,
         },
         "settings": {
             "mode": config.mode,
@@ -2806,87 +2812,6 @@ def _resolve_gshhs_skill_dir(path: str | None) -> Path:
 
 def _read_json(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
-
-
-def _upstream_bpoly_unresolved(region: dict[str, Any]) -> bool:
-    status = str(region.get("final_status") or "").lower()
-    domain_type = str(region.get("domain_type") or region.get("region_bpoly", {}).get("domain_type") or "").lower()
-    coords = region.get("polygon_lonlat") or region.get("region_bpoly", {}).get("polygon_lonlat")
-    if domain_type == "unresolved_autonomous_failure" or status == "needs_review":
-        return True
-    if region.get("schema_version") == "region_bpoly_final_v1" and domain_type == "coastal":
-        gate = region.get("qa", {}).get("land_side_visual_gate", {})
-        return gate.get("status") != "pass"
-    return not bool(coords)
-
-
-def _write_unresolved_upstream_manifest(
-    region: dict[str, Any],
-    offshore: dict[str, Any],
-    run_dir: Path,
-    name: str,
-    config: BdryArcConfig,
-    resolved_heuristic_mode: str,
-    place_memory_enabled: bool,
-) -> dict[str, Any]:
-    failure_taxonomy = ["upstream_region_bpoly_unresolved"]
-    upstream_failures = (
-        region.get("qa", {})
-        .get("bpoly_quality", {})
-        .get("failure_taxonomy", [])
-    )
-    for item in upstream_failures:
-        code = item.get("code") if isinstance(item, dict) else str(item)
-        if code and code not in failure_taxonomy:
-            failure_taxonomy.append(str(code))
-    manifest_path = run_dir / "bdry_arc_manifest.json"
-    manifest = {
-        "schema_version": "fvcom_bdry_arc_manifest_v1",
-        "name": name,
-        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "created_by": "fvcom-bdry-arc run_bdry_arc.py",
-        "final_status": "needs_review",
-        "failure_taxonomy": failure_taxonomy,
-        "settings": {
-            "mode": config.mode,
-            "target_resolution_m": float(config.target_resolution_m),
-            "review_depth": config.review_depth,
-            "coastline_source": config.coastline_source,
-            "topology_mode_requested": config.topology_mode,
-            "topology_mode_used": "upstream-unresolved",
-            "gshhs_resolution_requested": config.gshhs_resolution,
-            "gshhs_levels": config.gshhs_levels,
-            "heuristic_mode": resolved_heuristic_mode,
-            "place_memory_enabled": bool(place_memory_enabled),
-            "boundary_resolution_profile": config.boundary_resolution_profile,
-            "frame_clip_policy": config.frame_clip_policy,
-            "residual_boundary_policy": config.residual_boundary_policy,
-            "obc_placement_policy": config.obc_placement_policy,
-        },
-        "inputs": {
-            "region_name": region.get("name"),
-            "region_final_status": region.get("final_status"),
-            "region_domain_type": region.get("domain_type"),
-            "offshore_boundary_policy": offshore.get("boundary_policy"),
-        },
-        "wet_domain": {
-            "closure_method": "upstream_region_bpoly_unresolved",
-            "area_m2": 0.0,
-            "seed_inside": False,
-        },
-        "model_boundary_loops": {
-            "final_status": "needs_review",
-            "failure_taxonomy": ["upstream_region_bpoly_unresolved"],
-        },
-        "outputs": {
-            "bdry_arc_manifest": str(manifest_path),
-            "progress_state": str(run_dir / "bdry_arc_progress_state.json"),
-            "progress_jsonl": str(run_dir / "bdry_arc_progress.jsonl"),
-        },
-    }
-    manifest_path.write_text(json.dumps(_json_safe(manifest), indent=2), encoding="utf-8")
-    _write_progress(run_dir, "complete", "failed", {"failure_taxonomy": failure_taxonomy})
-    return manifest
 
 
 def _write_progress(run_dir: Path, stage: str, message: str, details: dict[str, Any] | None = None) -> None:

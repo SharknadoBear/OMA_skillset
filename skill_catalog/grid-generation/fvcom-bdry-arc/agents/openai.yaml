@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM Boundary Arc"
-  short_description: "Build one-pass FVCOM boundary chains and v2 contracts"
-  default_prompt: "Use $fvcom-bdry-arc with an accepted RegionBPoly to generate the boundary once, allow the offshore OBC beyond RegionBPoly, preserve physical landfall and topology gates, classify residual exterior roles with hash-bound maps, and emit an active v2 open-exterior contract without changing RegionBPoly."
+  short_description: "Invoke RegionBPoly and build FVCOM boundary arcs"
+  default_prompt: "Use $fvcom-bdry-arc to invoke $fvcom-region-bpoly, accept its returned geometry regardless of upstream review or delivery labels, then generate the boundary once, preserve Boundary Arc's physical landfall and topology gates, classify residual exterior roles, and emit the active v2 contract without changing the returned RegionBPoly."

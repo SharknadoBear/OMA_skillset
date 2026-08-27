@@ -704,7 +704,10 @@ def main() -> None:
     if unusable_maps:
         delivery_warnings.append("background geography unavailable in review maps: " + ", ".join(unusable_maps))
 
-    final_status = "needs_review" if domain_type == "coastal" else "pass"
+    # Coastal review is an iterative refinement state, not a terminal failure
+    # state.  The finalizer either requests one deterministic side expansion or
+    # accepts the latest valid geometry with explicit review warnings.
+    final_status = "review_pending" if domain_type == "coastal" else "pass"
     retained_intermediate = args.mode == "test"
     offshore_artifacts_path = case_dir / "offshore_boundary_artifacts.json"
     offshore_artifacts = build_offshore_boundary_artifacts(
@@ -741,7 +744,7 @@ def main() -> None:
         "place_discovery": place_discovery,
         "place_discovery_path": str(place_discovery_path) if place_discovery_path else None,
         "final_status": final_status,
-        "status_reasons": (["land_side_visual_review_required"] if domain_type == "coastal" else []),
+        "status_reasons": (["land_side_visual_review_pending"] if domain_type == "coastal" else []),
         "delivery_warnings": delivery_warnings,
         "region_bpoly": bpoly.to_dict(),
         "polygon_lonlat": bpoly.polygon_lonlat(),
@@ -782,7 +785,7 @@ def main() -> None:
             "side_focus_count": candidate.get("side_focus_count"),
             "initial_guess_artifacts": initial_guess_artifacts if retained_intermediate else {"retained": False},
             "delivery_policy": (
-                "coastal_land_side_visual_review_is_blocking"
+                "coastal_land_side_visual_review_refines_then_accepts_best_effort"
                 if domain_type == "coastal"
                 else "resolved_region_bpoly_qa_is_nonblocking"
             ),
@@ -812,8 +815,8 @@ def main() -> None:
     if args.mode == "execute" and intermediate.exists() and final_status == "pass":
         shutil.rmtree(intermediate)
     print(f"Wrote final RegionBPoly: {out}")
-    if final_status == "needs_review":
-        print("Final status needs review: inspect and finalize the hash-bound coastal land-side maps.")
+    if final_status == "review_pending":
+        print("Coastal review pending: inspect the hash-bound maps, repair one named land side when useful, then finalize the latest valid geometry.")
     if delivery_warnings:
         print("Delivered resolved RegionBPoly with QA warnings: " + "; ".join(delivery_warnings))
 

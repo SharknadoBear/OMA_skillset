@@ -387,7 +387,7 @@ def main() -> None:
         "name": args.name,
         "created_at_utc": utc_now(),
         "iteration": args.iteration,
-        "review_status": "needs_review",
+        "review_status": "review_pending",
         "request_path": str(req_path),
         "region_bpoly": bpoly.to_dict(),
         "region_box_compatibility": bpoly.to_dict(),

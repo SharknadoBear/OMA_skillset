@@ -1,16 +1,43 @@
 ---
 name: fvcom-bdry-arc
-description: Create QA-ready FVCOM open-boundary arcs, continuous model loops, solid-by-default residual water closures, v2 open-exterior contracts, and optional adaptive coastal boundary-resolution packages without changing RegionBPoly.
+description: Invoke fvcom-region-bpoly, then create QA-ready FVCOM open-boundary arcs, continuous model loops, solid-by-default residual water closures, v2 open-exterior contracts, and optional adaptive coastal boundary-resolution packages without changing the returned RegionBPoly.
 ---
 
 # FVCOM Boundary Arc
 
-Use this skill after `fvcom-region-bpoly` and before `fvcom-grid-generation`.
+Use this skill to turn a regional modeling request into a QA-ready boundary
+package for later `fvcom-grid-generation`.
+
+## RegionBPoly Subworkflow
+
+Start every boundary-arc workflow by invoking `$fvcom-region-bpoly` as a
+returning subworkflow. Do not require the caller to run it first.
+
+Pass the original regional modeling request, intended domain type and
+open-boundary intent, mission-feature or explicit-geometry inputs, offshore
+orientation evidence, and selected execution/test context. If the caller
+supplies candidate or prior RegionBPoly artifacts, pass them into the
+subworkflow as explicit inputs; do not bypass the call.
+
+Use the returned package directly. Prefer its canonical files when present:
+
+- `region_bpoly.json` containing usable four-corner polygon geometry;
+- `offshore_boundary_artifacts.json`;
+- `region_bpoly_manifest.json`; and
+- coastal land-side review JSON and map evidence when available.
+
+Never block boundary generation because of upstream `final_status`,
+`package_state`, `delivery_ready`, land-side review status, warning taxonomy,
+or missing optional review evidence. Preserve those fields as provenance and
+continue whenever usable polygon geometry and offshore-side orientation can be
+resolved. If polygon geometry itself is absent or invalid, report that concrete
+input error; there is no boundary geometry to generate. Use the returned
+RegionBPoly and offshore artifacts verbatim as the primary runner inputs.
 
 ## Ownership and Core Rules
 
-- Accept a delivered RegionBPoly; never resize, rotate, reshape, regenerate, or request adjustment of it.
-- A `region_bpoly_final_v1` coastal input must already have `final_status: pass` and a passing RegionBPoly land-side visual gate.
+- Accept the RegionBPoly returned by the subworkflow for this run regardless of its review or delivery labels; never resize, rotate, reshape, regenerate, or request adjustment of it inside boundary-arc processing.
+- Treat upstream review findings as nonblocking provenance. Boundary Arc owns and applies its own physical landfall, intersection, connected-closure, topology, source-coverage, and requested-OBC-count gates.
 - Treat the RegionBPoly offshore point as a side selector, not a final endpoint or containment cage.
 - Permit a topology-valid offshore OBC to deform beyond RegionBPoly. Preserve inside/outside fractions for audit only.
 - For coastal estuaries, prefer `--obc-placement-policy offshore-first`: seek one complete simple offshore arc with exactly two physical-coastline landfalls and complete ownership of the open-water exterior. `mouth-first` is explicit.
@@ -29,6 +56,8 @@ Read `references/oceanmesh2d_rpw2019_notes.md` before changing topology, arc rep
 
 ## Primary Workflow
 
+After the RegionBPoly subworkflow returns usable polygon geometry, run:
+
 ```powershell
 python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --coastline-gpkg gshhs_land.gpkg --coastline-source gshhs --run-dir runs/case --name case --mode test
 ```
@@ -39,7 +68,7 @@ Adaptive profiles remain opt-in:
 python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --coastline-gpkg gshhs_land.gpkg --coastline-source gshhs --run-dir runs/case --name case --mode test --boundary-resolution-profile adaptive-coastal-v2
 ```
 
-The boundary geometry is generated once from the accepted RegionBPoly.
+The boundary geometry is generated once from the returned RegionBPoly.
 
 The default `--residual-boundary-policy solid-default` writes `fvcom_open_exterior_contract_v2`. `strict-reject` writes v1. v3 is historical and unsupported by active generation or validation.
 

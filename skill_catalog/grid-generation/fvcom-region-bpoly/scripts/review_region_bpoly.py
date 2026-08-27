@@ -179,6 +179,10 @@ def main() -> None:
     if exhausted:
         failures.append("land-side truncation remains unresolved after the third review attempt")
 
+    clean_pass = args.decision == "pass" and not failures
+    repair_requested = args.decision == "revise" and not failures and iteration < 3
+    accepted_with_warnings = not clean_pass and not repair_requested
+
     review_map = run_dir / f"region_bpoly_land_side_review_i{iteration:02d}.png"
     maps_ok = not any("map" in failure.lower() or "geography" in failure.lower() for failure in failures)
     if maps_ok and request:
@@ -191,7 +195,13 @@ def main() -> None:
         "iteration": iteration,
         "maximum_iterations": 3,
         "decision": args.decision,
-        "effective_decision": "needs_review" if failures or args.decision != "pass" else "pass",
+        "effective_decision": (
+            "pass"
+            if clean_pass
+            else "expand_required"
+            if repair_requested
+            else "accepted_with_warnings"
+        ),
         "candidate_json": str(input_path),
         "region_bpoly_sha256": request.get("region_bpoly_sha256"),
         "review_request": request,
@@ -210,7 +220,7 @@ def main() -> None:
         "validation_failures": failures,
         "notes": args.notes,
     }
-    if args.decision == "revise" and not failures:
+    if repair_requested:
         expand_side = next(idx for idx, status in statuses.items() if status == "expand_required")
         review["next_action"] = {
             "operation": "expand_side",
@@ -222,48 +232,66 @@ def main() -> None:
     review_path = write_json(run_dir / f"region_bpoly_land_side_review_i{iteration:02d}.json", review)
     final["land_side_visual_review"] = review
     final["land_side_visual_review_path"] = str(review_path)
-    final["final_status"] = "pass" if args.decision == "pass" and not failures else "needs_review"
-    if final["final_status"] == "pass":
-        final["status_reasons"] = []
+    if repair_requested:
+        final["final_status"] = "repair_required"
+        final["status_reasons"] = ["land_side_expansion_required"]
         final["qa"]["land_side_visual_gate"] = {
-            "status": "pass",
+            "status": "expand_required",
             "iteration": iteration,
             "review_json": str(review_path),
-            "review_map": str(review_map),
+            "next_action": review["next_action"],
         }
-        final_review_path = write_json(run_dir / "region_bpoly_land_side_review.json", review)
-        final["land_side_visual_review_path"] = str(final_review_path)
-        if review_map.is_file():
-            final_map_alias = run_dir / "region_bpoly_land_side_review.png"
-            shutil.copyfile(review_map, final_map_alias)
-            final["land_side_visual_review_map_path"] = str(final_map_alias)
-        offshore_path = Path(final.get("offshore_boundary_artifacts_path", ""))
-        if offshore_path.is_file():
-            offshore = read_json(offshore_path)
-            offshore["final_status"] = "pass"
-            offshore["land_side_visual_review_path"] = str(final_review_path)
-            write_json(offshore_path, offshore)
         _write_final_documents(run_dir, name, final)
-        if final.get("mode") == "execute":
-            intermediate = Path(final.get("intermediate_dir") or run_dir / "intermediate")
-            if intermediate.is_dir():
-                shutil.rmtree(intermediate)
-            final["intermediate_dir"] = None
-            _write_final_documents(run_dir, name, final)
-        print(f"Wrote accepted RegionBPoly: {run_dir / 'region_bpoly.json'}")
+        print(f"Wrote land-side review requiring the authorized repair: {review_path}")
         return
 
-    final["status_reasons"] = ["land_side_visual_review_unresolved"] if exhausted else ["land_side_visual_review_required"]
+    final["final_status"] = "pass"
+    final["status_reasons"] = [] if clean_pass else ["land_side_visual_review_accepted_best_effort"]
+    warning_messages = list(final.get("delivery_warnings", []))
+    if accepted_with_warnings:
+        warning_messages.extend(f"land-side review: {failure}" for failure in failures)
+        warning_messages.extend(
+            f"land-side review: side {idx} remained {status}"
+            for idx, status in sorted(nonpass.items())
+        )
+        if not failures and not nonpass:
+            warning_messages.append(f"land-side review decision {args.decision!r} was accepted as best effort")
+    final["delivery_warnings"] = list(dict.fromkeys(warning_messages))
+    final.setdefault("qa", {})["delivery_warnings"] = final["delivery_warnings"]
     final["qa"]["land_side_visual_gate"] = {
-        "status": "needs_review",
+        "status": "pass" if clean_pass else "warning",
+        "outcome": "pass" if clean_pass else "accepted_best_effort",
         "iteration": iteration,
         "review_json": str(review_path),
+        "review_map": str(review_map) if review_map.is_file() else None,
         "validation_failures": failures,
     }
+    final_review_path = write_json(run_dir / "region_bpoly_land_side_review.json", review)
+    final["land_side_visual_review_path"] = str(final_review_path)
+    if review_map.is_file():
+        final_map_alias = run_dir / "region_bpoly_land_side_review.png"
+        shutil.copyfile(review_map, final_map_alias)
+        final["land_side_visual_review_map_path"] = str(final_map_alias)
+    else:
+        final["land_side_visual_review_map_path"] = None
+    offshore_path = Path(final.get("offshore_boundary_artifacts_path", ""))
+    if offshore_path.is_file():
+        offshore = read_json(offshore_path)
+        offshore["final_status"] = "pass"
+        offshore["land_side_visual_review_status"] = "pass" if clean_pass else "warning"
+        offshore["land_side_visual_review_path"] = str(final_review_path)
+        write_json(offshore_path, offshore)
     _write_final_documents(run_dir, name, final)
-    if failures:
-        raise SystemExit("RegionBPoly remains needs_review: " + "; ".join(failures))
-    print(f"Wrote land-side review requiring repair: {review_path}")
+    if clean_pass and final.get("mode") == "execute":
+        intermediate = Path(final.get("intermediate_dir") or run_dir / "intermediate")
+        if intermediate.is_dir():
+            shutil.rmtree(intermediate)
+        final["intermediate_dir"] = None
+        _write_final_documents(run_dir, name, final)
+    if clean_pass:
+        print(f"Wrote accepted RegionBPoly: {run_dir / 'region_bpoly.json'}")
+    else:
+        print(f"Wrote best-effort accepted RegionBPoly with retained review warnings: {run_dir / 'region_bpoly.json'}")
 
 
 if __name__ == "__main__":

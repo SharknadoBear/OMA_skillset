@@ -39,7 +39,6 @@ from fvcom_bdry_arc.workflow import (  # noqa: E402
     _normalize_open_arc_to_wet_exterior,
     _promote_delivered_open_arc_landfalls,
     _raster_connectivity_fill,
-    _upstream_bpoly_unresolved,
     _uses_island_loop_branch,
     extract_gshhs_vector_wet_domain,
     repair_coastline_graph,
@@ -440,42 +439,39 @@ def test_lake_closed_boundary_no_false_open_arc() -> None:
         assert "open_boundary_not_sufficiently_on_model_exterior" not in loop_manifest["failure_taxonomy"]
 
 
-def test_unresolved_upstream_bpoly_stops_before_coastline_load() -> None:
+def test_upstream_review_status_is_nonblocking() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        region_path = root / "region_bpoly.json"
-        offshore_path = root / "offshore_boundary_artifacts.json"
-        _write_json(
-            region_path,
+        region_path, offshore_path, gpkg = _synthetic_gshhs_inputs(root)
+        region = json.loads(region_path.read_text(encoding="utf-8"))
+        region.update(
             {
-                "name": "unknown_case",
+                "schema_version": "region_bpoly_final_v1",
                 "final_status": "needs_review",
-                "domain_type": "unresolved_autonomous_failure",
-                "polygon_lonlat": [],
-                "qa": {
-                    "bpoly_quality": {
-                        "failure_taxonomy": [
-                            {"code": "unknown_region_no_feature_plan", "severity": "fail"},
-                        ]
-                    }
-                },
-            },
+                "output_package": {"package_state": "internal_review", "delivery_ready": False},
+            }
         )
-        _write_json(offshore_path, {"boundary_policy": "unresolved_autonomous_failure"})
+        region.setdefault("qa", {})["land_side_visual_gate"] = {"status": "unresolved"}
+        _write_json(region_path, region)
         manifest = run_bdry_arc(
             region_path,
             offshore_path,
             root / "run",
-            "unknown_case",
-            coastline_gpkg=None,
-            config=BdryArcConfig(mode="test", coastline_source="gshhs", topology_mode="gshhs-vector"),
+            "review_status_nonblocking",
+            coastline_gpkg=gpkg,
+            config=BdryArcConfig(
+                mode="test",
+                target_resolution_m=5000.0,
+                coastline_source="gshhs",
+                topology_mode="gshhs-vector",
+            ),
         )
-        assert manifest["final_status"] == "needs_review"
-        assert manifest["settings"]["topology_mode_used"] == "upstream-unresolved"
-        assert "upstream_region_bpoly_unresolved" in manifest["failure_taxonomy"]
-        assert "unknown_region_no_feature_plan" in manifest["failure_taxonomy"]
-        assert Path(manifest["outputs"]["bdry_arc_manifest"]).exists()
-        assert Path(manifest["outputs"]["progress_state"]).exists()
+        upstream = manifest["inputs"]["upstream_region_bpoly"]
+        assert upstream["accepted_for_boundary_generation"] is True
+        assert upstream["status_fields_are_nonblocking"] is True
+        assert upstream["final_status"] == "needs_review"
+        assert manifest["settings"]["topology_mode_used"] != "upstream-unresolved"
+        assert "upstream_region_bpoly_review_status_nonblocking" in manifest["advisory_taxonomy"]
 
 
 def test_coastline_anchor_seaward_chain_closes_boundary() -> None:
@@ -1092,19 +1088,6 @@ def test_open_exterior_reader_drops_empty_geometry_placeholders() -> None:
         assert _read_open_exterior_layer(path, "frame_clip_boundary_arcs").empty
 
 
-def test_current_coastal_region_requires_land_side_visual_pass() -> None:
-    region = {
-        "schema_version": "region_bpoly_final_v1",
-        "domain_type": "coastal",
-        "final_status": "pass",
-        "polygon_lonlat": [[0, 0], [1, 0], [1, 1], [0, 1], [0, 0]],
-        "qa": {},
-    }
-    assert _upstream_bpoly_unresolved(region)
-    region["qa"]["land_side_visual_gate"] = {"status": "pass"}
-    assert not _upstream_bpoly_unresolved(region)
-
-
 def main() -> int:
     test_synthetic_package()
     test_gshhs_vector_package_prefers_coastline_lines()
@@ -1113,7 +1096,7 @@ def main() -> int:
     test_memory_off_disables_canonical_only_island_routing()
     test_antimeridian_projection_uses_compact_longitude_frame()
     test_lake_closed_boundary_no_false_open_arc()
-    test_unresolved_upstream_bpoly_stops_before_coastline_load()
+    test_upstream_review_status_is_nonblocking()
     test_coastline_anchor_seaward_chain_closes_boundary()
     test_open_arc_crossing_land_needs_review()
     test_source_arc_tail_trims_to_delivered_landfalls()
@@ -1133,7 +1116,6 @@ def main() -> int:
     test_coastal_obc_self_intersection_remains_blocking()
     test_open_exterior_contract_is_non_mutating_and_obc_unbound()
     test_open_exterior_reader_drops_empty_geometry_placeholders()
-    test_current_coastal_region_requires_land_side_visual_pass()
     print("fvcom-bdry-arc selftests passed")
     return 0
 

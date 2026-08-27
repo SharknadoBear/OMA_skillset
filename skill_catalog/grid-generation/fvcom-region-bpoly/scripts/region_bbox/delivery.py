@@ -43,9 +43,11 @@ def write_standard_delivery(run_dir: Path, name: str, final: dict[str, Any], *, 
         "offshore_boundary_artifacts": "offshore_boundary_artifacts.json",
         "manifest": "region_bpoly_manifest.json",
     }
+    review = final.get("land_side_visual_review") or {}
     if final.get("domain_type") == "coastal" and final.get("final_status") == "pass":
         canonical_files["land_side_review"] = "region_bpoly_land_side_review.json"
-        canonical_files["land_side_review_map"] = "region_bpoly_land_side_review.png"
+        if review.get("review_map_path"):
+            canonical_files["land_side_review_map"] = "region_bpoly_land_side_review.png"
     if final.get("place_discovery") is not None:
         canonical_files["place_discovery"] = "region_place_discovery.json"
 
@@ -68,7 +70,9 @@ def write_standard_delivery(run_dir: Path, name: str, final: dict[str, Any], *, 
         "offshore_boundary_artifacts",
     }
     if final.get("domain_type") == "coastal" and final.get("final_status") == "pass":
-        required_roles.update({"land_side_review", "land_side_review_map"})
+        required_roles.add("land_side_review")
+        if review.get("effective_decision") == "pass" and review.get("review_map_path"):
+            required_roles.add("land_side_review_map")
     if final.get("place_discovery") is not None:
         required_roles.add("place_discovery")
 
