@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM Boundary Arc"
   short_description: "Build mandatory Adaptive v2 FVCOM boundary arcs"
-  default_prompt: "Use $fvcom-bdry-arc to invoke $fvcom-region-bpoly directly, preserve its returned geometry, and generate a scientifically defensible Adaptive v2 boundary package with exact per-OBC chains, continuous model loops, residual-role QA, review maps, and a pass or needs_review assessment."
+  default_prompt: "Use $fvcom-bdry-arc to invoke $fvcom-region-bpoly for a direct request or consume its same-run parent return, then build a scientifically defensible Adaptive v2 boundary package without changing the RegionBPoly."

@@ -1,15 +1,44 @@
 ---
 name: fvcom-grid-generation
-description: Generate benchmark-ready SMS 2DM meshes from mandatory Adaptive v2 fvcom-bdry-arc packages and CUDEM/NBS/CRM/ETOPO bathymetry using deterministic Gmsh Frontal-Delaunay algorithm 6 by operational default, exact per-OBC chain ingestion, a generator-neutral mesh-intent contract, geometry-derived sizing, topology-priority conditioning, standardized project delivery, and FVCOM QA. Archived legacy/v1 products remain readable but cannot generate new grids.
+description: Invoke fvcom-region-bpoly, fvcom-bdry-arc, and cudem-bathy as returning subworkflows for a regional scientific request, then generate benchmark-ready SMS 2DM meshes with mandatory Adaptive v2 boundaries, deterministic Gmsh Frontal-Delaunay algorithm 6, exact per-OBC chains, geometry-derived sizing, topology-priority conditioning, standardized project delivery, and FVCOM QA.
 ---
 
 # fvcom-grid-generation
 
-Use this skill after the boundary and bathymetry steps:
+## Returning Upstream Subworkflows
+
+For a new regional scientific request, this skill owns the complete upstream
+orchestration. Invoke these skills in order and wait for each return:
 
 ```text
-fvcom-region-bpoly -> fvcom-bdry-arc -> cudem-bathy -> fvcom-grid-generation
+request -> S1 fvcom-region-bpoly -> S2 fvcom-bdry-arc -> S3 cudem-bathy -> grid generation
 ```
+
+1. Invoke `$fvcom-region-bpoly` as returning subworkflow **S1** with the
+   original scientific request. Receive its canonical `region_bpoly.json`,
+   `offshore_boundary_artifacts.json`, and manifest without changing the
+   returned geometry.
+2. Invoke `$fvcom-bdry-arc` as returning subworkflow **S2** with the original
+   request and the exact same-run S1 return. S2 must consume that return
+   directly and must not invoke RegionBPoly a second time. Receive the
+   finalized boundary-arc manifest, continuous model loops, active v2
+   open-exterior evidence, and passing `adaptive-coastal-v2` resolution
+   manifest.
+3. After S2 defines the finalized assembled wet domain, invoke `$cudem-bathy`
+   as returning subworkflow **S3**. Derive its request from that domain plus
+   the configured projected halo, and receive the source manifest, fetched or
+   mosaicked bathymetry, health evidence, and provenance.
+4. Resume this parent skill with the three returned packages. This skill owns
+   delivered-OBC bathymetry support, mesh intent, Gmsh generation,
+   conditioning, QA, and publication.
+
+Do not call S3 from the earlier RegionBPoly envelope. On a same-run resume,
+reuse a complete returned stage rather than invoking it twice. The explicit
+artifact interface remains a compatibility branch: when complete boundary,
+v2 resolution, and bathymetry artifacts are supplied, validate and consume
+them directly; when only boundary artifacts are supplied, invoke only S3 for
+the missing bathymetry. Record these branches as supplied-artifact reuse, not
+as subworkflow calls that did not occur.
 
 ## Core Rules
 
@@ -337,6 +366,7 @@ python scripts/selftest_visual_superthin.py
 python scripts/selftest_grid_project.py
 python scripts/selftest_grid_quality_policy.py
 python scripts/selftest_mesh_review_map.py
+python scripts/selftest_upstream_subworkflows.py
 python -m compileall scripts
 python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .
 ```

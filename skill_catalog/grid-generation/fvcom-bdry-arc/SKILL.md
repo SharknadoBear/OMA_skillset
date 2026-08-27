@@ -1,6 +1,6 @@
 ---
 name: fvcom-bdry-arc
-description: Invoke fvcom-region-bpoly, then create QA-ready FVCOM open-boundary arcs, continuous model loops, solid-by-default residual water closures, v2 open-exterior contracts, and mandatory Adaptive v2 boundary-resolution packages without changing the returned RegionBPoly.
+description: Create QA-ready FVCOM open-boundary arcs, continuous model loops, solid-by-default residual water closures, v2 open-exterior contracts, and mandatory Adaptive v2 boundary-resolution packages by invoking fvcom-region-bpoly for direct requests or consuming its same-run return when called as a subworkflow.
 ---
 
 # FVCOM Boundary Arc
@@ -8,13 +8,19 @@ description: Invoke fvcom-region-bpoly, then create QA-ready FVCOM open-boundary
 Use this skill to turn a regional FVCOM modeling request into a scientifically
 auditable boundary package for `fvcom-grid-generation`.
 
-## Direct RegionBPoly Subworkflow
+## RegionBPoly Entry Contract
 
-Start every run by invoking `$fvcom-region-bpoly` as a returning subworkflow.
-Pass the original scientific request, domain type, feature-retention needs, OBC
-intent, explicit geometry, execution mode, and heuristic context. A supplied
-candidate or prior RegionBPoly is an input to that call, not a reason to bypass
-it.
+For a direct regional request, invoke `$fvcom-region-bpoly` as a returning
+subworkflow. Pass the original scientific request, domain type,
+feature-retention needs, OBC intent, explicit geometry, execution mode, and
+heuristic context. A supplied candidate or prior RegionBPoly from an earlier
+run is an input to that call, not a reason to bypass it.
+
+When `$fvcom-grid-generation` invokes this skill as S2 and supplies the exact
+canonical RegionBPoly package just returned by S1 in the same parent run,
+consume that package directly and do not invoke RegionBPoly again. This is a
+returned-subworkflow handoff, not generic prior-artifact reuse. Preserve the S1
+paths and hashes in downstream lineage.
 
 Use the returned `region_bpoly.json` and
 `offshore_boundary_artifacts.json` verbatim. Never resize, rotate, reshape, or
@@ -93,7 +99,8 @@ Island topology and passage safeguards:
 
 ## Primary Run
 
-After the direct RegionBPoly subworkflow returns, run without a profile option:
+After the direct subworkflow or same-parent S1 handoff returns, run without a
+profile option:
 
 ```powershell
 python scripts/run_bdry_arc.py --region-bpoly-json region_bpoly.json --offshore-artifacts-json offshore_boundary_artifacts.json --coastline-gpkg gshhs_land.gpkg --coastline-source gshhs --run-dir runs/case --name case --mode test --expected-obc-count 1
