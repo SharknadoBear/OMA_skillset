@@ -43,7 +43,13 @@ def _resolve(value: str | Path | None, parent: Path) -> Path | None:
     if not value:
         return None
     path = Path(value)
-    return path if path.is_absolute() else (parent / path).resolve()
+    if path.is_absolute():
+        return path
+    parent_relative = (parent / path).resolve()
+    if parent_relative.exists():
+        return parent_relative
+    workspace_relative = path.resolve()
+    return workspace_relative if workspace_relative.exists() else parent_relative
 
 
 def discover_open_exterior_contract(source: str | Path) -> tuple[dict[str, Any] | None, Path | None]:

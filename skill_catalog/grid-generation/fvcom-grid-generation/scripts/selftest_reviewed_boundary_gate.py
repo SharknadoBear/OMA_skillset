@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -13,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fvcom_grid_generation.open_exterior import (  # noqa: E402
     validate_grid_boundary_gate,
+    validate_open_exterior_contract,
 )
 from fvcom_grid_generation.gmsh_experiment import check_case_readiness  # noqa: E402
 
@@ -57,6 +60,73 @@ def test_strict_policy_still_requires_open_exterior_contract() -> None:
         )
         assert report["passed"] is False
         assert "open_exterior_contract_missing" in report["failure_taxonomy"]
+
+
+def test_strict_contract_accepts_existing_workspace_relative_evidence() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        contract_dir = root / "stage" / "open_exterior"
+        evidence_dir = root / "evidence"
+        contract_dir.mkdir(parents=True)
+        evidence_dir.mkdir()
+        review_map = evidence_dir / "review.png"
+        review_map.write_bytes(b"review-map")
+        source_hashes = {"candidate": "fixture-sha"}
+        decision = evidence_dir / "decision.json"
+        decision.write_text(
+            json.dumps(
+                {
+                    "decision_actor": {"kind": "codex_agent"},
+                    "inspected_map_sha256": hashlib.sha256(
+                        review_map.read_bytes()
+                    ).hexdigest(),
+                    "bound_source_hashes": source_hashes,
+                }
+            ),
+            encoding="utf-8",
+        )
+        contract = contract_dir / "contract.json"
+        contract.write_text(
+            json.dumps(
+                {
+                    "schema_version": "fvcom_open_exterior_contract_v1",
+                    "report_only": False,
+                    "downstream_eligible": True,
+                    "hard_metrics": {
+                        "absolute_gate_pass": True,
+                        "fraction_gate_pass": True,
+                        "coverage_gate_pass": True,
+                        "absolute_limit_m": 250.0,
+                    },
+                    "agent_decision": {
+                        "status": "pass",
+                        "path": "evidence/decision.json",
+                        "sha256": hashlib.sha256(
+                            decision.read_bytes()
+                        ).hexdigest(),
+                    },
+                    "map": {"path": "evidence/review.png"},
+                    "source_hashes": source_hashes,
+                    "obc_geometry": {
+                        "expected_count": 0,
+                        "delivered_count": 0,
+                        "simple_nonbranching": True,
+                        "nonendpoint_land_crossing_m": 0.0,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        original_cwd = Path.cwd()
+        try:
+            os.chdir(root)
+            report = validate_open_exterior_contract(
+                contract,
+                require_topology_coverage=False,
+            )
+        finally:
+            os.chdir(original_cwd)
+        assert report["passed"] is True, report
 
 
 def test_reviewed_policy_accepts_exact_passing_adaptive_v2() -> None:
@@ -181,6 +251,7 @@ def test_gmsh_preflight_consumes_reviewed_policy() -> None:
 def main() -> int:
     tests = [
         test_strict_policy_still_requires_open_exterior_contract,
+        test_strict_contract_accepts_existing_workspace_relative_evidence,
         test_reviewed_policy_accepts_exact_passing_adaptive_v2,
         test_reviewed_policy_cannot_waive_resolved_land_crossing,
         test_reviewed_policy_rejects_mismatched_arc_lineage,
