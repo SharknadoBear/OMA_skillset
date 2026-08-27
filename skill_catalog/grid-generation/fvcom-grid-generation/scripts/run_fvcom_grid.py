@@ -16,6 +16,9 @@ from fvcom_grid_generation.node_budget import (  # noqa: E402
     DEFAULT_MAX_INTERIOR_POINTS,
     DEFAULT_NODE_BUDGET_STOP_FRACTION,
 )
+from fvcom_grid_generation.open_exterior import (  # noqa: E402
+    GRID_BOUNDARY_GATE_POLICIES,
+)
 from fvcom_grid_generation.systematic_v6_policy import (  # noqa: E402
     FIXED_GATE_POLICIES,
 )
@@ -113,6 +116,16 @@ def main() -> int:
         help=(
             "Deprecated compatibility selector. Boundary generation now always "
             "uses adaptive-coastal-v2."
+        ),
+    )
+    parser.add_argument(
+        "--open-exterior-gate-policy",
+        choices=GRID_BOUNDARY_GATE_POLICIES,
+        default="strict",
+        help=(
+            "Grid-only downstream decision policy. reviewed-adaptive-v2 may "
+            "continue an explicitly reviewed legacy/S2 arc only when its exact "
+            "Adaptive-v2 package and Grid Generation boundary contract pass."
         ),
     )
     parser.add_argument("--regional-spring-relaxation", action=argparse.BooleanOptionalAction, default=True)
@@ -288,6 +301,7 @@ def main() -> int:
             progress_interval_s=args.progress_interval_s,
             size_field_max_cells=args.size_field_max_cells,
             boundary_resolution_profile=args.boundary_resolution_profile,
+            open_exterior_gate_policy=args.open_exterior_gate_policy,
             regional_spring_relaxation=args.regional_spring_relaxation,
             spring_relax_iterations=args.spring_relax_iterations,
             spring_relax_quality_threshold=args.spring_relax_quality_threshold,

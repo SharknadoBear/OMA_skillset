@@ -33,6 +33,11 @@ the generation-time smoothed mesh.
 
 Adaptive boundary packages additionally require ordered explicit chains, per-node target spacing, and OBC size compatibility: 95th-percentile `L/h <= 1.55` and maximum `L/h <= 2.0`.
 
+Grid Generation's explicit `reviewed-adaptive-v2` compatibility gate changes
+only how upstream open-exterior review evidence is classified. It does not
+change any 2DM, OBC-chain, positive-area/depth, manifold, valence, superthin,
+node-cap, or roundtrip acceptance criterion in this reference.
+
 All boundary profiles use the single `fvcom_size_field_v4` production method.
 Construct its nearshore target as
 

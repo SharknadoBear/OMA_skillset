@@ -4,8 +4,27 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Any
+
+
+GRID_BOUNDARY_GATE_POLICIES = ("strict", "reviewed-adaptive-v2")
+
+
+def _finite_number(value: Any, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return number if math.isfinite(number) else float(default)
+
+
+def _integer(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
 
 
 def sha256_file(path: str | Path) -> str:
@@ -151,6 +170,177 @@ def validate_open_exterior_contract(
     }
 
 
+def validate_grid_boundary_gate(
+    open_exterior_source: str | Path | None,
+    boundary_resolution_source: str | Path | None,
+    *,
+    policy: str = "strict",
+    strict_contract_required: bool = True,
+) -> dict[str, Any]:
+    """Evaluate Grid Generation's explicit downstream boundary gate.
+
+    ``strict`` preserves the active open-exterior contract decision.  The
+    ``reviewed-adaptive-v2`` compatibility policy is intentionally narrower:
+    it may replace missing or rejected upstream review evidence only when the
+    exact Adaptive-v2 package passes its immutable, geometry-facing checks.
+    Mesh construction still performs the full loaded-node boundary contract.
+    """
+    if policy not in GRID_BOUNDARY_GATE_POLICIES:
+        raise ValueError(
+            "boundary gate policy must be one of "
+            + ", ".join(GRID_BOUNDARY_GATE_POLICIES)
+        )
+    strict_audit = validate_open_exterior_contract(
+        open_exterior_source or "",
+        required=bool(strict_contract_required),
+    )
+    if policy == "strict" or strict_audit["passed"]:
+        return {
+            "schema_version": "fvcom_grid_boundary_gate_v1",
+            "policy": policy,
+            "passed": bool(strict_audit["passed"]),
+            "decision_basis": "strict_open_exterior_contract",
+            "failure_taxonomy": list(strict_audit["failure_taxonomy"]),
+            "advisory_taxonomy": [],
+            "strict_open_exterior_audit": strict_audit,
+            "boundary_resolution": None,
+        }
+
+    failures: list[str] = []
+    resolution_path = (
+        Path(boundary_resolution_source).expanduser().resolve()
+        if boundary_resolution_source
+        else None
+    )
+    resolution: dict[str, Any] = {}
+    if resolution_path is None or not resolution_path.is_file():
+        failures.append("reviewed_boundary_resolution_manifest_missing")
+    else:
+        try:
+            resolution = _read(resolution_path)
+        except Exception:
+            failures.append("reviewed_boundary_resolution_manifest_unreadable")
+
+    if resolution:
+        if resolution.get("schema_version") != "fvcom_boundary_resolution_manifest_v2":
+            failures.append("reviewed_boundary_resolution_schema_invalid")
+        if resolution.get("profile") != "adaptive-coastal-v2":
+            failures.append("reviewed_boundary_resolution_profile_invalid")
+        if resolution.get("final_status") != "pass":
+            failures.append("reviewed_boundary_resolution_not_pass")
+        if list(resolution.get("failure_taxonomy") or []):
+            failures.append("reviewed_boundary_resolution_has_failures")
+
+    qa = resolution.get("qa") or {}
+    if resolution and qa.get("resolved_domain_valid") is not True:
+        failures.append("reviewed_boundary_domain_invalid")
+    if resolution and _finite_number(
+        qa.get("open_arc_land_intersection_m"), float("inf")
+    ) > 1.0e-6:
+        failures.append("reviewed_boundary_open_arc_intersects_land")
+    if resolution and _finite_number(
+        qa.get("open_arc_exterior_overlap_fraction"), 0.0
+    ) < 0.999:
+        failures.append("reviewed_boundary_open_arc_not_on_exterior")
+    if resolution and _integer(
+        qa.get("protected_underresolved_passage_count"), -1
+    ) != 0:
+        failures.append("reviewed_boundary_protected_passage_underresolved")
+    if resolution and _finite_number(
+        qa.get("maximum_edge_to_target_ratio"), float("inf")
+    ) > 1.55:
+        failures.append("reviewed_boundary_edge_to_target_maximum_exceeded")
+    if resolution and _finite_number(
+        qa.get("p95_edge_to_target_ratio"), float("inf")
+    ) > 1.55:
+        failures.append("reviewed_boundary_edge_to_target_p95_exceeded")
+    if resolution and _finite_number(
+        qa.get("maximum_target_gradation"), float("inf")
+    ) > 0.20 + 1.0e-9:
+        failures.append("reviewed_boundary_target_gradation_exceeded")
+
+    artifacts: dict[str, Any] = {}
+    if resolution_path and resolution_path.is_file():
+        artifacts["boundary_resolution_manifest"] = {
+            "path": str(resolution_path),
+            "sha256": sha256_file(resolution_path),
+        }
+    if resolution:
+        gpkg_path = _resolve(
+            (resolution.get("outputs") or {}).get("boundary_resolution_gpkg"),
+            resolution_path.parent,
+        )
+        loops_path = _resolve(
+            (resolution.get("inputs") or {}).get("model_boundary_loops_gpkg"),
+            resolution_path.parent,
+        )
+        for key, path, failure in (
+            (
+                "boundary_resolution_gpkg",
+                gpkg_path,
+                "reviewed_boundary_resolution_package_missing",
+            ),
+            (
+                "model_boundary_loops_gpkg",
+                loops_path,
+                "reviewed_boundary_source_loops_missing",
+            ),
+        ):
+            if path is None or not path.is_file():
+                failures.append(failure)
+            else:
+                artifacts[key] = {"path": str(path), "sha256": sha256_file(path)}
+
+    arc_path = Path(open_exterior_source).expanduser().resolve() if open_exterior_source else None
+    if arc_path and arc_path.is_file() and resolution_path and resolution_path.is_file():
+        try:
+            arc_doc = _read(arc_path)
+        except Exception:
+            failures.append("reviewed_boundary_arc_manifest_unreadable")
+        else:
+            recorded = _resolve(
+                (arc_doc.get("outputs") or {}).get("boundary_resolution_manifest"),
+                arc_path.parent,
+            )
+            if recorded is not None and recorded != resolution_path:
+                failures.append("reviewed_boundary_resolution_lineage_mismatch")
+            artifacts["bdry_arc_manifest"] = {
+                "path": str(arc_path),
+                "sha256": sha256_file(arc_path),
+            }
+
+    return {
+        "schema_version": "fvcom_grid_boundary_gate_v1",
+        "policy": policy,
+        "passed": not failures,
+        "decision_basis": "reviewed_adaptive_v2_package",
+        "failure_taxonomy": list(dict.fromkeys(failures)),
+        "advisory_taxonomy": [
+            f"upstream_open_exterior:{value}"
+            for value in strict_audit["failure_taxonomy"]
+        ],
+        "strict_open_exterior_audit": strict_audit,
+        "boundary_resolution": {
+            "schema_version": resolution.get("schema_version"),
+            "profile": resolution.get("profile"),
+            "final_status": resolution.get("final_status"),
+            "qa": {
+                key: qa.get(key)
+                for key in (
+                    "resolved_domain_valid",
+                    "open_arc_land_intersection_m",
+                    "open_arc_exterior_overlap_fraction",
+                    "protected_underresolved_passage_count",
+                    "maximum_edge_to_target_ratio",
+                    "p95_edge_to_target_ratio",
+                    "maximum_target_gradation",
+                )
+            },
+            "artifacts": artifacts,
+        },
+    }
+
+
 def _validate_residual_roles(
     contract: dict[str, Any],
     contract_path: Path,
@@ -253,4 +443,9 @@ def _validate_coastline_source_coverage(
             failures.append("coastline_source_coverage_map_not_bound_to_decision")
 
 
-__all__ = ["discover_open_exterior_contract", "validate_open_exterior_contract"]
+__all__ = [
+    "GRID_BOUNDARY_GATE_POLICIES",
+    "discover_open_exterior_contract",
+    "validate_grid_boundary_gate",
+    "validate_open_exterior_contract",
+]

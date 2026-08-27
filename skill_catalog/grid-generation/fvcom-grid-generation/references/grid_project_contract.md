@@ -55,6 +55,16 @@ map bindings. Missing, stale, pending, report-only, unassigned, or unsupported
 v3 evidence blocks mesh readiness and publication. RegionBPoly truncation is
 resolved upstream by `fvcom-region-bpoly`, not by this project contract.
 
+An explicitly user-reviewed retained arc may instead use Grid Generation's
+`reviewed-adaptive-v2` publication gate. Publication must receive the exact
+`boundary_resolution_manifest.json` through `--boundary-resolution-source` and
+records its manifest, package, and source-loop hashes. This branch downgrades
+only the upstream decision/coverage evidence to advisories. It remains blocked
+by a non-passing Adaptive-v2 manifest, invalid resolved wet domain, any resolved
+OBC land intersection, exterior overlap below 0.999, protected-passage debt,
+Adaptive-v2 size/gradation failure, or the independent loaded-node boundary
+contract. The strict gate remains the default.
+
 When a raw or conditioned terminal mesh exists, `publish` requires the mesh
 quality, conditioning, boundary-node, OBC-remap, and roundtrip companions. It
 automatically writes the standard positive-down bathymetry/triangle review map,

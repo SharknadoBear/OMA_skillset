@@ -11,6 +11,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fvcom_grid_generation.grid_project import init_project, promote, publish, validate  # noqa: E402
+from fvcom_grid_generation.open_exterior import GRID_BOUNDARY_GATE_POLICIES  # noqa: E402
 
 
 def _bool(value: str) -> bool:
@@ -50,6 +51,12 @@ def parser() -> argparse.ArgumentParser:
     publication.add_argument("--forcing-status", default="unknown")
     publication.add_argument("--failure", action="append", default=[])
     publication.add_argument("--open-exterior-source", type=Path)
+    publication.add_argument("--boundary-resolution-source", type=Path)
+    publication.add_argument(
+        "--boundary-gate-policy",
+        choices=GRID_BOUNDARY_GATE_POLICIES,
+        default="strict",
+    )
     publication.add_argument(
         "--basemap-provider",
         default="topo",
@@ -94,6 +101,8 @@ def main() -> int:
             forcing_status=args.forcing_status,
             failures=args.failure,
             open_exterior_source=args.open_exterior_source,
+            boundary_resolution_source=args.boundary_resolution_source,
+            boundary_gate_policy=args.boundary_gate_policy,
             basemap_provider=args.basemap_provider,
         )
     else:

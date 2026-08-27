@@ -179,6 +179,36 @@ def unsupported_v3_contract_fixture(root: Path) -> Path:
     return path
 
 
+def reviewed_resolution_fixture(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    package = write(root / "boundary_resolution.gpkg", "package")
+    loops = write(root / "model_boundary_loops.gpkg", "loops")
+    path = root / "boundary_resolution_manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "fvcom_boundary_resolution_manifest_v2",
+                "profile": "adaptive-coastal-v2",
+                "final_status": "pass",
+                "failure_taxonomy": [],
+                "inputs": {"model_boundary_loops_gpkg": str(loops)},
+                "outputs": {"boundary_resolution_gpkg": str(package)},
+                "qa": {
+                    "resolved_domain_valid": True,
+                    "open_arc_land_intersection_m": 0.0,
+                    "open_arc_exterior_overlap_fraction": 1.0,
+                    "protected_underresolved_passage_count": 0,
+                    "maximum_edge_to_target_ratio": 1.1,
+                    "p95_edge_to_target_ratio": 1.0,
+                    "maximum_target_gradation": 0.15,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def mesh_fixture(path: Path, *, open_boundary: bool = True) -> Path:
     chains = [[1, 2]] if open_boundary else []
     return write_2dm(
@@ -355,6 +385,25 @@ def main() -> None:
         )
         assert (project / "final" / "fvcom_grid.2dm").is_file()
         assert not validate(project, require_submission_ready=True)["passed"]
+
+        reviewed_project = base / "reviewed_boundary"
+        init_project(reviewed_project, "reviewed_boundary")
+        reviewed_resolution = reviewed_resolution_fixture(base / "reviewed_evidence")
+        reviewed_status = publish(
+            reviewed_project,
+            mesh=None,
+            companions={},
+            fvcom_ready=False,
+            submission_eligible=False,
+            obc_status="pass",
+            forcing_status="missing",
+            failures=[],
+            boundary_resolution_source=reviewed_resolution,
+            boundary_gate_policy="reviewed-adaptive-v2",
+            basemap_provider="offline",
+        )
+        assert reviewed_status["open_exterior_audit"]["passed"] is True
+        assert str(base) not in json.dumps(reviewed_status["open_exterior_audit"])
 
         ready = base / "ready"
         current_contract = role_contract_fixture(base / "current_project_contract")

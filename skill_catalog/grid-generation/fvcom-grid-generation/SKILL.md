@@ -23,7 +23,9 @@ request -> S1 fvcom-region-bpoly -> S2 fvcom-bdry-arc -> S3 cudem-bathy -> grid 
    directly and must not invoke RegionBPoly a second time. Receive the
    finalized boundary-arc manifest, continuous model loops, active v2
    open-exterior evidence, and passing `adaptive-coastal-v2` resolution
-   manifest.
+   manifest. When Bear explicitly designates a retained arc as ready to use,
+   S2 may instead return or regenerate the exact passing Adaptive-v2 package;
+   Grid Generation applies its reviewed-artifact gate without changing S2.
 3. After S2 defines the finalized assembled wet domain, invoke `$cudem-bathy`
    as returning subworkflow **S3**. Derive its request from that domain plus
    the configured projected halo, and receive the source manifest, fetched or
@@ -45,8 +47,8 @@ as subworkflow calls that did not occur.
 - Reuse upstream domain and boundary artifacts; do not redesign the region here.
 - Require a passing `adaptive-coastal-v2` boundary-resolution manifest for every new grid. Consume its exact per-`obc_id` node sequences without concatenation. Archived legacy/v1 packages remain readable only for provenance and inspection; never use them to generate a new mesh.
 - Use deterministic Gmsh Frontal-Delaunay algorithm 6 for every new operational/full-project raw mesh: one thread, seed 1, first-order triangles, eight native smoothing steps, and no algorithm fallback. The default portfolio executes only this candidate. Keep Gmsh 1/5 and clean-room SciPy-Delaunay available only when explicitly requested as research controls; never silently substitute them after a Gmsh-6 failure.
-- Revalidate the active `fvcom_open_exterior_contract_v2` evidence at every coastal entry point. Treat approved lagoon closures as fixed solid boundary, require station evidence and requested-count permission for secondary tidal OBCs, and reject unassigned water, missing or stale decisions/maps, invalid physical landfalls or topology, report-only packages, or `downstream_eligible=false` even when an upstream manifest says `pass`. Archived v1 is inspection-only and historical v3 is unsupported.
-- Revalidate `fvcom_coastline_source_coverage_v1` with every coastal open-exterior contract. Require at least 2x centered coverage, a physical-coastline-only landfall lineage, zero source-frame dependency, and current whole/zoom map hashes. Historical exact-bbox evidence remains readable but is ineligible for new standardized projects without this proof.
+- Use the strict open-exterior gate for fresh/unreviewed boundaries. Revalidate active `fvcom_open_exterior_contract_v2` evidence, approved lagoon closures, station-backed secondary OBCs, residual roles, source coverage, maps, hashes, and downstream eligibility. Archived v1 is inspection-only and historical v3 is unsupported on this default path.
+- For an arc that Bear has explicitly designated ready to use, select the Grid Generation-only `reviewed-adaptive-v2` gate. It may downgrade missing or rejected upstream decision/coverage evidence to recorded advisories, but only for the exact hash-bound Adaptive-v2 package. It may not waive a non-passing v2 manifest, invalid resolved wet domain, resolved OBC land intersection, exterior overlap below 0.999, protected-passage underresolution, `L/h` above 1.55, target gradation above 0.20, failed per-OBC chain/anchor checks, or any later mesh invariant. Do not change S2 or its own gates from this skill.
 - Keep full bathymetry for final node sampling and bound only the in-memory size-field grid.
 - For automatic acquisition, derive the bathymetry request bbox from the
   assembled `model_domain_polygon` with the configured projected halo (2 km by
@@ -83,6 +85,12 @@ Adaptive package:
 ```powershell
 python scripts/run_fvcom_grid.py --bdry-arc-manifest bdry_arc_manifest.json --boundary-loops-gpkg model_boundary_loops.gpkg --boundary-resolution-manifest boundary_resolution_manifest.json --bathy-nc bathy.nc --run-dir runs/case --name case --mode test --postprocess-profile none
 ```
+
+For an explicitly reviewed retained arc, add
+`--open-exterior-gate-policy reviewed-adaptive-v2`. Use the same policy plus
+`--boundary-resolution-source` when publishing the standardized project. Both
+steps recompute the exact manifest/package hashes; a stale or structurally
+failed Adaptive-v2 package remains blocking.
 
 Use this command only for test-mode mesh-intent/smoke evidence. Full clean-room
 execution requires the explicit `--allow-clean-room-execute` research override
@@ -181,6 +189,7 @@ Important controls:
 
 - `--boundary-resolution-profile adaptive-coastal-v2`, default `adaptive-coastal-v2`. This is a deprecated compatibility selector; removed values are rejected and normal commands omit it.
 - `--boundary-resolution-manifest`, required for new generation; its explicit per-OBC nodes and chains are authoritative.
+- `--open-exterior-gate-policy strict|reviewed-adaptive-v2`, default `strict`; the reviewed policy is an explicit Grid Generation compatibility decision for a user-approved retained arc, never a global S2 relaxation.
 - `--gradation`, default `0.20` in the production generator and `0.10` in `run_mesher_portfolio_case.py`; limits adjacent size growth after all candidates are combined.
 - `--slope-elements 10` and `--coastal-distance-m 25000` control the nearshore bathymetric-slope candidate.
 - `--hydraulic-elements-across-min 3` and `--hydraulic-elements-across-max 8` set the paired-bank cross-corridor element range. Importance increases the requested count continuously between those limits.

@@ -37,7 +37,11 @@ from .node_budget import (
 )
 from .plotting import write_mesh_gpkg, write_mesh_quality_gpkg, write_mesh_review_map
 from .progress import ProgressTracker
-from .open_exterior import validate_open_exterior_contract
+from .open_exterior import (
+    GRID_BOUNDARY_GATE_POLICIES,
+    sha256_file,
+    validate_grid_boundary_gate,
+)
 from .projection import (
     project_geometry,
     project_points,
@@ -89,6 +93,7 @@ class GridConfig:
     progress_interval_s: float = 10.0
     size_field_max_cells: int = 1_500_000
     boundary_resolution_profile: str = "adaptive-coastal-v2"
+    open_exterior_gate_policy: str = "strict"
     regional_spring_relaxation: bool = True
     spring_relax_iterations: int = 20
     spring_relax_quality_threshold: float = 0.40
@@ -154,6 +159,11 @@ def run_fvcom_grid(
         raise ValueError("Integrated post-generation cleanup is disabled; run postprocess_fvcom_mesh.py explicitly on the finished .2dm")
     if config.boundary_resolution_profile != "adaptive-coastal-v2":
         raise ValueError("boundary_resolution_profile must be adaptive-coastal-v2")
+    if config.open_exterior_gate_policy not in GRID_BOUNDARY_GATE_POLICIES:
+        raise ValueError(
+            "open_exterior_gate_policy must be one of "
+            + ", ".join(GRID_BOUNDARY_GATE_POLICIES)
+        )
     if not np.isfinite(float(config.gradation)) or float(config.gradation) < 0.0:
         raise ValueError("gradation must be nonnegative")
     if not np.isfinite(float(config.slope_elements)) or float(config.slope_elements) <= 0.0:
@@ -238,16 +248,6 @@ def run_fvcom_grid(
     boundary_resolution_manifest = upstream.get("boundary_resolution_manifest")
     bathy_nc = upstream["bathy_nc"]
     bdry_arc_manifest = upstream.get("bdry_arc_manifest")
-    if bdry_arc_manifest:
-        # Historical lower-level packages may predate the contract.  When the
-        # lineage contains one, every metric/decision is hard-revalidated;
-        # standardized new projects require it again at publication.
-        open_exterior_audit = validate_open_exterior_contract(bdry_arc_manifest, required=False)
-        if not open_exterior_audit["passed"]:
-            raise ValueError(
-                "strict open-exterior contract failed: "
-                + ", ".join(open_exterior_audit["failure_taxonomy"])
-            )
     if not boundary_resolution_manifest:
         raise ValueError(
             "adaptive-coastal-v2 requires --boundary-resolution-manifest or an upstream boundary run"
@@ -276,6 +276,12 @@ def run_fvcom_grid(
             BoundaryConfig(land_spacing_m=land_spacing, open_spacing_m=open_spacing, island_spacing_m=land_spacing),
         )
         resolution_doc = None
+    open_exterior_audit = validate_grid_boundary_gate(
+        bdry_arc_manifest,
+        boundary_resolution_manifest,
+        policy=str(config.open_exterior_gate_policy),
+        strict_contract_required=False,
+    )
     boundary_nodes_path = run_dir / "boundary_nodes.geojson"
     boundary_nodes_path.write_text(json.dumps(boundary_nodes_geojson(boundary_nodes), indent=2), encoding="utf-8")
     boundary_contract_path = None
@@ -288,6 +294,26 @@ def run_fvcom_grid(
     )
     boundary_contract_path = run_dir / "boundary_contract_v2.json"
     boundary_contract_path.write_text(json.dumps(_json_safe(boundary_contract), indent=2), encoding="utf-8")
+    open_exterior_audit["grid_boundary_contract"] = {
+        "path": str(boundary_contract_path),
+        "sha256": sha256_file(boundary_contract_path),
+        "passed": bool(boundary_contract["passed"]),
+        "failure_taxonomy": list(boundary_contract["failure_taxonomy"]),
+    }
+    open_exterior_audit["passed"] = bool(
+        open_exterior_audit["passed"] and boundary_contract["passed"]
+    )
+    open_exterior_audit["failure_taxonomy"] = list(
+        dict.fromkeys(
+            list(open_exterior_audit["failure_taxonomy"])
+            + list(boundary_contract["failure_taxonomy"])
+        )
+    )
+    boundary_gate_report_path = run_dir / "grid_boundary_gate.json"
+    boundary_gate_report_path.write_text(
+        json.dumps(_json_safe(open_exterior_audit), indent=2),
+        encoding="utf-8",
+    )
     progress.update(
         "boundary_contract_v2",
         24.0,
@@ -295,10 +321,10 @@ def run_fvcom_grid(
         artifact=boundary_contract_path,
         extra={"passed": bool(boundary_contract["passed"]), "failures": boundary_contract["failure_taxonomy"]},
     )
-    if not boundary_contract["passed"]:
+    if not open_exterior_audit["passed"]:
         raise ValueError(
-            "adaptive-coastal-v2 boundary contract failed: "
-            + ", ".join(boundary_contract["failure_taxonomy"])
+            f"{config.open_exterior_gate_policy} grid boundary gate failed: "
+            + ", ".join(open_exterior_audit["failure_taxonomy"])
         )
 
     progress.update("load_bathymetry", 28.0, message="Loading positive-down bathymetry grid.", artifact=bathy_nc)
@@ -737,6 +763,7 @@ def run_fvcom_grid(
             "bathy_fetch_halo_m": float(config.bathy_fetch_halo_m),
             "size_field_max_cells": int(config.size_field_max_cells),
             "boundary_resolution_profile": config.boundary_resolution_profile,
+            "open_exterior_gate_policy": config.open_exterior_gate_policy,
             "regional_spring_relaxation": bool(config.regional_spring_relaxation),
             "spring_relax_iterations": int(config.spring_relax_iterations),
             "thin_triangle_repair": bool(config.thin_triangle_repair),
@@ -827,6 +854,7 @@ def run_fvcom_grid(
         },
         "mesh": mesh.report,
         "boundary_resolution": resolution_doc,
+        "grid_boundary_gate": open_exterior_audit,
         "hydraulic_skeleton": size_field.report.get(
             "hydraulic_skeleton",
             {},
@@ -853,6 +881,7 @@ def run_fvcom_grid(
             "size_field_components_png": str(size_components_png),
             "boundary_nodes_geojson": str(boundary_nodes_path),
             "boundary_contract_v2_json": str(boundary_contract_path) if boundary_contract_path else None,
+            "grid_boundary_gate_json": str(boundary_gate_report_path),
             "node_budget_preflight_json": str(node_budget_path),
             "node_budget_delivered_json": str(
                 delivered_node_budget_path

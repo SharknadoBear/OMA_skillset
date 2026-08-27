@@ -10,7 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .open_exterior import validate_open_exterior_contract
+from .open_exterior import (
+    GRID_BOUNDARY_GATE_POLICIES,
+    validate_grid_boundary_gate,
+)
 from .plotting import (
     validate_standard_mesh_review_map,
     write_standard_mesh_review_map,
@@ -75,6 +78,19 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
 
 def _read(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def _portable_boundary_audit(value: Any) -> Any:
+    """Strip workstation paths while retaining exact artifact hashes."""
+    if isinstance(value, dict):
+        return {
+            key: _portable_boundary_audit(item)
+            for key, item in value.items()
+            if key not in {"path", "contract_path"}
+        }
+    if isinstance(value, list):
+        return [_portable_boundary_audit(item) for item in value]
+    return value
 
 
 def _root(project: str | Path) -> Path:
@@ -379,6 +395,8 @@ def publish(
     forcing_status: str,
     failures: list[str],
     open_exterior_source: str | Path | None = None,
+    boundary_resolution_source: str | Path | None = None,
+    boundary_gate_policy: str = "strict",
     basemap_provider: str = "topo",
 ) -> dict[str, Any]:
     root = _root(project)
@@ -401,20 +419,23 @@ def publish(
         raise ValueError("project is not bound to the installed grid-quality policy")
     all_findings = list(map(str, failures))
     open_audit = None
-    if open_exterior_source:
-        open_audit = validate_open_exterior_contract(
+    if boundary_gate_policy not in GRID_BOUNDARY_GATE_POLICIES:
+        raise ValueError(
+            "boundary_gate_policy must be one of "
+            + ", ".join(GRID_BOUNDARY_GATE_POLICIES)
+        )
+    if open_exterior_source or boundary_gate_policy == "reviewed-adaptive-v2":
+        open_audit = validate_grid_boundary_gate(
             open_exterior_source,
-            required=True,
+            boundary_resolution_source,
+            policy=boundary_gate_policy,
+            strict_contract_required=True,
         )
         if not open_audit["passed"]:
             all_findings.extend(open_audit["failure_taxonomy"])
         # Delivery manifests remain portable: retain the evidence hash and
         # decision, never an absolute workstation path.
-        open_audit = {
-            key: value
-            for key, value in open_audit.items()
-            if key != "contract_path"
-        }
+        open_audit = _portable_boundary_audit(open_audit)
     final_dir = root / "final"
     publication_companions = dict(companions)
     quality_document: dict[str, Any] | None = None
@@ -435,7 +456,9 @@ def publish(
         quality_source = Path(publication_companions["mesh_quality"]).resolve()
         boundary_source = Path(publication_companions["boundary_nodes"]).resolve()
         terminal_mesh_document = read_2dm(selected_mesh)
-        if terminal_mesh_document.open_boundary_chains and open_exterior_source is None:
+        if terminal_mesh_document.open_boundary_chains and (
+            open_audit is None or open_audit.get("passed") is not True
+        ):
             all_findings.append("open_exterior_contract_missing_or_stale")
         quality_document = _read(quality_source)
         if quality_document.get("quality_policy") != policy_binding:
@@ -529,6 +552,7 @@ def publish(
         "submission_eligible": bool(derived_submission_eligible),
         "obc_status": obc_status,
         "forcing_status": forcing_status,
+        "boundary_gate_policy": boundary_gate_policy,
         "selected_stage_hashes": manifest.get("selected_artifacts", {}),
         "open_exterior_audit": open_audit,
         "failure_taxonomy": list(dict.fromkeys(benchmark_failures)),
