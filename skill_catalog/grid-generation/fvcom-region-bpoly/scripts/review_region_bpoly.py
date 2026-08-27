@@ -7,6 +7,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 
+from region_bbox.delivery import write_standard_delivery
 from region_bbox.geometry import RegionBPoly
 from region_bbox.io import canonical_sha256, file_sha256, read_json, utc_now, write_json
 
@@ -107,8 +108,7 @@ def _compact_review_map(path: Path, request: dict, statuses: dict[int, str], not
 
 
 def _write_final_documents(run_dir: Path, name: str, final: dict) -> None:
-    write_json(run_dir / "region_bpoly.json", final)
-    write_json(run_dir / f"{name}_region_bpoly.json", final)
+    write_standard_delivery(run_dir, name, final, write_name_alias=True)
 
 
 def main() -> None:

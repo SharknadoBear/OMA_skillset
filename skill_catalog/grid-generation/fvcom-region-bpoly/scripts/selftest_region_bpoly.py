@@ -8,6 +8,7 @@ from pathlib import Path
 
 import geopandas as gpd
 import matplotlib.pyplot as plt
+import numpy as np
 from shapely.geometry import LineString
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from region_bbox.discovery import discover_named_region_features, extract_named_
 from region_bbox.features import infer_target_region_features
 from region_bbox.basemap import _coastline_candidates, _draw_offline_coastline
 from region_bbox.geometry import RegionBPoly
+from region_bbox.io import file_sha256
 from region_bbox.map_policy import resolve_basemap_provider
 from region_bbox.scoring import score_bpoly_quality
 
@@ -97,6 +99,10 @@ def assert_feature_artifacts(candidate: dict, expected_zoom_count: int) -> None:
     geojson = load(geojson_path)
     assert features["schema_version"] == "target_region_features_v1"
     assert features["features"], "feature decomposition should produce feature boxes"
+    assert features["source_kind"] in {"catalog_memory", "explicit", "web_discovery", "agent_supplied_bbox"}
+    assert features["geometry_status"] in {"heuristic_seed", "user_supplied", "discovered_seed", "inferred_seed"}
+    assert all(feature.get("purpose") for feature in features["features"])
+    assert all(feature.get("source_kind") == features["source_kind"] for feature in features["features"])
     assert len(geojson["features"]) == len(features["features"])
     feature_ids = {item["id"] for item in features["features"]}
     scored_ids = {item["id"] for item in candidate["ingredient_coverage"]["ingredients"]}
@@ -106,6 +112,40 @@ def assert_feature_artifacts(candidate: dict, expected_zoom_count: int) -> None:
     assert candidate["basemap"]["enabled"] is True
     assert candidate["basemap"]["required"] is True
     assert all(review["basemap"]["enabled"] is True and review["basemap"]["required"] is True for review in candidate["side_focus_reviews"])
+
+
+def assert_standard_delivery(run_dir: Path, final: dict, expected_source_kind: str) -> None:
+    canonical = {
+        "region_bpoly": run_dir / "region_bpoly.json",
+        "target_region_features": run_dir / "target_region_features.json",
+        "final_map": run_dir / "region_bpoly_final_map.png",
+        "offshore_boundary_artifacts": run_dir / "offshore_boundary_artifacts.json",
+        "manifest": run_dir / "region_bpoly_manifest.json",
+    }
+    assert all(path.is_file() for path in canonical.values()), canonical
+    feature_doc = load_raw(canonical["target_region_features"])
+    assert feature_doc == final["target_region_features"]
+    assert feature_doc["source_kind"] == expected_source_kind
+    assert feature_doc["source_key"]
+    assert all(feature.get("purpose") for feature in feature_doc["features"])
+    assert all(feature.get("source_kind") == expected_source_kind for feature in feature_doc["features"])
+
+    package = final["output_package"]
+    assert package["schema_version"] == "region_bpoly_output_package_v1"
+    assert package["package_complete"] is True
+    assert package["delivery_ready"] is (final["final_status"] == "pass")
+    assert package["canonical_files"]["target_region_features"] == "target_region_features.json"
+
+    manifest = load_raw(canonical["manifest"])
+    assert manifest["schema_version"] == "region_bpoly_delivery_manifest_v1"
+    assert manifest["package_complete"] is True
+    assert manifest["delivery_ready"] is (final["final_status"] == "pass")
+    records = {record["role"]: record for record in manifest["files"]}
+    for role, path in canonical.items():
+        if role == "manifest":
+            continue
+        assert records[role]["present"] is True
+        assert records[role]["sha256"] == file_sha256(path)
 
 
 def main() -> None:
@@ -129,6 +169,66 @@ def main() -> None:
         assert cached_coast in _coastline_candidates([nested_output])
         run_dir = cache_root / "Workspace" / "Preprocessing" / "fvcom-grid-generation" / "runs" / "selftest"
         run_dir.mkdir(parents=True)
+
+        # Antimeridian display windows must be split into native tile requests
+        # and recomposed without stretching a dateline tile across the globe.
+        aleutian_display_bbox = [-194.45, 46.9295, -151.55, 59.3705]
+        longitude_segments = basemap_module._display_longitude_segments(aleutian_display_bbox)
+        assert len(longitude_segments) == 2, longitude_segments
+        assert longitude_segments[0]["native_bbox"][0] == 165.55, longitude_segments
+        assert longitude_segments[0]["native_bbox"][2] == 180.0, longitude_segments
+        assert longitude_segments[0]["display_shift_deg"] == -360.0, longitude_segments
+        assert longitude_segments[1]["native_bbox"][0] == -180.0, longitude_segments
+        assert longitude_segments[1]["native_bbox"][2] == -151.55, longitude_segments
+        assert longitude_segments[1]["display_shift_deg"] == 0.0, longitude_segments
+
+        synthetic_tiles = np.zeros((64, 64, 4), dtype=np.uint8)
+        synthetic_tiles[:, :, 3] = 255
+        _, safe_extent = basemap_module._warp_tiles_edge_safe(
+            synthetic_tiles,
+            (-20037508.342789244, -16280475.52851626, 5009377.08569731, 8766409.899970295),
+        )
+        assert safe_extent[1] - safe_extent[0] < 60.0, safe_extent
+        assert -180.0001 <= safe_extent[0] <= -179.999, safe_extent
+
+        online_calls = []
+
+        def fake_bounds2img(west, south, east, north, **_kwargs):
+            online_calls.append([west, south, east, north])
+            pixels = np.zeros((8, 8, 4), dtype=np.uint8)
+            pixels[:, :, 3] = 255
+            return pixels, (west, east, south, north)
+
+        fig, ax = plt.subplots()
+        ax.set_xlim(aleutian_display_bbox[0], aleutian_display_bbox[2])
+        ax.set_ylim(aleutian_display_bbox[1], aleutian_display_bbox[3])
+        with patch("contextily.tile.bounds2img", side_effect=fake_bounds2img), patch.object(
+            basemap_module,
+            "_warp_tiles_edge_safe",
+            side_effect=lambda image, extent, target_crs="EPSG:4326": (image, extent),
+        ):
+            import xyzservices.providers as xyz
+
+            composed = basemap_module._add_online_tiles(ax, xyz.Esri.WorldTopoMap, None)
+        assert online_calls == [segment["native_bbox"] for segment in longitude_segments], online_calls
+        assert len(ax.images) == 2
+        assert composed["antimeridian_composited"] is True, composed
+        assert composed["longitude_segment_count"] == 2, composed
+        assert composed["display_coverage_fraction"] == 1.0, composed
+        assert composed["longitude_segments"][0]["displayed_extent"][0] == 165.55 - 360.0, composed
+        assert composed["longitude_segments"][1]["displayed_extent"][1] == -151.55, composed
+        plt.close(fig)
+
+        fig, ax = plt.subplots()
+        ax.set_xlim(aleutian_display_bbox[0], aleutian_display_bbox[2])
+        ax.set_ylim(aleutian_display_bbox[1], aleutian_display_bbox[3])
+        with patch.object(basemap_module, "_coastline_candidates", return_value=[cached_coast]):
+            offline_antimeridian = _draw_offline_coastline(ax, aleutian_display_bbox)
+        plt.close(fig)
+        assert offline_antimeridian is not None, offline_antimeridian
+        assert offline_antimeridian["antimeridian_composited"] is True, offline_antimeridian
+        assert offline_antimeridian["display_coverage_fraction"] == 1.0, offline_antimeridian
+        assert len(offline_antimeridian["longitude_segments"]) == 2, offline_antimeridian
 
         # Regional maps fall through independent online providers before the
         # verified offline coastline. A transient Esri failure must select the
@@ -302,6 +402,7 @@ def main() -> None:
                 assert final["qa"]["bpoly_quality"]["antimeridian_qa"]["map_display_lon_span_deg"] < 80.0
             assert (out_dir / "intermediate" / "visual_review").exists()
             assert (out_dir / "offshore_boundary_artifacts.json").exists()
+            assert_standard_delivery(out_dir, final, "catalog_memory")
 
         # Antimeridian detection also escalates.
         aleut = RegionBPoly([[172.0, 48.9], [-162.0, 49.9], [-161.5, 57.6], [172.0, 56.7]], 172.0)
@@ -341,6 +442,7 @@ def main() -> None:
         assert not (exec_dir / "intermediate").exists()
         assert final["offshore_boundary_artifacts_path"].endswith("offshore_boundary_artifacts.json")
         assert final["qa"]["initial_guess_artifacts"]["retained"] is False
+        assert_standard_delivery(exec_dir, final, "catalog_memory")
         downstream = final["downstream_contract"]
         assert "only for RegionBPoly-stage coastline-source planning" in downstream["bathymetry_and_coastline_fetch"]
         assert "final model_domain_polygon" in downstream["bathymetry_and_coastline_fetch"]
@@ -374,6 +476,9 @@ def main() -> None:
             discovered_features, discovery = discover_named_region_features(galveston_prompt, "coastal")
         discovered_bbox = discovered_features["features"][0]["geometry"]
         assert discovered_features["source"] == "online_named_place_discovery"
+        assert discovered_features["source_kind"] == "web_discovery"
+        assert discovered_features["geometry_status"] == "discovered_seed"
+        assert discovered_features["features"][0]["purpose"] == "discovered_geographic_seed"
         assert discovery["selected_type"] == "bay"
         assert discovered_bbox[2] - discovered_bbox[0] > 1.0, discovered_bbox
         assert discovered_bbox[3] - discovered_bbox[1] > 1.0, discovered_bbox
@@ -413,6 +518,7 @@ def main() -> None:
         assert galveston["place_discovery"]["requires_visual_scope_confirmation"] is True
         assert Path(galveston["place_discovery_path"]).exists()
         assert galveston["open_boundary_reference"]["side_index"] == 0, galveston["open_boundary_reference"]
+        assert_standard_delivery(galveston_dir, galveston, "agent_supplied_bbox")
 
         # Unknown or memory-disabled prompts must never pass through the old
         # Delaware/NJ fallback box. With online discovery explicitly disabled,
@@ -523,6 +629,7 @@ def main() -> None:
         assert explicit["heuristic_mode"] == "unknown"
         assert explicit["place_memory_enabled"] is False
         assert explicit["qa"]["ingredient_coverage"]["required_count"] == 2
+        assert_standard_delivery(explicit_dir, explicit, "explicit")
 
         # Test mode keeps visual-review artifacts.
         test_dir = run_dir / "test_case"
@@ -583,6 +690,7 @@ def main() -> None:
         assert lake["domain_type"] == "lake"
         assert lake["boundary_policy"] == "no_open_boundary"
         assert lake["open_boundary_reference"] is None
+        assert_standard_delivery(lake_dir, lake, "catalog_memory")
 
         # Cook Inlet wave-current domains need broad wave-fetch context.
         cook_dir = run_dir / "cook_case"

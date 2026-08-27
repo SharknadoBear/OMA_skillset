@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 from .geometry import RegionBPoly
@@ -52,6 +53,63 @@ def _bbox_feature(
     features.append(record)
 
 
+def standardize_feature_doc(
+    features_doc: dict[str, Any],
+    request: dict[str, Any] | str,
+    *,
+    source_kind: str | None = None,
+    source_key: str | None = None,
+    geometry_status: str | None = None,
+) -> dict[str, Any]:
+    """Add portable, per-feature provenance without changing the v1 geometry schema."""
+    out = deepcopy(features_doc)
+    source = str(out.get("source") or "")
+    if source_kind is None:
+        if source == "online_named_place_discovery":
+            source_kind = "web_discovery"
+            geometry_status = geometry_status or "discovered_seed"
+        elif source == "agent_supplied_place_discovery":
+            source_kind = "agent_supplied_bbox"
+            geometry_status = geometry_status or "inferred_seed"
+        elif source == "place_memory_disabled_unknown_region":
+            source_kind = "unresolved"
+            geometry_status = geometry_status or "unresolved"
+        elif isinstance(request, dict) and isinstance(request.get("target_region_features"), dict):
+            source_kind = "explicit"
+            geometry_status = geometry_status or "user_supplied"
+        else:
+            source_kind = "catalog_memory"
+            geometry_status = geometry_status or "heuristic_seed"
+    if source_key is None:
+        if source_kind == "catalog_memory":
+            source_key = canonical_region_key(request) or None
+        elif source_kind == "explicit":
+            source_key = "request.target_region_features"
+        else:
+            discovery = out.get("place_discovery") or {}
+            source_key = discovery.get("query") or None
+
+    out["source_kind"] = source_kind
+    out["source_key"] = source_key
+    out["geometry_status"] = geometry_status
+    out["provenance"] = {
+        "source_kind": source_kind,
+        "source_key": source_key,
+        "geometry_status": geometry_status,
+        "catalog_entry": source_kind == "catalog_memory",
+    }
+    standardized_features = []
+    for raw_feature in out.get("features", []):
+        feature = dict(raw_feature)
+        feature.setdefault("purpose", feature.get("role") or feature.get("category"))
+        feature.setdefault("source_kind", source_kind)
+        feature.setdefault("source_key", source_key)
+        feature.setdefault("geometry_status", geometry_status)
+        standardized_features.append(feature)
+    out["features"] = standardized_features
+    return out
+
+
 def _considerations(text: str) -> dict[str, list[str]]:
     notes: dict[str, list[str]] = {
         "forcing_data_source_consideration": [],
@@ -82,7 +140,7 @@ def _considerations(text: str) -> dict[str, list[str]]:
 
 def _empty_feature_doc(request: dict[str, Any] | str, source: str = "heuristic_prompt_decomposition") -> dict[str, Any]:
     text = normalize_request_text(request)
-    return {
+    return standardize_feature_doc({
         "schema_version": "target_region_features_v1",
         "source": source,
         "request_text": request_text(request),
@@ -90,7 +148,7 @@ def _empty_feature_doc(request: dict[str, Any] | str, source: str = "heuristic_p
         "domain_variant": None,
         "considerations": _considerations(text),
         "features": [],
-    }
+    }, request, source_kind="unresolved", geometry_status="unresolved")
 
 
 def infer_target_region_features(request: dict[str, Any] | str, use_place_memory: bool = True) -> dict[str, Any]:
@@ -100,7 +158,13 @@ def infer_target_region_features(request: dict[str, Any] | str, use_place_memory
     making the target-region features first-class artifacts for visual review.
     """
     if isinstance(request, dict) and isinstance(request.get("target_region_features"), dict):
-        return request["target_region_features"]
+        return standardize_feature_doc(
+            request["target_region_features"],
+            request,
+            source_kind="explicit",
+            source_key="request.target_region_features",
+            geometry_status="user_supplied",
+        )
     if not use_place_memory:
         return _empty_feature_doc(request, source="place_memory_disabled_unknown_region")
 
@@ -232,7 +296,7 @@ def infer_target_region_features(request: dict[str, Any] | str, use_place_memory
 
     domain_scale = "small_estuary" if key == "murderkill" else "regional"
     domain_variant = cook_inlet_domain_variant(request) if key == "cook_inlet" else None
-    return {
+    return standardize_feature_doc({
         "schema_version": "target_region_features_v1",
         "source": "heuristic_prompt_decomposition",
         "request_text": request_text(request),
@@ -240,7 +304,7 @@ def infer_target_region_features(request: dict[str, Any] | str, use_place_memory
         "domain_variant": domain_variant,
         "considerations": _considerations(text),
         "features": features,
-    }
+    }, request, source_kind="catalog_memory", source_key=key or None, geometry_status="heuristic_seed")
 
 
 def features_as_ingredients(features_doc: dict[str, Any]) -> list[dict[str, Any]]:

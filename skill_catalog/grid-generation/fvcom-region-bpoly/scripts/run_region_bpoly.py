@@ -14,6 +14,7 @@ from region_bbox.features import (
     is_complex_feature_request,
 )
 from region_bbox.discovery import PlaceDiscoveryError, discover_named_region_features
+from region_bbox.delivery import write_standard_delivery
 from propose_region_bpoly import deform_bpoly, guess_region_box, known_repair_candidates, load_request
 from region_bbox.geometry import RegionBPoly
 from region_bbox.ingredients import mission_scope_notes, required_ingredients, request_text
@@ -767,7 +768,7 @@ def main() -> None:
             "target_region_features": {
                 "feature_count": len(features_doc.get("features", [])),
                 "categories": sorted({f.get("category") for f in features_doc.get("features", []) if f.get("category")}),
-                "retained_path": candidate.get("target_region_features_path") if retained_intermediate else None,
+                "retained_path": str(case_dir / "target_region_features.json"),
                 "retained_geojson_path": candidate.get("target_region_feature_polygons_path") if retained_intermediate else None,
             },
             "mission_scope_notes": mission_notes,
@@ -807,7 +808,7 @@ def main() -> None:
             "offshore_point": "Use the offshore point only to identify the intended offshore side for later coastline-anchor snapping; do not interpret it as a generated boundary arc.",
         },
     }
-    out = write_json(case_dir / "region_bpoly.json", final)
+    out = write_standard_delivery(case_dir, args.name, final)
     if args.mode == "execute" and intermediate.exists() and final_status == "pass":
         shutil.rmtree(intermediate)
     print(f"Wrote final RegionBPoly: {out}")

@@ -9,6 +9,8 @@ from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .features import standardize_feature_doc
+
 from .normalization import request_text
 
 
@@ -157,7 +159,9 @@ def feature_doc_from_bbox(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     seed_bbox = normalize_seed_bbox([float(value) for value in bbox], domain_type)
     feature_id = f"{_slug(label)}_discovered_extent"
-    feature_doc = {
+    source_kind = "agent_supplied_bbox" if source == "agent_supplied_place_discovery" else "web_discovery"
+    geometry_status = "inferred_seed" if source_kind == "agent_supplied_bbox" else "discovered_seed"
+    feature_doc = standardize_feature_doc({
         "schema_version": "target_region_features_v1",
         "source": source,
         "request_text": request_text(request),
@@ -177,7 +181,7 @@ def feature_doc_from_bbox(
             }
         ],
         "place_discovery": discovery,
-    }
+    }, request, source_kind=source_kind, source_key=discovery.get("query"), geometry_status=geometry_status)
     discovery_record = dict(discovery)
     discovery_record.update(
         {

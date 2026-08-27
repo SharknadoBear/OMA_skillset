@@ -113,13 +113,15 @@ After any expansion, render fresh whole-domain and start/middle/end maps and ret
 
 Every run derives target feature boxes before fitting the polygon. Required features may include upstream rivers, estuary/channel connectivity, forcing aprons, lake connections, island chains, and explicitly requested geopolitical or mission context.
 
+The built-in regional feature-plan catalog is explicit heuristic guidance for the feature inference/scoring modules. In a Skill X-Ray, represent the catalog as one example leaf attached to T2 rather than one leaf per bounding box. Catalog boxes remain initial feature-plan seeds and never replace required-feature scoring or visual review.
+
 Unknown or memory-disabled requests must never fall back to Delaware or another known box. Resolve them in this order: explicit `target_region_features` or polygon seed, catalog memory when enabled, cached online named-place discovery, then an agent-supplied researched or inferred `--discovery-bbox`. If all routes fail, return a nonzero `region_discovery_failed` error without writing a final `region_bpoly.json`.
 
 Nominatim discovery is a bounded, user-triggered lookup: extract a concise named place from the modeling objective, issue at most one query, use an identifying User-Agent, cache the result, retain OpenStreetMap attribution, and record how the result was selected. A point-like result is expanded to a regional initial frame; it is not treated as authoritative mission coverage.
 
 For every discovery-seeded coastal case, inspect the initial whole-domain map before final review. Confirm the scientific scope and explicitly correct `--offshore-azimuth-deg` when the inferred/default side is not ocean-facing. Then apply the normal hash-bound land-side truncation gate. Do not accept a discovered bbox merely because it geocoded successfully.
 
-Use road-detail maps for small estuaries and topographic context for regional, lake, island-chain, and archipelago cases. Antimeridian domains require a compact longitude display frame.
+Use road-detail maps for small estuaries and topographic context for regional, lake, island-chain, and archipelago cases. Antimeridian domains require a compact longitude display frame assembled from separate native tile/coastline requests on each side of the dateline. The combined background must cover the complete display frame before it is considered geographically usable.
 
 After the strict coastal land-side gate passes, resolved tightness, obstruction, landing, and similar QA findings remain explicit nonblocking diagnostics unless they violate required-feature coverage or valid four-corner geometry.
 
@@ -150,7 +152,7 @@ Preserve this operational ordering and loop:
 - W9 inspect whole-domain and land-side start/middle/end maps
 - G3 land-side truncation gate
   - expand: W11 apply one authorized `expand_side`, then return to W9 with fresh maps
-  - pass: W10 retain resolved QA, then W12 package final evidence, then W13 terminal delivery
+  - pass: W10 retain resolved QA, then W12 package standardized final evidence and provenance, then W13 terminal delivery
   - unresolved or attempt limit: terminal `needs_review`
 
 The five primary tool nodes are:
@@ -163,15 +165,21 @@ The five primary tool nodes are:
 
 ## Outputs
 
-A passing delivery contains:
+A run that reaches W12 uses the canonical package defined in
+[region_bpoly_output_contract.md](references/region_bpoly_output_contract.md).
+The standardized root-level files are:
 
 - `region_bpoly.json`
+- `target_region_features.json`
 - `region_bpoly_final_map.png`
 - `offshore_boundary_artifacts.json`
+- `region_bpoly_manifest.json`
 - `region_bpoly_land_side_review.json` and `.png` for coastal domains
 - `region_place_discovery.json` when catalog/explicit feature geometry was unavailable
 
-The final coastal JSON retains the review decision, iteration, side evidence, source hashes, and compact-map path. `final_status: pass` is impossible without this evidence.
+Every feature records its purpose, source kind, source key, and geometry status. The manifest records package state, delivery readiness, file sizes, and SHA-256 hashes. This packaging is part of W12 and does not introduce a new gate.
+
+The final coastal JSON retains the review decision, iteration, side evidence, source hashes, and compact-map path. `final_status: pass` is impossible without this evidence. Consumers use the canonical filenames; `<name>_region_bpoly.json` may remain only as a compatibility alias.
 
 ## Validation
 
