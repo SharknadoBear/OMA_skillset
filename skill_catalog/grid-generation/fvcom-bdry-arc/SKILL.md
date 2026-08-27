@@ -42,11 +42,15 @@ changing topology, arc repair, island filtering, or passage rules.
 
 - Treat the RegionBPoly offshore point as a side selector, not a final endpoint or containment cage. A topology-valid OBC may deform outside the polygon; retain inside/outside fractions for audit.
 - Use GSHHS/GSHHG polygons and physical coastline lines as the normal topology source. Full resolution `f`, level 1, is the default. Keep `cusp-legacy` only as an unrelated explicit debug/source-compatibility name.
+- Require the GSHHS connector to validate selected source polygons before clipping and to record any in-memory `make_valid` repair without modifying the source cache. Reject the coastline package if selected output geometry remains invalid.
 - Fetch a centered 3x RegionBPoly source footprint, never below 2x. Source-frame edges are not coastline, landfalls, or physical residual-role candidates.
+- Treat projected-centroid centering and hash-bound source-manifest centering as distinct evidence: a locally projected footprint may appear shifted by projection distortion, but it is centered only when either the projected test passes or the bound topology manifest records exact zero source-center offset. Coverage factors and RegionBPoly containment remain independent hard gates.
 - Require simple/nonbranching OBCs, physical landfall rules, no nonendpoint land crossing, one valid connected wet component, a continuous exterior ring, current source hashes, and the requested OBC count.
 - For coastal domains, use `offshore-first` unless the request explicitly calls for `mouth-first`.
 - Carry each exact `delivered_open_boundary_arc` into v2. Proximity classification is map/QA evidence only and may not restore discarded source tails.
 - Preserve protected islands, mission water bodies, river context, and narrow passages. Never close a channel automatically.
+- If a coastal OBC crosses blocking land away from its physical endpoints, detour around the blocking polygon in projected coordinates. Select only a simple branch that keeps the blocker inside the seeded frame, preserves the seed component, clears that blocker, and retains the full open chain; record the before/after land intersection and routing lineage.
+- Scale the physical landfall/source-coastline comparison tolerance with the requested boundary target as `max(25 m, min(250 m, 0.5 h))`; this gate accommodates source/projection discretization but does not permit nonendpoint land crossing.
 - Keep the aggregate edge/target limit at 1.55, enforce gradation and topology-area gates, and keep protected-passage underresolution as a hard review condition.
 
 ## Domain-Aware Adaptive v2
@@ -115,7 +119,10 @@ Keep `bdry_arc_package.gpkg` immutable as candidate evidence. A passing
 hash-bound decision creates `bdry_arc_package_final.gpkg`, promotes accepted
 secondary OBCs after the primary in residual-segment order, moves accepted
 solid closures into the landward boundary with provenance, and removes those
-components from the frame layer. The final package becomes canonical while the
+components from the frame layer. Absorb any already-classified intentional-open
+fragment into the nearest existing OBC endpoint only within the recorded hard
+distance limit; keep its `obc_id`, require a simple joined line, and record the
+absorbed residual segment IDs. The final package becomes canonical while the
 candidate path and hash remain recorded. Rebuild model loops, final
 open-exterior QA, and Adaptive v2 resolution from the finalized package.
 

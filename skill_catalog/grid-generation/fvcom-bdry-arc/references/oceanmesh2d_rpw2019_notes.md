@@ -33,6 +33,7 @@ For `fvcom-bdry-arc`, translate that idea into a Python postprocessor:
 - find open-boundary anchors where those adjacent bpoly sides intersect the physical GSHHS `coastline_lines`, choosing the crossing closest to each offshore-side corner;
 - use the selected bpoly offshore-side endpoints as control corners, not final anchors;
 - create a smooth open-boundary arc by deforming the full seaward chain from one coastline/bpoly anchor through the offshore side to the other coastline/bpoly anchor;
+- if that full chain crosses isolated blocking land away from its endpoints, route around a projected clearance buffer and choose the simple branch that keeps the blocker inside the seeded frame, retains the seed component, and clears the crossing; never solve this by discarding the source tail or excluding the island;
 - combine the smooth arc with the non-seaward bpoly path between anchors to form a closed deformed frame;
 - subtract GSHHS land polygons from the deformed bpoly frame;
 - choose the seeded wet-domain face rather than the largest arbitrary polygon;
@@ -45,6 +46,19 @@ That boundary includes artificial source-frame segments. Keep the land polygons
 for mask subtraction, but use only source-derived coastline lines for landfalls,
 arc trimming, and shoreline-bracketed residual roles. Require a centered source
 footprint before any of those decisions.
+
+Validate selected GSHHS source polygons before clipping. Repair only invalid
+in-memory polygonal features with `make_valid`, retain polygonal components,
+derive land and coastline from that validated geometry, and preserve source
+component hashes as proof that the cache was not edited. Record validity
+reasons, repair method, equal-area change, and post-repair validity.
+
+A centered source footprint may have a shifted centroid after local projection.
+Accept centering from projection geometry or from an exact-zero center offset
+in the hash-bound GSHHS topology manifest, but never waive the independent 2x
+coverage and RegionBPoly-containment gates. Compare physical landfalls to the
+source coastline with `max(25 m, min(250 m, 0.5 h))`; nonendpoint OBC/land
+intersection remains a zero-tolerance topology condition.
 
 ## Island / Archipelago Branch
 
@@ -78,6 +92,15 @@ maps and audits, but it must never expand an OBC or restore discarded
 source/coastal tails. Derive each intervening landward chain as the
 complementary exterior interval between exact delivered chains, preserving one
 continuous exterior polygon ring.
+
+During hash-bound residual finalization, keep the candidate GeoPackage as
+evidence. Materialize each accepted secondary OBC as a separate chain, move
+accepted solid closures into the landward boundary, and remove both from the
+frame layer. An intentional-open fragment may be joined only to the nearest
+existing OBC endpoint within the hard distance limit; the join must remain a
+simple line and retain its OBC ID and absorbed-segment provenance. Rebuild the
+model loop, open-exterior QA, and Adaptive v2 package from the role-resolved
+GeoPackage rather than reusing candidate frame-length gates.
 
 For a closed island/archipelago OBC, do not use landfall repair. Require the
 delivered loop to equal the exterior, unwrap it in the minimum-span longitude

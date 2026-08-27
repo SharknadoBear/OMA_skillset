@@ -78,6 +78,7 @@ Use `--levels 1` by default. Level 1 is land. Other levels may be useful for lak
 - Keep exact `--bbox` behavior for generic extraction. Require `--model-bbox` for new FVCOM topology products, with centered 3x coverage and 2x as the hard minimum.
 - Treat `coastline_lines` as the only physical shoreline layer. Never reinterpret the boundary of clipped `land_polygons` as coastline because it contains artificial source-frame edges.
 - Preserve CRS, selected resolution, requested levels, source paths, source URL, cache status, bbox split/antimeridian metadata, feature counts, and warnings in the manifest.
+- Validate selected source polygons before clipping. Apply `make_valid` only to invalid in-memory features, retain polygonal components, leave cached source files unchanged, and record repair counts, reasons, methods, and equal-area change in the manifest. Derive both clipped land and physical coastline from the validated geometry.
 - Handle antimeridian bboxes by splitting the request into two longitude windows and recording that split.
 - Keep model-specific topology decisions in downstream skills such as `fvcom-bdry-arc`.
 

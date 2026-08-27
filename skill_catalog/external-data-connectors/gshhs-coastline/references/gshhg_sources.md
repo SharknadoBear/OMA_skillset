@@ -52,6 +52,13 @@ RegionBPoly feedback look-ahead needs more room. Derive physical coastline
 from the original polygon boundary before clipping. A clipped land polygon's
 boundary includes the artificial request frame and is never shoreline evidence.
 
+Some official source polygons can be invalid for strict GEOS overlay even when
+the shapefile is readable. Validate only the features selected for a request,
+repair invalid polygons in memory with `make_valid`, discard non-polygonal
+repair remnants, and derive coastline from that validated polygon geometry.
+Never rewrite the cached GSHHG files. Record the original validity reason,
+repair method, and equal-area change so downstream users can audit the repair.
+
 ## Local Cache Policy
 
 Search for cache in this order:

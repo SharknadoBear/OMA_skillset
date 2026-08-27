@@ -35,11 +35,13 @@ from fvcom_bdry_arc.projection import local_utm_projection, project_geometry  # 
 from fvcom_bdry_arc.workflow import (  # noqa: E402
     _classify_relevant_lines,
     _coastline_bpoly_anchor_points,
+    _deformed_bpoly_frame,
     _final_status,
     _gshhs_resolution_policy,
     _normalize_open_arc_to_wet_exterior,
     _promote_delivered_open_arc_landfalls,
     _raster_connectivity_fill,
+    _reroute_open_arc_around_blocking_land,
     _uses_island_loop_branch,
     extract_gshhs_vector_wet_domain,
     repair_coastline_graph,
@@ -699,7 +701,7 @@ def test_coastline_anchor_seaward_chain_closes_boundary() -> None:
     assert metadata["frame_clip_boundary_length_m"] >= 0.0
 
 
-def test_open_arc_crossing_land_needs_review() -> None:
+def test_open_arc_crossing_blocker_is_rerouted() -> None:
     bpoly = box(0.0, 0.0, 10_000.0, 10_000.0)
     land = [box(9_500.0, 3_000.0, 10_500.0, 7_000.0)]
     coast = [box(0.0, 0.0, 2_000.0, 10_000.0).boundary]
@@ -707,15 +709,18 @@ def test_open_arc_crossing_land_needs_review() -> None:
     anchors = _coastline_bpoly_anchor_points(coast[0], selected_side, bpoly, 250.0)
     arc = LineString([(2_000.0, 10_000.0), (10_700.0, 5_000.0), (2_000.0, 0.0)])
     result = extract_gshhs_vector_wet_domain([], land, arc, bpoly, Point(7_000.0, 5_000.0), 250.0, anchors=anchors)
-    assert result["metadata"]["arc_land_intersection"] is True
+    assert result["metadata"]["arc_land_intersection"] is False
+    assert result["metadata"]["open_arc_blocking_land_rerouted"] is True
+    assert result["metadata"]["open_arc_blocking_land_unresolved_count"] == 0
     status, failures = _final_status(
-        {"selected": {"metrics": {"extra_coastline_intersection": False}}},
+        {"selected": {"metrics": {"extra_coastline_intersection": True}}},
         result,
         {**anchors, "start_distance_m": 0.0, "end_distance_m": 0.0},
         [],
     )
-    assert status == "needs_review"
-    assert "gshhs_open_arc_crosses_land" in failures
+    assert status == "pass"
+    assert "gshhs_open_arc_crosses_land" not in failures
+    assert "open_arc_intersects_extra_coastline" not in failures
 
 
 def test_source_arc_tail_trims_to_delivered_landfalls() -> None:
@@ -774,6 +779,33 @@ def test_source_arc_tail_trims_to_delivered_landfalls() -> None:
     )
     assert status == "pass"
     assert "open_arc_intersects_extra_coastline" not in failures
+
+
+def test_blocking_island_is_rerouted_inside_seeded_frame() -> None:
+    bpoly = box(0.0, 0.0, 10_000.0, 10_000.0)
+    source_arc = LineString([(0.0, 0.0), (10_000.0, 0.0)])
+    blocker = box(4_000.0, -1_000.0, 6_000.0, 1_000.0)
+    seed = Point(5_000.0, 5_000.0)
+
+    rerouted, report = _reroute_open_arc_around_blocking_land(
+        source_arc,
+        [blocker],
+        blocker,
+        bpoly,
+        seed,
+        250.0,
+        None,
+    )
+
+    assert report["open_arc_blocking_land_initial_count"] == 1
+    assert report["open_arc_blocking_land_rerouted"] is True
+    assert report["open_arc_blocking_land_reroute_count"] == 1
+    assert report["open_arc_blocking_land_unresolved_count"] == 0
+    assert rerouted.is_simple
+    assert rerouted.intersection(blocker.buffer(2.0)).length <= 2.0
+    frame, _ = _deformed_bpoly_frame(bpoly, rerouted, None)
+    assert frame.covers(blocker.representative_point())
+    assert frame.difference(blocker).buffer(2.0).contains(seed)
 
 
 def test_unprotected_passage_is_advisory_only() -> None:
@@ -1292,8 +1324,9 @@ def main() -> int:
     test_lake_closed_boundary_no_false_open_arc()
     test_upstream_review_status_is_nonblocking()
     test_coastline_anchor_seaward_chain_closes_boundary()
-    test_open_arc_crossing_land_needs_review()
+    test_open_arc_crossing_blocker_is_rerouted()
     test_source_arc_tail_trims_to_delivered_landfalls()
+    test_blocking_island_is_rerouted_inside_seeded_frame()
     test_unprotected_passage_is_advisory_only()
     test_endpoint_repair_is_conservative()
     test_raster_fill_respects_connectivity_barrier()

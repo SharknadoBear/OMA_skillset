@@ -1452,6 +1452,235 @@ def extract_lake_closed_wet_domain(
     }
 
 
+def _polygon_parts(geometry) -> list[Polygon]:
+    if geometry is None or geometry.is_empty:
+        return []
+    if isinstance(geometry, Polygon):
+        return [geometry]
+    if hasattr(geometry, "geoms"):
+        return [part for part in geometry.geoms if isinstance(part, Polygon) and not part.is_empty]
+    return []
+
+
+def _forward_ring_path(ring: LineString, start_position: float, end_position: float) -> LineString:
+    length = float(ring.length)
+    start = min(max(float(start_position), 0.0), length)
+    end = min(max(float(end_position), 0.0), length)
+    if end >= start:
+        return substring(ring, start, end)
+    first = substring(ring, start, length)
+    second = substring(ring, 0.0, end)
+    coords = list(first.coords) + list(second.coords)[1:]
+    return LineString(_dedupe_consecutive_coords(coords))
+
+
+def _ring_paths_between(ring: LineString, start: Point, end: Point) -> list[LineString]:
+    start_position = float(ring.project(start))
+    end_position = float(ring.project(end))
+    forward = _forward_ring_path(ring, start_position, end_position)
+    reverse_from_end = _forward_ring_path(ring, end_position, start_position)
+    backward = LineString(list(reversed(list(reverse_from_end.coords))))
+    return [forward, backward]
+
+
+def _replace_line_interval(
+    line: LineString,
+    start_position: float,
+    end_position: float,
+    detour: LineString,
+) -> LineString:
+    prefix = substring(line, 0.0, float(start_position))
+    suffix = substring(line, float(end_position), float(line.length))
+    coords = list(prefix.coords)
+    coords.extend(list(detour.coords)[1:])
+    coords.extend(list(suffix.coords)[1:])
+    return LineString(_dedupe_consecutive_coords(coords))
+
+
+def _blocking_land_components(
+    open_arc: LineString,
+    land_polygons_xy: list[Polygon],
+    target_resolution_m: float,
+) -> list[dict[str, Any]]:
+    endpoint_guard = max(3.0 * float(target_resolution_m), 500.0)
+    endpoints = Point(open_arc.coords[0]).buffer(endpoint_guard).union(
+        Point(open_arc.coords[-1]).buffer(endpoint_guard)
+    )
+    inspect_arc = open_arc.difference(endpoints)
+    if inspect_arc.is_empty:
+        return []
+    records: list[dict[str, Any]] = []
+    for source_index, polygon in enumerate(land_polygons_xy):
+        for part_index, part in enumerate(_polygon_parts(polygon)):
+            if part.is_empty or not inspect_arc.intersects(part):
+                continue
+            crossing = inspect_arc.intersection(part)
+            if crossing.is_empty or float(getattr(crossing, "length", 0.0)) <= 1.0e-6:
+                continue
+            intersection_positions = _line_intersection_positions(open_arc, open_arc.intersection(part.boundary))
+            if len(intersection_positions) < 2:
+                continue
+            records.append(
+                {
+                    "source_index": int(source_index),
+                    "part_index": int(part_index),
+                    "polygon": part,
+                    "first_position_m": float(min(intersection_positions)),
+                    "last_position_m": float(max(intersection_positions)),
+                    "crossing_length_m": float(getattr(crossing, "length", 0.0)),
+                }
+            )
+    records.sort(key=lambda item: (item["first_position_m"], item["source_index"], item["part_index"]))
+    return records
+
+
+def _reroute_open_arc_around_blocking_land(
+    source_open_arc: LineString,
+    land_polygons_xy: list[Polygon],
+    land_union,
+    bpoly_xy: Polygon,
+    seed_xy: Point,
+    target_resolution_m: float,
+    anchors: dict[str, Any] | None,
+) -> tuple[LineString, dict[str, Any]]:
+    """Route an OBC around blocking islands while keeping them in the model frame."""
+    clearance_m = max(2.0 * float(target_resolution_m), 100.0)
+    tolerance_m = max(2.0, 0.02 * float(target_resolution_m))
+    current = source_open_arc
+    initial_blockers = _blocking_land_components(current, land_polygons_xy, target_resolution_m)
+    report: dict[str, Any] = {
+        "open_arc_blocking_land_policy": "projected_buffer_detour_keep_blocker_inside_seeded_frame",
+        "open_arc_blocking_land_initial_count": int(len(initial_blockers)),
+        "open_arc_blocking_land_rerouted": False,
+        "open_arc_blocking_land_reroute_count": 0,
+        "open_arc_blocking_land_unresolved_count": int(len(initial_blockers)),
+        "open_arc_blocking_land_clearance_m": float(clearance_m),
+        "pre_reroute_source_open_arc_length_m": float(source_open_arc.length),
+        "post_reroute_source_open_arc_length_m": float(source_open_arc.length),
+        "open_arc_blocking_land_reroutes": [],
+    }
+    if not initial_blockers:
+        return current, report
+
+    processed: set[tuple[int, int]] = set()
+    while True:
+        blockers = [
+            item
+            for item in _blocking_land_components(current, land_polygons_xy, target_resolution_m)
+            if (item["source_index"], item["part_index"]) not in processed
+        ]
+        if not blockers:
+            break
+        blocker = blockers[0]
+        blocker_key = (blocker["source_index"], blocker["part_index"])
+        processed.add(blocker_key)
+        polygon = blocker["polygon"]
+        clearance_polygon = polygon.buffer(clearance_m)
+        if clearance_polygon.is_empty or not isinstance(clearance_polygon, Polygon):
+            continue
+        ring = LineString(clearance_polygon.exterior.coords)
+        positions = _line_intersection_positions(current, current.intersection(ring))
+        positions = _unique_sorted_positions(positions, float(current.length))
+        if len(positions) < 2:
+            continue
+        start_position = float(positions[0])
+        end_position = float(positions[-1])
+        start = Point(current.interpolate(start_position))
+        end = Point(current.interpolate(end_position))
+        alternatives: list[dict[str, Any]] = []
+        for detour_index, detour in enumerate(_ring_paths_between(ring, start, end)):
+            candidate = _replace_line_interval(current, start_position, end_position, detour)
+            frame, _frame_meta = _deformed_bpoly_frame(bpoly_xy, candidate, anchors)
+            candidate_water = frame.difference(land_union).buffer(0) if not land_union.is_empty else frame.buffer(0)
+            candidate_domain = _choose_seed_component(candidate_water, seed_xy)
+            seed_inside = bool(
+                candidate_domain is not None
+                and not candidate_domain.is_empty
+                and candidate_domain.buffer(tolerance_m).contains(seed_xy)
+            )
+            blocker_inside_frame = bool(frame.buffer(tolerance_m).covers(polygon.representative_point()))
+            endpoint_guard = max(3.0 * float(target_resolution_m), 500.0)
+            inspect_candidate = candidate.difference(
+                Point(candidate.coords[0]).buffer(endpoint_guard).union(
+                    Point(candidate.coords[-1]).buffer(endpoint_guard)
+                )
+            )
+            total_land_intersection_m = 0.0
+            blocker_land_intersection_m = 0.0
+            if not inspect_candidate.is_empty and not land_union.is_empty:
+                total_land_intersection_m = float(
+                    getattr(inspect_candidate.intersection(land_union.buffer(tolerance_m)), "length", 0.0)
+                )
+                blocker_land_intersection_m = float(
+                    getattr(inspect_candidate.intersection(polygon.buffer(tolerance_m)), "length", 0.0)
+                )
+            exterior_overlap = (
+                _line_fraction_near_boundary(candidate, candidate_domain.boundary, tolerance_m)
+                if candidate_domain is not None and not candidate_domain.is_empty
+                else 0.0
+            )
+            alternatives.append(
+                {
+                    "detour_index": int(detour_index),
+                    "candidate": candidate,
+                    "candidate_simple": bool(candidate.is_simple),
+                    "blocker_inside_frame": blocker_inside_frame,
+                    "seed_inside": seed_inside,
+                    "blocker_land_intersection_m": float(blocker_land_intersection_m),
+                    "total_land_intersection_m": float(total_land_intersection_m),
+                    "exterior_overlap_fraction": float(exterior_overlap),
+                    "candidate_length_m": float(candidate.length),
+                }
+            )
+        alternatives.sort(
+            key=lambda item: (
+                item["candidate_simple"],
+                item["blocker_inside_frame"],
+                item["seed_inside"],
+                item["blocker_land_intersection_m"] <= tolerance_m,
+                -item["total_land_intersection_m"],
+                item["exterior_overlap_fraction"],
+                -item["candidate_length_m"],
+                -item["detour_index"],
+            ),
+            reverse=True,
+        )
+        selected = alternatives[0] if alternatives else None
+        if not selected or not (
+            selected["candidate_simple"]
+            and selected["blocker_inside_frame"]
+            and selected["seed_inside"]
+            and selected["blocker_land_intersection_m"] <= tolerance_m
+        ):
+            continue
+        current = selected["candidate"]
+        report["open_arc_blocking_land_reroutes"].append(
+            {
+                "source_index": int(blocker["source_index"]),
+                "part_index": int(blocker["part_index"]),
+                "source_crossing_length_m": float(blocker["crossing_length_m"]),
+                "detour_length_m": float(current.length),
+                "clearance_m": float(clearance_m),
+                "blocker_inside_frame": True,
+                "seed_inside": True,
+                "post_detour_blocker_land_intersection_m": float(selected["blocker_land_intersection_m"]),
+                "post_detour_total_land_intersection_m": float(selected["total_land_intersection_m"]),
+                "post_detour_exterior_overlap_fraction": float(selected["exterior_overlap_fraction"]),
+            }
+        )
+
+    unresolved = _blocking_land_components(current, land_polygons_xy, target_resolution_m)
+    report.update(
+        {
+            "open_arc_blocking_land_rerouted": bool(report["open_arc_blocking_land_reroutes"]),
+            "open_arc_blocking_land_reroute_count": int(len(report["open_arc_blocking_land_reroutes"])),
+            "open_arc_blocking_land_unresolved_count": int(len(unresolved)),
+            "post_reroute_source_open_arc_length_m": float(current.length),
+        }
+    )
+    return current, report
+
+
 def extract_gshhs_vector_wet_domain(
     coastline_lines_xy: list[LineString],
     land_polygons_xy: list[Polygon],
@@ -1470,6 +1699,16 @@ def extract_gshhs_vector_wet_domain(
         physical_land_boundary_xy
         if physical_land_boundary_xy is not None and not physical_land_boundary_xy.is_empty
         else (land_union.boundary if not land_union.is_empty else GeometryCollection())
+    )
+    source_offshore_arc_xy = offshore_arc_xy
+    offshore_arc_xy, blocker_reroute = _reroute_open_arc_around_blocking_land(
+        source_offshore_arc_xy,
+        land_polygons_xy,
+        land_union,
+        bpoly_xy,
+        seed_xy,
+        target_resolution_m,
+        anchors,
     )
     deformed_frame, frame_meta = _deformed_bpoly_frame(bpoly_xy, offshore_arc_xy, anchors)
     base_water = deformed_frame.difference(land_union).buffer(0) if not land_union.is_empty else deformed_frame.buffer(0)
@@ -1599,6 +1838,7 @@ def extract_gshhs_vector_wet_domain(
             "arc_land_intersection_length_m": float(arc_land_intersection_length_m),
             "source_arc_land_intersection": bool(source_arc_land_intersection),
             "source_arc_land_intersection_length_m": float(source_arc_land_intersection_length_m),
+            **blocker_reroute,
             "open_arc_boundary_overlap_fraction": float(open_overlap_fraction),
             "source_open_arc_boundary_overlap_fraction": float(source_open_overlap_fraction),
             **trim_report,
@@ -4073,7 +4313,15 @@ def _final_status(
     failures: list[str] = []
     metrics = scored["selected"]["metrics"]
     metadata = wet_result["metadata"]
-    if metrics.get("extra_coastline_intersection") and not metadata.get("open_arc_trimmed_to_wet_exterior"):
+    if (
+        metrics.get("extra_coastline_intersection")
+        and not metadata.get("open_arc_trimmed_to_wet_exterior")
+        and not (
+            metadata.get("open_arc_blocking_land_rerouted")
+            and int(metadata.get("open_arc_blocking_land_unresolved_count", 0) or 0) == 0
+            and not metadata.get("arc_land_intersection")
+        )
+    ):
         failures.append("open_arc_intersects_extra_coastline")
     if metadata.get("source") == "fallback_bpoly_polygon":
         failures.append("seeded_wet_domain_polygonize_failed")

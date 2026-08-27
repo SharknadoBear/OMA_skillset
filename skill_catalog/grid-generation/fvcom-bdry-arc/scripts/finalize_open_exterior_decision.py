@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -330,6 +331,35 @@ def _append_lines(
     )
 
 
+def _endpoint_distance_m(first: tuple[float, float], second: tuple[float, float]) -> float:
+    mean_lat = math.radians(0.5 * (float(first[1]) + float(second[1])))
+    dx = (float(first[0]) - float(second[0])) * 111_320.0 * math.cos(mean_lat)
+    dy = (float(first[1]) - float(second[1])) * 110_574.0
+    return float(math.hypot(dx, dy))
+
+
+def _join_open_lines(base: LineString, addition: LineString, tolerance_m: float) -> LineString:
+    """Absorb an adjacent intentional-open fragment without creating another OBC."""
+    base_coords = list(base.coords)
+    addition_coords = list(addition.coords)
+    alternatives = [
+        (_endpoint_distance_m(base_coords[-1], addition_coords[0]), base_coords, addition_coords),
+        (_endpoint_distance_m(base_coords[-1], addition_coords[-1]), base_coords, list(reversed(addition_coords))),
+        (_endpoint_distance_m(base_coords[0], addition_coords[-1]), addition_coords, base_coords),
+        (_endpoint_distance_m(base_coords[0], addition_coords[0]), list(reversed(addition_coords)), base_coords),
+    ]
+    gap_m, first, second = min(alternatives, key=lambda item: item[0])
+    if gap_m > float(tolerance_m):
+        raise ValueError(
+            f"intentional open-boundary fragment is {gap_m:.3f} m from the nearest OBC endpoint; "
+            f"limit is {float(tolerance_m):.3f} m"
+        )
+    joined = LineString(first + second)
+    if joined.is_empty or not joined.is_simple:
+        raise ValueError("intentional open-boundary fragment would create a branched or self-crossing OBC")
+    return joined
+
+
 def _materialize_finalized_package(manifest: dict, contract: dict, run_dir: Path) -> dict:
     """Create a role-resolved package while preserving the candidate GeoPackage."""
     candidate = Path(manifest.get("outputs", {}).get("bdry_arc_package_gpkg", ""))
@@ -345,6 +375,7 @@ def _materialize_finalized_package(manifest: dict, contract: dict, run_dir: Path
     open_layer = open_layer.sort_values("obc_id").reset_index(drop=True)
     open_layer["obc_id"] = list(range(len(open_layer)))
     open_layer["residual_role"] = "primary_delivered_obc"
+    open_layer["absorbed_segment_ids"] = ""
 
     frame_layer = layers.get("frame_clip_boundary_arcs", gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")).copy()
     frame_layer = frame_layer.reset_index(drop=True)
@@ -357,6 +388,39 @@ def _materialize_finalized_package(manifest: dict, contract: dict, run_dir: Path
         contract.get("residual_components", []),
         key=lambda item: int(item.get("segment_id", -1)),
     )
+    intentional_absorbed: list[int] = []
+    join_tolerance_m = max(
+        250.0,
+        float(contract.get("hard_metrics", {}).get("absolute_limit_m", 250.0) or 250.0),
+    )
+    for component in components:
+        if component.get("classification") != "intentional_open_boundary":
+            continue
+        segment_id = int(component.get("segment_id", -1))
+        coords = component.get("geometry_lonlat") or []
+        if len(coords) < 2:
+            raise ValueError(f"intentional open-boundary segment {segment_id} has no materializable geometry")
+        fragment = LineString([(float(x), float(y)) for x, y in coords])
+        nearest_index = min(
+            range(len(open_layer)),
+            key=lambda index: min(
+                _endpoint_distance_m(tuple(open_layer.iloc[index].geometry.coords[0]), tuple(fragment.coords[0])),
+                _endpoint_distance_m(tuple(open_layer.iloc[index].geometry.coords[0]), tuple(fragment.coords[-1])),
+                _endpoint_distance_m(tuple(open_layer.iloc[index].geometry.coords[-1]), tuple(fragment.coords[0])),
+                _endpoint_distance_m(tuple(open_layer.iloc[index].geometry.coords[-1]), tuple(fragment.coords[-1])),
+            ),
+        )
+        open_layer.at[nearest_index, "geometry"] = _join_open_lines(
+            open_layer.iloc[nearest_index].geometry,
+            fragment,
+            join_tolerance_m,
+        )
+        prior = str(open_layer.at[nearest_index, "absorbed_segment_ids"] or "")
+        open_layer.at[nearest_index, "absorbed_segment_ids"] = ",".join(
+            item for item in (prior, str(segment_id)) if item
+        )
+        remove_segments.add(segment_id)
+        intentional_absorbed.append(segment_id)
     for component in components:
         role = component.get("assigned_role")
         if role not in {"secondary_tidal_obc", "solid_lagoon_closure"}:
@@ -429,16 +493,32 @@ def _materialize_finalized_package(manifest: dict, contract: dict, run_dir: Path
         "chains": chains,
         "solid_component_count": int(len(solid_rows)),
         "secondary_obc_count": int(len(secondary_rows)),
+        "intentional_open_fragment_count": int(len(intentional_absorbed)),
+        "intentional_open_fragment_segment_ids": intentional_absorbed,
     }
 
 
 def _rebuild_final_loops(manifest: dict, package: dict, manifest_path: Path) -> dict:
     source = dict(manifest)
+    source["settings"] = dict(manifest.get("settings", {}))
+    source["wet_domain"] = dict(manifest.get("wet_domain", {}))
+    source["outputs"] = dict(manifest.get("outputs", {}))
     source["final_status"] = "pass"
     source["failure_taxonomy"] = [
         item for item in source.get("failure_taxonomy", []) if item not in DECISION_FAILURES
     ]
     source.setdefault("outputs", {})["bdry_arc_package_gpkg"] = package["bdry_arc_package_final_gpkg"]
+    source["wet_domain"]["candidate_frame_clip_boundary_length_m"] = float(
+        source["wet_domain"].get("frame_clip_boundary_length_m", 0.0) or 0.0
+    )
+    source["wet_domain"]["frame_clip_boundary_length_m"] = 0.0
+    source["wet_domain"]["residual_roles_materialized"] = True
+    source["wet_domain"]["role_resolved_solid_component_count"] = int(
+        package.get("solid_component_count", 0)
+    )
+    source["wet_domain"]["role_resolved_secondary_obc_count"] = int(
+        package.get("secondary_obc_count", 0)
+    )
     source_path = manifest_path.parent / "bdry_arc_finalization_source.json"
     atomic_json(source_path, source)
     loop_dir = manifest_path.parent / "model_boundary_loops_final"

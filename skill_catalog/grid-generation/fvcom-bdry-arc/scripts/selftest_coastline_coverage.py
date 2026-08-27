@@ -37,13 +37,21 @@ def _product(root: Path, source_bbox, model_bbox=REGION.bounds, *, include_model
     height = source_bbox[3] - source_bbox[1]
     model_width = model_bbox[2] - model_bbox[0]
     model_height = model_bbox[3] - model_bbox[1]
+    source_center = ((source_bbox[0] + source_bbox[2]) / 2.0, (source_bbox[1] + source_bbox[3]) / 2.0)
+    model_center = ((model_bbox[0] + model_bbox[2]) / 2.0, (model_bbox[1] + model_bbox[3]) / 2.0)
+    center_offset = [source_center[0] - model_center[0], source_center[1] - model_center[1]]
+    declared_centered = bool(
+        abs(center_offset[0]) <= 0.05 * model_width
+        and abs(center_offset[1]) <= 0.05 * model_height
+    )
     manifest = {
         "schema_version": "gshhs_coastline_fetch_v2",
         "topology_coverage": {
             "schema_version": "gshhs_topology_coverage_v1",
             "coverage_factor_lon": width / model_width,
             "coverage_factor_lat": height / model_height,
-            "model_bbox_centrally_contained": True,
+            "model_bbox_centrally_contained": declared_centered,
+            "source_center_offset_lonlat": center_offset,
             "downstream_topology_eligible": width / model_width >= 2.0 and height / model_height >= 2.0,
         },
     }

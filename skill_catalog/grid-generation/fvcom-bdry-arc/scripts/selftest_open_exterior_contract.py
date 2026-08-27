@@ -89,6 +89,7 @@ def _test_materialized_residual_roles() -> None:
             [
                 {"segment_id": 0, "geometry": LineString([(0.0, 4.0), (0.0, 3.0)])},
                 {"segment_id": 1, "geometry": LineString([(0.0, 1.0), (0.0, 0.0)])},
+                {"segment_id": 2, "geometry": LineString([(4.0, 4.0), (3.9999, 4.0)])},
             ],
             geometry="geometry",
             crs="EPSG:4326",
@@ -112,6 +113,11 @@ def _test_materialized_residual_roles() -> None:
                     "assigned_role": "solid_lagoon_closure",
                     "geometry_lonlat": [[0.0, 1.0], [0.0, 0.0]],
                 },
+                {
+                    "segment_id": 2,
+                    "classification": "intentional_open_boundary",
+                    "geometry_lonlat": [[4.0, 4.0], [3.9999, 4.0]],
+                },
             ],
         }
         package = finalizer._materialize_finalized_package(
@@ -126,6 +132,8 @@ def _test_materialized_residual_roles() -> None:
         final_open = gpd.read_file(final_path, layer="open_boundary_arc").sort_values("obc_id")
         assert list(final_open["obc_id"]) == [0, 1]
         assert list(final_open["residual_role"]) == ["primary_delivered_obc", "secondary_tidal_obc"]
+        assert final_open.iloc[0]["absorbed_segment_ids"] == "2"
+        assert package["intentional_open_fragment_segment_ids"] == [2]
         final_land = gpd.read_file(final_path, layer="land_patch_boundary_arcs")
         assert len(final_land) == 1
         assert final_land.iloc[0]["residual_role"] == "solid_lagoon_closure"

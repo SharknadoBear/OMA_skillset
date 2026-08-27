@@ -7,8 +7,10 @@ from typing import Any
 
 import geopandas as gpd
 import pandas as pd
+from shapely import make_valid
 from shapely.geometry import box
 from shapely.ops import unary_union
+from shapely.validation import explain_validity
 
 from .plot import plot_gshhs_map
 from .quality import summarize_gdf
@@ -42,15 +44,111 @@ def _explode(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gdf.explode(index_parts=False, ignore_index=True)
 
 
-def _read_level_clip(path: Path, bbox_parts: list[tuple[float, float, float, float]]) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+def _polygonal_components(geometry):
+    """Return only polygonal components from a geometry-repair result."""
+    if geometry is None or geometry.is_empty:
+        return geometry
+    if geometry.geom_type in {"Polygon", "MultiPolygon"}:
+        return geometry
+    polygons = []
+    for part in getattr(geometry, "geoms", (geometry,)):
+        if part.geom_type == "Polygon":
+            polygons.append(part)
+        elif part.geom_type == "MultiPolygon":
+            polygons.extend(part.geoms)
+    return unary_union(polygons) if polygons else None
+
+
+def _equal_area_m2(geometry) -> float:
+    if geometry is None or geometry.is_empty:
+        return 0.0
+    return float(gpd.GeoSeries([geometry], crs="EPSG:4326").to_crs(6933).area.iloc[0])
+
+
+def _validate_polygonal_source(gdf: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, dict[str, Any]]:
+    """Repair invalid selected source polygons without modifying the cache."""
+    out = gdf.copy()
+    repaired_flags: list[bool] = []
+    repair_methods: list[str | None] = []
+    repaired_geometries = []
+    details: list[dict[str, Any]] = []
+    for source_index, geometry in out.geometry.items():
+        if geometry is None or geometry.is_empty:
+            repaired_geometries.append(geometry)
+            repaired_flags.append(False)
+            repair_methods.append(None)
+            continue
+        if geometry.geom_type not in {"Polygon", "MultiPolygon"}:
+            raise ValueError(
+                f"GSHHS land source feature {source_index!r} has non-polygonal geometry {geometry.geom_type!r}."
+            )
+        if geometry.is_valid:
+            repaired_geometries.append(geometry)
+            repaired_flags.append(False)
+            repair_methods.append(None)
+            continue
+
+        reason = explain_validity(geometry)
+        source_area_m2 = _equal_area_m2(geometry)
+        repaired = _polygonal_components(make_valid(geometry))
+        if repaired is None or repaired.is_empty or repaired.geom_type not in {"Polygon", "MultiPolygon"}:
+            raise ValueError(
+                f"GSHHS land source feature {source_index!r} could not be repaired to polygonal geometry: {reason}"
+            )
+        if not repaired.is_valid:
+            raise ValueError(
+                f"GSHHS land source feature {source_index!r} remains invalid after make_valid: "
+                f"{explain_validity(repaired)}"
+            )
+        repaired_area_m2 = _equal_area_m2(repaired)
+        denominator = max(abs(source_area_m2), 1.0)
+        details.append(
+            {
+                "source_index": str(source_index),
+                "source_geometry_type": geometry.geom_type,
+                "source_validity_reason": reason,
+                "repair_method": "shapely.make_valid_polygonal_components",
+                "repaired_geometry_type": repaired.geom_type,
+                "source_equal_area_m2": source_area_m2,
+                "repaired_equal_area_m2": repaired_area_m2,
+                "relative_area_change": abs(repaired_area_m2 - source_area_m2) / denominator,
+            }
+        )
+        repaired_geometries.append(repaired)
+        repaired_flags.append(True)
+        repair_methods.append("shapely.make_valid_polygonal_components")
+
+    out["geometry"] = repaired_geometries
+    out["source_geometry_repaired"] = repaired_flags
+    out["geometry_repair_method"] = repair_methods
+    return out, {
+        "policy": "validate_selected_source_then_make_valid_invalid_polygonal_features",
+        "cache_modified": False,
+        "selected_feature_count": int(len(out)),
+        "invalid_source_feature_count": int(len(details)),
+        "repaired_source_feature_count": int(len(details)),
+        "unrepaired_source_feature_count": 0,
+        "max_relative_area_change": max((float(item["relative_area_change"]) for item in details), default=0.0),
+        "details": details,
+    }
+
+
+def _read_level_clip(
+    path: Path,
+    bbox_parts: list[tuple[float, float, float, float]],
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, list[dict[str, Any]]]:
     raw_parts: list[gpd.GeoDataFrame] = []
     land_parts: list[gpd.GeoDataFrame] = []
+    validation_records: list[dict[str, Any]] = []
     for part in bbox_parts:
         bbox_poly = box(*part)
         raw = gpd.read_file(path, bbox=part)
         if raw.empty:
             continue
         raw = raw.to_crs(4326)
+        raw, validation = _validate_polygonal_source(raw)
+        validation["bbox_part_wsen"] = [float(value) for value in part]
+        validation_records.append(validation)
         raw_parts.append(raw)
         clipped = gpd.clip(raw, gpd.GeoDataFrame(geometry=[bbox_poly], crs="EPSG:4326"), keep_geom_type=True)
         if not clipped.empty:
@@ -63,7 +161,7 @@ def _read_level_clip(path: Path, bbox_parts: list[tuple[float, float, float, flo
         land_gdf = _explode(gpd.GeoDataFrame(pd.concat(land_parts, ignore_index=True), crs="EPSG:4326"))
     else:
         land_gdf = _empty_gdf()
-    return raw_gdf, land_gdf
+    return raw_gdf, land_gdf, validation_records
 
 
 def _derive_coastline(raw_gdf: gpd.GeoDataFrame, bbox_parts: list[tuple[float, float, float, float]]) -> gpd.GeoDataFrame:
@@ -157,6 +255,7 @@ def fetch_gshhs_bbox(
     warnings = list(resolution_warnings)
     missing_levels: list[int] = []
     source_component_hashes: dict[str, str] = {}
+    source_geometry_validation: list[dict[str, Any]] = []
     for level in level_list:
         shp = shapefile_path(source.gshhs_dir, selected_resolution, level)
         if not shp.exists():
@@ -167,7 +266,12 @@ def fetch_gshhs_bbox(
             if component.is_file():
                 key = str(component.relative_to(source.gshhs_dir)).replace("\\", "/")
                 source_component_hashes[key] = _sha256(component)
-        raw, land = _read_level_clip(shp, bbox_parts)
+        raw, land, validation_records = _read_level_clip(shp, bbox_parts)
+        for record in validation_records:
+            record["gshhs_resolution"] = selected_resolution
+            record["gshhs_level"] = int(level)
+            record["source_path"] = str(shp)
+            source_geometry_validation.append(record)
         if not raw.empty:
             raw["gshhs_resolution"] = selected_resolution
             raw["gshhs_level"] = int(level)
@@ -274,6 +378,19 @@ def fetch_gshhs_bbox(
             "selected_levels": level_list,
             "missing_levels": missing_levels,
             "selected_source_component_sha256": source_component_hashes,
+            "geometry_validation": {
+                "policy": "validate_selected_source_then_make_valid_invalid_polygonal_features",
+                "cache_modified": False,
+                "selected_feature_count": sum(int(item["selected_feature_count"]) for item in source_geometry_validation),
+                "invalid_source_feature_count": sum(int(item["invalid_source_feature_count"]) for item in source_geometry_validation),
+                "repaired_source_feature_count": sum(int(item["repaired_source_feature_count"]) for item in source_geometry_validation),
+                "unrepaired_source_feature_count": sum(int(item["unrepaired_source_feature_count"]) for item in source_geometry_validation),
+                "max_relative_area_change": max(
+                    (float(item["max_relative_area_change"]) for item in source_geometry_validation),
+                    default=0.0,
+                ),
+                "parts": source_geometry_validation,
+            },
         },
         "bbox_handling": bbox_metadata,
         "topology_coverage": topology_coverage,

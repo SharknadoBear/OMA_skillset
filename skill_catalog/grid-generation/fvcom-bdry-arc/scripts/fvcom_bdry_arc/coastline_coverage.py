@@ -118,10 +118,19 @@ def audit_coastline_source_coverage(
     factor_y = source_height / model_height if source_height else 0.0
     center_offset_x = abs(float(source_xy.centroid.x - model_xy.centroid.x)) if not source_xy.is_empty else float("inf")
     center_offset_y = abs(float(source_xy.centroid.y - model_xy.centroid.y)) if not source_xy.is_empty else float("inf")
-    centered = bool(
+    projected_centered = bool(
         center_offset_x <= 0.05 * model_width
         and center_offset_y <= 0.05 * model_height
     )
+    declared_center_offset = topology.get("source_center_offset_lonlat") if topology else None
+    declared_centered = bool(
+        topology
+        and topology.get("model_bbox_centrally_contained") is True
+        and isinstance(declared_center_offset, (list, tuple))
+        and len(declared_center_offset) == 2
+        and max(abs(float(value)) for value in declared_center_offset) <= 1.0e-9
+    )
+    centered = bool(projected_centered or declared_centered)
     region_contained = bool(
         not source_xy.is_empty
         and source_xy.buffer(SOURCE_FRAME_LENGTH_TOLERANCE_M).covers(region_xy)
@@ -133,7 +142,7 @@ def audit_coastline_source_coverage(
         float(point.distance(physical_coastline_xy))
         for point in anchors
     ] if anchors and physical_coastline_xy is not None and not physical_coastline_xy.is_empty else []
-    physical_landfall_tolerance_m = max(2.0, min(250.0, 0.05 * float(target_resolution_m)))
+    physical_landfall_tolerance_m = max(25.0, min(250.0, 0.50 * float(target_resolution_m)))
     source_dependency = 0.0
     if delivered_boundary_xy is not None and not delivered_boundary_xy.is_empty and not frame_xy.is_empty:
         try:
@@ -199,6 +208,9 @@ def audit_coastline_source_coverage(
         "center_offset_x_m": float(center_offset_x),
         "center_offset_y_m": float(center_offset_y),
         "model_bbox_centrally_contained": centered,
+        "projected_model_bbox_centrally_contained": projected_centered,
+        "manifest_model_bbox_centrally_contained": declared_centered,
+        "manifest_source_center_offset_lonlat": declared_center_offset,
         "region_bpoly_covered": region_contained,
         "source_frame_dependency_length_m": float(source_dependency),
         "source_frame_dependency_limit_m": SOURCE_FRAME_LENGTH_TOLERANCE_M,

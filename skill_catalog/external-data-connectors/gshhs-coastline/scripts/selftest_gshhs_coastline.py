@@ -10,10 +10,11 @@ import tempfile
 from pathlib import Path
 
 import geopandas as gpd
+from shapely.geometry import Polygon
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from gshhs_coastline.fetch import fetch_gshhs_bbox  # noqa: E402
+from gshhs_coastline.fetch import _validate_polygonal_source, fetch_gshhs_bbox  # noqa: E402
 from gshhs_coastline.quality import summarize_product  # noqa: E402
 from gshhs_coastline.sources import (  # noqa: E402
     expand_centered_topology_bbox,
@@ -75,6 +76,43 @@ def test_full_resolution_clip() -> None:
         )
         assert result.manifest["source"]["selected_resolution"] == "f"
         assert int(result.manifest["quality"]["land_polygons"]["feature_count"]) > 0
+
+
+def test_invalid_polygon_repair_contract() -> None:
+    invalid = Polygon([(0.0, 0.0), (2.0, 2.0), (0.0, 2.0), (2.0, 0.0), (0.0, 0.0)])
+    source = gpd.GeoDataFrame({"source_id": [7]}, geometry=[invalid], crs="EPSG:4326")
+    repaired, evidence = _validate_polygonal_source(source)
+    assert evidence["cache_modified"] is False
+    assert evidence["invalid_source_feature_count"] == 1
+    assert evidence["repaired_source_feature_count"] == 1
+    assert evidence["unrepaired_source_feature_count"] == 0
+    assert repaired.geometry.is_valid.all()
+    assert repaired.geometry.iloc[0].geom_type in {"Polygon", "MultiPolygon"}
+    assert bool(repaired.iloc[0]["source_geometry_repaired"]) is True
+    assert repaired.iloc[0]["geometry_repair_method"] == "shapely.make_valid_polygonal_components"
+
+
+def test_long_island_sound_full_resolution_source_repair() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        result = fetch_gshhs_bbox(
+            model_bbox=(-74.44, 39.77, -70.98, 41.93),
+            coverage_factor=3.0,
+            lookahead_km=10.0,
+            run_dir=tmp,
+            name="long_island_sound_topology",
+            resolution="f",
+            levels="1",
+            formats="gpkg",
+            make_plot=False,
+            quiet=True,
+        )
+        evidence = result.manifest["source"]["geometry_validation"]
+        assert evidence["cache_modified"] is False
+        assert evidence["invalid_source_feature_count"] >= 1
+        assert evidence["repaired_source_feature_count"] == evidence["invalid_source_feature_count"]
+        assert evidence["unrepaired_source_feature_count"] == 0
+        assert result.land_gdf.geometry.is_valid.all()
+        assert result.coastline_gdf.geometry.is_valid.all()
 
 
 def test_empty_bbox_behavior() -> None:
@@ -201,6 +239,8 @@ def main() -> None:
     test_cache_discovery()
     test_bbox_clip_and_coastline_outputs()
     test_full_resolution_clip()
+    test_invalid_polygon_repair_contract()
+    test_long_island_sound_full_resolution_source_repair()
     test_empty_bbox_behavior()
     test_antimeridian_split()
     test_centered_topology_coverage_contract()
