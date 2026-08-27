@@ -140,3 +140,9 @@ equidistribute `integral(ds/h)` independently between retained anchors. Never
 concatenate separate OBCs.
 
 Use the same target spacing on both sides of each land/OBC junction and grade toward the land-boundary target. Inventory only conservative connectors whose interiors are covered by the accepted wet domain and whose bank tangents are compatible. A passage may lower targets on both banks, but this boundary-stage tool must not close the passage. Derive the permitted minimum passage spacing from the minimum protected passage width divided by the protected element count; record the controlling passage and apply the targets locally on both banks. Do not substitute a fixed regional spacing floor. If an explicit user floor makes a protected passage unresolved, retain the geometry and mark it as a hard review gate. Always preserve downstream node-budget and serialization gates because an exceptionally narrow protected passage can imply expensive local refinement.
+
+For many-island domains, use expanded component envelopes only as the
+conservative passage-pair broad phase. Apply exact nearest-distance and wet
+connector tests to every retained candidate; the index may admit false
+positives for speed but may not remove a pair whose exact separation is within
+the configured maximum width.

@@ -1944,7 +1944,13 @@ def _inventory_narrow_passages(
         ("island", index, LineString(polygon.exterior.coords)) for index, polygon in enumerate(islands)
     ]
     component_geometries = [item[2] for item in components]
-    component_tree = STRtree(component_geometries)
+    # Use envelopes for the broad phase so GEOS does not repeatedly evaluate
+    # exact distances between highly detailed whole-island coastlines.  An
+    # axis-aligned envelope expanded by max_width contains every geometry
+    # whose exact distance can be <= max_width; the unchanged nearest-points
+    # and wet-connector checks below reject the conservative false positives.
+    component_envelopes = [geometry.envelope for geometry in component_geometries]
+    component_tree = STRtree(component_envelopes)
     indexed_component_pair_count = 0
     all_component_pair_count = len(components) * max(0, len(components) - 1) // 2
     if progress is not None:
@@ -1954,7 +1960,14 @@ def _inventory_narrow_passages(
             {"substage": "cross_component", "raw_candidate_count": len(raw_candidates)},
         )
     for first, geometry_a in enumerate(component_geometries):
-        nearby = component_tree.query(geometry_a, predicate="dwithin", distance=max_width)
+        min_x, min_y, max_x, max_y = geometry_a.bounds
+        search_envelope = box(
+            min_x - max_width,
+            min_y - max_width,
+            max_x + max_width,
+            max_y + max_width,
+        )
+        nearby = component_tree.query(search_envelope)
         for second in sorted(int(value) for value in nearby if int(value) > first):
             indexed_component_pair_count += 1
             kind_a, component_a, geometry_a = components[first]
@@ -2136,6 +2149,7 @@ def _inventory_narrow_passages(
                 if controlling_passage is not None
                 else None
             ),
+            "component_pair_index_policy": "expanded_envelope_broad_phase_then_exact_distance_and_wet_connector",
             "all_component_pair_count": int(all_component_pair_count),
             "spatially_indexed_component_pair_count": int(indexed_component_pair_count),
             "passages": passages,

@@ -1385,6 +1385,40 @@ def test_v2_passage_inventory_harmonizes_or_gates_without_closure() -> None:
     assert no_protected_report["unprotected_unresolved_count"] >= 1
 
 
+def test_v2_passage_inventory_uses_conservative_sparse_broad_phase() -> None:
+    projection = local_utm_projection((-75.5, 38.5, -72.5, 41.5))
+    origin = project_geometry(Point(-75.0, 39.0), projection)
+    x0, y0 = float(origin.x), float(origin.y)
+    islands = [
+        box(x0 + 10_000.0 * column, y0 + 10_000.0 * row, x0 + 10_000.0 * column + 500.0, y0 + 10_000.0 * row + 500.0)
+        for row in range(5)
+        for column in range(5)
+    ]
+    outer = [
+        (x0 - 5_000.0, y0 - 5_000.0),
+        (x0 + 46_000.0, y0 - 5_000.0),
+        (x0 + 46_000.0, y0 + 46_000.0),
+        (x0 - 5_000.0, y0 + 46_000.0),
+    ]
+    domain = Polygon(outer, holes=[list(island.exterior.coords) for island in islands])
+    report, controls, island_targets = _inventory_narrow_passages(
+        [],
+        islands,
+        domain,
+        None,
+        BoundaryResolutionV2Config(passage_max_width_m=1_000.0),
+        projection,
+    )
+    assert report["component_pair_index_policy"] == (
+        "expanded_envelope_broad_phase_then_exact_distance_and_wet_connector"
+    )
+    assert report["all_component_pair_count"] == 300
+    assert report["spatially_indexed_component_pair_count"] == 0
+    assert report["passage_count"] == 0
+    assert controls == []
+    assert island_targets == {}
+
+
 def test_coastal_obc_scoring_is_compact_not_bpoly_containment_driven() -> None:
     bpoly = box(0.0, 0.0, 10.0, 10.0)
     compact = {
@@ -1537,6 +1571,7 @@ def main() -> int:
     test_adaptive_uses_exact_delivered_obc_not_proximity_tails()
     test_v2_feature_anchors_and_junction_spacing()
     test_v2_passage_inventory_harmonizes_or_gates_without_closure()
+    test_v2_passage_inventory_uses_conservative_sparse_broad_phase()
     test_coastal_obc_scoring_is_compact_not_bpoly_containment_driven()
     test_coastal_obc_self_intersection_remains_blocking()
     test_open_exterior_contract_is_non_mutating_and_obc_unbound()
