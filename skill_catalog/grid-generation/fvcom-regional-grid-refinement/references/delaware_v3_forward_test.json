@@ -1,0 +1,65 @@
+{
+  "schema_version": "icom_fvcom_regional_grid_refinement_forward_test_v3",
+  "status": "PASS",
+  "workspace": "Workspace/Grid_n_bathymetry_maps_v3",
+  "product_status": "REFINED_GRID_V3_STAGED_DATUM_REVIEW_REQUIRED",
+  "source_patch": {
+    "buffer_m": 7500.0,
+    "selected_elements": 71590,
+    "selected_nodes": 37679,
+    "boundary_loops": 4,
+    "stitch_edges": 570,
+    "physical_edges": 3202
+  },
+  "selected_candidate": {
+    "generator": "Gmsh Frontal-Delaunay algorithm 6",
+    "scale": 0.81,
+    "boundary_mode": "selected_exact_chord_split",
+    "patch_nodes": 71871,
+    "patch_elements": 139892,
+    "inserted_exact_chord_nodes": 82,
+    "boundary_l_over_h_p95": 1.283712592802238,
+    "boundary_l_over_h_maximum": 1.4900474942686952
+  },
+  "resolution": {
+    "station_count": 605,
+    "includes_exact_ncf_terminal": true,
+    "minimum_effective_vertex_columns": 4.039549798504384,
+    "median_effective_vertex_columns": 4.710667288996264
+  },
+  "coastal_hotspots": {
+    "claymont_bellevue": {
+      "v2_median_refined_source_area_ratio": 0.106,
+      "v3_median_refined_source_area_ratio": 0.2055568152786731,
+      "adjacent_area_ratio_p95": 1.3913233027663523
+    },
+    "south_philadelphia_camden": {
+      "v2_median_refined_source_area_ratio": 0.146,
+      "v3_median_refined_source_area_ratio": 0.3128294228979904,
+      "adjacent_area_ratio_p95": 1.3796094837145731
+    }
+  },
+  "delivered_mesh": {
+    "nodes": 150696,
+    "elements": 287502,
+    "boundary_components": 6,
+    "quality_minimum": 0.4164754004950519,
+    "minimum_angle_deg": 15.549007427245536,
+    "maximum_valence": 8,
+    "maximum_barotropic_courant_at_0p25s": 0.20125115766362636,
+    "mesh_sha256": "921F0CB0ECAA468B18687625D8005DB5BBA1589AFD650D18D6B982BCBD33FCAB"
+  },
+  "contracts": {
+    "obc_node_ids": "1-139 unchanged",
+    "river_node_count": 10,
+    "source_vertices_preserved": true,
+    "maximum_exact_chord_geometry_error_m": 0.0,
+    "fvcom_scenarios": ["G0", "G45", "G50", "G60"],
+    "figure_exports": 30,
+    "production_integration": "EXCLUDED"
+  },
+  "evidence": {
+    "workflow_sha256": "B516304DC0C77091D4155A8BA5E80B82B7C33AA66B3B6E669BFA41CD568A8AAB",
+    "terminal_validation_sha256": "6F008824B2DD11890594AC2EDCF1FD623CF7B09235AFCCBFAF790B367E865ADA"
+  }
+}

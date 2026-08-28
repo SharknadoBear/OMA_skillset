@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM Regional Grid Refinement"
+  short_description: "Refine protected FVCOM regions and boundaries safely"
+  default_prompt: "Use $fvcom-regional-grid-refinement to refine this FVCOM mesh inside the supplied polygon, optionally split selected exact physical-boundary chords, preserve protected node IDs, and validate the stitched result."

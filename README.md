@@ -186,6 +186,10 @@ usable skill families at different maturity levels:
   wet polygon, solid boundary geometry, and bathymetry during mesh-size
   construction and can lock that intent for controlled clean-room/Gmsh
   generator portfolios without changing the production default.
+  `fvcom-regional-grid-refinement` adds deterministic element-aligned local
+  refinement for existing FVCOM/SMS meshes while preserving protected node
+  identities, boundary chords, bathymetry lineage, and preconfiguration
+  contracts.
 - `memory-control/` now contains the two active HTML project-memory workflow
   skills: `brain-dumping` for durable session memos and `brain-refreshing` for
   workspace reorientation before continuing work.

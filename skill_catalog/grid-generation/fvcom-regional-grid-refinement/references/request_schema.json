@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "icom_fvcom_regional_grid_refinement_request_v2",
+  "type": "object",
+  "required": [
+    "source_mesh",
+    "refinement_polygon",
+    "projected_crs",
+    "output_workspace",
+    "protected_node_ids",
+    "patch",
+    "size_field",
+    "mesher"
+  ],
+  "properties": {
+    "source_mesh": {"type": "string", "minLength": 1},
+    "refinement_polygon": {"type": "string", "minLength": 1},
+    "centerline": {"type": ["string", "null"]},
+    "projected_crs": {"type": "string", "pattern": "^(EPSG:)?[0-9]+$"},
+    "output_workspace": {"type": "string", "minLength": 1},
+    "protected_node_ids": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 1},
+      "uniqueItems": true
+    },
+    "obc_node_ids": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 1},
+      "uniqueItems": true
+    },
+    "river_node_ids": {
+      "type": "array",
+      "items": {"type": "integer", "minimum": 1},
+      "uniqueItems": true
+    },
+    "patch": {
+      "type": "object",
+      "required": ["initial_buffer_m", "maximum_buffer_m", "increment_m"],
+      "properties": {
+        "initial_buffer_m": {"type": "number", "exclusiveMinimum": 0},
+        "maximum_buffer_m": {"type": "number", "exclusiveMinimum": 0},
+        "increment_m": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "size_field": {
+      "type": "object",
+      "required": ["minimum_m", "maximum_core_m", "gradation"],
+      "properties": {
+        "minimum_m": {"type": "number", "exclusiveMinimum": 0},
+        "maximum_core_m": {"type": "number", "exclusiveMinimum": 0},
+        "gradation": {"type": "number", "exclusiveMinimum": 0, "maximum": 0.10},
+        "cross_feature_vertex_columns": {"type": ["number", "array"]}
+      }
+    },
+    "mesher": {
+      "type": "object",
+      "required": ["algorithm", "threads", "seed", "element_order", "smoothing_steps", "node_cap"],
+      "properties": {
+        "algorithm": {"const": 6},
+        "threads": {"const": 1},
+        "seed": {"const": 1},
+        "element_order": {"const": 1},
+        "smoothing_steps": {"const": 8},
+        "node_cap": {"type": "integer", "minimum": 1, "maximum": 1000000},
+        "algorithm_fallback": {"const": false}
+      }
+    },
+    "bathymetry_sources": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "physical_boundary_refinement": {
+      "type": "object",
+      "default": {"mode": "locked"},
+      "required": [
+        "mode",
+        "selection_tolerance_m",
+        "maximum_edge_to_target_ratio",
+        "preserve_source_vertices",
+        "forbid_protected_incidence"
+      ],
+      "properties": {
+        "mode": {"enum": ["locked", "selected_exact_chord_split"]},
+        "selector_geojson": {"type": "string", "minLength": 1},
+        "selection_tolerance_m": {"type": "number", "minimum": 0},
+        "maximum_edge_to_target_ratio": {"type": "number", "exclusiveMinimum": 0},
+        "preserve_source_vertices": {"const": true},
+        "forbid_protected_incidence": {"const": true}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"mode": {"const": "selected_exact_chord_split"}}},
+          "then": {"required": ["selector_geojson"]}
+        }
+      ],
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,38 @@
+{
+  "source_mesh": "path/to/source.2dm",
+  "refinement_polygon": "path/to/refinement.geojson",
+  "centerline": null,
+  "projected_crs": "EPSG:26918",
+  "output_workspace": "Workspace/regional_refinement_locked_example",
+  "protected_node_ids": [1, 2, 3, 1001],
+  "obc_node_ids": [1, 2, 3],
+  "river_node_ids": [1001],
+  "patch": {
+    "initial_buffer_m": 7500.0,
+    "maximum_buffer_m": 15000.0,
+    "increment_m": 2500.0
+  },
+  "size_field": {
+    "minimum_m": 20.0,
+    "maximum_core_m": 160.0,
+    "gradation": 0.1,
+    "cross_feature_vertex_columns": 4
+  },
+  "mesher": {
+    "algorithm": 6,
+    "threads": 1,
+    "seed": 1,
+    "element_order": 1,
+    "smoothing_steps": 8,
+    "node_cap": 900000,
+    "algorithm_fallback": false
+  },
+  "bathymetry_sources": ["path/to/bathymetry.nc"],
+  "physical_boundary_refinement": {
+    "mode": "locked",
+    "selection_tolerance_m": 25.0,
+    "maximum_edge_to_target_ratio": 1.5,
+    "preserve_source_vertices": true,
+    "forbid_protected_incidence": true
+  }
+}

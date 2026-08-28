@@ -1,0 +1,67 @@
+{
+  "schema_version": "icom_fvcom_regional_grid_refinement_forward_test_v1",
+  "status": "PASS",
+  "run_date": "2026-08-23",
+  "workspace": "Workspace/Grid_n_bathymetry_maps_v2",
+  "scientific_status": "REFINED_GRID_STAGED_DATUM_REVIEW_REQUIRED",
+  "production_integration": "EXCLUDED",
+  "source": {
+    "grid": "FVCOM grid v6",
+    "nodes": 116504,
+    "elements": 219200,
+    "protected_obc_node_ids": "1-139",
+    "protected_river_node_count": 10
+  },
+  "patch": {
+    "buffer_m": 7500.0,
+    "source_elements_replaced": 71590,
+    "source_nodes_involved": 37679,
+    "boundary_nodes": 3772,
+    "stitch_edges": 570,
+    "boundary_loops": 4
+  },
+  "generation": {
+    "generator": "Gmsh",
+    "algorithm": 6,
+    "threads": 1,
+    "seed": 1,
+    "element_order": 1,
+    "native_smoothing_steps": 8,
+    "algorithm_fallback": false,
+    "selected_retry_scale": 1.0
+  },
+  "delivered": {
+    "nodes": 153410,
+    "elements": 293012,
+    "boundary_components": 6,
+    "minimum_quality": 0.4164754004950519,
+    "minimum_angle_deg": 15.549007427245536,
+    "maximum_valence": 8,
+    "nonmanifold_edges": 0,
+    "superthin_elements": 0,
+    "barotropic_courant_maximum_at_0p25s": 0.19983156603725355
+  },
+  "effective_vertex_columns": {
+    "below_55km_median": 2.9826020183012196,
+    "below_55km_minimum": 2.676401869093201,
+    "above_65km_median": 6.04188991768628,
+    "above_65km_minimum": 5.268706903559085
+  },
+  "outputs": {
+    "bathymetry_cases": ["G0", "G45", "G50", "G60"],
+    "fvcom_dat_files_per_case": 6,
+    "figure_families": 8,
+    "figure_exports": 24
+  },
+  "hashes_at_forward_test": {
+    "config_json": "942d4236583cef9dea7227dbeab6fa8a2c4c79f22fd3cf5739656517d561ef7e",
+    "project_workflow_script": "a1fe4c8f93cb9e2553b5f53accba2c98fdd6b445dbdce72d58672ba3ff320d36",
+    "terminal_validation_report": "1ac4dd50764aac36fe490a9b0a8e46ff9273dffb4945e7937d150f0177897540",
+    "delivered_g0_2dm": "f7d79e4b7f6c725433bef0c3126b22a6685de07f032d9674e3dd8c1cc1b8251a"
+  },
+  "notes": [
+    "The exact NCF polygon was evaluated continuously in the size callback to prevent coarse-source-triangle holes.",
+    "Six local edge flips under minimal-topology-v1 closed all valence debt without moving nodes or changing boundary edges.",
+    "Negative inherited wet/dry depths are retained under the project compatibility adapter; the vertical-datum release gate remains open."
+  ]
+}
