@@ -36,6 +36,9 @@ from fvcom_grid_generation.autonomous_thin import (  # noqa: E402
     shoreline_junction_turns_deg,
     validate_agent_decision,
 )
+from fvcom_grid_generation.node_budget import (  # noqa: E402
+    DEFAULT_HARD_NODE_LIMIT,
+)
 from fvcom_grid_generation.portfolio_case import (  # noqa: E402
     PortfolioCaseConfig,
     run_portfolio_case,
@@ -707,7 +710,10 @@ def _run_interior_topology(
     return result
 
 
-def _conditionable_raw_remesh(output: Path, hard_node_cap: int = 1_000_000) -> dict[str, Any]:
+def _conditionable_raw_remesh(
+    output: Path,
+    hard_node_cap: int = DEFAULT_HARD_NODE_LIMIT,
+) -> dict[str, Any]:
     """Separate successful raw publication from full raw-quality acceptance."""
     candidate = output / "remesh" / "candidates" / "gmsh_frontal_delaunay_6"
     raw = candidate / "raw_mesh.2dm"

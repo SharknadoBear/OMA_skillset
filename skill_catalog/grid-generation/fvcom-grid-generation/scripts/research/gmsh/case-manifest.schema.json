@@ -288,12 +288,12 @@
         "preflight_node_threshold": {
           "type": "integer",
           "minimum": 1,
-          "description": "Planning threshold; current default 900000 and historical overrides remain valid."
+          "description": "Planning threshold; current default 4500000 and historical overrides remain valid."
         },
         "hard_node_cap": {
           "type": "integer",
           "minimum": 1,
-          "description": "Delivered-node ceiling; current default 1000000 and historical overrides remain valid."
+          "description": "Delivered-node ceiling; current default 5000000 and historical overrides remain valid."
         },
         "hu_increment_m": {
           "const": 25,

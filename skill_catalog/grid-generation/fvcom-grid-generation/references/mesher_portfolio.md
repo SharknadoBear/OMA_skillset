@@ -83,8 +83,8 @@ than guessing.
 - Stratify results by boundary-discretization policy; do not rank unmatched
   policies as an algorithm-only bakeoff.
 - Use fresh, non-overwriting candidate directories.
-- By default, enforce the same 900,000-node preflight threshold and
-  1,000,000-node hard cap. Explicit smaller budgets remain valid reproducibility
+- By default, enforce the same 4,500,000-node preflight threshold and
+  5,000,000-node hard cap. Explicit smaller budgets remain valid reproducibility
   overrides.
 - Re-audit the delivered mesh after generation. A delivered count above the
   hard cap is a hard failure even when the metric preflight passed.
@@ -123,9 +123,9 @@ h_b=
 \]
 
 then select the smallest 25 m multiple \(h_u\ge h_b\) that satisfies the common
-900,000-node metric preflight. Here \(\Delta x_{95}\) and \(\Delta y_{95}\)
+4,500,000-node metric preflight. Here \(\Delta x_{95}\) and \(\Delta y_{95}\)
 describe bathymetry raster support; 25 m is only the deterministic rounding and
-search quantum. The 1,000,000-node cap is a ceiling, not a requested node count:
+search quantum. The 5,000,000-node cap is a ceiling, not a requested node count:
 selection stops at \(h_b\) when that floor already fits. Assign \(h_u\) to every
 solid and island target and use the case manifest's near-OBC target for every
 open chain. Reject a configuration whose maximum size is below selected
@@ -221,7 +221,7 @@ truncation is not the v2 contract.
 
 After reconciliation, integrate the final size callback at every active wet
 raster-cell centre and use that callback-adjusted interior estimate in the
-900,000-node preflight. The stored raster estimate is retained for comparison,
+4,500,000-node preflight. The stored raster estimate is retained for comparison,
 but it cannot authorize triangulation when the sampled trace makes the
 callback finer.
 

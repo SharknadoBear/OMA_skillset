@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 
-DEFAULT_HARD_NODE_LIMIT = 1_000_000
+DEFAULT_HARD_NODE_LIMIT = 5_000_000
 """Maximum delivered node count for a default regional run."""
 
-DEFAULT_PREFLIGHT_NODE_LIMIT = 900_000
+DEFAULT_PREFLIGHT_NODE_LIMIT = 4_500_000
 """Planning threshold that reserves ten percent below the hard cap."""
 
 DEFAULT_NODE_BUDGET_STOP_FRACTION = (

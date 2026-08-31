@@ -1,6 +1,6 @@
 {
   "schema_version": "fvcom_grid_quality_policy_v1",
-  "policy_id": "benchmark-first-2026-08-23",
+  "policy_id": "benchmark-first-2026-08-30",
   "description": "Ordered FVCOM benchmark-grid policy: absolute invariants, valence, superthin debt, regional refinement debt, then descriptive advisories.",
   "priority_order": [
     "absolute_structural_invariants",
@@ -21,8 +21,8 @@
     "regional_target_size_l_over_h_p95": 1.55,
     "regional_target_size_l_over_h_maximum": 2.0,
     "roundtrip_coordinate_tolerance_m": 0.01,
-    "planning_node_limit": 900000,
-    "hard_node_limit": 1000000
+    "planning_node_limit": 4500000,
+    "hard_node_limit": 5000000
   },
   "buckets": {
     "benchmark_baseline": {

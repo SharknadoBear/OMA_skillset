@@ -18,6 +18,10 @@ import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import substring
 
+from .node_budget import (
+    DEFAULT_HARD_NODE_LIMIT,
+    DEFAULT_PREFLIGHT_NODE_LIMIT,
+)
 from .quality_policy import (
     apply_quality_policy,
     classify_failure_codes,
@@ -50,8 +54,8 @@ class AutonomousThinConfig:
     stable_bracket_target_multiplier: float = 2.0
     maximum_candidates_per_component: int = 3
     maximum_remesh_cycles: int = 3
-    planning_node_limit: int = 900_000
-    hard_node_limit: int = 1_000_000
+    planning_node_limit: int = DEFAULT_PREFLIGHT_NODE_LIMIT
+    hard_node_limit: int = DEFAULT_HARD_NODE_LIMIT
 
 
 def sha256_file(path: str | Path) -> str:

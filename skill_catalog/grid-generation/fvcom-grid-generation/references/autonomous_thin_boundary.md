@@ -36,7 +36,7 @@ contracts are present.
 
 - Require three elements across an ordinary wet connection. Treat a requested
   resolution as infeasible when width/3 lies below the bathymetry-supported
-  floor or its node estimate exceeds the 900,000-node planning threshold.
+  floor or its node estimate exceeds the 4,500,000-node planning threshold.
 - Derive the local CUSP window buffer as
   `clip(max(10*h, 2*component_diameter, 1 km), 1 km, 5 km)`.
 - Keep GSHHS as the closed topology scaffold. Use CUSP only as request-bounded

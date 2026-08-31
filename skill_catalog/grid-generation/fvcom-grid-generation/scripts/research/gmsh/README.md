@@ -265,7 +265,7 @@ the raw primary, with Gmsh Delaunay algorithm 5 as the first hard-gate
 challenger. This is routing policy only; it is not a regional-result,
 algorithm-winner, or production-promotion claim.
 
-The portfolio defaults are a 900,000-node planning threshold, a 1,000,000-node
+The portfolio defaults are a 4,500,000-node planning threshold, a 5,000,000-node
 hard cap, gradation `0.10`, boundary/field compatibility factor `1.5`, and at
 most eight boundary/field fixed-point passes. For every immutable source chord
 of length \(L\), derive the geometry-aware endpoint target
@@ -300,7 +300,7 @@ at most 4,096 to bound adaptive-neighbour memory without changing values or
 aggregate counters. Because this callback can be finer than the stored
 cell-centred raster, recompute the interior node-budget
 estimate with active neighboring-raster support and adaptive trace subcells
-before applying the 900,000-node preflight. Each trace subcell subtracts its
+before applying the 4,500,000-node preflight. Each trace subcell subtracts its
 maximum Lipschitz release from the exact subcell-centre trace value, capped by
 the global minimum trace target.
 
@@ -347,8 +347,8 @@ it does not silently flatten them.
 
 ## Direct six-case node budget and size field
 
-The current common hard cap is 1,000,000 nodes and the planning threshold is
-900,000, preserving ten percent headroom. These are defaults for fresh runs;
+The current common hard cap is 5,000,000 nodes and the planning threshold is
+4,500,000, preserving ten percent headroom. These are defaults for fresh runs;
 explicit smaller values remain available for baseline reproduction. The
 bathymetry floor is three times the geometric mean of the projected p95
 raster-cell dimensions, rounded upward on a 25 m numerical grid. The projected
@@ -358,7 +358,7 @@ then choose the smallest 25 m increment of uniform interior size `h_u`
 satisfying
 
 ```text
-N_boundary + integral_Omega[2 / (sqrt(3) * h(x)^2)] dA <= 900000.
+N_boundary + integral_Omega[2 / (sqrt(3) * h(x)^2)] dA <= 4500000.
 ```
 
 Open-boundary cases use one Gmsh `Distance` field over all OBC curves and a
@@ -373,8 +373,8 @@ native smoothing steps, no recombination, no Netgen optimization, and no OMA
 conditioning or postprocessing. Use one thread, a fixed random seed,
 reproducible mode, and disabled automatic algorithm switching.
 
-If a completed mesh exceeds 1,000,000 nodes, one deterministic rerun may scale
-`h_u` by `sqrt(N_actual / 900000)`. A second overflow is `needs_review`.
+If a completed mesh exceeds 5,000,000 nodes, one deterministic rerun may scale
+`h_u` by `sqrt(N_actual / 4500000)`. A second overflow is `needs_review`.
 
 ## Required artifacts
 

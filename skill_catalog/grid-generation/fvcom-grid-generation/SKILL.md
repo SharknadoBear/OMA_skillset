@@ -121,9 +121,9 @@ By default, derive the bathymetry floor from three times the geometric mean of
 the projected p95 raster-cell dimensions, round it upward on a 25 m numerical
 grid, and select the smallest budget-compatible uniform target `h_u` on that
 same grid. The 25 m value is a deterministic rounding/search quantum, not the
-bathymetry resolution. Use a 900,000-node planning threshold and a 1,000,000-node
-hard cap by default; this permits finer meshes but does not require one million
-nodes. Assign `h_u` to solid/island targets and the manifest's near-OBC target
+bathymetry resolution. Use a 4,500,000-node planning threshold and a
+5,000,000-node hard cap by default; this permits finer meshes but does not
+require five million nodes. Assign `h_u` to solid/island targets and the manifest's near-OBC target
 to open chains. If budget-selected `h_u` exceeds the configured maximum size,
 fail with an explicit request to raise that maximum; never silently lower the
 bathymetry-supported floor. Preserve every source vertex and its lineage. For each source
@@ -222,8 +222,9 @@ Important controls:
 - `--area-transition-relaxation|--no-area-transition-relaxation`; normal generation applies sequential target-aware spring patches after thin repair.
 - `--area-transition-max-patches`, default 12; bounds accepted local transition patches. The raw adjacent-area trigger defaults to `0.50`, equivalent to an area ratio of two.
 - `--postprocess-profile`, compatibility default `none`; non-`none` integrated requests are rejected with standalone-tool guidance.
-- `--max-total-nodes` and `--node-budget-stop-fraction` default to 1,000,000 and `0.90`, producing a 900,000-node planning gate. They audit the pre-triangulation estimate, including explicit boundary and boundary-front seeds. The audit is recorded for every boundary package and remains a hard gate for adaptive-coastal-v2. Independently audit the delivered node count after every generator; exceeding 1,000,000 is a hard failure even when preflight passed.
-- `--land-spacing-m`, `--open-spacing-m`, `--max-interior-points`, and `--size-field-max-cells` set the boundary targets and execution limits. The default interior-seed ceiling is 900,000 so it does not retain the former 80,000-point bottleneck.
+- `--max-total-nodes` and `--node-budget-stop-fraction` default to 5,000,000 and `0.90`, producing a 4,500,000-node planning gate. They audit the pre-triangulation estimate, including explicit boundary and boundary-front seeds. The audit is recorded for every boundary package and remains a hard gate for adaptive-coastal-v2. Independently audit the delivered node count after every generator; exceeding 5,000,000 is a hard failure even when preflight passed.
+- `--land-spacing-m`, `--open-spacing-m`, `--max-interior-points`, and `--size-field-max-cells` set the boundary targets and execution limits. The default interior-seed ceiling is 4,500,000 so it does not retain the former 900,000-point bottleneck.
+- Treat five million nodes as a safety ceiling, not a target. Preserve estimate-first evidence and record forecast and actual runtime, storage, and peak memory when available. Do not execute multiple estimated-million-node meshing cases concurrently on one workstation unless resource preflight confirms sufficient headroom.
 - `--bathy-fetch-halo-m`, default `2000`, buffers the assembled wet-domain
   polygon in projected meters before automatic CUDEM/NBS/CRM/ETOPO acquisition.
   RegionBPoly remains provenance and source-coverage intent, not the fetch

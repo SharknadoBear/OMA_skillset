@@ -39,8 +39,8 @@
     "comparison_policy": "metric_by_metric_no_composite_winner"
   },
   "budget": {
-    "preflight_node_threshold": 900000,
-    "hard_node_cap": 1000000,
+    "preflight_node_threshold": 4500000,
+    "hard_node_cap": 5000000,
     "hu_increment_m": 25,
     "overflow_reruns": 1
   },

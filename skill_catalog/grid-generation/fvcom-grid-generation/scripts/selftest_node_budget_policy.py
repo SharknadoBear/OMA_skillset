@@ -44,36 +44,43 @@ from run_mesher_portfolio_case import (  # noqa: E402
 
 
 def test_shared_default_budget() -> None:
-    assert DEFAULT_HARD_NODE_LIMIT == 1_000_000
-    assert DEFAULT_PREFLIGHT_NODE_LIMIT == 900_000
+    assert DEFAULT_HARD_NODE_LIMIT == 5_000_000
+    assert DEFAULT_PREFLIGHT_NODE_LIMIT == 4_500_000
     assert DEFAULT_NODE_BUDGET_STOP_FRACTION == 0.90
-    assert DEFAULT_MAX_INTERIOR_POINTS == 900_000
+    assert DEFAULT_MAX_INTERIOR_POINTS == 4_500_000
     assert DEFAULT_SPACING_QUANTUM_M == 25.0
 
     gmsh = BudgetConfig()
-    assert DEFAULT_NODE_LIMIT == gmsh.max_nodes == 1_000_000
-    assert DEFAULT_PREFLIGHT_LIMIT == gmsh.preflight_nodes == 900_000
+    assert DEFAULT_NODE_LIMIT == gmsh.max_nodes == 5_000_000
+    assert DEFAULT_PREFLIGHT_LIMIT == gmsh.preflight_nodes == 4_500_000
     assert gmsh.step_m == 25.0
 
     portfolio = PortfolioCaseConfig()
-    assert portfolio.preflight_node_limit == 900_000
-    assert portfolio.hard_node_limit == 1_000_000
+    assert portfolio.preflight_node_limit == 4_500_000
+    assert portfolio.hard_node_limit == 5_000_000
 
     production = GridConfig()
-    assert production.max_total_nodes == 1_000_000
+    assert production.max_total_nodes == 5_000_000
     assert production.node_budget_stop_fraction == 0.90
     assert (
         production.max_total_nodes * production.node_budget_stop_fraction
-        == 900_000
+        == 4_500_000
     )
-    assert production.max_interior_points == 900_000
-    assert MeshConfig().max_interior_points == 900_000
+    assert production.max_interior_points == 4_500_000
+    assert MeshConfig().max_interior_points == 4_500_000
+
+    policy_path = (
+        SCRIPTS.parent / "references" / "fvcom_grid_quality_policy_v1.json"
+    )
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    assert policy["thresholds"]["planning_node_limit"] == DEFAULT_PREFLIGHT_NODE_LIMIT
+    assert policy["thresholds"]["hard_node_limit"] == DEFAULT_HARD_NODE_LIMIT
 
 
 def test_cli_defaults_and_legacy_overrides() -> None:
     gmsh = build_gmsh_parser().parse_args(["--case-manifest", "case.json"])
-    assert gmsh.preflight_node_threshold == 900_000
-    assert gmsh.hard_node_cap == 1_000_000
+    assert gmsh.preflight_node_threshold == 4_500_000
+    assert gmsh.hard_node_cap == 5_000_000
     gmsh_legacy = build_gmsh_parser().parse_args(
         [
             "--case-manifest",
@@ -90,8 +97,8 @@ def test_cli_defaults_and_legacy_overrides() -> None:
     portfolio = build_portfolio_parser().parse_args(
         ["--case-manifest", "case.json", "--output-dir", "output"]
     )
-    assert portfolio.preflight_node_limit == 900_000
-    assert portfolio.hard_node_limit == 1_000_000
+    assert portfolio.preflight_node_limit == 4_500_000
+    assert portfolio.hard_node_limit == 5_000_000
     portfolio_legacy = build_portfolio_parser().parse_args(
         [
             "--case-manifest",
@@ -147,12 +154,12 @@ def test_spacing_quantum_is_configurable_search_granularity() -> None:
 
 
 def test_delivered_hard_cap_is_an_acceptance_gate() -> None:
-    passing = delivered_node_budget_report(1_000_000, 1_000_000)
+    passing = delivered_node_budget_report(5_000_000, 5_000_000)
     assert passing["passed"] is True
     assert passing["remaining_node_capacity"] == 0
     assert passing["failure_taxonomy"] == []
 
-    failing = delivered_node_budget_report(1_000_001, 1_000_000)
+    failing = delivered_node_budget_report(5_000_001, 5_000_000)
     assert failing["passed"] is False
     assert failing["remaining_node_capacity"] == -1
     assert failing["failure_taxonomy"] == ["hard_node_cap_exceeded"]
@@ -179,8 +186,8 @@ def test_current_case_manifests_declare_future_run_defaults() -> None:
     assert len(cases) == 6
     for case in cases:
         payload = json.loads(case.read_text())
-        assert payload["budget"]["preflight_node_threshold"] == 900_000
-        assert payload["budget"]["hard_node_cap"] == 1_000_000
+        assert payload["budget"]["preflight_node_threshold"] == 4_500_000
+        assert payload["budget"]["hard_node_cap"] == 5_000_000
         assert payload["budget"]["hu_increment_m"] == 25
 
 
@@ -202,8 +209,8 @@ def test_lake_superior_continuity_manifest_contract() -> None:
     assert payload["bathymetry"]["netcdf"].endswith(
         "lake_superior_fvcom_depth_v2.nc"
     )
-    assert payload["budget"]["preflight_node_threshold"] == 900_000
-    assert payload["budget"]["hard_node_cap"] == 1_000_000
+    assert payload["budget"]["preflight_node_threshold"] == 4_500_000
+    assert payload["budget"]["hard_node_cap"] == 5_000_000
     assert payload["budget"]["hu_increment_m"] == 25
     assert payload["readiness"]["status"] == "ready"
 
