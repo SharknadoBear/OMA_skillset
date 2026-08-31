@@ -200,6 +200,11 @@ def run_bdry_arc(
     land_polygons_xy_gdf = _project_gdf_densified(land_polygons_raw, projection)
     raw_lines_xy = _flatten_lines(coastline_xy.geometry)
     land_polygons_xy = _flatten_polygons(land_polygons_xy_gdf.geometry)
+    land_union_xy = (
+        unary_union(land_polygons_xy).buffer(0)
+        if land_polygons_xy
+        else GeometryCollection()
+    )
     _write_progress(run_dir, "project-coastline", "done", {"line_count": int(len(raw_lines_xy))})
     audit = audit_coastline_topology(raw_lines_xy, bpoly_xy, config.target_resolution_m)
     _write_progress(run_dir, "audit", "done", {"line_count": audit["line_count"]})
@@ -323,9 +328,11 @@ def run_bdry_arc(
             topology_time_budget_s=config.topology_time_budget_s,
             obc_placement_policy=config.obc_placement_policy,
             physical_land_boundary_xy=physical_coastline_boundary_xy,
+            land_union_xy=land_union_xy,
         )
         scored = topology_selection["scored"]
         wet_result = topology_selection["wet_result"]
+        anchors = topology_selection["anchors"]
         selected_arc_xy = wet_result.get("open_arc_xy", scored["selected"]["geometry"])
         scored["selected"]["geometry"] = selected_arc_xy
         _write_progress(run_dir, "gshhs-vector", "done", wet_result["metadata"])
@@ -384,8 +391,9 @@ def run_bdry_arc(
             coastline_gpkg,
             bpoly_lonlat,
             projection,
-            physical_coastline_boundary_xy,
+            land_union_xy.boundary if not land_union_xy.is_empty else physical_coastline_boundary_xy,
             anchors_xy=[Point(anchors["start_xy"]), Point(anchors["end_xy"])] if not lake_closed_branch and not island_loop_branch else [],
+            landfall_construction=anchors.get("landfall_extension"),
             delivered_boundary_xy=wet_result["wet_domain_xy"].boundary,
             target_resolution_m=config.target_resolution_m,
             output_dir=run_dir / "coastline_source_coverage",
@@ -556,7 +564,13 @@ def run_bdry_arc(
             "end_anchor_found": anchors.get("end_anchor_found"),
             "start_snap_distance_m": anchors.get("start_snap_distance_m"),
             "end_snap_distance_m": anchors.get("end_snap_distance_m"),
+            "start_extension_length_m": anchors.get("start_extension_length_m"),
+            "end_extension_length_m": anchors.get("end_extension_length_m"),
             "anchor_tolerance_m": anchors.get("anchor_tolerance_m"),
+            "landfall_acceptance_tolerance_m": anchors.get("landfall_acceptance_tolerance_m"),
+            "landfall_construction_stage": anchors.get("landfall_construction_stage"),
+            "provisional_side_reference_only": anchors.get("provisional_side_reference_only"),
+            "landfall_extension": anchors.get("landfall_extension"),
             "seaward_chain_lonlat": [
                 [float(pt.x), float(pt.y)]
                 for pt in (
@@ -1161,14 +1175,23 @@ def select_gshhs_open_side_topology(
     topology_time_budget_s: float | None = None,
     obc_placement_policy: str = "offshore-first",
     physical_land_boundary_xy=None,
+    land_union_xy=None,
 ) -> dict[str, Any]:
     """Select the coastline-anchor seaward-chain deformation that creates the best domain."""
-    evaluated: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    evaluated: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
     start_time = time.monotonic()
     budget_exceeded = False
     if run_dir is not None:
         _write_progress(run_dir, "gshhs-vector", "land-union-start", {"land_polygon_count": len(land_polygons_xy)})
-    land_union_xy = unary_union(land_polygons_xy).buffer(0) if land_polygons_xy else GeometryCollection()
+    land_union_xy = (
+        land_union_xy
+        if land_union_xy is not None
+        else (
+            unary_union(land_polygons_xy).buffer(0)
+            if land_polygons_xy
+            else GeometryCollection()
+        )
+    )
     if run_dir is not None:
         _write_progress(run_dir, "gshhs-vector", "land-union-done", {"land_union_empty": land_union_xy.is_empty})
     for idx, candidate in enumerate(scored["candidates"], start=1):
@@ -1179,19 +1202,44 @@ def select_gshhs_open_side_topology(
                 "candidate-start",
                 {"candidate_id": candidate.get("candidate_id"), "candidate_index": idx, "candidate_count": len(scored["candidates"])},
             )
+        try:
+            extended_arc, landfall_extension = _extend_open_arc_to_land_polygons(
+                candidate["geometry"],
+                land_union_xy,
+            )
+        except ValueError as exc:
+            if run_dir is not None:
+                _write_progress(
+                    run_dir,
+                    "gshhs-vector",
+                    "candidate-landfall-rejected",
+                    {
+                        "candidate_id": candidate.get("candidate_id"),
+                        "candidate_index": idx,
+                        "candidate_count": len(scored["candidates"]),
+                        "reason": str(exc),
+                    },
+                )
+            continue
+        candidate_anchors = _promote_pre_refinement_landfalls(
+            anchors or {},
+            extended_arc,
+            landfall_extension,
+        )
         result = extract_gshhs_vector_wet_domain(
             coastline_lines_xy,
             land_polygons_xy,
-            candidate["geometry"],
+            extended_arc,
             bpoly_xy,
             seed_xy,
             target_resolution_m,
-            anchors=anchors,
+            anchors=candidate_anchors,
             land_union_xy=land_union_xy,
             obc_placement_policy=obc_placement_policy,
             physical_land_boundary_xy=physical_land_boundary_xy,
         )
         metadata = result["metadata"]
+        metadata["pre_refinement_landfall_extension"] = landfall_extension
         metrics = dict(candidate.get("metrics", {}))
         metrics.update(
             {
@@ -1235,10 +1283,11 @@ def select_gshhs_open_side_topology(
 
         item = dict(candidate)
         item["geometry"] = delivered_arc
+        item["pre_refinement_landfall_extension"] = landfall_extension
         item["metrics"] = metrics
         item["score"] = float(topology_score)
         result["metadata"]["candidate_id"] = candidate.get("candidate_id")
-        evaluated.append((item, result))
+        evaluated.append((item, result, candidate_anchors))
         if run_dir is not None:
             _write_progress(
                 run_dir,
@@ -1267,6 +1316,11 @@ def select_gshhs_open_side_topology(
                 )
             break
 
+    if not evaluated:
+        raise ValueError(
+            "No provisional OBC candidate has two exact terminal-ray intersections "
+            "with physical land polygons"
+        )
     evaluated.sort(
         key=lambda pair: (
             bool(pair[0]["metrics"].get("structural_topology_pass")),
@@ -1280,12 +1334,16 @@ def select_gshhs_open_side_topology(
         ),
         reverse=True,
     )
-    selected, wet_result = evaluated[0]
+    selected, wet_result, selected_anchors = evaluated[0]
     if budget_exceeded:
         wet_result["metadata"]["topology_budget_exceeded"] = True
         wet_result["metadata"]["topology_time_budget_s"] = float(topology_time_budget_s or 0.0)
-    candidates = [item for item, _result in evaluated]
-    return {"scored": {"selected": selected, "candidates": candidates}, "wet_result": wet_result}
+    candidates = [item for item, _result, _anchors in evaluated]
+    return {
+        "scored": {"selected": selected, "candidates": candidates},
+        "wet_result": wet_result,
+        "anchors": selected_anchors,
+    }
 
 
 def select_island_loop_topology(
@@ -4193,20 +4251,17 @@ def _coastline_bpoly_anchor_points(
     target_resolution_m: float,
     logical_sides_xy: list[LineString] | None = None,
 ) -> dict[str, Any]:
-    """Find open-boundary anchors where coastline intersects the two adjacent bpoly sides."""
+    """Choose provisional side references for later exact OBC-ray landfalls."""
     context = _selected_side_context(bpoly_xy, selected_side_xy, logical_sides_xy=logical_sides_xy)
-    tolerance = max(float(target_resolution_m), 250.0)
     start_anchor = _find_side_coastline_anchor(
         context["start_adjacent_side_xy"],
         coastline_boundary_xy,
         Point(context["selected_side_start_corner_xy"]),
-        tolerance,
     )
     end_anchor = _find_side_coastline_anchor(
         context["end_adjacent_side_xy"],
         coastline_boundary_xy,
         Point(context["selected_side_end_corner_xy"]),
-        tolerance,
     )
     seaward_chain_xy = [
         start_anchor["xy"],
@@ -4224,13 +4279,18 @@ def _coastline_bpoly_anchor_points(
         "end_line_index": None,
         "start_distance_m": float(start_anchor["distance_to_corner_m"]),
         "end_distance_m": float(end_anchor["distance_to_corner_m"]),
-        "start_snap_distance_m": float(start_anchor["snap_distance_m"]),
-        "end_snap_distance_m": float(end_anchor["snap_distance_m"]),
+        "start_snap_distance_m": 0.0,
+        "end_snap_distance_m": 0.0,
+        "start_reference_to_coastline_distance_m": float(start_anchor["reference_to_coastline_distance_m"]),
+        "end_reference_to_coastline_distance_m": float(end_anchor["reference_to_coastline_distance_m"]),
         "start_anchor_found": bool(start_anchor["found"]),
         "end_anchor_found": bool(end_anchor["found"]),
         "start_anchor_method": start_anchor["method"],
         "end_anchor_method": end_anchor["method"],
-        "anchor_tolerance_m": float(tolerance),
+        "anchor_tolerance_m": 0.0,
+        "landfall_acceptance_tolerance_m": None,
+        "provisional_side_reference_only": True,
+        "landfall_construction_stage": "pending_pre_refinement_obc_ray_extension",
         "selected_side_index": int(context["selected_side_index"]),
         "start_adjacent_side_index": int(context["start_adjacent_side_index"]),
         "end_adjacent_side_index": int(context["end_adjacent_side_index"]),
@@ -4300,7 +4360,6 @@ def _find_side_coastline_anchor(
     adjacent_side_xy: LineString,
     coastline_boundary_xy,
     offshore_corner_xy: Point,
-    tolerance_m: float,
 ) -> dict[str, Any]:
     if coastline_boundary_xy is None or coastline_boundary_xy.is_empty:
         fallback = adjacent_side_xy.interpolate(adjacent_side_xy.project(offshore_corner_xy))
@@ -4308,7 +4367,7 @@ def _find_side_coastline_anchor(
             "xy": (float(fallback.x), float(fallback.y)),
             "found": False,
             "method": "missing_coastline_boundary",
-            "snap_distance_m": float("inf"),
+            "reference_to_coastline_distance_m": float("inf"),
             "distance_to_corner_m": float(fallback.distance(offshore_corner_xy)),
         }
 
@@ -4320,52 +4379,356 @@ def _find_side_coastline_anchor(
                 "point": point,
                 "found": True,
                 "method": "exact_intersection",
-                "snap_distance_m": 0.0,
+                "reference_to_coastline_distance_m": 0.0,
                 "distance_to_corner_m": float(point.distance(offshore_corner_xy)),
             }
         )
-    try:
-        near_geom = coastline_boundary_xy.intersection(adjacent_side_xy.buffer(tolerance_m))
-    except Exception:
-        near_geom = GeometryCollection()
-    for coast_point in _points_from_intersection(near_geom, offshore_corner_xy):
-        side_point = adjacent_side_xy.interpolate(adjacent_side_xy.project(coast_point))
-        snap_distance = float(side_point.distance(coast_point))
-        if snap_distance <= tolerance_m:
-            candidates.append(
-                {
-                    "point": side_point,
-                    "found": True,
-                    "method": "snapped_within_tolerance" if snap_distance > 0.0 else "exact_intersection",
-                    "snap_distance_m": snap_distance,
-                    "distance_to_corner_m": float(side_point.distance(offshore_corner_xy)),
-                }
-            )
     if candidates:
-        chosen_item = min(candidates, key=lambda item: (item["distance_to_corner_m"], item["snap_distance_m"]))
+        chosen_item = min(
+            candidates,
+            key=lambda item: (
+                item["distance_to_corner_m"],
+                item["reference_to_coastline_distance_m"],
+            ),
+        )
         chosen = chosen_item["point"]
         return {
             "xy": (float(chosen.x), float(chosen.y)),
             "found": bool(chosen_item["found"]),
             "method": chosen_item["method"],
-            "snap_distance_m": float(chosen_item["snap_distance_m"]),
+            "reference_to_coastline_distance_m": float(
+                chosen_item["reference_to_coastline_distance_m"]
+            ),
             "distance_to_corner_m": float(chosen_item["distance_to_corner_m"]),
         }
 
     try:
         side_point, coast_point = nearest_points(adjacent_side_xy, coastline_boundary_xy)
-        snap_distance = float(side_point.distance(coast_point))
+        reference_distance = float(side_point.distance(coast_point))
     except Exception:
         side_point = adjacent_side_xy.interpolate(adjacent_side_xy.project(offshore_corner_xy))
-        snap_distance = float("inf")
-    found = bool(snap_distance <= tolerance_m)
+        reference_distance = float("inf")
+    found = bool(math.isfinite(reference_distance))
     return {
         "xy": (float(side_point.x), float(side_point.y)),
         "found": found,
-        "method": "snapped_within_tolerance" if found else "nearest_exceeds_tolerance",
-        "snap_distance_m": float(snap_distance),
+        "method": "provisional_side_reference" if found else "coastline_reference_unavailable",
+        "reference_to_coastline_distance_m": reference_distance,
         "distance_to_corner_m": float(side_point.distance(offshore_corner_xy)),
     }
+
+
+def _extend_open_arc_to_land_polygons(
+    open_arc_xy: LineString,
+    land_union_xy,
+) -> tuple[LineString, dict[str, Any]]:
+    """Put both OBC endpoints on their first exact land-polygon crossing.
+
+    An endpoint already in water is extended along its outward terminal ray.
+    An endpoint inside land is trimmed along the existing source chain to its
+    first waterward exit.  This is a construction step, not a distance-based
+    snap.  It runs before Adaptive-v2 arc refinement so the two exact landfalls
+    become source-chain endpoints and no post-refinement short edge is
+    introduced.
+    """
+    if not isinstance(open_arc_xy, LineString) or open_arc_xy.is_empty or len(open_arc_xy.coords) < 2:
+        raise ValueError("A provisional OBC requires at least two coordinates")
+    if land_union_xy is None or land_union_xy.is_empty:
+        raise ValueError("Physical land polygons are unavailable for OBC ray intersection")
+    source_start_inside = bool(land_union_xy.contains(Point(open_arc_xy.coords[0])))
+    source_end_inside = bool(land_union_xy.contains(Point(open_arc_xy.coords[-1])))
+    prepared_arc, inside_reports = _trim_inside_land_endpoints(open_arc_xy, land_union_xy)
+    coordinates = [(float(x), float(y)) for x, y in prepared_arc.coords]
+    if source_start_inside:
+        start_point = Point(coordinates[0])
+        start_report = inside_reports["start"]
+    else:
+        start_point, start_report = _terminal_ray_landfall(
+            coordinates[0],
+            coordinates[1],
+            land_union_xy,
+            endpoint_name="start",
+        )
+        if start_report["point_added"]:
+            coordinates.insert(0, (float(start_point.x), float(start_point.y)))
+        else:
+            coordinates[0] = (float(start_point.x), float(start_point.y))
+    if source_end_inside:
+        end_point = Point(coordinates[-1])
+        end_report = inside_reports["end"]
+    else:
+        end_point, end_report = _terminal_ray_landfall(
+            coordinates[-1],
+            coordinates[-2],
+            land_union_xy,
+            endpoint_name="end",
+        )
+        if end_report["point_added"]:
+            coordinates.append((float(end_point.x), float(end_point.y)))
+        else:
+            coordinates[-1] = (float(end_point.x), float(end_point.y))
+    extended = LineString(coordinates)
+    if extended.is_empty or not extended.is_simple:
+        raise ValueError("Exact land-polygon extension creates a branched or self-crossing OBC")
+    return extended, {
+        "method": "exact_terminal_ray_land_polygon_intersection",
+        "construction_stage": "before_adaptive_arc_refinement",
+        "acceptance_tolerance_m": None,
+        "source_vertex_count": int(len(open_arc_xy.coords)),
+        "extended_vertex_count": int(len(extended.coords)),
+        "start": start_report,
+        "end": end_report,
+        "source_trim_length_m": float(
+            start_report.get("trim_length_m", 0.0) + end_report.get("trim_length_m", 0.0)
+        ),
+        "extension_length_m": float(
+            start_report["extension_length_m"] + end_report["extension_length_m"]
+        ),
+        "exact_landfall_count": 2,
+    }
+
+
+def _trim_inside_land_endpoints(
+    open_arc_xy: LineString,
+    land_union_xy,
+) -> tuple[LineString, dict[str, dict[str, Any]]]:
+    """Trim land-interior source tails at exact waterward boundary exits."""
+    start = Point(open_arc_xy.coords[0])
+    end = Point(open_arc_xy.coords[-1])
+    start_inside = bool(land_union_xy.contains(start))
+    end_inside = bool(land_union_xy.contains(end))
+    reports: dict[str, dict[str, Any]] = {}
+    if not start_inside and not end_inside:
+        return open_arc_xy, reports
+
+    length = float(open_arc_xy.length)
+    if length <= 0.0:
+        raise ValueError("A provisional OBC source chain has zero length")
+    positions = _land_boundary_crossing_positions(open_arc_xy, land_union_xy.boundary)
+    start_position = 0.0
+    end_position = length
+    if start_inside:
+        start_position = _first_waterward_exit_position(
+            open_arc_xy,
+            land_union_xy,
+            positions,
+            endpoint_name="start",
+        )
+    if end_inside:
+        end_position = _first_waterward_exit_position(
+            open_arc_xy,
+            land_union_xy,
+            positions,
+            endpoint_name="end",
+        )
+    if start_position >= end_position:
+        raise ValueError(
+            "Provisional OBC land-interior tails leave no waterward source chain between exact landfalls"
+        )
+    trimmed = substring(open_arc_xy, start_position, end_position)
+    if not isinstance(trimmed, LineString) or trimmed.is_empty or len(trimmed.coords) < 2:
+        raise ValueError("Exact land-interior trimming leaves fewer than two OBC coordinates")
+    if start_inside:
+        point = Point(trimmed.coords[0])
+        reports["start"] = _inside_landfall_report(
+            "start",
+            point,
+            start_position,
+            land_union_xy.boundary,
+        )
+    if end_inside:
+        point = Point(trimmed.coords[-1])
+        reports["end"] = _inside_landfall_report(
+            "end",
+            point,
+            length - end_position,
+            land_union_xy.boundary,
+        )
+    return trimmed, reports
+
+
+def _land_boundary_crossing_positions(open_arc_xy: LineString, land_boundary_xy) -> list[float]:
+    intersection = open_arc_xy.intersection(land_boundary_xy)
+    points: list[Point] = []
+
+    def collect(geometry) -> None:
+        if geometry is None or geometry.is_empty:
+            return
+        if isinstance(geometry, Point):
+            points.append(geometry)
+            return
+        if isinstance(geometry, LineString):
+            coordinates = list(geometry.coords)
+            if coordinates:
+                points.extend([Point(coordinates[0]), Point(coordinates[-1])])
+            return
+        if hasattr(geometry, "geoms"):
+            for part in geometry.geoms:
+                collect(part)
+
+    collect(intersection)
+    return sorted(set(float(open_arc_xy.project(point)) for point in points))
+
+
+def _first_waterward_exit_position(
+    open_arc_xy: LineString,
+    land_union_xy,
+    crossing_positions: list[float],
+    *,
+    endpoint_name: str,
+) -> float:
+    length = float(open_arc_xy.length)
+    if endpoint_name == "start":
+        ordered = [position for position in crossing_positions if position >= 0.0]
+        for index, position in enumerate(ordered):
+            next_position = ordered[index + 1] if index + 1 < len(ordered) else length
+            if next_position > position:
+                probe = open_arc_xy.interpolate(0.5 * (position + next_position))
+                if not land_union_xy.covers(probe):
+                    return float(position)
+    elif endpoint_name == "end":
+        ordered = [position for position in crossing_positions if position <= length]
+        for index in range(len(ordered) - 1, -1, -1):
+            position = ordered[index]
+            previous_position = ordered[index - 1] if index > 0 else 0.0
+            if position > previous_position:
+                probe = open_arc_xy.interpolate(0.5 * (previous_position + position))
+                if not land_union_xy.covers(probe):
+                    return float(position)
+    else:
+        raise ValueError(f"Unknown OBC endpoint name: {endpoint_name}")
+    raise ValueError(
+        f"Provisional OBC {endpoint_name} endpoint starts inside physical land "
+        "and the source chain has no exact waterward land-polygon exit"
+    )
+
+
+def _inside_landfall_report(
+    endpoint_name: str,
+    landfall: Point,
+    trim_length_m: float,
+    land_boundary_xy,
+) -> dict[str, Any]:
+    return {
+        "endpoint": endpoint_name,
+        "method": "source_chain_first_waterward_land_polygon_exit",
+        "point_added": True,
+        "extension_length_m": 0.0,
+        "trim_length_m": float(trim_length_m),
+        "landfall_xy": [float(landfall.x), float(landfall.y)],
+        "distance_to_land_polygon_boundary_m": float(landfall.distance(land_boundary_xy)),
+    }
+
+
+def _terminal_ray_landfall(
+    endpoint_xy: tuple[float, float],
+    interior_neighbor_xy: tuple[float, float],
+    land_union_xy,
+    *,
+    endpoint_name: str,
+) -> tuple[Point, dict[str, Any]]:
+    endpoint = Point(endpoint_xy)
+    land_boundary = land_union_xy.boundary
+    if land_boundary.intersects(endpoint):
+        return endpoint, {
+            "endpoint": endpoint_name,
+            "method": "already_on_land_polygon_boundary",
+            "point_added": False,
+            "extension_length_m": 0.0,
+            "landfall_xy": [float(endpoint.x), float(endpoint.y)],
+            "distance_to_land_polygon_boundary_m": 0.0,
+        }
+    if land_union_xy.contains(endpoint):
+        raise ValueError(
+            f"Provisional OBC {endpoint_name} endpoint starts inside physical land; "
+            "trim it on the source chain before terminal-ray extension"
+        )
+    direction = np.asarray(endpoint_xy, dtype=float) - np.asarray(interior_neighbor_xy, dtype=float)
+    norm = float(np.linalg.norm(direction))
+    if norm <= 0.0:
+        raise ValueError(f"Provisional OBC {endpoint_name} terminal ray has zero length")
+    direction /= norm
+    minx, miny, maxx, maxy = land_union_xy.bounds
+    corners = [
+        Point(minx, miny),
+        Point(minx, maxy),
+        Point(maxx, miny),
+        Point(maxx, maxy),
+    ]
+    ray_extent_m = 2.0 * max(float(endpoint.distance(corner)) for corner in corners)
+    if not math.isfinite(ray_extent_m) or ray_extent_m <= 0.0:
+        raise ValueError("Physical land-polygon bounds cannot define a terminal ray")
+    far = np.asarray(endpoint_xy, dtype=float) + direction * ray_extent_m
+    ray = LineString([endpoint_xy, (float(far[0]), float(far[1]))])
+    intersection = ray.intersection(land_boundary)
+    crossings = sorted(
+        (
+            (float(ray.project(point)), point)
+            for point in _points_from_intersection(intersection, endpoint)
+            if float(ray.project(point)) > 0.0
+        ),
+        key=lambda item: item[0],
+    )
+    if not crossings:
+        raise ValueError(
+            f"Provisional OBC {endpoint_name} terminal ray does not intersect a physical land polygon"
+        )
+    position, landfall = crossings[0]
+    return landfall, {
+        "endpoint": endpoint_name,
+        "method": "terminal_ray_first_land_polygon_intersection",
+        "point_added": True,
+        "extension_length_m": float(position),
+        "ray_extent_m": float(ray_extent_m),
+        "landfall_xy": [float(landfall.x), float(landfall.y)],
+        "distance_to_land_polygon_boundary_m": float(landfall.distance(land_boundary)),
+    }
+
+
+def _promote_pre_refinement_landfalls(
+    anchors: dict[str, Any],
+    extended_arc: LineString,
+    extension_report: dict[str, Any],
+) -> dict[str, Any]:
+    out = dict(anchors)
+    start = (float(extended_arc.coords[0][0]), float(extended_arc.coords[0][1]))
+    end = (float(extended_arc.coords[-1][0]), float(extended_arc.coords[-1][1]))
+    out.update(
+        {
+            "source_start_xy": out.get("start_xy"),
+            "source_end_xy": out.get("end_xy"),
+            "start_xy": start,
+            "end_xy": end,
+            "start_role": "exact_physical_land_polygon_landfall",
+            "end_role": "exact_physical_land_polygon_landfall",
+            "start_anchor_found": True,
+            "end_anchor_found": True,
+            "start_anchor_method": "obc_terminal_ray_land_polygon_intersection",
+            "end_anchor_method": "obc_terminal_ray_land_polygon_intersection",
+            "start_snap_distance_m": 0.0,
+            "end_snap_distance_m": 0.0,
+            "start_extension_length_m": float(extension_report["start"]["extension_length_m"]),
+            "end_extension_length_m": float(extension_report["end"]["extension_length_m"]),
+            "anchor_tolerance_m": 0.0,
+            "landfall_acceptance_tolerance_m": None,
+            "provisional_side_reference_only": False,
+            "landfall_construction_stage": "before_adaptive_arc_refinement",
+            "landfall_extension": extension_report,
+            "seaward_chain_xy": [
+                start,
+                out["selected_side_start_corner_xy"],
+                out["selected_side_end_corner_xy"],
+                end,
+            ],
+        }
+    )
+    out["start_distance_m"] = float(
+        Point(start).distance(Point(out["selected_side_start_corner_xy"]))
+    )
+    out["end_distance_m"] = float(
+        Point(end).distance(Point(out["selected_side_end_corner_xy"]))
+    )
+    return out
 
 
 def _points_from_intersection(geom, reference: Point) -> list[Point]:
@@ -5024,11 +5387,8 @@ def _final_status(
             failures.append("start_coastline_bpoly_anchor_missing")
         if not anchors.get("end_anchor_found", False):
             failures.append("end_coastline_bpoly_anchor_missing")
-        tolerance = float(anchors.get("anchor_tolerance_m", 0.0))
-        if float(anchors.get("start_snap_distance_m", 0.0)) > tolerance:
-            failures.append("start_coastline_bpoly_anchor_snap_exceeds_tolerance")
-        if float(anchors.get("end_snap_distance_m", 0.0)) > tolerance:
-            failures.append("end_coastline_bpoly_anchor_snap_exceeds_tolerance")
+        if anchors.get("landfall_construction_stage") != "before_adaptive_arc_refinement":
+            failures.append("exact_pre_refinement_landfall_construction_missing")
     if not metadata.get("seed_inside"):
         failures.append("seed_not_inside_wet_domain")
     if metadata.get("forbidden_overlap"):

@@ -50,10 +50,12 @@ from fvcom_bdry_arc.workflow import (  # noqa: E402
     _classify_relevant_lines,
     _coastline_bpoly_anchor_points,
     _deformed_bpoly_frame,
+    _extend_open_arc_to_land_polygons,
     _final_status,
     _gshhs_resolution_policy,
     _normalize_open_arc_to_wet_exterior,
     _promote_delivered_open_arc_landfalls,
+    _promote_pre_refinement_landfalls,
     _raster_connectivity_fill,
     _reroute_open_arc_around_blocking_land,
     _route_closed_island_loop_clear_of_land,
@@ -690,10 +692,12 @@ def test_gshhs_vector_package_prefers_coastline_lines() -> None:
         assert manifest["wet_domain"]["coastline_line_count"] >= 2
         assert manifest["wet_domain"]["closure_method"] == "coastline_anchor_seaward_bpoly_chain"
         assert manifest["anchors"]["source"] == "coastline_bpoly_intersection"
-        assert manifest["anchors"]["start_role"] == "coastline_bpoly_start_anchor"
-        assert manifest["anchors"]["end_role"] == "coastline_bpoly_end_anchor"
+        assert manifest["anchors"]["start_role"] == "exact_physical_land_polygon_landfall"
+        assert manifest["anchors"]["end_role"] == "exact_physical_land_polygon_landfall"
         assert manifest["anchors"]["start_anchor_found"] is True
         assert manifest["anchors"]["end_anchor_found"] is True
+        assert manifest["anchors"]["landfall_acceptance_tolerance_m"] is None
+        assert manifest["anchors"]["landfall_construction_stage"] == "before_adaptive_arc_refinement"
         assert abs(manifest["anchors"]["start_lonlat"][0] - 1.0) < 0.01
         assert abs(manifest["anchors"]["start_lonlat"][1] - 4.0) < 0.01
         assert abs(manifest["anchors"]["end_lonlat"][0] - 1.0) < 0.01
@@ -950,6 +954,7 @@ def test_coastline_anchor_seaward_chain_closes_boundary() -> None:
     coast = [poly.boundary for poly in land]
     selected_side = LineString([(10_000.0, 10_000.0), (10_000.0, 0.0)])
     anchors = _coastline_bpoly_anchor_points(coast[0], selected_side, bpoly, 250.0)
+    anchors["landfall_construction_stage"] = "before_adaptive_arc_refinement"
     arc = LineString([(2_000.0, 10_000.0), (11_000.0, 8_000.0), (11_000.0, 2_000.0), (2_000.0, 0.0)])
     result = extract_gshhs_vector_wet_domain(coast, land, arc, bpoly, Point(4_000.0, 5_000.0), 250.0, anchors=anchors)
     wet = result["wet_domain_xy"]
@@ -969,6 +974,7 @@ def test_open_arc_crossing_blocker_is_rerouted() -> None:
     coast = [box(0.0, 0.0, 2_000.0, 10_000.0).boundary]
     selected_side = LineString([(10_000.0, 10_000.0), (10_000.0, 0.0)])
     anchors = _coastline_bpoly_anchor_points(coast[0], selected_side, bpoly, 250.0)
+    anchors["landfall_construction_stage"] = "before_adaptive_arc_refinement"
     arc = LineString([(2_000.0, 10_000.0), (10_700.0, 5_000.0), (2_000.0, 0.0)])
     result = extract_gshhs_vector_wet_domain([], land, arc, bpoly, Point(7_000.0, 5_000.0), 250.0, anchors=anchors)
     assert result["metadata"]["arc_land_intersection"] is False
@@ -1014,6 +1020,7 @@ def test_source_arc_tail_trims_to_delivered_landfalls() -> None:
             "selected_side_end_corner_xy": (12.0, 0.0),
             "start_distance_m": 0.0,
             "end_distance_m": 0.0,
+            "landfall_construction_stage": "before_adaptive_arc_refinement",
         },
         delivered,
         land_boundary,
@@ -1132,15 +1139,106 @@ def test_coastline_bpoly_anchor_selection_rules() -> None:
     assert Point(anchors["end_xy"]).distance(Point(3_000.0, 0.0)) < 1.0e-8
     assert anchors["seaward_chain_xy"][1] == (10_000.0, 10_000.0)
     assert anchors["seaward_chain_xy"][2] == (10_000.0, 0.0)
+    assert anchors["landfall_acceptance_tolerance_m"] is None
+    assert anchors["provisional_side_reference_only"] is True
 
 
-def test_missing_coastline_bpoly_anchor_needs_review() -> None:
+def test_exact_pre_refinement_landfall_extension_has_no_snap_tolerance() -> None:
+    land = unary_union(
+        [
+            box(-5.0, -5.0, 0.0, 5.0),
+            box(10.0, -5.0, 15.0, 5.0),
+        ]
+    )
+    provisional = LineString([(2.0, 0.0), (5.0, 0.0), (8.0, 0.0)])
+    extended, report = _extend_open_arc_to_land_polygons(provisional, land)
+    assert list(extended.coords)[0] == (0.0, 0.0)
+    assert list(extended.coords)[-1] == (10.0, 0.0)
+    assert report["acceptance_tolerance_m"] is None
+    assert report["construction_stage"] == "before_adaptive_arc_refinement"
+    assert math.isclose(report["start"]["extension_length_m"], 2.0, abs_tol=1.0e-12)
+    assert math.isclose(report["end"]["extension_length_m"], 2.0, abs_tol=1.0e-12)
+    assert report["start"]["distance_to_land_polygon_boundary_m"] == 0.0
+    assert report["end"]["distance_to_land_polygon_boundary_m"] == 0.0
+    assert extended.is_simple
+    config = BoundaryResolutionV2Config(
+        open_anchor_spacing_m=2.0,
+        open_central_spacing_m=4.0,
+    )
+    _coords, _sizes, metadata, sampling = _sample_open_arc_v2(
+        extended,
+        config,
+        land_union=land,
+    )
+    assert sampling["feature_anchor_count"] == 0
+    assert sum(item["anchor_type"] == "open_landfall" for item in metadata) == 2
+
+
+def test_exact_pre_refinement_inside_land_tails_trim_to_first_waterward_exits() -> None:
+    land = unary_union(
+        [
+            box(-5.0, -5.0, 0.0, 5.0),
+            box(10.0, -5.0, 15.0, 5.0),
+        ]
+    )
+    provisional = LineString([(-3.0, 0.0), (-1.0, 0.0), (2.0, 0.0), (8.0, 0.0), (12.0, 0.0)])
+    prepared, report = _extend_open_arc_to_land_polygons(provisional, land)
+    assert list(prepared.coords) == [(0.0, 0.0), (2.0, 0.0), (8.0, 0.0), (10.0, 0.0)]
+    assert report["acceptance_tolerance_m"] is None
+    assert report["extension_length_m"] == 0.0
+    assert math.isclose(report["source_trim_length_m"], 5.0, abs_tol=1.0e-12)
+    assert report["start"]["method"] == "source_chain_first_waterward_land_polygon_exit"
+    assert report["end"]["method"] == "source_chain_first_waterward_land_polygon_exit"
+    assert math.isclose(report["start"]["trim_length_m"], 3.0, abs_tol=1.0e-12)
+    assert math.isclose(report["end"]["trim_length_m"], 2.0, abs_tol=1.0e-12)
+    assert report["start"]["distance_to_land_polygon_boundary_m"] == 0.0
+    assert report["end"]["distance_to_land_polygon_boundary_m"] == 0.0
+    config = BoundaryResolutionV2Config(
+        open_anchor_spacing_m=2.0,
+        open_central_spacing_m=4.0,
+    )
+    _coords, _sizes, metadata, sampling = _sample_open_arc_v2(
+        prepared,
+        config,
+        land_union=land,
+    )
+    assert sampling["feature_anchor_count"] == 0
+    assert sum(item["anchor_type"] == "open_landfall" for item in metadata) == 2
+
+
+def test_inside_land_tail_without_waterward_exit_is_typed_blocker() -> None:
+    land = box(-5.0, -5.0, 15.0, 5.0)
+    provisional = LineString([(-3.0, 0.0), (2.0, 0.0), (12.0, 0.0)])
+    try:
+        _extend_open_arc_to_land_polygons(provisional, land)
+    except ValueError as exc:
+        assert "no exact waterward land-polygon exit" in str(exc)
+    else:
+        raise AssertionError("Expected an inside-land source chain without a water exit to be rejected")
+
+
+def test_inside_land_predicate_accepts_exact_endpoint_crossing_without_tolerance() -> None:
+    land = unary_union(
+        [
+            box(-5.0, -5.0, 0.0, 5.0),
+            box(10.0, -5.0, 15.0, 5.0),
+        ]
+    )
+    provisional = LineString([(0.0, 0.0), (4.0, 0.0), (8.0, 0.0), (12.0, 0.0)])
+    prepared, report = _extend_open_arc_to_land_polygons(provisional, land)
+    assert list(prepared.coords) == [(0.0, 0.0), (4.0, 0.0), (8.0, 0.0), (10.0, 0.0)]
+    assert report["acceptance_tolerance_m"] is None
+    assert report["start"]["extension_length_m"] == 0.0
+    assert report["end"]["method"] == "source_chain_first_waterward_land_polygon_exit"
+
+
+def test_missing_exact_land_polygon_intersection_needs_review() -> None:
     bpoly = box(0.0, 0.0, 10_000.0, 10_000.0)
     selected_side = LineString([(10_000.0, 10_000.0), (10_000.0, 0.0)])
     coastline = LineString([(-10_000.0, -10_000.0), (-9_000.0, -9_000.0)])
     anchors = _coastline_bpoly_anchor_points(coastline, selected_side, bpoly, 250.0)
-    assert anchors["start_anchor_found"] is False
-    assert anchors["end_anchor_found"] is False
+    assert anchors["start_anchor_found"] is True
+    assert anchors["end_anchor_found"] is True
     status, failures = _final_status(
         {"selected": {"metrics": {"extra_coastline_intersection": False}}},
         {
@@ -1156,8 +1254,7 @@ def test_missing_coastline_bpoly_anchor_needs_review() -> None:
         [],
     )
     assert status == "needs_review"
-    assert "start_coastline_bpoly_anchor_missing" in failures
-    assert "end_coastline_bpoly_anchor_missing" in failures
+    assert "exact_pre_refinement_landfall_construction_missing" in failures
 
 
 def test_model_boundary_loop_package() -> None:
@@ -1704,7 +1801,11 @@ def main() -> int:
     test_raster_fill_respects_connectivity_barrier()
     test_component_classification_drops_disconnected_lines()
     test_coastline_bpoly_anchor_selection_rules()
-    test_missing_coastline_bpoly_anchor_needs_review()
+    test_exact_pre_refinement_landfall_extension_has_no_snap_tolerance()
+    test_exact_pre_refinement_inside_land_tails_trim_to_first_waterward_exits()
+    test_inside_land_tail_without_waterward_exit_is_typed_blocker()
+    test_inside_land_predicate_accepts_exact_endpoint_crossing_without_tolerance()
+    test_missing_exact_land_polygon_intersection_needs_review()
     test_model_boundary_loop_package()
     test_model_boundary_loop_unclassified_needs_review()
     test_adaptive_boundary_resolution_package()

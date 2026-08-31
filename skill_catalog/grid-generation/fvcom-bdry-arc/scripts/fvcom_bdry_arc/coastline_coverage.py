@@ -83,6 +83,7 @@ def audit_coastline_source_coverage(
     physical_coastline_xy,
     *,
     anchors_xy: list[Point] | None = None,
+    landfall_construction: dict[str, Any] | None = None,
     delivered_boundary_xy=None,
     target_resolution_m: float = 250.0,
     output_dir: str | Path | None = None,
@@ -146,7 +147,20 @@ def audit_coastline_source_coverage(
         float(point.distance(physical_coastline_xy))
         for point in anchors
     ] if anchors and physical_coastline_xy is not None and not physical_coastline_xy.is_empty else []
-    physical_landfall_tolerance_m = max(25.0, min(250.0, 0.50 * float(target_resolution_m)))
+    construction = dict(landfall_construction or {})
+    exact_construction = bool(
+        construction.get("method") == "exact_terminal_ray_land_polygon_intersection"
+        and construction.get("construction_stage") == "before_adaptive_arc_refinement"
+        and construction.get("acceptance_tolerance_m") is None
+        and int(construction.get("exact_landfall_count", 0)) == 2
+    )
+    exact_topology_hits = bool(
+        anchors
+        and physical_coastline_xy is not None
+        and not physical_coastline_xy.is_empty
+        and all(physical_coastline_xy.intersects(point) for point in anchors)
+    )
+    physical_landfalls_exact = bool(not anchors or exact_construction or exact_topology_hits)
     source_dependency = 0.0
     if delivered_boundary_xy is not None and not delivered_boundary_xy.is_empty and not frame_xy.is_empty:
         try:
@@ -176,7 +190,7 @@ def audit_coastline_source_coverage(
         failures.append("coastline_clip_edge_landfall")
     if anchors and not anchor_coast_distances:
         failures.append("coastline_physical_landfall_evidence_missing")
-    elif anchor_coast_distances and max(anchor_coast_distances) > physical_landfall_tolerance_m:
+    elif not physical_landfalls_exact:
         failures.append("coastline_physical_landfall_evidence_missing")
 
     output_path = Path(output_dir) if output_dir else None
@@ -224,13 +238,13 @@ def audit_coastline_source_coverage(
         "projection_crs": projection.crs.to_string(),
         "anchor_to_source_frame_distance_m": anchor_frame_distances,
         "anchor_to_physical_coastline_distance_m": anchor_coast_distances,
-        "physical_landfall_tolerance_m": float(physical_landfall_tolerance_m),
+        "physical_landfall_tolerance_m": None,
+        "physical_landfall_policy": "exact_pre_refinement_obc_ray_land_polygon_intersection",
+        "exact_landfall_construction": construction or None,
+        "exact_landfall_construction_verified": exact_construction,
+        "exact_topological_landfall_hits": exact_topology_hits,
         "physical_coastline_only_landfalls": bool(
-            not anchors
-            or (
-                bool(anchor_coast_distances)
-                and max(anchor_coast_distances) <= physical_landfall_tolerance_m
-            )
+            physical_landfalls_exact
         ),
         "gshhs_topology_coverage": topology,
         "source_hashes": {
