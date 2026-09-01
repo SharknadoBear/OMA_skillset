@@ -22,7 +22,7 @@ from fvcom_grid_generation.autonomous_thin import (  # noqa: E402
     DIAGNOSTIC_SCHEMA,
     AutonomousThinConfig,
     decision_template,
-    derive_cusp_buffer_m,
+    derive_shoreline_context_buffer_m,
     json_safe,
     sha256_file,
 )
@@ -186,7 +186,6 @@ def _plot_decision(
     triangles: np.ndarray,
     component: dict[str, Any],
     boundary_xy: np.ndarray,
-    cusp_lines: list[LineString],
     gshhs_lines: list[LineString],
     *,
     dpi: int,
@@ -219,10 +218,6 @@ def _plot_decision(
         if line.distance(LineString([centre, centre + [1.0, 0.0]])) <= 2.0 * radius:
             x, y = line.xy
             ax.plot(x, y, color="#3274a1", linewidth=0.9, alpha=0.7, label="GSHHS" if "GSHHS" not in ax.get_legend_handles_labels()[1] else None)
-    for line in cusp_lines:
-        if line.distance(LineString([centre, centre + [1.0, 0.0]])) <= 2.0 * radius:
-            x, y = line.xy
-            ax.plot(x, y, color="#2ca02c", linewidth=1.1, alpha=0.8, label="CUSP" if "CUSP" not in ax.get_legend_handles_labels()[1] else None)
     for node in node_ids:
         ax.annotate(str(int(node) + 1), points[node], fontsize=8, color="#4b1d8f")
     ax.set_xlim(centre[0] - radius, centre[0] + radius)
@@ -264,7 +259,7 @@ def _plot_decision(
         f"minimum angle: {component.get('minimum_angle_deg')}°\n"
         f"diameter: {component['component_diameter_m']:.1f} m\n"
         f"local target h: {component['local_target_m']:.1f} m\n"
-        f"CUSP buffer: {component['cusp_request_buffer_m']:.1f} m\n"
+        f"GSHHS context: {component['shoreline_context_buffer_m']:.1f} m\n"
         f"source chain: {component.get('source_chain_index_zero_based')}\n"
         f"source nodes: {component.get('source_node_indices_zero_based')}\n\n"
         "Agent must choose exactly one route:\n"
@@ -290,7 +285,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bathymetry-nc", type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--conditioning-report", type=Path)
-    parser.add_argument("--cusp-gpkg", type=Path)
     parser.add_argument("--gshhs-gpkg", type=Path)
     parser.add_argument("--region-bpoly-json", type=Path)
     parser.add_argument("--case-manifest-json", type=Path)
@@ -341,7 +335,6 @@ def main() -> int:
     whole_map = output / "whole.png"
     components = [dict(value) for value in atlas.get("components", [])]
     _plot_whole(whole_map, points, triangles, components, boundary_xy, dpi=args.dpi)
-    cusp_lines = _read_line_context(str(args.cusp_gpkg) if args.cusp_gpkg else None, projection)
     gshhs_lines = _read_line_context(str(args.gshhs_gpkg) if args.gshhs_gpkg else None, projection)
     decision_dir = output / "d"
     decision_dir.mkdir(parents=True, exist_ok=True)
@@ -355,9 +348,11 @@ def main() -> int:
         component.update(evidence)
         component["component_diameter_m"] = diameter
         component["local_target_m"] = local_target
-        component["cusp_request_buffer_m"] = derive_cusp_buffer_m(local_target, diameter)
+        component["shoreline_context_buffer_m"] = derive_shoreline_context_buffer_m(
+            local_target, diameter
+        )
         centre = np.mean(coords, axis=0)
-        buffer_m = float(component["cusp_request_buffer_m"])
+        buffer_m = float(component["shoreline_context_buffer_m"])
         bbox_xy = np.asarray(
             [
                 [centre[0] - buffer_m, centre[1] - buffer_m],
@@ -366,7 +361,7 @@ def main() -> int:
             dtype=float,
         )
         bbox_ll = unproject_points(bbox_xy, projection)
-        component["cusp_request_bbox_wsen"] = [
+        component["shoreline_context_bbox_wsen"] = [
             float(bbox_ll[0, 0]),
             float(bbox_ll[0, 1]),
             float(bbox_ll[1, 0]),
@@ -384,7 +379,6 @@ def main() -> int:
             triangles,
             component,
             boundary_xy,
-            cusp_lines,
             gshhs_lines,
             dpi=args.dpi,
         )
@@ -407,7 +401,6 @@ def main() -> int:
             "boundary_nodes_geojson": sha256_file(args.boundary_nodes_geojson),
             "size_field_nc": sha256_file(args.size_field_nc),
             "bathymetry_nc": sha256_file(args.bathymetry_nc) if args.bathymetry_nc else None,
-            "cusp_gpkg": sha256_file(args.cusp_gpkg) if args.cusp_gpkg else None,
             "gshhs_gpkg": sha256_file(args.gshhs_gpkg) if args.gshhs_gpkg else None,
             "region_bpoly_json": sha256_file(args.region_bpoly_json) if args.region_bpoly_json else None,
             "case_manifest_json": sha256_file(args.case_manifest_json) if args.case_manifest_json else None,
@@ -425,7 +418,6 @@ def main() -> int:
             "boundary_resolution_manifest": str(args.boundary_resolution_manifest.resolve()) if args.boundary_resolution_manifest else None,
             "region_bpoly_json": str(args.region_bpoly_json.resolve()) if args.region_bpoly_json else None,
             "case_manifest_json": str(args.case_manifest_json.resolve()) if args.case_manifest_json else None,
-            "cusp_gpkg": str(args.cusp_gpkg.resolve()) if args.cusp_gpkg else None,
             "gshhs_gpkg": str(args.gshhs_gpkg.resolve()) if args.gshhs_gpkg else None,
         },
         "projection_epsg": int(projection.epsg),

@@ -4,8 +4,8 @@
 The command performs the deterministic stages itself.  When residual thin
 components require visual classification, it emits hash-bound pending Codex
 decision documents and stops with a successful ``agent_decision_required``
-status.  Supply one completed decision (and local CUSP evidence when that route
-needs it) to resume without repeating accepted earlier stages.
+status. Supply one completed decision to resume without repeating accepted
+earlier stages. GSHHS is the only shoreline source used by this workflow.
 """
 
 from __future__ import annotations
@@ -68,7 +68,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gshhs-gpkg", required=True, type=Path)
     parser.add_argument("--workspace-root", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
-    parser.add_argument("--cusp-gpkg", type=Path)
     parser.add_argument("--decision", type=Path)
     parser.add_argument("--execute", action="store_true")
     return parser
@@ -121,8 +120,8 @@ def main() -> int:
     conditioned_mesh = initial_dir / "conditioned.2dm"
     if not conditioned_mesh.is_file():
         raise FileNotFoundError(conditioned_mesh)
-    cusp_key = sha256_file(args.cusp_gpkg)[:12] if args.cusp_gpkg else "scaffold"
-    diagnostic_dir = output / f"02_diagnostic_{cusp_key}"
+    gshhs_key = sha256_file(args.gshhs_gpkg)[:12]
+    diagnostic_dir = output / f"02_diagnostic_{gshhs_key}"
     diagnostic_path = diagnostic_dir / "thin_v2.json"
     if not diagnostic_path.is_file():
         if diagnostic_dir.exists() and any(diagnostic_dir.iterdir()):
@@ -147,8 +146,6 @@ def main() -> int:
             "--boundary-contract-json", str(args.boundary_contract_json.resolve()),
             "--output-dir", str(diagnostic_dir),
         ]
-        if args.cusp_gpkg:
-            command.extend(["--cusp-gpkg", str(args.cusp_gpkg.resolve())])
         diagnostic = _run(command)
         history.append({"stage": "diagnostic", **diagnostic})
         if not diagnostic_path.is_file():
@@ -183,8 +180,6 @@ def main() -> int:
                 "--workspace-root", str(args.workspace_root.resolve()),
                 "--output-dir", str(closure_dir),
             ]
-            if args.cusp_gpkg:
-                command.extend(["--cusp-gpkg", str(args.cusp_gpkg.resolve())])
             if args.execute:
                 command.append("--execute")
             closure_run = _run(command)

@@ -263,7 +263,7 @@ def _write_patch_packages(
     diagnostic: dict[str, Any],
     output: Path,
     *,
-    cusp_gpkg: Path | None,
+    gshhs_gpkg: Path,
 ) -> dict[str, Any]:
     source_manifest = _read_json(source_manifest_path)
     source_gpkg = _resolve_manifest_gpkg(source_manifest_path, source_manifest)
@@ -311,17 +311,16 @@ def _write_patch_packages(
         replacement_options.append((replacement, source_method, None))
     elif route == "subgrid_boundary_spike_or_sliver":
         ranked: list[dict[str, Any]] = []
-        if cusp_gpkg is not None:
-            geometries, accuracies, source_dates = _line_frames(cusp_gpkg, projection)
-            ranked = rank_shoreline_candidates(
-                geometries,
-                tuple(xy[start]),
-                tuple(xy[end]),
-                original_window,
-                local_target_m=local_target,
-                horizontal_accuracy_m=accuracies,
-                source_dates=source_dates,
-            )[: AutonomousThinConfig().maximum_candidates_per_component]
+        geometries, accuracies, source_dates = _line_frames(gshhs_gpkg, projection)
+        ranked = rank_shoreline_candidates(
+            geometries,
+            tuple(xy[start]),
+            tuple(xy[end]),
+            original_window,
+            local_target_m=local_target,
+            horizontal_accuracy_m=accuracies,
+            source_dates=source_dates,
+        )[: AutonomousThinConfig().maximum_candidates_per_component]
         incoming = xy[start] - xy[(start - 1) % len(xy)]
         outgoing = xy[(end + 1) % len(xy)] - xy[end]
         maximum_junction_turn_deg = 135.0
@@ -354,7 +353,7 @@ def _write_patch_packages(
             if record["eligible"]:
                 replacement_options.append((
                     trial,
-                    "nearest_eligible_cusp_arc_model_scale_regularized",
+                    "nearest_eligible_gshhs_arc_model_scale_regularized",
                     len(candidate_records) - 1,
                 ))
         if not replacement_options and len(candidate_records) < AutonomousThinConfig().maximum_candidates_per_component:
@@ -806,7 +805,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--bathymetry-nc", type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--workspace-root", type=Path)
-    parser.add_argument("--cusp-gpkg", type=Path)
     parser.add_argument("--execute", action="store_true")
     return parser
 
@@ -890,12 +888,18 @@ def main() -> int:
                 interior.get("failure_taxonomy") or ["interior_topology_repair_failed"]
             )
     else:
+        gshhs_value = (diagnostic.get("input_paths") or {}).get("gshhs_gpkg")
+        if not gshhs_value:
+            raise ValueError("active boundary closure requires hash-bound GSHHS input")
+        gshhs_gpkg = Path(str(gshhs_value)).resolve()
+        if not gshhs_gpkg.is_file():
+            raise FileNotFoundError(gshhs_gpkg)
         patch = _write_patch_packages(
             args.source_boundary_resolution_manifest.resolve(),
             decision,
             diagnostic,
             output,
-            cusp_gpkg=args.cusp_gpkg.resolve() if args.cusp_gpkg else None,
+            gshhs_gpkg=gshhs_gpkg,
         )
         report["patch"] = patch
         case_path = _write_case_manifest(args.source_case_manifest.resolve(), patch, output)

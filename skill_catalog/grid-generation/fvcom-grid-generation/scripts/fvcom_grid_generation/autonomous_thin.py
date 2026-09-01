@@ -47,10 +47,6 @@ ROUTES = {
 @dataclass(frozen=True)
 class AutonomousThinConfig:
     minimum_elements_across: int = 3
-    cusp_buffer_minimum_m: float = 1_000.0
-    cusp_buffer_maximum_m: float = 5_000.0
-    cusp_target_multiplier: float = 10.0
-    cusp_component_multiplier: float = 2.0
     stable_bracket_target_multiplier: float = 2.0
     maximum_candidates_per_component: int = 3
     maximum_remesh_cycles: int = 3
@@ -76,19 +72,18 @@ def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def derive_cusp_buffer_m(
+def derive_shoreline_context_buffer_m(
     local_target_m: float,
     component_diameter_m: float,
     config: AutonomousThinConfig | None = None,
 ) -> float:
-    """Return the bounded, scale-relative local CUSP request buffer."""
-    cfg = config or AutonomousThinConfig()
+    """Return a bounded, scale-relative GSHHS diagnostic context buffer."""
     value = max(
-        cfg.cusp_target_multiplier * float(local_target_m),
-        cfg.cusp_component_multiplier * float(component_diameter_m),
-        cfg.cusp_buffer_minimum_m,
+        10.0 * float(local_target_m),
+        2.0 * float(component_diameter_m),
+        1_000.0,
     )
-    return float(min(cfg.cusp_buffer_maximum_m, value))
+    return float(min(5_000.0, value))
 
 
 def resolution_feasibility(
@@ -207,9 +202,6 @@ def validate_agent_decision(
         ):
             if protected.get(key) is not False:
                 raise ValueError(f"boundary route has protected or unresolved lineage: {key}")
-        if route == "subgrid_boundary_spike_or_sliver":
-            if not diagnostic_input_hashes or not diagnostic_input_hashes.get("cusp_gpkg"):
-                raise ValueError("shoreline-correction route requires hash-bound CUSP evidence")
         if diagnostic_input_hashes and not diagnostic_input_hashes.get("gshhs_gpkg"):
             raise ValueError("boundary route requires hash-bound GSHHS evidence")
     if route == "resolved_channel_meshing_defect":
@@ -402,7 +394,7 @@ def rank_shoreline_candidates(
     horizontal_accuracy_m: Iterable[float | None] | None = None,
     source_dates: Iterable[str | int | None] | None = None,
 ) -> list[dict[str, Any]]:
-    """Rank CUSP arcs that span stable brackets without source-specific rules."""
+    """Rank GSHHS arcs that span stable brackets without regional rules."""
     start = Point(start_xy)
     end = Point(end_xy)
     values = list(geometries)

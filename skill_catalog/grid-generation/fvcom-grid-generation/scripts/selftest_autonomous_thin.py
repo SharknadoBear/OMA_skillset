@@ -17,7 +17,7 @@ from fvcom_grid_generation.autonomous_thin import (
     boundary_transaction_audit,
     canonical_sha256,
     closure_acceptance,
-    derive_cusp_buffer_m,
+    derive_shoreline_context_buffer_m,
     interior_topology_plan,
     no_op_closure_report,
     rank_shoreline_candidates,
@@ -37,7 +37,6 @@ def _decision(image: Path, route: str) -> dict:
         "input_mesh_sha256": "b" * 64,
         "bound_input_hashes": {
             "mesh": "b" * 64,
-            "cusp_gpkg": "c" * 64,
             "gshhs_gpkg": "d" * 64,
         },
         "component_id": "thin-1-test",
@@ -74,8 +73,8 @@ def _decision(image: Path, route: str) -> dict:
 
 
 def main() -> int:
-    assert derive_cusp_buffer_m(100.0, 25.0) == 1000.0
-    assert derive_cusp_buffer_m(700.0, 4000.0) == 5000.0
+    assert derive_shoreline_context_buffer_m(100.0, 25.0) == 1000.0
+    assert derive_shoreline_context_buffer_m(700.0, 4000.0) == 5000.0
     feasible = resolution_feasibility(900.0, 400.0, 200.0, 300_000)
     assert feasible["resolvable"] and not feasible["resolved_at_current_target"]
     infeasible = resolution_feasibility(300.0, 200.0, 150.0, 1_200_000)
