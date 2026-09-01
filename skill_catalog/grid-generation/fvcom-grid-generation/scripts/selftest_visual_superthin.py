@@ -16,6 +16,9 @@ from fvcom_grid_generation.visual_superthin import (  # noqa: E402
     _action_candidates,
     _apply_candidate,
     _force_remove_restricted_replacement_edges,
+    _quality_advisory_counts,
+    _visual_acceptance_failures,
+    _visual_quality_advisories,
     apply_visual_superthin_plan,
     create_visual_state,
     validate_visual_plan,
@@ -343,6 +346,54 @@ def test_failed_visual_route_rolls_back_atomically() -> None:
     assert result.report["post_acceptance_atlas_required"] is False
 
 
+def test_class_2_tail_regressions_are_advisory_only() -> None:
+    points, triangles, fixed, chains, open_nodes, targets = _fixture()
+    state, config, initial_components = create_visual_state(
+        points,
+        triangles,
+        fixed,
+        chains,
+        open_nodes,
+        target_spacing_m=targets,
+    )
+    components = _inventory_superthin_components(state, config)
+    assert len(components) == 1
+    from fvcom_grid_generation.local_topology import _audit_state, _summary
+
+    before = _summary(state, config)
+    after = dict(before)
+    after["superthin_triangle_count"] = 0
+    after["superthin_severity_sum"] = 0.0
+    after["q_l3_sigma"] = float(before["q_l3_sigma"]) - 1.0e-4
+    after["area_transition_count_above_0_50"] = (
+        int(before["area_transition_count_above_0_50"]) + 2
+    )
+    invariant_ok, invariants, _ = _audit_state(state, config, initial_components)
+    failures = _visual_acceptance_failures(
+        state,
+        state,
+        components[0],
+        components,
+        before,
+        after,
+        invariant_ok,
+        invariants,
+        tolerance=1.0e-9,
+    )
+    advisories = _visual_quality_advisories(before, after, tolerance=1.0e-9)
+    assert failures == []
+    assert advisories == [
+        "area_transition_count_above_0_50_regression",
+        "q_l3_sigma_regression",
+    ]
+    assert _quality_advisory_counts(
+        [{"quality_advisories": advisories}, {"quality_advisories": advisories[:1]}]
+    ) == {
+        "area_transition_count_above_0_50_regression": 2,
+        "q_l3_sigma_regression": 1,
+    }
+
+
 def test_obc_source_arc_insertion_preserves_original_subsequence() -> None:
     points, triangles, fixed, chains, _, targets = _fixture()
     open_nodes = np.asarray([0, 1], dtype=int)
@@ -446,6 +497,7 @@ def main() -> int:
         test_collapsed_front_support_spokes_are_executed,
         test_minmax_cavity_action_is_bounded_and_deterministic,
         test_failed_visual_route_rolls_back_atomically,
+        test_class_2_tail_regressions_are_advisory_only,
         test_obc_source_arc_insertion_preserves_original_subsequence,
         test_passage_support_discovers_two_patch_banks,
     ]

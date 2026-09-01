@@ -333,11 +333,17 @@ def apply_visual_superthin_plan(
                     invariants,
                     tolerance=float(visual_config.minimum_quality_tolerance),
                 )
+                advisories = _visual_quality_advisories(
+                    before,
+                    after,
+                    tolerance=float(visual_config.minimum_quality_tolerance),
+                )
                 record.update(
                     {
                         "invariants": invariants,
                         "after": after,
                         "failures": failures,
+                        "quality_advisories": advisories,
                     }
                 )
                 attempts.append(record)
@@ -403,6 +409,7 @@ def apply_visual_superthin_plan(
         "after": after,
         "attempts": attempts,
         "failure_counts": _failure_counts(attempts),
+        "quality_advisory_counts": _quality_advisory_counts(attempts),
         "remaining_components": remaining,
         "post_acceptance_atlas_required": bool(accepted),
         "next_visual_plan_requires_new_mesh_hash": bool(accepted),
@@ -1152,18 +1159,6 @@ def _visual_acceptance_failures(
         and float(after["superthin_severity_sum"]) <= float(before["superthin_severity_sum"]) + tolerance
     ):
         failures.append("superthin_debt_not_strictly_reduced")
-    guarded = (
-        ("q_min", tolerance),
-        ("q_p01", tolerance),
-        ("q_l3_sigma", tolerance),
-        ("minimum_angle_p01_deg", 1.0e-3),
-    )
-    for key, slack in guarded:
-        if float(after[key]) + float(slack) < float(before[key]):
-            failures.append(f"{key}_regression")
-    for key in ("l_over_h_count_above_1_55", "area_transition_count_above_0_50"):
-        if int(after[key]) > int(before[key]):
-            failures.append(f"{key}_regression")
     if _restricted_edge_violation_records(after_state):
         failures.append("restricted_edge_violation")
     before_fixed = {
@@ -1203,6 +1198,47 @@ def _visual_acceptance_failures(
             failures.append("new_superthin_component_elsewhere")
             break
     return sorted(set(failures))
+
+
+def _visual_quality_advisories(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    *,
+    tolerance: float,
+) -> list[str]:
+    """Record nonblocking Class-2/3 changes for a visual transaction.
+
+    The benchmark-first policy permits these representation-dependent tails to
+    move in either direction.  Exact structure, valence, superthin debt,
+    constraints, OBC lineage, and boundary-coordinate checks remain blocking in
+    ``_visual_acceptance_failures``.
+    """
+    findings: list[str] = []
+    guarded = (
+        ("q_min", tolerance),
+        ("q_p01", tolerance),
+        ("q_l3_sigma", tolerance),
+        ("minimum_angle_p01_deg", 1.0e-3),
+    )
+    for key, slack in guarded:
+        if float(after[key]) + float(slack) < float(before[key]):
+            findings.append(f"{key}_regression")
+    for key in (
+        "l_over_h_count_above_1_55",
+        "area_transition_count_above_0_50",
+    ):
+        if int(after[key]) > int(before[key]):
+            findings.append(f"{key}_regression")
+    return sorted(set(findings))
+
+
+def _quality_advisory_counts(attempts: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for attempt in attempts:
+        for finding in attempt.get("quality_advisories", []):
+            key = str(finding)
+            counts[key] = int(counts.get(key, 0) + 1)
+    return dict(sorted(counts.items()))
 
 
 def _append_node(
