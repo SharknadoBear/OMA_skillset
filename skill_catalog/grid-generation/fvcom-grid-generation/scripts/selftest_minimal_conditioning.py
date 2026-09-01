@@ -13,6 +13,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import fvcom_grid_generation.local_topology as local_topology  # noqa: E402
 from fvcom_grid_generation.local_topology import (  # noqa: E402
     AggressiveConditioningConfig,
     condition_mesh_aggressive,
@@ -343,6 +344,70 @@ def test_fixed_hard_fan_refinement_never_changes_an_obc() -> None:
     assert result.edit_ledger == []
 
 
+def _cross_chain_passage_state() -> local_topology._State:
+    points = np.asarray(
+        [
+            [0.0, 0.0],
+            [0.05, 0.0],
+            [0.05, 1.0],
+            [-2.0, -2.0],
+            [-2.0, 2.0],
+            [2.0, 0.5],
+        ],
+        dtype=float,
+    )
+    return local_topology._State(
+        points=points,
+        triangles=np.asarray([[0, 1, 2]], dtype=int),
+        fixed=np.ones(len(points), dtype=bool),
+        targets=np.full(len(points), 10.0, dtype=float),
+        chains=[[0, 3, 4], [1, 2, 5]],
+        open_nodes=np.empty(0, dtype=int),
+        kinds=["land", "island", "island", "land", "land", "island"],
+        hard=np.asarray([True, False, False, False, False, False]),
+        lineage=np.arange(len(points), dtype=int),
+        source_points=points.copy(),
+        source_chains=[[0, 3, 4], [1, 2, 5]],
+    )
+
+
+def test_cross_chain_passage_has_one_exact_non_obc_midpoint_route() -> None:
+    state = _cross_chain_passage_state()
+    components = local_topology._inventory_superthin_components(
+        state,
+        _minimal_config(),
+    )
+    assert len(components) == 1
+    component = components[0]
+    assert component["classification"] == "under-resolved-passage"
+    assert component["gap_over_h"] < 0.25
+    assert local_topology._fixed_hard_fan_ineligibility(state, component) == []
+    assert local_topology._automatic_source_arc_edge_is_eligible(
+        state, (1, 2), require_hard=False
+    )
+    assert not local_topology._automatic_source_arc_edge_is_eligible(
+        state, (1, 2), require_hard=True
+    )
+
+
+def test_cross_chain_midpoint_route_rejects_obc_and_nonlocal_passage() -> None:
+    state = _cross_chain_passage_state()
+    component = local_topology._inventory_superthin_components(
+        state,
+        _minimal_config(),
+    )[0]
+    state.open_nodes = np.asarray([1], dtype=int)
+    assert "component_touches_open_boundary" in local_topology._fixed_hard_fan_ineligibility(
+        state, component
+    )
+    state.open_nodes = np.empty(0, dtype=int)
+    component = dict(component)
+    component["gap_over_h"] = 0.5
+    assert "passage_not_strictly_sub_resolution" in local_topology._fixed_hard_fan_ineligibility(
+        state, component
+    )
+
+
 def test_expired_deadline_stops_before_first_transaction() -> None:
     points, triangles, fixed, chains, kinds = _nine_spoke_fixture()
     result = _run(
@@ -390,6 +455,8 @@ TESTS: tuple[Callable[[], None], ...] = (
     test_protected_superthin_boundary_is_reported_not_deleted,
     test_fixed_hard_non_obc_fan_gets_one_bounded_arc_refinement,
     test_fixed_hard_fan_refinement_never_changes_an_obc,
+    test_cross_chain_passage_has_one_exact_non_obc_midpoint_route,
+    test_cross_chain_midpoint_route_rejects_obc_and_nonlocal_passage,
     test_expired_deadline_stops_before_first_transaction,
     test_deterministic_replay_matches_connectivity_and_lineage,
 )

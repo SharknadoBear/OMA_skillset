@@ -1458,12 +1458,14 @@ def _repair_fixed_hard_boundary_fans(
     config: AggressiveConditioningConfig,
     initial_components: int,
 ) -> dict[str, Any]:
-    """Close deterministic all-hard non-OBC fans with one source-arc midpoint.
+    """Close deterministic non-OBC boundary fans with one source-arc midpoint.
 
     This is a narrow automatic fallback for the default minimal profile.  It
     reuses the constrained patch transaction exercised by the visual tool, but
-    its eligibility and acceptance are entirely exact and require no visual
-    classification or Class-2/3 proxy nonregression.
+    its eligibility and acceptance are entirely exact. In addition to the
+    original one-chain all-hard fan, it admits a one-triangle, two-chain
+    under-resolved passage only when that triangle has exactly one source-chain
+    edge. No original coordinate is moved and no OBC edge is refined.
     """
     from .visual_superthin import _action_candidates, _apply_candidate
 
@@ -1485,6 +1487,11 @@ def _repair_fixed_hard_boundary_fans(
         if not eligible:
             break
         component = eligible[0]
+        repair_class = (
+            "cross_chain_under_resolved_passage"
+            if str(component.get("classification")) == "under-resolved-passage"
+            else "fixed_hard_boundary_fan"
+        )
         before_state = state.clone()
         before = _summary(state, config)
         topology = build_edge_topology(len(state.points), state.triangles)
@@ -1526,7 +1533,11 @@ def _repair_fixed_hard_boundary_fans(
                 if len(boundary_insertions) != 1:
                     continue
                 edge = tuple(sorted(map(int, boundary_insertions[0]["edge"])))
-                if not _automatic_source_arc_edge_is_eligible(state, edge):
+                if not _automatic_source_arc_edge_is_eligible(
+                    state,
+                    edge,
+                    require_hard=repair_class == "fixed_hard_boundary_fan",
+                ):
                     continue
                 trial = state.clone()
                 changed, construction_failures, evidence = _apply_candidate(
@@ -1541,6 +1552,7 @@ def _repair_fixed_hard_boundary_fans(
                     "operation": "fixed-hard-fan-source-arc-refinement",
                     "component_id": str(component["component_id"]),
                     "component_lineage": list(map(int, component["node_lineage"])),
+                    "repair_class": repair_class,
                     "patch_rings": int(rings),
                     "candidate_index": int(candidate_index),
                     "source_edge_lineage": [
@@ -1600,11 +1612,13 @@ def _repair_fixed_hard_boundary_fans(
                 entry["operation"] = "minimal-fixed-hard-fan-source-arc-refinement"
                 entry["automatic"] = True
                 entry["review_required"] = False
+                entry["repair_class"] = repair_class
                 break
         state.ledger.append(
             {
                 "operation": "minimal-fixed-hard-fan-transaction-accepted",
                 "component_id": str(component["component_id"]),
+                "repair_class": repair_class,
                 "source_edge_lineage": list(selected["source_edge_lineage"]),
                 "patch_rings": int(selected["patch_rings"]),
                 "superthin_before": int(before["superthin_triangle_count"]),
@@ -1636,16 +1650,37 @@ def _fixed_hard_fan_ineligibility(
             )
         )
     ) if triangles else []
-    if str(component.get("classification")) != "fixed-boundary-hard-anchor-fan":
-        reasons.append("classification_not_fixed_hard_fan")
+    classification = str(component.get("classification"))
+    if classification not in {
+        "fixed-boundary-hard-anchor-fan",
+        "under-resolved-passage",
+    }:
+        reasons.append("classification_not_supported_boundary_fan")
     if len(triangles) != 1 or len(nodes) != 3:
         reasons.append("component_not_one_triangle")
     if nodes and not all(bool(state.fixed[node]) for node in nodes):
         reasons.append("component_has_movable_node")
-    if nodes and not all(bool(state.hard[node]) for node in nodes):
-        reasons.append("component_has_nonhard_node")
-    if len(component.get("boundary_chain_ids", [])) != 1:
-        reasons.append("component_not_on_one_boundary_chain")
+    chain_ids = list(map(int, component.get("boundary_chain_ids", [])))
+    if classification == "fixed-boundary-hard-anchor-fan":
+        if nodes and not all(bool(state.hard[node]) for node in nodes):
+            reasons.append("component_has_nonhard_node")
+        if len(chain_ids) != 1:
+            reasons.append("component_not_on_one_boundary_chain")
+    elif classification == "under-resolved-passage":
+        gap_over_h = component.get("gap_over_h")
+        if len(chain_ids) != 2:
+            reasons.append("passage_not_exactly_two_boundary_chains")
+        if gap_over_h is None or not np.isfinite(float(gap_over_h)) or float(gap_over_h) > 0.25:
+            reasons.append("passage_not_strictly_sub_resolution")
+        constrained_edges = []
+        if len(triangles) == 1:
+            constrained_edges = [
+                edge
+                for edge in _triangle_edge_keys(state.triangles[int(triangles[0])])
+                if _find_chain_edge(state.chains, edge) is not None
+            ]
+        if len(constrained_edges) != 1:
+            reasons.append("passage_triangle_not_one_unambiguous_source_arc_edge")
     if set(nodes) & set(map(int, state.open_nodes.tolist())):
         reasons.append("component_touches_open_boundary")
     return sorted(set(reasons))
@@ -1654,6 +1689,8 @@ def _fixed_hard_fan_ineligibility(
 def _automatic_source_arc_edge_is_eligible(
     state: _State,
     edge: tuple[int, int],
+    *,
+    require_hard: bool = True,
 ) -> bool:
     membership = _find_chain_edge(state.chains, edge)
     if membership is None:
@@ -1664,8 +1701,7 @@ def _automatic_source_arc_edge_is_eligible(
     return bool(
         state.fixed[a]
         and state.fixed[b]
-        and state.hard[a]
-        and state.hard[b]
+        and (not require_hard or (state.hard[a] and state.hard[b]))
         and str(state.kinds[a]) == str(state.kinds[b])
     )
 

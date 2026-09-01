@@ -1164,7 +1164,7 @@ def _compose_lineage(previous: np.ndarray, current: np.ndarray) -> np.ndarray:
 def _authorized_fixed_hard_fan_refinements(
     edit_ledger: Iterable[dict[str, Any]] | None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Extract only complete, accepted fixed-hard-fan midpoint transactions."""
+    """Extract only complete accepted fixed-boundary midpoint transactions."""
 
     entries = [dict(entry) for entry in (edit_ledger or [])]
     accepted_entries = [

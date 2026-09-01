@@ -82,7 +82,7 @@ def main_with_mode(forced_mode: str | None = None) -> int:
         default=False,
         help=(
             "Enable the default-minimal bounded non-OBC source-arc midpoint "
-            "repair for one-triangle all-fixed/all-hard superthin fans."
+            "repair for eligible one-triangle fixed-boundary superthin fans."
         ),
     )
     parser.add_argument("--max-prunes-per-round", type=int, default=500)
