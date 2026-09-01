@@ -39,6 +39,8 @@ class AggressiveConditioningConfig:
     collapse_l_over_h: float = 0.50
     max_collapses_per_round: int = 100
     max_boundary_edits_per_round: int = 25
+    enable_fixed_hard_fan_arc_refinement: bool = False
+    max_fixed_hard_fan_arc_refinements_per_round: int = 8
     max_superthin_flips_per_round: int = 100
     max_boundary_welds_per_round: int = 25
     max_boundary_ear_removals_per_round: int = 25
@@ -425,6 +427,14 @@ def _thin_budget(config: AggressiveConditioningConfig) -> int:
         + max(0, int(config.max_collapses_per_round))
         + max(0, int(config.max_boundary_edits_per_round))
         + max(0, int(config.systematic_collapse_welds_per_round))
+        + (
+            max(
+                0,
+                int(config.max_fixed_hard_fan_arc_refinements_per_round),
+            )
+            if bool(config.enable_fixed_hard_fan_arc_refinement)
+            else 0
+        )
         + (
             max(0, int(config.systematic_v5_max_star_transactions_per_round))
             if str(config.thin_repair_profile).lower() == "systematic-v5"
@@ -1170,6 +1180,7 @@ def _repair_superthin_guarded(state: _State, config: AggressiveConditioningConfi
     collapse_count = 0
     boundary_split_count = 0
     boundary_remove_count = 0
+    fixed_hard_fan_refinement_count = 0
     rejected = 0
     rejected_cases: list[dict[str, Any]] = []
     screened_rejections: list[dict[str, Any]] = []
@@ -1394,6 +1405,25 @@ def _repair_superthin_guarded(state: _State, config: AggressiveConditioningConfi
                 boundary_remove_count += 1
             before = trial
             blocked_boundary.clear()
+    fixed_hard_fan = {
+        "enabled": False,
+        "accepted": 0,
+        "rejected": 0,
+        "attempts": [],
+    }
+    if bool(config.enable_fixed_hard_fan_arc_refinement):
+        fixed_hard_fan = _repair_fixed_hard_boundary_fans(
+            state,
+            config,
+            initial_components,
+        )
+        fixed_hard_fan_refinement_count = int(fixed_hard_fan["accepted"])
+        rejected += int(fixed_hard_fan["rejected"])
+        rejected_cases.extend(
+            attempt
+            for attempt in fixed_hard_fan["attempts"]
+            if attempt.get("failures")
+        )
     return {
         "accepted": int(
             ear_remove_count
@@ -1402,6 +1432,7 @@ def _repair_superthin_guarded(state: _State, config: AggressiveConditioningConfi
             + collapse_count
             + boundary_split_count
             + boundary_remove_count
+            + fixed_hard_fan_refinement_count
         ),
         "boundary_ear_removals": int(ear_remove_count),
         "boundary_arc_welds": int(boundary_weld_count),
@@ -1409,6 +1440,10 @@ def _repair_superthin_guarded(state: _State, config: AggressiveConditioningConfi
         "interior_pair_collapses": int(collapse_count),
         "boundary_edge_splits": int(boundary_split_count),
         "boundary_vertex_removals": int(boundary_remove_count),
+        "fixed_hard_fan_arc_refinements": int(
+            fixed_hard_fan_refinement_count
+        ),
+        "fixed_hard_fan_arc_refinement": fixed_hard_fan,
         "rejected": int(rejected),
         "rejected_cases": rejected_cases,
         "screened_rejections": _deduplicate_rejections(screened_rejections),
@@ -1416,6 +1451,276 @@ def _repair_superthin_guarded(state: _State, config: AggressiveConditioningConfi
         "before": stage_before,
         "after": _summary(state, config),
     }
+
+
+def _repair_fixed_hard_boundary_fans(
+    state: _State,
+    config: AggressiveConditioningConfig,
+    initial_components: int,
+) -> dict[str, Any]:
+    """Close deterministic all-hard non-OBC fans with one source-arc midpoint.
+
+    This is a narrow automatic fallback for the default minimal profile.  It
+    reuses the constrained patch transaction exercised by the visual tool, but
+    its eligibility and acceptance are entirely exact and require no visual
+    classification or Class-2/3 proxy nonregression.
+    """
+    from .visual_superthin import _action_candidates, _apply_candidate
+
+    accepted = 0
+    rejected = 0
+    attempts: list[dict[str, Any]] = []
+    limit = max(0, int(config.max_fixed_hard_fan_arc_refinements_per_round))
+    patch_ring_ladder = (1, 2, 4)
+    for _ in range(limit):
+        if _deadline_reached(config):
+            break
+        components = _inventory_superthin_components(state, config)
+        eligible: list[dict[str, Any]] = []
+        for component in components:
+            reasons = _fixed_hard_fan_ineligibility(state, component)
+            if reasons:
+                continue
+            eligible.append(component)
+        if not eligible:
+            break
+        component = eligible[0]
+        before_state = state.clone()
+        before = _summary(state, config)
+        topology = build_edge_topology(len(state.points), state.triangles)
+        best: tuple[tuple[float, ...], _State, dict[str, Any]] | None = None
+        for rings in patch_ring_ladder:
+            patch = _expand_triangle_patch(
+                state.triangles,
+                topology,
+                component["triangle_indices"],
+                rings,
+            )
+            ring = _ordered_patch_boundary(state.triangles, patch)
+            if ring is None:
+                attempts.append(
+                    {
+                        "operation": "fixed-hard-fan-source-arc-refinement",
+                        "component_id": str(component["component_id"]),
+                        "patch_rings": int(rings),
+                        "failures": ["non_simple_patch_boundary"],
+                    }
+                )
+                rejected += 1
+                continue
+            candidates = _action_candidates(
+                state,
+                component,
+                patch,
+                ring,
+                "source_arc_insertion",
+                {
+                    "tool": "source_arc_insertion",
+                    "maximum_support_nodes": 0,
+                    "remove_movable_component_nodes": False,
+                },
+                0,
+            )
+            for candidate_index, candidate in enumerate(candidates):
+                boundary_insertions = list(candidate.get("boundary_insertions", []))
+                if len(boundary_insertions) != 1:
+                    continue
+                edge = tuple(sorted(map(int, boundary_insertions[0]["edge"])))
+                if not _automatic_source_arc_edge_is_eligible(state, edge):
+                    continue
+                trial = state.clone()
+                changed, construction_failures, evidence = _apply_candidate(
+                    trial,
+                    component,
+                    patch,
+                    ring,
+                    candidate,
+                    config,
+                )
+                record = {
+                    "operation": "fixed-hard-fan-source-arc-refinement",
+                    "component_id": str(component["component_id"]),
+                    "component_lineage": list(map(int, component["node_lineage"])),
+                    "patch_rings": int(rings),
+                    "candidate_index": int(candidate_index),
+                    "source_edge_lineage": [
+                        int(state.lineage[edge[0]]),
+                        int(state.lineage[edge[1]]),
+                    ],
+                    "evidence": evidence,
+                    "failures": list(construction_failures),
+                }
+                if not changed:
+                    attempts.append(record)
+                    rejected += 1
+                    continue
+                invariant_ok, invariants, after = _audit_state(
+                    trial,
+                    config,
+                    initial_components,
+                )
+                failures = _automatic_fixed_hard_fan_failures(
+                    before_state,
+                    trial,
+                    before,
+                    after,
+                    invariant_ok,
+                    invariants,
+                    config,
+                )
+                record.update(
+                    {
+                        "invariants": invariants,
+                        "after": _summary_from(after),
+                        "failures": failures,
+                    }
+                )
+                attempts.append(record)
+                if failures:
+                    rejected += 1
+                    continue
+                score = (
+                    float(after["superthin_triangle_count"]),
+                    float(after["superthin_severity_sum"]),
+                    float(after["maximum_valence"]),
+                    -float(after["q_min"]),
+                    float(rings),
+                    float(candidate_index),
+                )
+                if best is None or score < best[0]:
+                    best = (score, trial, record)
+            if best is not None:
+                break
+        if best is None:
+            break
+        _, delivered, selected = best
+        _restore(state, delivered)
+        for entry in reversed(state.ledger):
+            if entry.get("operation") == "visual-constrained-patch-reconstruction":
+                entry["operation"] = "minimal-fixed-hard-fan-source-arc-refinement"
+                entry["automatic"] = True
+                entry["review_required"] = False
+                break
+        state.ledger.append(
+            {
+                "operation": "minimal-fixed-hard-fan-transaction-accepted",
+                "component_id": str(component["component_id"]),
+                "source_edge_lineage": list(selected["source_edge_lineage"]),
+                "patch_rings": int(selected["patch_rings"]),
+                "superthin_before": int(before["superthin_triangle_count"]),
+                "superthin_after": int(_summary(state, config)["superthin_triangle_count"]),
+            }
+        )
+        selected["accepted"] = True
+        accepted += 1
+    return {
+        "enabled": True,
+        "accepted": int(accepted),
+        "rejected": int(rejected),
+        "attempts": attempts,
+        "after": _summary(state, config),
+    }
+
+
+def _fixed_hard_fan_ineligibility(
+    state: _State,
+    component: dict[str, Any],
+) -> list[str]:
+    reasons: list[str] = []
+    triangles = list(map(int, component.get("triangle_indices", [])))
+    nodes = sorted(
+        set(
+            map(
+                int,
+                np.unique(state.triangles[np.asarray(triangles, dtype=int)]),
+            )
+        )
+    ) if triangles else []
+    if str(component.get("classification")) != "fixed-boundary-hard-anchor-fan":
+        reasons.append("classification_not_fixed_hard_fan")
+    if len(triangles) != 1 or len(nodes) != 3:
+        reasons.append("component_not_one_triangle")
+    if nodes and not all(bool(state.fixed[node]) for node in nodes):
+        reasons.append("component_has_movable_node")
+    if nodes and not all(bool(state.hard[node]) for node in nodes):
+        reasons.append("component_has_nonhard_node")
+    if len(component.get("boundary_chain_ids", [])) != 1:
+        reasons.append("component_not_on_one_boundary_chain")
+    if set(nodes) & set(map(int, state.open_nodes.tolist())):
+        reasons.append("component_touches_open_boundary")
+    return sorted(set(reasons))
+
+
+def _automatic_source_arc_edge_is_eligible(
+    state: _State,
+    edge: tuple[int, int],
+) -> bool:
+    membership = _find_chain_edge(state.chains, edge)
+    if membership is None:
+        return False
+    if set(map(int, edge)) & set(map(int, state.open_nodes.tolist())):
+        return False
+    a, b = map(int, edge)
+    return bool(
+        state.fixed[a]
+        and state.fixed[b]
+        and state.hard[a]
+        and state.hard[b]
+        and str(state.kinds[a]) == str(state.kinds[b])
+    )
+
+
+def _automatic_fixed_hard_fan_failures(
+    before_state: _State,
+    after_state: _State,
+    before: dict[str, Any],
+    after: dict[str, Any],
+    invariant_ok: bool,
+    invariants: dict[str, Any],
+    config: AggressiveConditioningConfig,
+) -> list[str]:
+    failures: list[str] = []
+    if not invariant_ok:
+        failures.extend(_failed_invariant_names(invariants))
+    before_debt = (
+        int(before["superthin_triangle_count"]),
+        float(before["superthin_severity_sum"]),
+    )
+    after_debt = (
+        int(after["superthin_triangle_count"]),
+        float(after["superthin_severity_sum"]),
+    )
+    if not after_debt < before_debt:
+        failures.append("superthin_debt_not_strictly_reduced")
+    before_valence = (
+        int(before["count_valence_above_limit"]),
+        int(before["valence_excess_sum"]),
+        int(before["maximum_valence"]),
+    )
+    after_valence = (
+        int(after["count_valence_above_limit"]),
+        int(after["valence_excess_sum"]),
+        int(after["maximum_valence"]),
+    )
+    if after_valence > before_valence or int(after["maximum_valence"]) > int(config.max_valence):
+        failures.append("valence_regression")
+    before_open = _open_boundary_lineage_sequence(before_state)
+    after_open = _open_boundary_lineage_sequence(after_state)
+    if after_open != before_open:
+        failures.append("open_boundary_membership_or_order_changed")
+    delivered_by_lineage = {
+        int(lineage): after_state.points[index]
+        for index, lineage in enumerate(after_state.lineage)
+        if int(lineage) >= 0
+    }
+    for index, lineage in enumerate(before_state.lineage):
+        if not bool(before_state.fixed[index]) or int(lineage) < 0:
+            continue
+        delivered = delivered_by_lineage.get(int(lineage))
+        if delivered is None or not np.array_equal(before_state.points[index], delivered):
+            failures.append("original_boundary_coordinate_changed")
+            break
+    return sorted(set(failures))
 
 
 def _repair_superthin_components(

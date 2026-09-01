@@ -109,6 +109,8 @@ def test_auto_resolver_is_minimal_and_disables_broad_edits() -> None:
     assert resolved.max_boundary_edits_per_round == 0
     assert resolved.max_boundary_welds_per_round == 0
     assert resolved.max_boundary_ear_removals_per_round == 0
+    assert resolved.enable_fixed_hard_fan_arc_refinement
+    assert resolved.max_fixed_hard_fan_arc_refinements_per_round == 8
     assert resolved.micro_relax_cycles == 0
     assert resolved.topology_escrow_enabled
 
@@ -254,6 +256,93 @@ def test_protected_superthin_boundary_is_reported_not_deleted() -> None:
     assert _canonical_triangles(result.triangles) == [(0, 1, 2)]
 
 
+def _fixed_hard_fan_fixture() -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    list[list[int]],
+    list[str],
+]:
+    points = np.asarray(
+        [
+            [0.0, 0.0],
+            [-202.53342621243792, -139.4223343185149],
+            [-442.683838472527, -46.290730671491474],
+            [-284.64227076625684, -162.47637594863772],
+            [-46.94825545203639, -121.90163250686601],
+        ],
+        dtype=float,
+    )
+    triangles = np.asarray(
+        [[1, 4, 0], [2, 3, 1], [3, 4, 1]],
+        dtype=int,
+    )
+    fixed = np.ones(len(points), dtype=bool)
+    return (
+        points,
+        triangles,
+        fixed,
+        [[0, 1, 2, 3, 4]],
+        ["fixed_topological_boundary"] * len(points),
+    )
+
+
+def test_fixed_hard_non_obc_fan_gets_one_bounded_arc_refinement() -> None:
+    points, triangles, fixed, chains, kinds = _fixed_hard_fan_fixture()
+    result = _run(
+        points,
+        triangles,
+        fixed,
+        chains,
+        kinds,
+        np.full(len(points), 1375.0, dtype=float),
+        _minimal_config(
+            enable_fixed_hard_fan_arc_refinement=True,
+            max_fixed_hard_fan_arc_refinements_per_round=1,
+            max_superthin_flips_per_round=0,
+            max_collapses_per_round=0,
+            max_valence_removals_per_round=0,
+        ),
+    )
+    assert result.report["before"]["superthin_triangle_count"] == 1
+    assert result.report["after"]["superthin_triangle_count"] == 0
+    assert result.report["after"]["maximum_valence"] <= 8
+    assert result.report["minimal_local_debt_closed"]
+    assert len(result.nodes_xy) == len(points) + 1
+    assert np.array_equal(result.nodes_xy[: len(points)], points)
+    assert result.open_boundary_nodes_zero_based.size == 0
+    assert result.report["edit_counts"] == {
+        "minimal-fixed-hard-fan-source-arc-refinement": 1,
+        "minimal-fixed-hard-fan-transaction-accepted": 1,
+    }
+
+
+def test_fixed_hard_fan_refinement_never_changes_an_obc() -> None:
+    points, triangles, fixed, chains, kinds = _fixed_hard_fan_fixture()
+    open_nodes = np.asarray([0, 1, 2, 3, 4], dtype=int)
+    result = condition_mesh_aggressive(
+        points,
+        triangles,
+        fixed,
+        chains,
+        open_nodes,
+        target_spacing_m=np.full(len(points), 1375.0, dtype=float),
+        boundary_kinds=["open"] * len(points),
+        hard_anchor_mask=fixed,
+        config=_minimal_config(
+            enable_fixed_hard_fan_arc_refinement=True,
+            max_fixed_hard_fan_arc_refinements_per_round=1,
+            max_superthin_flips_per_round=0,
+            max_collapses_per_round=0,
+            max_valence_removals_per_round=0,
+        ),
+    )
+    assert result.report["after"]["superthin_triangle_count"] == 1
+    assert np.array_equal(result.nodes_xy, points)
+    assert np.array_equal(result.open_boundary_nodes_zero_based, open_nodes)
+    assert result.edit_ledger == []
+
+
 def test_expired_deadline_stops_before_first_transaction() -> None:
     points, triangles, fixed, chains, kinds = _nine_spoke_fixture()
     result = _run(
@@ -299,6 +388,8 @@ TESTS: tuple[Callable[[], None], ...] = (
     test_valence_only_repair_closes_without_boundary_movement,
     test_superthin_only_repair_is_an_atomic_flip,
     test_protected_superthin_boundary_is_reported_not_deleted,
+    test_fixed_hard_non_obc_fan_gets_one_bounded_arc_refinement,
+    test_fixed_hard_fan_refinement_never_changes_an_obc,
     test_expired_deadline_stops_before_first_transaction,
     test_deterministic_replay_matches_connectivity_and_lineage,
 )

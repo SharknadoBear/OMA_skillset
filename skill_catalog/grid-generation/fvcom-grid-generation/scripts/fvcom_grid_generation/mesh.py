@@ -486,6 +486,10 @@ def generate_mesh(
                     else str(config.aggressive_boundary_edit_policy)
                 ),
                 max_boundary_edits_per_round=(0 if minimal_profile else 25),
+                enable_fixed_hard_fan_arc_refinement=bool(minimal_profile),
+                max_fixed_hard_fan_arc_refinements_per_round=(
+                    8 if minimal_profile else 0
+                ),
                 max_boundary_welds_per_round=(0 if minimal_profile else 25),
                 max_boundary_ear_removals_per_round=(0 if minimal_profile else 25),
                 max_prunes_per_round=(

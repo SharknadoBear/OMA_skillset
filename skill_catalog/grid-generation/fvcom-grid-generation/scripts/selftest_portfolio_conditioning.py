@@ -389,12 +389,158 @@ def test_rejected_primary_candidate_is_retained_deterministically() -> None:
             assert first[key]["sha256"] == second[key]["sha256"]
 
 
+def _authorized_midpoint_audit_fixture() -> tuple[
+    conditioning_module._ConditioningState,
+    np.ndarray,
+    list[list[int]],
+    list[dict[str, object]],
+]:
+    raw_points = np.asarray(
+        [
+            [0.0, 0.0],
+            [2.0, 0.0],
+            [2.0, 2.0],
+            [0.0, 2.0],
+            [1.0, 1.0],
+        ],
+        dtype=float,
+    )
+    points = np.vstack((raw_points, np.asarray([[1.0, 0.0]])))
+    triangles = np.asarray(
+        [
+            [0, 5, 4],
+            [5, 1, 4],
+            [1, 2, 4],
+            [2, 3, 4],
+            [3, 0, 4],
+        ],
+        dtype=int,
+    )
+    fixed = np.asarray([True, True, True, True, False, True])
+    hard = np.asarray([True, True, True, True, False, False])
+    state = conditioning_module._ConditioningState(
+        points=points,
+        triangles=triangles,
+        fixed=fixed,
+        constraint_chains=[[0, 5, 1, 2, 3]],
+        boundary_kinds=[
+            "fixed_boundary",
+            "fixed_boundary",
+            "fixed_boundary",
+            "fixed_boundary",
+            "interior",
+            "fixed_boundary",
+        ],
+        hard=hard,
+        targets=np.full(len(points), 1.0, dtype=float),
+        raw_lineage=np.asarray([0, 1, 2, 3, 4, -1], dtype=int),
+    )
+    ledger: list[dict[str, object]] = [
+        {
+            "operation": "minimal-fixed-hard-fan-source-arc-refinement",
+            "component_id": "thin-0-fixture",
+            "automatic": True,
+            "review_required": False,
+            "inserted_boundary_node_count": 1,
+            "inserted_support_node_count": 0,
+            "removed_movable_node_count": 0,
+        },
+        {
+            "operation": "minimal-fixed-hard-fan-transaction-accepted",
+            "component_id": "thin-0-fixture",
+            "source_edge_lineage": [0, 1],
+        },
+    ]
+    return state, raw_points, [[0, 1, 2, 3]], ledger
+
+
+def _run_midpoint_audit(
+    state: conditioning_module._ConditioningState,
+    raw_points: np.ndarray,
+    raw_boundary_chains: list[list[int]],
+    ledger: list[dict[str, object]] | None,
+    *,
+    raw_obc_chains: list[list[int]] | None = None,
+) -> dict[str, object]:
+    obc = raw_obc_chains or []
+    return conditioning_module._global_structural_audit(
+        state,
+        raw_points,
+        raw_boundary_chains,
+        obc,
+        list(range(1, len(obc) + 1)),
+        [False] * len(obc),
+        lambda values: np.ones(len(values), dtype=float),
+        boundary_refinement_ledger=ledger,
+    )
+
+
+def test_ledger_authorizes_exact_non_obc_boundary_midpoint() -> None:
+    state, raw_points, raw_boundary_chains, ledger = (
+        _authorized_midpoint_audit_fixture()
+    )
+    audit = _run_midpoint_audit(
+        state,
+        raw_points,
+        raw_boundary_chains,
+        ledger,
+    )
+    assert audit["core_passed"], audit
+    assert audit["raw_boundary_refinement_authorized"]
+    assert audit["authorized_boundary_insertion_count"] == 1
+    assert audit["raw_boundary_lineage_topology_preserved"]
+    assert audit["boundary_edge_set_exact"]
+
+
+def test_unlogged_or_invalid_boundary_midpoint_is_rejected() -> None:
+    state, raw_points, raw_boundary_chains, ledger = (
+        _authorized_midpoint_audit_fixture()
+    )
+    unlogged = _run_midpoint_audit(
+        state,
+        raw_points,
+        raw_boundary_chains,
+        None,
+    )
+    assert not unlogged["core_passed"]
+    assert "unauthorized_boundary_refinement" in unlogged["core_failures"]
+
+    shifted = state.clone()
+    shifted.points[5] = np.asarray([1.0, 0.05])
+    bad_midpoint = _run_midpoint_audit(
+        shifted,
+        raw_points,
+        raw_boundary_chains,
+        ledger,
+    )
+    assert not bad_midpoint["core_passed"]
+    assert (
+        "inserted_boundary_node_is_not_exact_midpoint"
+        in bad_midpoint["boundary_refinement_failures"]
+    )
+
+    obc_touch = _run_midpoint_audit(
+        state,
+        raw_points,
+        raw_boundary_chains,
+        ledger,
+        raw_obc_chains=[[0, 1]],
+    )
+    assert not obc_touch["core_passed"]
+    assert (
+        "open_boundary_edge_refinement_not_allowed"
+        in obc_touch["boundary_refinement_failures"]
+    )
+
+
 TESTS: tuple[Callable[[], None], ...] = (
     test_closed_lake_common_conditioning,
     test_two_obc_ids_order_and_boundary_are_preserved,
     test_cyclic_obc_and_source_forcing_remain_readiness_failures,
     test_scientific_input_failure_is_separate_from_local_closure,
     test_rejected_primary_candidate_is_retained_deterministically,
+    test_ledger_authorizes_exact_non_obc_boundary_midpoint,
+    test_unlogged_or_invalid_boundary_midpoint_is_rejected,
 )
 
 

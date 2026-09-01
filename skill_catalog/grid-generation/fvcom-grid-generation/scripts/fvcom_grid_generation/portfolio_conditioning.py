@@ -391,6 +391,7 @@ def condition_portfolio_mesh(
         raw_obc_ids,
         open_boundary_cyclic,
         target_sampler_xy,
+        boundary_refinement_ledger=primary_result.edit_ledger,
     )
     primary_regressions = _stage_regressions(
         raw_audit,
@@ -507,16 +508,13 @@ def condition_portfolio_mesh(
             pre_area_audit if terminal_rollback else terminal_audit
         )
 
-    final_boundary_chains = _mapped_source_chains(
-        raw_boundary_chains,
-        final_state.raw_lineage,
-        "boundary",
-    )
-    final_obc_chains = _mapped_source_chains(
-        raw_obc_chains,
-        final_state.raw_lineage,
-        "open-boundary",
-    )
+    final_boundary_chains = [
+        list(map(int, chain))
+        for chain in final_audit["_mapped_boundary_chains"]
+    ]
+    final_obc_chains = [
+        list(map(int, chain)) for chain in final_audit["_mapped_obc_chains"]
+    ]
     final_lonlat = unproject_points(final_state.points, projection)
     final_depths = bathymetry.sample(final_lonlat)
     if np.any(~np.isfinite(final_depths)) or np.any(final_depths <= 0.0):
@@ -748,7 +746,12 @@ def condition_portfolio_mesh(
                     "serialized-quality-audit",
                 ]
             ),
-            "boundary_edit_policy": "none",
+            "boundary_edit_policy": (
+                "one_ledger_authorized_non_obc_source_arc_midpoint_per_"
+                "fixed_hard_fan_transaction"
+                if effective_profile == "minimal-topology-v1"
+                else "none"
+            ),
             "all_topological_boundary_nodes_fixed": True,
             "internal_legacy_flat_obc_disabled": True,
             "plural_obc_policy": (
@@ -1055,6 +1058,8 @@ def _primary_topology_config(
         max_rounds=int(config.primary_rounds),
         boundary_edit_policy="none",
         max_boundary_edits_per_round=0,
+        enable_fixed_hard_fan_arc_refinement=minimal,
+        max_fixed_hard_fan_arc_refinements_per_round=(8 if minimal else 0),
         max_boundary_welds_per_round=0,
         max_boundary_ear_removals_per_round=0,
         max_prunes_per_round=(
@@ -1156,6 +1161,216 @@ def _compose_lineage(previous: np.ndarray, current: np.ndarray) -> np.ndarray:
     return output
 
 
+def _authorized_fixed_hard_fan_refinements(
+    edit_ledger: Iterable[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Extract only complete, accepted fixed-hard-fan midpoint transactions."""
+
+    entries = [dict(entry) for entry in (edit_ledger or [])]
+    accepted_entries = [
+        entry
+        for entry in entries
+        if entry.get("operation")
+        == "minimal-fixed-hard-fan-transaction-accepted"
+    ]
+    reconstruction_entries = [
+        entry
+        for entry in entries
+        if entry.get("operation")
+        == "minimal-fixed-hard-fan-source-arc-refinement"
+    ]
+    authorizations: list[dict[str, Any]] = []
+    failures: list[str] = []
+    seen_components: set[str] = set()
+    seen_edges: set[tuple[int, int]] = set()
+    for accepted in accepted_entries:
+        component_id = str(accepted.get("component_id", "")).strip()
+        source_edge = accepted.get("source_edge_lineage")
+        if (
+            not component_id
+            or not isinstance(source_edge, (list, tuple))
+            or len(source_edge) != 2
+        ):
+            failures.append("malformed_accepted_refinement_record")
+            continue
+        try:
+            source_pair = tuple(sorted(map(int, source_edge)))
+        except (TypeError, ValueError):
+            failures.append("malformed_accepted_refinement_source_edge")
+            continue
+        if source_pair[0] < 0 or source_pair[0] == source_pair[1]:
+            failures.append("invalid_accepted_refinement_source_edge")
+            continue
+        matches = [
+            entry
+            for entry in reconstruction_entries
+            if str(entry.get("component_id", "")) == component_id
+            and bool(entry.get("automatic"))
+            and not bool(entry.get("review_required", True))
+            and int(entry.get("inserted_boundary_node_count", -1)) == 1
+            and int(entry.get("inserted_support_node_count", -1)) == 0
+            and int(entry.get("removed_movable_node_count", -1)) == 0
+        ]
+        if len(matches) != 1:
+            failures.append("accepted_refinement_missing_unique_reconstruction")
+            continue
+        if component_id in seen_components or source_pair in seen_edges:
+            failures.append("duplicate_accepted_refinement_authorization")
+            continue
+        seen_components.add(component_id)
+        seen_edges.add(source_pair)
+        authorizations.append(
+            {
+                "component_id": component_id,
+                "source_edge_lineage": list(source_pair),
+            }
+        )
+    if len(reconstruction_entries) != len(accepted_entries):
+        failures.append("unpaired_fixed_hard_fan_reconstruction_record")
+    return authorizations, sorted(set(failures))
+
+
+def _audit_authorized_boundary_refinements(
+    state: _ConditioningState,
+    raw_points: np.ndarray,
+    raw_boundary_chains: list[list[int]],
+    raw_obc_chains: list[list[int]],
+    open_boundary_cyclic: list[bool],
+    mapped_boundary: list[list[int]],
+    edit_ledger: Iterable[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Prove that delivered boundary changes are only logged midpoints."""
+
+    authorizations, failures = _authorized_fixed_hard_fan_refinements(
+        edit_ledger
+    )
+    delivered_chains = [
+        list(map(int, chain)) for chain in state.constraint_chains
+    ]
+    lineage = np.asarray(state.raw_lineage, dtype=int)
+    boundary_occurrences: dict[int, list[tuple[int, int]]] = {}
+    for chain_index, chain in enumerate(delivered_chains):
+        for position, delivered in enumerate(chain):
+            if delivered < 0 or delivered >= len(lineage):
+                failures.append("delivered_boundary_node_out_of_range")
+                continue
+            if int(lineage[delivered]) < 0:
+                boundary_occurrences.setdefault(int(delivered), []).append(
+                    (int(chain_index), int(position))
+                )
+
+    inserted_boundary_nodes = sorted(boundary_occurrences)
+    if not inserted_boundary_nodes and not authorizations and not failures:
+        return {
+            "authorized": False,
+            "passed": True,
+            "failures": [],
+            "inserted_boundary_nodes": [],
+            "authorizations": [],
+            "delivered_boundary_chains": mapped_boundary,
+            "raw_boundary_lineage_topology_preserved": True,
+        }
+
+    if len(delivered_chains) != len(raw_boundary_chains):
+        failures.append("boundary_chain_count_changed")
+    else:
+        for chain_index, (delivered, raw) in enumerate(
+            zip(delivered_chains, raw_boundary_chains, strict=True)
+        ):
+            collapsed = [
+                int(lineage[node])
+                for node in delivered
+                if 0 <= node < len(lineage) and int(lineage[node]) >= 0
+            ]
+            if collapsed != list(map(int, raw)):
+                failures.append(
+                    f"boundary_chain_{chain_index}_raw_order_changed"
+                )
+
+    authorized_edges = {
+        tuple(map(int, record["source_edge_lineage"]))
+        for record in authorizations
+    }
+    observed_edges: set[tuple[int, int]] = set()
+    raw_obc_edges: set[tuple[int, int]] = set()
+    for chain, cyclic in zip(
+        raw_obc_chains,
+        open_boundary_cyclic,
+        strict=True,
+    ):
+        nodes = list(map(int, chain))
+        for first, second in zip(nodes[:-1], nodes[1:]):
+            raw_obc_edges.add(tuple(sorted((first, second))))
+        if cyclic and len(nodes) > 1:
+            raw_obc_edges.add(tuple(sorted((nodes[-1], nodes[0]))))
+    points = np.asarray(state.points, dtype=float)
+    raw_xy = np.asarray(raw_points, dtype=float)
+    for delivered in inserted_boundary_nodes:
+        occurrences = boundary_occurrences[delivered]
+        if len(occurrences) != 1:
+            failures.append("inserted_boundary_node_not_unique_to_one_chain")
+            continue
+        chain_index, position = occurrences[0]
+        chain = delivered_chains[chain_index]
+        if len(chain) < 3:
+            failures.append("refined_boundary_chain_too_short")
+            continue
+        previous_node = int(chain[(position - 1) % len(chain)])
+        next_node = int(chain[(position + 1) % len(chain)])
+        previous_source = int(lineage[previous_node])
+        next_source = int(lineage[next_node])
+        if previous_source < 0 or next_source < 0:
+            failures.append("adjacent_inserted_boundary_nodes_not_allowed")
+            continue
+        source_edge = tuple(sorted((previous_source, next_source)))
+        observed_edges.add(source_edge)
+        if source_edge not in authorized_edges:
+            failures.append("inserted_boundary_node_has_no_authorized_parent_edge")
+        if source_edge not in chain_edges([raw_boundary_chains[chain_index]]):
+            failures.append("refinement_parent_is_not_a_raw_boundary_edge")
+        if source_edge in raw_obc_edges:
+            failures.append("open_boundary_edge_refinement_not_allowed")
+        if (
+            delivered >= len(state.fixed)
+            or not bool(state.fixed[delivered])
+        ):
+            failures.append("inserted_boundary_midpoint_not_fixed")
+        if (
+            delivered < len(state.boundary_kinds)
+            and str(state.boundary_kinds[delivered]) == "open_boundary"
+        ):
+            failures.append("inserted_boundary_midpoint_classified_as_obc")
+        midpoint = 0.5 * (
+            raw_xy[source_edge[0]] + raw_xy[source_edge[1]]
+        )
+        edge_length = float(
+            np.linalg.norm(
+                raw_xy[source_edge[0]] - raw_xy[source_edge[1]]
+            )
+        )
+        tolerance = max(1.0e-9, edge_length * 1.0e-12)
+        if float(np.linalg.norm(points[delivered] - midpoint)) > tolerance:
+            failures.append("inserted_boundary_node_is_not_exact_midpoint")
+
+    if observed_edges != authorized_edges:
+        failures.append("accepted_refinement_authorizations_not_one_to_one")
+    passed = bool(authorizations and not failures)
+    return {
+        "authorized": bool(authorizations),
+        "passed": passed,
+        "failures": sorted(set(failures)),
+        "inserted_boundary_nodes": inserted_boundary_nodes,
+        "authorizations": authorizations,
+        "delivered_boundary_chains": (
+            delivered_chains if passed else mapped_boundary
+        ),
+        "raw_boundary_lineage_topology_preserved": bool(
+            not any("raw_order_changed" in item for item in failures)
+            and "boundary_chain_count_changed" not in failures
+        ),
+    }
+
+
 def _global_structural_audit(
     state: _ConditioningState,
     raw_points: np.ndarray,
@@ -1164,6 +1379,8 @@ def _global_structural_audit(
     raw_obc_ids: list[int],
     open_boundary_cyclic: list[bool],
     target_sampler_xy: Callable[[np.ndarray], np.ndarray],
+    *,
+    boundary_refinement_ledger: Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     points = np.asarray(state.points, dtype=float)
     triangles = np.asarray(state.triangles, dtype=int)
@@ -1189,17 +1406,30 @@ def _global_structural_audit(
     except ValueError as exc:
         mapping_failures.append(str(exc))
 
-    expected_boundary_edges = chain_edges(mapped_boundary)
+    refinement_audit = _audit_authorized_boundary_refinements(
+        state,
+        raw_points,
+        raw_boundary_chains,
+        raw_obc_chains,
+        open_boundary_cyclic,
+        mapped_boundary,
+        boundary_refinement_ledger,
+    )
+    audited_boundary = [
+        list(map(int, chain))
+        for chain in refinement_audit["delivered_boundary_chains"]
+    ]
+    expected_boundary_edges = chain_edges(audited_boundary)
     actual_boundary_edges = set(topology.boundary_edges)
     expected_boundary_nodes = {
-        int(node) for chain in mapped_boundary for node in chain
+        int(node) for chain in audited_boundary for node in chain
     }
     actual_boundary_nodes = {
         int(node) for edge in topology.boundary_edges for node in edge
     }
     integrity = constraint_integrity(
         topology,
-        mapped_boundary,
+        audited_boundary,
         None,
         mapped_obc,
         open_boundary_cyclic,
@@ -1225,7 +1455,7 @@ def _global_structural_audit(
     metrics = compute_mesh_metrics(
         points,
         triangles,
-        constraint_chains=mapped_boundary,
+        constraint_chains=audited_boundary,
         open_boundary_chains_zero_based=mapped_obc,
         open_boundary_cyclic=open_boundary_cyclic,
         target_size_by_triangle=targets_by_triangle,
@@ -1270,6 +1500,8 @@ def _global_structural_audit(
     core_failures: list[str] = []
     if mapping_failures:
         core_failures.append("source_lineage_mapping_failure")
+    if not bool(refinement_audit["passed"]):
+        core_failures.append("unauthorized_boundary_refinement")
     if int(metrics["topology"]["connected_component_count"]) != 1:
         core_failures.append("wet_component_count_not_one")
     if int(metrics["topology"]["nonmanifold_edge_count"]) != 0:
@@ -1312,6 +1544,20 @@ def _global_structural_audit(
             metrics["topology"]["singly_connected_triangle_count"]
         ),
         "boundary_edge_set_exact": boundary_edge_exact,
+        "raw_boundary_refinement_authorized": bool(
+            refinement_audit["authorized"] and refinement_audit["passed"]
+        ),
+        "authorized_boundary_insertion_count": int(
+            len(refinement_audit["inserted_boundary_nodes"])
+            if refinement_audit["passed"]
+            else 0
+        ),
+        "boundary_refinement_failures": list(
+            refinement_audit["failures"]
+        ),
+        "raw_boundary_lineage_topology_preserved": bool(
+            refinement_audit["raw_boundary_lineage_topology_preserved"]
+        ),
         "fixed_boundary_coordinate_max_shift_m": float(boundary_shift),
         "open_boundary_chain_count": int(len(mapped_obc)),
         "open_boundary_ids": list(map(int, raw_obc_ids)),
@@ -1339,7 +1585,7 @@ def _global_structural_audit(
         ),
         "l_over_h_p95": float(size_error["quantiles"]["p95"]),
         "l_over_h_maximum": float(size_error["maximum"]),
-        "_mapped_boundary_chains": mapped_boundary,
+        "_mapped_boundary_chains": audited_boundary,
         "_mapped_obc_chains": mapped_obc,
     }
 

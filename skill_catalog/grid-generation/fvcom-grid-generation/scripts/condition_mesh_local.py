@@ -76,6 +76,15 @@ def main_with_mode(forced_mode: str | None = None) -> int:
     )
     parser.add_argument("--rounds", type=int, default=4)
     parser.add_argument("--boundary-edit-policy", choices=("kind-aware-envelope", "split-only", "none"), default="kind-aware-envelope")
+    parser.add_argument(
+        "--fixed-hard-fan-arc-refinement",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable the default-minimal bounded non-OBC source-arc midpoint "
+            "repair for one-triangle all-fixed/all-hard superthin fans."
+        ),
+    )
     parser.add_argument("--max-prunes-per-round", type=int, default=500)
     parser.add_argument("--max-valence-repairs-per-round", type=int, default=500)
     parser.add_argument("--max-valence-flip-batch", type=int, default=64)
@@ -166,6 +175,9 @@ def main_with_mode(forced_mode: str | None = None) -> int:
         enable_thin_repair=thin_enabled and mode in {"all", "thin", "valence"},
         enable_valence_repair=mode in {"all", "valence"},
         boundary_edit_policy=str(args.boundary_edit_policy),
+        enable_fixed_hard_fan_arc_refinement=bool(
+            args.fixed_hard_fan_arc_refinement
+        ),
         max_prunes_per_round=int(args.max_prunes_per_round) if mode in {"all", "prune"} else 0,
         max_collapses_per_round=100 if mode in {"all", "thin", "valence"} else 0,
         max_boundary_edits_per_round=25 if mode in {"all", "thin", "valence"} else 0,
