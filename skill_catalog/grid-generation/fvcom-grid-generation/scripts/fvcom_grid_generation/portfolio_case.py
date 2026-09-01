@@ -1423,6 +1423,9 @@ def _load_canonical_boundary(
         metadata=metadata,
         passage_diagnostics=passage_diagnostics,
         open_boundaries=open_boundaries,
+        topology_compensation=(
+            loaded.topology_compensation if input_kind == "adaptive_v2" else None
+        ),
     )
     report = {
         "schema_version": "fvcom_portfolio_canonical_boundary_v1",
@@ -1442,6 +1445,11 @@ def _load_canonical_boundary(
             "final_status": resolution_payload.get("final_status"),
             "profile": resolution_payload.get("profile"),
         },
+        "boundary_topology_compensation": (
+            loaded.topology_compensation.report
+            if input_kind == "adaptive_v2" and loaded.topology_compensation is not None
+            else None
+        ),
     }
     return boundary, report
 

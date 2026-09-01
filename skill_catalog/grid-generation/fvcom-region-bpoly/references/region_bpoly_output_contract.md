@@ -59,7 +59,10 @@ or `for investigating` is excluded from the geographic query.
 
 `output_package.package_state` and the manifest distinguish:
 
-- `internal_review`: a nonterminal `review_pending` or `repair_required` state;
+- `internal_review`: a nonterminal `review_pending` or `repair_required` state,
+  or the terminal typed S1 blocker
+  `s1_offshore_orientation_unresolved_after_single_repair` that is ineligible
+  for S2 intake;
 - `accepted_delivery`: the latest valid RegionBPoly has been finalized with
   `final_status: pass`, either cleanly or with explicit review warnings.
 
@@ -69,3 +72,7 @@ Downstream consumers preserve all review provenance but must not reject usable
 RegionBPoly geometry because of review, package-state, scientific-usefulness,
 or readiness labels.
 These are W12 packaging results, not a new RegionBPoly decision gate.
+
+An accepted pass includes `accepted_s1_geometry_freeze` with the canonical
+RegionBPoly hash, immutable candidate/review hashes, offshore-side index, and
+`downstream_geometry_repair_permitted: false`. S2 consumes that exact geometry.

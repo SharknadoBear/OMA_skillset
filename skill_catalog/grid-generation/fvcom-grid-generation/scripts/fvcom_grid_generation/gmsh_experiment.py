@@ -27,6 +27,12 @@ from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, P
 from shapely.ops import unary_union
 
 from .bathymetry import BathymetryGrid, bathymetry_coverage_report, load_bathymetry
+from .boundary_topology import (
+    BoundaryTopologyCompensation,
+    expected_hole_count_matches,
+    normalize_boundary_topology,
+    write_boundary_topology_compensation,
+)
 from .node_budget import (
     DEFAULT_HARD_NODE_LIMIT,
     DEFAULT_PREFLIGHT_NODE_LIMIT,
@@ -37,6 +43,7 @@ from .projection import (
     local_utm_projection,
     project_geometry,
     project_points,
+    unproject_geometry,
     unproject_points,
 )
 from .quality import evaluate_mesh_quality
@@ -78,6 +85,7 @@ class PreparedCase:
     input_paths: dict[str, Path]
     boundary_revalidation: dict[str, Any]
     manifest_sha256: str
+    topology_compensation: BoundaryTopologyCompensation | None = None
 
 
 @dataclass(frozen=True)
@@ -765,6 +773,7 @@ def _validate_adaptive_boundary_evidence(
     open_geometry: LineString | MultiLineString,
     holes_xy: tuple[np.ndarray, ...],
     open_boundaries: tuple[SourceOpenBoundary, ...],
+    topology_compensation: BoundaryTopologyCompensation,
 ) -> tuple[dict[str, Any], dict[str, Path]]:
     """Enforce adaptive-package topology and case-specific scientific gates."""
     boundary = manifest["boundary"]
@@ -775,8 +784,12 @@ def _validate_adaptive_boundary_evidence(
     failures: list[str] = []
     _require_metric(failures, bool(domain_xy.is_valid and domain_xy.area > 0.0), "wet_domain_invalid")
     _require_metric(failures, len(open_boundaries) == expected_open, "open_boundary_count_mismatch")
+    expected_holes_passed, expected_holes_mode = expected_hole_count_matches(
+        int(expected_holes) if expected_holes is not None else None,
+        topology_compensation,
+    )
     if expected_holes is not None:
-        _require_metric(failures, len(holes_xy) == int(expected_holes), "island_hole_count_mismatch")
+        _require_metric(failures, expected_holes_passed, "island_hole_count_mismatch")
     if "wet_component_count" in qa:
         _require_metric(failures, int(qa["wet_component_count"]) == 1, "wet_component_count_not_one")
     if "resolved_domain_valid" in qa:
@@ -918,6 +931,10 @@ def _validate_adaptive_boundary_evidence(
         "source_manifest": str(resolution_manifest),
         "wet_component_count": 1,
         "island_hole_count": len(holes_xy),
+        "source_island_chain_count": topology_compensation.report["counts"]["source_island_chain_count"],
+        "expected_island_holes": int(expected_holes) if expected_holes is not None else None,
+        "expected_island_holes_match_mode": expected_holes_mode,
+        "topology_compensation": topology_compensation.report,
         "open_boundary_count": len(open_boundaries),
         "independent_open_boundary_exterior_overlap_fraction": overlap,
         "upstream_qa": qa,
@@ -1060,6 +1077,7 @@ def _load_adaptive_geometry(
     Polygon,
     dict[str, Path],
     dict[str, Any],
+    BoundaryTopologyCompensation,
 ]:
     boundary = manifest["boundary"]
     resolution_manifest = resolve_input_path(boundary.get("resolution_manifest"), workspace_root)
@@ -1091,6 +1109,7 @@ def _load_adaptive_geometry(
         label="adaptive resolved_domain_polygon",
     )
     projection = _projection_for_case(manifest, domain_lonlat)
+    source_domain_xy = project_geometry(domain_lonlat, projection)
     nodes = gpd.read_file(gpkg, layer="boundary_nodes").to_crs(projection.crs)
     if not {"chain_id", "chain_position"}.issubset(nodes.columns):
         raise ValueError("Adaptive boundary_nodes lacks chain_id/chain_position")
@@ -1099,14 +1118,29 @@ def _load_adaptive_geometry(
     if not grouped:
         raise ValueError("Adaptive boundary package contains no source vertices")
     loop_arrays: list[np.ndarray] = []
+    loop_target_arrays: list[np.ndarray] = []
+    loop_chain_ids: list[str] = []
     hard_exterior: list[int] = []
     exterior_vertex_kinds: list[str] = []
+    exterior_targets: list[float] = []
+    exterior_hard_values: list[bool] = []
     for group_index, (_chain_id, group) in enumerate(grouped):
         array = _ring_xy([[point.x, point.y] for point in group.geometry])
         loop_arrays.append(array)
+        loop_target_arrays.append(np.asarray(group["target_spacing_m"], dtype=float))
+        loop_chain_ids.append(str(_chain_id))
         if group_index == 0:
             exterior_vertex_kinds = [
                 str(value).lower() for value in group["boundary_kind"].tolist()
+            ]
+            exterior_targets = [float(value) for value in group["target_spacing_m"]]
+            exterior_hard_values = [
+                bool(value)
+                for value in (
+                    group["is_hard_anchor"]
+                    if "is_hard_anchor" in group
+                    else np.zeros(len(group), dtype=bool)
+                )
             ]
             if len(exterior_vertex_kinds) != len(array):
                 raise ValueError(
@@ -1118,8 +1152,26 @@ def _load_adaptive_geometry(
                     for position, value in enumerate(group["is_hard_anchor"].tolist())
                     if bool(value)
                 ]
-    exterior_xy = loop_arrays[0]
-    holes_xy = tuple(loop_arrays[1:])
+    compensation = normalize_boundary_topology(
+        loop_arrays[0],
+        loop_arrays[1:],
+        loop_target_arrays[1:],
+        source_chain_ids=loop_chain_ids[1:],
+        reference_holes_xy=[
+            np.asarray(ring.coords, dtype=float) for ring in source_domain_xy.interiors
+        ],
+        source_resolution_manifest=resolution_manifest,
+        source_boundary_gpkg=gpkg,
+        protected_exterior_contract={
+            "coordinates_xy": loop_arrays[0].tolist(),
+            "boundary_kind": exterior_vertex_kinds,
+            "target_spacing_m": exterior_targets,
+            "is_hard_anchor": exterior_hard_values,
+            "open_boundary_chains": resolution_payload.get("open_boundary_chains") or [],
+        },
+    )
+    exterior_xy = compensation.exterior_xy
+    holes_xy = tuple(value.xy for value in compensation.delivered_islands)
     # boundary_kind is the authoritative adaptive-v2 classification.  Requiring
     # both endpoints to be open yields exactly the ordered nodestring edges and
     # avoids splitting one arc because of sub-meter geometry-overlay gaps.
@@ -1146,10 +1198,8 @@ def _load_adaptive_geometry(
     open_geometry = (
         unary_union(open_geometries) if open_geometries else LineString()
     )
-    domain_xy = Polygon(
-        exterior_xy,
-        holes=[values.tolist() for values in holes_xy],
-    )
+    domain_xy = compensation.wet_domain_xy
+    domain_lonlat = unproject_geometry(domain_xy, projection)
     revalidation, evidence_paths = _validate_adaptive_boundary_evidence(
         manifest,
         workspace_root,
@@ -1159,6 +1209,7 @@ def _load_adaptive_geometry(
         open_geometry,
         holes_xy,
         open_boundaries,
+        compensation,
     )
     return (
         projection,
@@ -1174,6 +1225,7 @@ def _load_adaptive_geometry(
             **evidence_paths,
         },
         revalidation,
+        compensation,
     )
 
 
@@ -1190,6 +1242,7 @@ def _load_model_loops_geometry(
     Polygon,
     dict[str, Path],
     dict[str, Any],
+    BoundaryTopologyCompensation | None,
 ]:
     boundary = manifest["boundary"]
     loop_manifest = resolve_input_path(boundary.get("model_boundary_loop_manifest"), workspace_root)
@@ -1260,6 +1313,7 @@ def _load_model_loops_geometry(
             **evidence_paths,
         },
         revalidation,
+        None,
     )
 
 
@@ -1304,12 +1358,23 @@ def prepare_case(
         domain_lonlat,
         paths,
         boundary_revalidation,
+        topology_compensation,
     ) = geometry_values
     expected_holes = manifest["boundary"].get("expected_island_holes")
-    if expected_holes is not None and len(holes_xy) != int(expected_holes):
-        raise ValueError(
-            f"Detected {len(holes_xy)} island holes; expected {expected_holes}"
+    if topology_compensation is not None:
+        expected_passed, expected_mode = expected_hole_count_matches(
+            int(expected_holes) if expected_holes is not None else None,
+            topology_compensation,
         )
+        boundary_revalidation["expected_island_holes_match_mode"] = expected_mode
+        if not expected_passed:
+            raise ValueError(
+                f"Detected {len(holes_xy)} delivered island holes from "
+                f"{topology_compensation.report['counts']['source_island_chain_count']} "
+                f"source chains; expected {expected_holes}"
+            )
+    elif expected_holes is not None and len(holes_xy) != int(expected_holes):
+        raise ValueError(f"Detected {len(holes_xy)} island holes; expected {expected_holes}")
     bathy_value = (
         str(bathymetry_override)
         if bathymetry_override is not None
@@ -1335,6 +1400,7 @@ def prepare_case(
         input_paths=paths,
         boundary_revalidation=boundary_revalidation,
         manifest_sha256=manifest_sha256,
+        topology_compensation=topology_compensation,
     )
 
 
@@ -1531,6 +1597,7 @@ def check_case_readiness(
             domain_lonlat,
             geometry_paths,
             boundary_revalidation,
+            topology_compensation,
         ) = geometry_values
         paths.update(geometry_paths)
         domain_xy = Polygon(exterior, holes=[values.tolist() for values in holes])
@@ -1548,11 +1615,24 @@ def check_case_readiness(
             "domain_area_m2": float(domain_xy.area),
             "open_segment_count": int(sum(value == "open" for value in kinds)),
             "automatic_revalidation": boundary_revalidation,
+            "topology_compensation": (
+                topology_compensation.report
+                if topology_compensation is not None
+                else None
+            ),
         }
         if not domain_xy.is_valid or domain_xy.area <= 0.0:
             blockers.append("invalid_or_empty_wet_domain")
         expected_holes = manifest["boundary"].get("expected_island_holes")
-        if expected_holes is not None and len(holes) != int(expected_holes):
+        if topology_compensation is not None:
+            expected_passed, expected_mode = expected_hole_count_matches(
+                int(expected_holes) if expected_holes is not None else None,
+                topology_compensation,
+            )
+            geometry_report["expected_island_holes_match_mode"] = expected_mode
+            if not expected_passed:
+                blockers.append("island_hole_count_mismatch")
+        elif expected_holes is not None and len(holes) != int(expected_holes):
             blockers.append("island_hole_count_mismatch")
         expected_open = int(manifest["boundary"].get("expected_open_boundary_count", 1))
         if len(open_boundaries) != expected_open:
@@ -2452,6 +2532,13 @@ def run_gmsh_experiment(
         output / "boundary_revalidation.json",
         prepared.boundary_revalidation,
     )
+    topology_compensation_outputs: dict[str, str] = {}
+    if prepared.topology_compensation is not None:
+        topology_compensation_outputs = write_boundary_topology_compensation(
+            output,
+            prepared.topology_compensation,
+            prepared.projection,
+        )
 
     environment = environment_report()
     geometry = _backend_geometry(prepared)
@@ -2725,6 +2812,10 @@ def run_gmsh_experiment(
         "case_manifest_snapshot": str(case_manifest_snapshot),
         "case_readiness": str(readiness_path),
         "boundary_revalidation": str(revalidation_path),
+        **{
+            f"boundary_topology_compensation_{key}": value
+            for key, value in topology_compensation_outputs.items()
+        },
         **maps,
     }
     if contextual_path is not None:
@@ -2749,6 +2840,11 @@ def run_gmsh_experiment(
         "selected_h_uniform_m": float(current_h),
         "bathymetry_coverage": coverage,
         "boundary_revalidation": prepared.boundary_revalidation,
+        "boundary_topology_compensation": (
+            prepared.topology_compensation.report
+            if prepared.topology_compensation is not None
+            else None
+        ),
         "environment": environment,
         "input_hashes": input_hashes,
         "attempts": attempts,

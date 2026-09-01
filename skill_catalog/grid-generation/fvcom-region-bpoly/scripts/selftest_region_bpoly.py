@@ -85,6 +85,7 @@ def review_cmd(
     geometry_changed: bool = False,
     before_region_json: Path | None = None,
     no_meaningful_repair_remaining: bool = False,
+    problem_class: str = "general_scientific",
 ) -> list[object]:
     cmd: list[object] = [
         "review_region_bpoly.py",
@@ -92,6 +93,8 @@ def review_cmd(
         path,
         "--problem-detected",
         "yes" if problem_detected else "no",
+        "--problem-class",
+        problem_class,
         "--problem-description",
         (
             "The mapped frame has a meaningful scientific coverage or placement problem."
@@ -976,6 +979,76 @@ def main() -> None:
         assert reviewed["scientific_review"]["next_action"]["operation"] == "agent_selected_repair"
         assert "side_index" not in reviewed["scientific_review"]["next_action"]
 
+        # Offshore orientation has exactly one internal repair opportunity.
+        orientation_dir = run_dir / "offshore_orientation_i01"
+        run(
+            [
+                "run_region_bpoly.py",
+                "--request-text",
+                "Delaware River and Delaware Bay with one Atlantic-facing offshore side",
+                "--run-dir",
+                orientation_dir,
+                "--name",
+                "offshore_orientation_i01",
+                "--mode",
+                "test",
+                "--heuristic-mode",
+                "memory",
+                "--basemap-provider",
+                "none",
+            ]
+        )
+        orientation_path = orientation_dir / "region_bpoly.json"
+        run(
+            review_cmd(
+                orientation_path,
+                problem_detected=True,
+                scientifically_useful=False,
+                problem_class="offshore_orientation",
+            )
+        )
+        orientation_repair = load_raw(orientation_path)
+        assert orientation_repair["final_status"] == "repair_required"
+        assert orientation_repair["scientific_review"]["next_action"]["next_iteration"] == 2
+        assert "one permitted internal offshore" in orientation_repair["scientific_review"]["next_action"]["constraints"]
+        orientation_i02 = run_dir / "offshore_orientation_i02"
+        run(
+            [
+                "run_region_bpoly.py",
+                "--request-text",
+                "Delaware River and Delaware Bay with one Atlantic-facing offshore side",
+                "--input-region-json",
+                orientation_path,
+                "--review-iteration",
+                "2",
+                "--run-dir",
+                orientation_i02,
+                "--name",
+                "offshore_orientation_i02",
+                "--mode",
+                "test",
+                "--heuristic-mode",
+                "memory",
+                "--basemap-provider",
+                "none",
+            ]
+        )
+        orientation_i02_path = orientation_i02 / "region_bpoly.json"
+        run(
+            review_cmd(
+                orientation_i02_path,
+                problem_detected=True,
+                scientifically_useful=False,
+                problem_class="offshore_orientation",
+            )
+        )
+        orientation_blocked = load_raw(orientation_i02_path)
+        assert orientation_blocked["final_status"] == "blocked"
+        assert orientation_blocked["status_reasons"] == [
+            "s1_offshore_orientation_unresolved_after_single_repair"
+        ]
+        assert orientation_blocked["output_package"]["delivery_ready"] is False
+
         # A repair cycle accepts multiple sides and arbitrary combinations of
         # rotate, contract/scale, reshape, and offshore-side movement.
         multi_manifest = run_dir / "multi_operation_repair.json"
@@ -1087,6 +1160,8 @@ def main() -> None:
         assert accepted["scientific_review"]["geometry_change_verified"] is True
         assert accepted["scientific_review"]["effective_scientifically_useful"] is True
         assert accepted["qa"]["scientific_review"]["iteration"] == 12
+        assert accepted["accepted_s1_geometry_freeze"]["downstream_geometry_repair_permitted"] is False
+        assert accepted["accepted_s1_geometry_freeze"]["region_bpoly_sha256"] == accepted["scientific_review"]["region_bpoly_sha256"]
         assert (iteration_dir / "region_bpoly_land_side_review.json").exists()
         assert (iteration_dir / "region_bpoly_land_side_review.png").exists()
 

@@ -248,6 +248,11 @@ def _scientific_review_request(
         "schema_version": "region_bpoly_scientific_review_request_v1",
         "iteration": iteration,
         "iteration_policy": "agent_decided_no_numeric_limit",
+        "offshore_orientation_repair_policy": {
+            "maximum_internal_adjustments": 1,
+            "failure_taxonomy_after_limit": "s1_offshore_orientation_unresolved_after_single_repair",
+            "downstream_repair_permitted": False,
+        },
         "candidate_json": str(candidate_json),
         "candidate_json_sha256": file_sha256(candidate_json),
         "region_bpoly_sha256": canonical_sha256(bpoly.to_dict()),
@@ -487,7 +492,7 @@ def main() -> None:
         dest="review_iteration",
         type=int,
         default=1,
-        help="Positive descriptive cycle number; there is no numeric repair limit.",
+        help="Positive descriptive cycle number; general repairs have no numeric limit, while offshore-orientation repair is limited to one adjustment.",
     )
     ap.add_argument("--run-dir", required=True, help="Final case output folder.")
     ap.add_argument("--name", required=True)

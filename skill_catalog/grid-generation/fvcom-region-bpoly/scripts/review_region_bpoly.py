@@ -41,6 +41,13 @@ def _verify_request(final: dict, request: dict) -> list[str]:
         failures.append("scientific review iteration must be a positive integer")
     if request.get("iteration_policy") != "agent_decided_no_numeric_limit":
         failures.append("scientific review does not declare the agent-decided iteration policy")
+    offshore_policy = request.get("offshore_orientation_repair_policy") or {}
+    if int(offshore_policy.get("maximum_internal_adjustments", -1)) != 1:
+        failures.append("scientific review does not declare the single offshore-orientation repair limit")
+    if offshore_policy.get("failure_taxonomy_after_limit") != "s1_offshore_orientation_unresolved_after_single_repair":
+        failures.append("scientific review does not declare the offshore-orientation terminal taxonomy")
+    if offshore_policy.get("downstream_repair_permitted") is not False:
+        failures.append("scientific review does not freeze RegionBPoly against downstream repair")
     serialized_region = final.get("region_bpoly") or RegionBPoly.from_dict(final).to_dict()
     if canonical_sha256(serialized_region) != request.get("region_bpoly_sha256"):
         failures.append("RegionBPoly geometry is stale relative to the review request")
@@ -101,6 +108,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Record the coarse, agent-directed RegionBPoly scientific review.")
     ap.add_argument("--candidate-json", required=True, help="Provisional top-level region_bpoly.json from run_region_bpoly.py.")
     ap.add_argument("--problem-detected", required=True, choices=["yes", "no"])
+    ap.add_argument(
+        "--problem-class",
+        choices=["general_scientific", "offshore_orientation"],
+        default="general_scientific",
+        help="Classify an offshore-orientation defect so its one-repair limit can be enforced.",
+    )
     ap.add_argument("--problem-description", required=True, help="Concise scientific problem statement, or why none was found.")
     ap.add_argument("--change-required", required=True, choices=["yes", "no"])
     ap.add_argument("--geometry-changed", required=True, choices=["yes", "no"])
@@ -171,13 +184,22 @@ def main() -> None:
         failures.append("reviewer did not find the maps usable")
 
     clean_pass = reported_useful and not failures
+    offshore_orientation_unresolved = bool(
+        args.problem_class == "offshore_orientation"
+        and problem_detected
+        and not reported_useful
+        and change_required
+        and iteration >= 2
+        and not failures
+    )
     repair_requested = (
         not reported_useful
         and change_required
         and not args.no_meaningful_repair_remaining
         and not failures
+        and not offshore_orientation_unresolved
     )
-    accepted_with_warnings = not clean_pass and not repair_requested
+    accepted_with_warnings = not clean_pass and not repair_requested and not offshore_orientation_unresolved
     effective_useful = bool(clean_pass)
 
     review_map = run_dir / f"region_bpoly_land_side_review_i{iteration:02d}.png"
@@ -191,8 +213,25 @@ def main() -> None:
         "reviewer": "codex-agent-scientific-inspection",
         "iteration": iteration,
         "iteration_policy": "agent_decided_no_numeric_limit",
-        "decision": "repair" if repair_requested else "accept" if clean_pass else "stop_best_effort",
-        "effective_decision": "repair_required" if repair_requested else "pass" if clean_pass else "accepted_best_effort",
+        "problem_class": args.problem_class,
+        "decision": (
+            "block"
+            if offshore_orientation_unresolved
+            else "repair"
+            if repair_requested
+            else "accept"
+            if clean_pass
+            else "stop_best_effort"
+        ),
+        "effective_decision": (
+            "s1_offshore_orientation_unresolved_after_single_repair"
+            if offshore_orientation_unresolved
+            else "repair_required"
+            if repair_requested
+            else "pass"
+            if clean_pass
+            else "accepted_best_effort"
+        ),
         "candidate_json": str(input_path),
         "region_bpoly_sha256": current_hash,
         "review_request": request,
@@ -222,7 +261,11 @@ def main() -> None:
         review["next_action"] = {
             "operation": "agent_selected_repair",
             "next_iteration": iteration + 1,
-            "constraints": "Choose any scientifically defensible geometry change; preserve only valid four-corner geometry and required mission features.",
+            "constraints": (
+                "Apply the one permitted internal offshore-side/reference adjustment, rerender, and audit once more."
+                if args.problem_class == "offshore_orientation"
+                else "Choose any scientifically defensible geometry change; preserve only valid four-corner geometry and required mission features."
+            ),
         }
 
     review_path = write_json(run_dir / f"region_bpoly_land_side_review_i{iteration:02d}.json", review)
@@ -241,6 +284,30 @@ def main() -> None:
         }
         _write_final_documents(run_dir, name, final)
         print(f"Wrote scientific review requesting an agent-selected repair: {review_path}")
+        return
+
+    if offshore_orientation_unresolved:
+        blocker = "s1_offshore_orientation_unresolved_after_single_repair"
+        final["final_status"] = "blocked"
+        final["status_reasons"] = [blocker]
+        final.setdefault("qa", {})["scientific_review"] = {
+            "status": "blocked",
+            "outcome": blocker,
+            "scientifically_useful": False,
+            "iteration": iteration,
+            "review_json": str(review_path),
+            "validation_failures": [],
+        }
+        final["qa"]["land_side_visual_gate"] = dict(final["qa"]["scientific_review"])
+        offshore_path = Path(final.get("offshore_boundary_artifacts_path", ""))
+        if offshore_path.is_file():
+            offshore = read_json(offshore_path)
+            offshore["final_status"] = "blocked"
+            offshore["failure_taxonomy"] = [blocker]
+            offshore["scientific_review_path"] = str(review_path)
+            write_json(offshore_path, offshore)
+        _write_final_documents(run_dir, name, final)
+        print(f"Stopped S1 after the single offshore-orientation repair: {review_path}")
         return
 
     final["final_status"] = "pass"
@@ -264,6 +331,17 @@ def main() -> None:
         "validation_failures": failures,
     }
     final["qa"]["land_side_visual_gate"] = dict(final["qa"]["scientific_review"])
+    final["accepted_s1_geometry_freeze"] = {
+        "schema_version": "region_bpoly_accepted_geometry_freeze_v1",
+        "region_bpoly_sha256": current_hash,
+        "candidate_json": request.get("candidate_json"),
+        "candidate_json_sha256": request.get("candidate_json_sha256"),
+        "scientific_review_json": str(review_path),
+        "scientific_review_json_sha256": file_sha256(review_path),
+        "review_iteration": iteration,
+        "offshore_side_index": request.get("offshore_side_index"),
+        "downstream_geometry_repair_permitted": False,
+    }
     final_review_path = write_json(run_dir / "region_bpoly_land_side_review.json", review)
     final["scientific_review_path"] = str(final_review_path)
     final["land_side_visual_review_path"] = str(final_review_path)

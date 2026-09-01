@@ -38,7 +38,17 @@ def test_request_text_invokes_s1_s2_s3_once_in_order() -> None:
             if script == "run_region_bpoly.py":
                 calls.append("fvcom-region-bpoly")
                 assert cmd.count("--request-text") == 1
-                (run_root / "region_bpoly.json").write_text("{}", encoding="utf-8")
+                (run_root / "region_bpoly.json").write_text(
+                    json.dumps(
+                        {
+                            "final_status": "pass",
+                            "accepted_s1_geometry_freeze": {
+                                "downstream_geometry_repair_permitted": False
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
                 (run_root / "offshore_boundary_artifacts.json").write_text(
                     "{}", encoding="utf-8"
                 )
@@ -123,6 +133,69 @@ def test_request_text_invokes_s1_s2_s3_once_in_order() -> None:
         assert Path(result["bathy_nc"]).parent.name == "cudem_bathy"
 
 
+def test_s1_orientation_blocker_stops_before_s2() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        run_dir = root / "case"
+        calls: list[str] = []
+        original_find = workflow._find_skill
+        original_run = workflow._run
+
+        def fake_find(skill_name: str, catalog_relative: tuple[str, str]) -> Path:
+            del catalog_relative
+            return root / "skills" / skill_name
+
+        def fake_run(cmd: list[str], **_kwargs) -> None:
+            script = Path(cmd[1]).name
+            calls.append(script)
+            if script != "run_region_bpoly.py":
+                raise AssertionError("S2 must not run after the typed S1 blocker")
+            output = Path(cmd[cmd.index("--run-dir") + 1])
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "region_bpoly.json").write_text(
+                json.dumps(
+                    {
+                        "final_status": "blocked",
+                        "status_reasons": [
+                            "s1_offshore_orientation_unresolved_after_single_repair"
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output / "offshore_boundary_artifacts.json").write_text(
+                json.dumps({"final_status": "blocked"}),
+                encoding="utf-8",
+            )
+
+        workflow._find_skill = fake_find
+        workflow._run = fake_run
+        try:
+            try:
+                workflow._resolve_upstream_artifacts(
+                    run_dir,
+                    "case",
+                    "Build an FVCOM tidal model for a scientific region.",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    1000.0,
+                    workflow.GridConfig(mode="test"),
+                    _Progress(),
+                )
+            except ValueError as exc:
+                assert str(exc) == "s1_offshore_orientation_unresolved_after_single_repair"
+            else:
+                raise AssertionError("Expected the typed S1 blocker")
+        finally:
+            workflow._find_skill = original_find
+            workflow._run = original_run
+        assert calls == ["run_region_bpoly.py"]
+
+
 def test_complete_explicit_artifacts_bypass_subworkflows() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -164,6 +237,7 @@ def test_complete_explicit_artifacts_bypass_subworkflows() -> None:
 
 def main() -> int:
     test_request_text_invokes_s1_s2_s3_once_in_order()
+    test_s1_orientation_blocker_stops_before_s2()
     test_complete_explicit_artifacts_bypass_subworkflows()
     print("upstream subworkflow selftests passed")
     return 0

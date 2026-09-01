@@ -27,6 +27,7 @@ from .boundary import (
     load_boundary_resolution,
     prepare_boundary_nodes,
 )
+from .boundary_topology import write_boundary_topology_compensation
 from .mesh import MeshConfig, generate_mesh
 from .metrics import triangle_geometry
 from .node_budget import (
@@ -276,6 +277,13 @@ def run_fvcom_grid(
             BoundaryConfig(land_spacing_m=land_spacing, open_spacing_m=open_spacing, island_spacing_m=land_spacing),
         )
         resolution_doc = None
+    topology_compensation_outputs: dict[str, str] = {}
+    if boundary_nodes.topology_compensation is not None:
+        topology_compensation_outputs = write_boundary_topology_compensation(
+            run_dir,
+            boundary_nodes.topology_compensation,
+            boundary_nodes.projection,
+        )
     open_exterior_audit = validate_grid_boundary_gate(
         bdry_arc_manifest,
         boundary_resolution_manifest,
@@ -300,6 +308,18 @@ def run_fvcom_grid(
         "passed": bool(boundary_contract["passed"]),
         "failure_taxonomy": list(boundary_contract["failure_taxonomy"]),
     }
+    if boundary_nodes.topology_compensation is not None:
+        topology_report_path = Path(topology_compensation_outputs["report_json"])
+        topology_report = boundary_nodes.topology_compensation.report
+        open_exterior_audit["boundary_topology_compensation"] = {
+            "path": str(topology_report_path),
+            "sha256": sha256_file(topology_report_path),
+            "schema_version": topology_report.get("schema_version"),
+            "status": topology_report.get("status"),
+            "changed": bool(topology_report.get("changed")),
+            "counts": topology_report.get("counts"),
+            "validity": topology_report.get("validity"),
+        }
     open_exterior_audit["passed"] = bool(
         open_exterior_audit["passed"] and boundary_contract["passed"]
     )
@@ -854,6 +874,11 @@ def run_fvcom_grid(
         },
         "mesh": mesh.report,
         "boundary_resolution": resolution_doc,
+        "boundary_topology_compensation": (
+            boundary_nodes.topology_compensation.report
+            if boundary_nodes.topology_compensation is not None
+            else None
+        ),
         "grid_boundary_gate": open_exterior_audit,
         "hydraulic_skeleton": size_field.report.get(
             "hydraulic_skeleton",
@@ -880,6 +905,9 @@ def run_fvcom_grid(
             "size_field_png": str(size_png),
             "size_field_components_png": str(size_components_png),
             "boundary_nodes_geojson": str(boundary_nodes_path),
+            "boundary_topology_compensation_json": topology_compensation_outputs.get("report_json"),
+            "boundary_topology_compensation_overview_map": topology_compensation_outputs.get("overview_map"),
+            "boundary_topology_compensation_zoom_map": topology_compensation_outputs.get("zoom_map"),
             "boundary_contract_v2_json": str(boundary_contract_path) if boundary_contract_path else None,
             "grid_boundary_gate_json": str(boundary_gate_report_path),
             "node_budget_preflight_json": str(node_budget_path),
@@ -988,6 +1016,20 @@ def _resolve_upstream_artifacts(
             stage="run_region_bpoly",
             percent=5.0,
         )
+    s1_doc = json.loads(region_bpoly_json.read_text(encoding="utf-8-sig"))
+    s1_status = str(s1_doc.get("final_status", "review_pending"))
+    if s1_status == "blocked" and "s1_offshore_orientation_unresolved_after_single_repair" in list(
+        s1_doc.get("status_reasons") or []
+    ):
+        raise ValueError("s1_offshore_orientation_unresolved_after_single_repair")
+    if s1_status != "pass":
+        raise ValueError(
+            "S1 RegionBPoly must complete scientific review before S2; "
+            f"received final_status={s1_status}"
+        )
+    geometry_freeze = s1_doc.get("accepted_s1_geometry_freeze")
+    if geometry_freeze is not None and geometry_freeze.get("downstream_geometry_repair_permitted") is not False:
+        raise ValueError("S1 accepted geometry freeze permits an invalid downstream repair")
 
     bdry_arc_manifest = Path(bdry_arc_manifest) if bdry_arc_manifest else bdry_dir / "bdry_arc_manifest.json"
     if not bdry_arc_manifest.exists():

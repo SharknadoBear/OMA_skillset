@@ -11,7 +11,7 @@ Do not generate coastline boundary arcs, bathymetry, or meshes.
 
 ## Ownership and invariants
 
-RegionBPoly owns mission scope, required-feature coverage, offshore-side orientation, and map-guided geographic suitability. Downstream skills must not request or apply RegionBPoly repair.
+RegionBPoly owns mission scope, required-feature coverage, offshore-side orientation, and map-guided geographic suitability. Audit offshore orientation before returning S1. Permit at most one internal offshore-side/reference adjustment and rerender; if the adjusted map remains scientifically wrong, stop S1 with `s1_offshore_orientation_unresolved_after_single_repair` before S2. Freeze an accepted geometry and its hashes. Downstream skills must not request or apply RegionBPoly repair.
 
 Preserve only the invariants needed by downstream consumers:
 
@@ -37,7 +37,7 @@ For a forward test, use a new UTC-stamped directory under Workspace/Preprocessin
 - CLI map generation is noninteractive and must force Matplotlib's `Agg` backend before importing `pyplot`; online-tile work must not create Tk objects or GUI-thread cleanup failures.
 - Unknown named regions enter discovery; they never fall back to Delaware or another unrelated box.
 
-A coastal run produces final_status: review_pending with a hash-bound region_bpoly_scientific_review_request_v1. Never stop at review_pending, repair_required, or needs_review. Continue scientific review and any useful repair. Once valid geometry exists, finish with final_status: pass, either as a scientifically accepted delivery or accepted_best_effort with explicit warnings.
+A coastal run produces final_status: review_pending with a hash-bound region_bpoly_scientific_review_request_v1. Never stop at review_pending or repair_required. Continue scientific review and any useful general repair. Offshore-orientation repair is the sole bounded exception: perform no more than one internal adjustment and stop with the typed S1 blocker if the second audit remains scientifically wrong. Otherwise, once valid geometry exists, finish with final_status: pass, either as a scientifically accepted delivery or accepted_best_effort with explicit warnings.
 
 Lake and island candidates may also be freely adjusted when their maps show an incomplete or scientifically unsuitable frame; they do not require the coastal hash-bound finalizer.
 
@@ -82,7 +82,7 @@ Rerender with any positive descriptive cycle number:
 
     python scripts/run_region_bpoly.py --request-text "..." --input-region-json runs/case/region_bpoly_adjusted.json --review-iteration 2 --run-dir runs/case_i02 --name case_i02 --mode test --heuristic-mode memory --basemap-provider auto
 
-On acceptance after repair, provide --before-region-json and report --geometry-changed yes; the finalizer verifies the hash change. There is no numeric iteration limit. Continue while a meaningful scientific change remains.
+On acceptance after repair, provide --before-region-json and report --geometry-changed yes; the finalizer verifies the hash change. There is no numeric iteration limit for general scientific repair. Offshore-side/reference orientation permits exactly one internal adjustment; classify it with `--problem-class offshore_orientation` so the second unsuccessful audit emits the typed S1 blocker instead of another repair request.
 
 If no useful repair remains, use --no-meaningful-repair-remaining. The latest valid geometry is delivered as accepted_best_effort with scientifically_useful: false; it is never mislabeled as scientifically accepted and never ends as needs_review.
 
@@ -112,7 +112,8 @@ Domain types:
 - W8 write provisional candidate and hash bindings
 - W9 inspect scientific suitability
 - G3 coarse scientific review
-  - repair: W11 apply any agent-selected geometry change, rerender, and return to W9
+  - general repair: W11 apply any agent-selected geometry change, rerender, and return to W9
+  - offshore-orientation repair: W11 apply one internal adjustment, rerender, and return once to W9; unresolved then stops before S2
   - accept: W10 retain review provenance, W12 package standardized evidence, W13 terminal delivery
   - no meaningful repair remains: W10 retain warning provenance, W12 package latest valid best effort, W13 terminal delivery
 
@@ -136,7 +137,7 @@ Use [region_bpoly_output_contract.md](references/region_bpoly_output_contract.md
 - region_bpoly_land_side_review.json for finalized coastal domains, plus its compact map when usable
 - region_place_discovery.json when named-place discovery was used
 
-Clean and best-effort deliveries both use final_status: pass; the review outcome and scientifically_useful field distinguish them. Downstream consumers treat review provenance as nonblocking and consume the latest valid geometry.
+Clean and best-effort deliveries both use final_status: pass; the review outcome and scientifically_useful field distinguish them. The bounded offshore-orientation failure uses final_status: blocked and is not a downstream input. Downstream consumers treat pass-state review provenance as nonblocking, verify `accepted_s1_geometry_freeze`, and consume its exact geometry without revision.
 
 ## Validation
 

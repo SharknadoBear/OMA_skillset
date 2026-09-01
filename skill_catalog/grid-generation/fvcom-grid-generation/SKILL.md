@@ -46,6 +46,7 @@ as subworkflow calls that did not occur.
 
 - Reuse upstream domain and boundary artifacts; do not redesign the region here.
 - Require a passing `adaptive-coastal-v2` boundary-resolution manifest for every new grid. Consume its exact per-`obc_id` node sequences without concatenation. Archived legacy/v1 packages remain readable only for provenance and inspection; never use them to generate a new mesh.
+- Before mesh construction, apply the Grid-owned deterministic island-topology normalizer to Adaptive-v2 chains in both the production and Gmsh-6 loaders. Remove a complete island that touches, crosses, or extends outside the unchanged exterior. Merge chains that reconstruct the same resolved S2 hole when their separation is no greater than `min(h_i,h_j)`, where each `h_i` is the chain's minimum finite positive `target_spacing_m`; resample the merge at the finest member spacing and preserve source-chain lineage. Never clip an exterior-conflicting island, loop back to S1/S2, or request visual review for these two compensation classes. Require strictly contained, mutually disjoint holes, one wet component, exact chain/hole agreement, and byte-identical exterior/OBC coordinates, order, IDs, segmentation, and hard anchors. Write `boundary_topology_compensation.json` plus overview/zoom maps without modifying the S2 package or v8 Grid manifest schema.
 - Use deterministic Gmsh Frontal-Delaunay algorithm 6 for every new operational/full-project raw mesh: one thread, seed 1, first-order triangles, eight native smoothing steps, and no algorithm fallback. The default portfolio executes only this candidate. Keep Gmsh 1/5 and clean-room SciPy-Delaunay available only when explicitly requested as research controls; never silently substitute them after a Gmsh-6 failure.
 - Use the strict open-exterior gate for fresh/unreviewed boundaries. Revalidate active `fvcom_open_exterior_contract_v2` evidence, approved lagoon closures, station-backed secondary OBCs, residual roles, source coverage, maps, hashes, and downstream eligibility. Resolve an existing relative evidence path first against its declaring manifest and then against the active workspace, so S2's workspace-relative hash bindings remain portable without weakening any content or hash check. Archived v1 is inspection-only and historical v3 is unsupported on this default path.
 - For an arc that Bear has explicitly designated ready to use, select the Grid Generation-only `reviewed-adaptive-v2` gate. It may downgrade missing or rejected upstream decision/coverage evidence to recorded advisories, but only for the exact hash-bound Adaptive-v2 package. It may not waive a non-passing v2 manifest, invalid resolved wet domain, resolved OBC land intersection, exterior overlap below 0.999, protected-passage underresolution, `L/h` above 1.55, target gradation above 0.20, failed per-OBC chain/anchor checks, or any later mesh invariant. Do not change S2 or its own gates from this skill.
@@ -335,6 +336,7 @@ Hard anchors and all boundary nodes not explicitly handled by the kind-aware edi
 - `mesh_edit_ledger.json` (operation, source-node lineage, and local edit evidence)
 - `obc_remap_manifest.json` (original/delivered OBC lineage, source-arc position, redistribution status, and forcing compatibility)
 - `boundary_nodes.geojson` (input boundary-node package)
+- `boundary_topology_compensation.json`, `boundary_topology_compensation_overview.png`, and `boundary_topology_compensation_zoom.png`
 - `delivered_boundary_nodes.geojson` (terminal constraint chains, including any recovery nodes)
 - `size_field.nc`, `size_field.png`, and `size_field_components.png`
 - `node_budget_preflight.json` and `node_budget_delivered.json` for every run, plus `boundary_contract_v2.json` for adaptive v2
@@ -366,6 +368,7 @@ For a human-approved whole-passage deletion, replace the ordinary one-wet-compon
 python scripts/selftest_fvcom_grid.py
 python scripts/selftest_node_budget_policy.py
 python scripts/selftest_boundary_contract_v2.py
+python scripts/selftest_boundary_topology_compensation.py
 python scripts/selftest_size_field.py
 python scripts/selftest_gmsh_mesher_portfolio.py
 python scripts/selftest_mesher_bakeoff.py

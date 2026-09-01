@@ -12,7 +12,11 @@ import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 from shapely.ops import unary_union
 
-from .projection import LocalProjection, local_utm_projection, project_geometry, project_points, unproject_points
+from .boundary_topology import (
+    BoundaryTopologyCompensation,
+    normalize_boundary_topology,
+)
+from .projection import LocalProjection, local_utm_projection, project_geometry, project_points, unproject_geometry, unproject_points
 
 
 @dataclass(frozen=True)
@@ -65,6 +69,7 @@ class BoundaryNodes:
     metadata: dict[str, np.ndarray] | None = None
     passage_diagnostics: list[dict[str, Any]] | None = None
     open_boundaries: list[OpenBoundaryChain] | None = None
+    topology_compensation: BoundaryTopologyCompensation | None = None
 
 
 def load_boundary_package(path: str | Path) -> BoundaryPackage:
@@ -202,37 +207,58 @@ def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage
     domain = next(geom for geom in domain_gdf.geometry if isinstance(geom, Polygon) and not geom.is_empty)
     open_gdf = gpd.read_file(gpkg, layer="resolved_open_boundary").to_crs("EPSG:4326")
     open_boundary = unary_union([geom for geom in open_gdf.geometry if geom is not None and not geom.is_empty])
-    islands = []
-    if "resolved_island_polygons" in layers:
-        island_gdf = gpd.read_file(gpkg, layer="resolved_island_polygons").to_crs("EPSG:4326")
-        islands = [geom for geom in island_gdf.geometry if isinstance(geom, Polygon) and not geom.is_empty]
     projection = local_utm_projection(tuple(float(v) for v in domain.bounds))
-    package = BoundaryPackage(
-        domain_polygon_lonlat=domain,
-        open_boundary_lonlat=open_boundary,
-        land_boundary_lonlat=LineString(domain.exterior.coords),
-        frame_boundary_lonlat=LineString(),
-        island_polygons_lonlat=islands,
-        source_gpkg=str(gpkg),
-        projection=projection,
-    )
+    source_domain_xy = project_geometry(domain, projection)
     nodes_gdf = gpd.read_file(gpkg, layer="boundary_nodes").to_crs("EPSG:4326")
     nodes_gdf = nodes_gdf.sort_values(["chain_id", "chain_position"]).reset_index(drop=True)
-    source_node_to_loaded = {
-        int(source): int(loaded)
-        for loaded, source in enumerate(
-            nodes_gdf.get("node_index_zero_based", np.arange(len(nodes_gdf)))
-        )
-    }
-    lonlat = np.asarray([[float(point.x), float(point.y)] for point in nodes_gdf.geometry], dtype=float)
-    xy = project_points(lonlat, projection)
-    kinds = [str(value) for value in nodes_gdf["boundary_kind"]]
-    targets = np.asarray(nodes_gdf["target_spacing_m"], dtype=float)
-    hard_anchors = (
-        np.asarray(nodes_gdf["is_hard_anchor"], dtype=bool)
-        if "is_hard_anchor" in nodes_gdf
-        else np.zeros(len(nodes_gdf), dtype=bool)
+    grouped = [
+        (str(chain_id), group.reset_index(drop=True))
+        for chain_id, group in nodes_gdf.groupby("chain_id", sort=True)
+    ]
+    if not grouped:
+        raise ValueError("Boundary resolution package contains no boundary chains")
+    exterior_group = grouped[0][1]
+    exterior_lonlat = np.asarray(
+        [[float(point.x), float(point.y)] for point in exterior_group.geometry],
+        dtype=float,
     )
+    exterior_xy = project_points(exterior_lonlat, projection)
+    source_island_xy: list[np.ndarray] = []
+    source_island_targets: list[np.ndarray] = []
+    source_island_ids: list[str] = []
+    for chain_id, group in grouped[1:]:
+        group_lonlat = np.asarray(
+            [[float(point.x), float(point.y)] for point in group.geometry],
+            dtype=float,
+        )
+        source_island_xy.append(project_points(group_lonlat, projection))
+        source_island_targets.append(np.asarray(group["target_spacing_m"], dtype=float))
+        source_island_ids.append(chain_id)
+    protected_exterior_contract = {
+        "coordinates_xy": exterior_xy.tolist(),
+        "boundary_kind": [str(value) for value in exterior_group["boundary_kind"]],
+        "target_spacing_m": [float(value) for value in exterior_group["target_spacing_m"]],
+        "is_hard_anchor": [
+            bool(value)
+            for value in (
+                exterior_group["is_hard_anchor"]
+                if "is_hard_anchor" in exterior_group
+                else np.zeros(len(exterior_group), dtype=bool)
+            )
+        ],
+        "open_boundary_chains": manifest.get("open_boundary_chains") or [],
+    }
+    compensation = normalize_boundary_topology(
+        exterior_xy,
+        source_island_xy,
+        source_island_targets,
+        source_chain_ids=source_island_ids,
+        reference_holes_xy=[np.asarray(ring.coords, dtype=float) for ring in source_domain_xy.interiors],
+        source_resolution_manifest=manifest_path,
+        source_boundary_gpkg=gpkg,
+        protected_exterior_contract=protected_exterior_contract,
+    )
+
     reserved_columns = {
         "geometry",
         "node_index_zero_based",
@@ -242,12 +268,67 @@ def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage
         "target_spacing_m",
         "is_hard_anchor",
     }
-    metadata: dict[str, np.ndarray] = {}
-    for column in nodes_gdf.columns:
-        if column in reserved_columns:
-            continue
-        values = nodes_gdf[column].to_numpy(copy=True)
-        metadata[str(column)] = values
+    metadata_columns = [
+        str(column) for column in nodes_gdf.columns if column not in reserved_columns
+    ]
+    metadata_values: dict[str, list[Any]] = {column: [] for column in metadata_columns}
+    xy_parts: list[np.ndarray] = []
+    kinds: list[str] = []
+    target_parts: list[np.ndarray] = []
+    hard_parts: list[np.ndarray] = []
+    chains: list[list[int]] = []
+    source_node_to_loaded: dict[int, int] = {}
+    offset = 0
+
+    def append_source_group(group: gpd.GeoDataFrame, group_xy: np.ndarray) -> list[int]:
+        nonlocal offset
+        count = len(group_xy)
+        chain = list(range(offset, offset + count))
+        xy_parts.append(np.asarray(group_xy, dtype=float))
+        kinds.extend(str(value) for value in group["boundary_kind"])
+        target_parts.append(np.asarray(group["target_spacing_m"], dtype=float))
+        hard_parts.append(
+            np.asarray(group["is_hard_anchor"], dtype=bool)
+            if "is_hard_anchor" in group
+            else np.zeros(count, dtype=bool)
+        )
+        for column in metadata_columns:
+            metadata_values[column].extend(group[column].tolist())
+        offset += count
+        return chain
+
+    exterior = append_source_group(exterior_group, exterior_xy)
+    for loaded, source in zip(
+        exterior,
+        exterior_group.get("node_index_zero_based", np.arange(len(exterior_group))),
+    ):
+        source_node_to_loaded[int(source)] = int(loaded)
+    chains.append(exterior)
+
+    for delivered in compensation.delivered_islands:
+        if delivered.unchanged and len(delivered.source_indices) == 1:
+            source_group = grouped[int(delivered.source_indices[0]) + 1][1]
+            chain = append_source_group(source_group, delivered.xy)
+        else:
+            count = len(delivered.xy)
+            chain = list(range(offset, offset + count))
+            xy_parts.append(np.asarray(delivered.xy, dtype=float))
+            kinds.extend(["island"] * count)
+            target_parts.append(np.asarray(delivered.target_spacing_m, dtype=float))
+            hard_parts.append(np.zeros(count, dtype=bool))
+            for column in metadata_columns:
+                metadata_values[column].extend([None] * count)
+            offset += count
+        chains.append(chain)
+
+    xy = np.vstack(xy_parts) if xy_parts else np.empty((0, 2), dtype=float)
+    lonlat = unproject_points(xy, projection) if len(xy) else np.empty((0, 2), dtype=float)
+    targets = np.concatenate(target_parts) if target_parts else np.empty(0, dtype=float)
+    hard_anchors = np.concatenate(hard_parts) if hard_parts else np.empty(0, dtype=bool)
+    metadata = {
+        column: np.asarray(values, dtype=object)
+        for column, values in metadata_values.items()
+    }
     passage_diagnostics: list[dict[str, Any]] = []
     if "passage_diagnostics" in layers:
         passage_gdf = gpd.read_file(gpkg, layer="passage_diagnostics").to_crs("EPSG:4326")
@@ -262,10 +343,6 @@ def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage
             }
             record["geometry_xy"] = project_geometry(geometry, projection)
             passage_diagnostics.append(record)
-    chains: list[list[int]] = []
-    for _, group in nodes_gdf.groupby("chain_id", sort=True):
-        chains.append([int(value) for value in group.index])
-    exterior = chains[0] if chains else []
     open_indices = [idx for idx in exterior if kinds[idx] == "open"]
     open_boundaries = _manifest_open_boundary_chains(
         manifest,
@@ -274,8 +351,19 @@ def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage
     )
     if not open_boundaries:
         open_boundaries = _open_boundary_chains(exterior, kinds)
-    domain_xy = project_geometry(domain, projection).buffer(0)
-    islands_xy = [project_geometry(poly, projection).buffer(0) for poly in islands]
+    domain_xy = compensation.wet_domain_xy
+    islands_xy = [Polygon(value.xy) for value in compensation.delivered_islands]
+    domain_lonlat = unproject_geometry(domain_xy, projection)
+    islands_lonlat = [unproject_geometry(poly, projection) for poly in islands_xy]
+    package = BoundaryPackage(
+        domain_polygon_lonlat=domain_lonlat,
+        open_boundary_lonlat=open_boundary,
+        land_boundary_lonlat=LineString(domain_lonlat.exterior.coords),
+        frame_boundary_lonlat=LineString(),
+        island_polygons_lonlat=islands_lonlat,
+        source_gpkg=str(gpkg),
+        projection=projection,
+    )
     nodes = BoundaryNodes(
         xy=xy,
         lonlat=lonlat,
@@ -296,6 +384,7 @@ def load_boundary_resolution(manifest_path: str | Path) -> tuple[BoundaryPackage
         metadata=metadata,
         passage_diagnostics=passage_diagnostics,
         open_boundaries=open_boundaries,
+        topology_compensation=compensation,
     )
     return package, nodes, manifest
 
