@@ -764,6 +764,143 @@ def _open_boundaries_from_runs(
     return tuple(output)
 
 
+def _coordinate_sha256(values: np.ndarray) -> str:
+    array = np.asarray(values, dtype="<f8")
+    return hashlib.sha256(array.tobytes(order="C")).hexdigest()
+
+
+def _delivered_open_boundary_membership_report(
+    manifest: dict[str, Any],
+    exterior_xy: np.ndarray,
+    exterior_segment_kinds: tuple[str, ...],
+    hard_anchor_vertex_indices: tuple[int, ...],
+    open_boundaries: tuple[SourceOpenBoundary, ...],
+    resolution_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate the exact delivered Adaptive-v2 OBC/exterior relationship.
+
+    Adaptive-v2 classifies the delivered exterior vertices directly.  Grid
+    must validate that discrete contract, not compare the smooth source arc
+    with its chorded representation through a fixed-distance overlay.
+    """
+
+    exterior = np.asarray(exterior_xy, dtype=float)
+    segment_count = int(len(exterior))
+    failures: list[str] = []
+    if segment_count < 3 or len(exterior_segment_kinds) != segment_count:
+        failures.append("delivered_exterior_segment_classification_invalid")
+    open_segment_set = {
+        int(index)
+        for index, value in enumerate(exterior_segment_kinds)
+        if str(value).lower() == "open"
+    }
+    hard_set = {int(value) for value in hard_anchor_vertex_indices}
+    declared = list((manifest.get("boundary") or {}).get("open_boundaries") or [])
+    declared_ids = [str(value.get("id")) for value in declared]
+    delivered_ids = [str(value.chain_id) for value in open_boundaries]
+    if len(set(delivered_ids)) != len(delivered_ids):
+        failures.append("delivered_open_boundary_ids_not_unique")
+    if delivered_ids != declared_ids:
+        failures.append("delivered_open_boundary_ids_do_not_match_manifest")
+
+    covered_segments: list[int] = []
+    delivered_signatures: list[tuple[bool, int, int]] = []
+    chain_reports: list[dict[str, Any]] = []
+    for boundary in open_boundaries:
+        indices = [int(value) for value in boundary.exterior_segment_indices]
+        chain_failures: list[str] = []
+        if not indices:
+            chain_failures.append("empty_segment_sequence")
+        if any(value < 0 or value >= segment_count for value in indices):
+            chain_failures.append("segment_index_out_of_range")
+        if len(indices) != len(set(indices)):
+            chain_failures.append("duplicate_segment_index")
+        if indices and all(0 <= value < segment_count for value in indices):
+            if any(
+                right != (left + 1) % segment_count
+                for left, right in zip(indices, indices[1:])
+            ):
+                chain_failures.append("segment_sequence_not_contiguous")
+            if any(value not in open_segment_set for value in indices):
+                chain_failures.append("land_segment_in_open_boundary")
+        if boundary.cyclic and len(indices) != segment_count:
+            chain_failures.append("cyclic_open_boundary_not_complete_exterior")
+        if not boundary.cyclic and len(indices) >= segment_count:
+            chain_failures.append("noncyclic_open_boundary_covers_complete_exterior")
+
+        node_indices: list[int] = []
+        if indices and all(0 <= value < segment_count for value in indices):
+            node_indices = [indices[0], *[(value + 1) % segment_count for value in indices]]
+            if boundary.cyclic and node_indices[-1] == node_indices[0]:
+                node_indices = node_indices[:-1]
+        hard_count = int(sum(value in hard_set for value in node_indices))
+        delivered_signatures.append(
+            (bool(boundary.cyclic), int(len(node_indices)), hard_count)
+        )
+        coordinate_hash = (
+            _coordinate_sha256(exterior[np.asarray(node_indices, dtype=int)])
+            if node_indices
+            else None
+        )
+        chain_reports.append(
+            {
+                "chain_id": str(boundary.chain_id),
+                "kind": str(boundary.kind),
+                "cyclic": bool(boundary.cyclic),
+                "orientation": str(boundary.orientation),
+                "exterior_segment_indices": indices,
+                "delivered_node_count": int(len(node_indices)),
+                "delivered_hard_anchor_count": hard_count,
+                "delivered_coordinate_sha256": coordinate_hash,
+                "passed": not chain_failures,
+                "failure_taxonomy": chain_failures,
+            }
+        )
+        failures.extend(
+            f"delivered_open_boundary:{boundary.chain_id}:{value}"
+            for value in chain_failures
+        )
+        covered_segments.extend(indices)
+
+    if len(covered_segments) != len(set(covered_segments)):
+        failures.append("delivered_open_boundary_segments_covered_more_than_once")
+    if set(covered_segments) != open_segment_set:
+        failures.append("delivered_open_boundary_segments_do_not_exactly_cover_open_exterior")
+
+    source_chains = list(resolution_payload.get("open_boundary_chains") or [])
+    if len(source_chains) != len(open_boundaries):
+        failures.append("adaptive_v2_open_boundary_chain_count_mismatch")
+    source_ids = [int(value.get("obc_id", -1)) for value in source_chains]
+    if len(source_ids) != len(set(source_ids)) or any(value < 0 for value in source_ids):
+        failures.append("adaptive_v2_obc_ids_invalid")
+    source_signatures = sorted(
+        (
+            bool(value.get("is_closed")),
+            int(value.get("node_count", -1)),
+            int(value.get("hard_anchor_count", -1)),
+        )
+        for value in source_chains
+    )
+    if sorted(delivered_signatures) != source_signatures:
+        failures.append("adaptive_v2_delivered_obc_signature_mismatch")
+
+    return {
+        "contract": "exact_adaptive_v2_delivered_open_boundary_membership_v1",
+        "passed": not failures,
+        "failure_taxonomy": list(dict.fromkeys(failures)),
+        "exterior_segment_count": segment_count,
+        "open_exterior_segment_count": int(len(open_segment_set)),
+        "covered_open_segment_count": int(len(set(covered_segments))),
+        "complete_open_segment_coverage": set(covered_segments) == open_segment_set,
+        "segments_covered_exactly_once": len(covered_segments) == len(set(covered_segments)),
+        "exterior_coordinate_sha256": _coordinate_sha256(exterior),
+        "declared_open_boundary_ids": declared_ids,
+        "delivered_open_boundary_ids": delivered_ids,
+        "source_adaptive_v2_obc_ids": source_ids,
+        "chains": chain_reports,
+    }
+
+
 def _validate_adaptive_boundary_evidence(
     manifest: dict[str, Any],
     workspace_root: Path,
@@ -772,6 +909,9 @@ def _validate_adaptive_boundary_evidence(
     domain_xy: Polygon,
     open_geometry: LineString | MultiLineString,
     holes_xy: tuple[np.ndarray, ...],
+    exterior_xy: np.ndarray,
+    exterior_segment_kinds: tuple[str, ...],
+    hard_anchor_vertex_indices: tuple[int, ...],
     open_boundaries: tuple[SourceOpenBoundary, ...],
     topology_compensation: BoundaryTopologyCompensation,
 ) -> tuple[dict[str, Any], dict[str, Path]]:
@@ -781,6 +921,14 @@ def _validate_adaptive_boundary_evidence(
     expected_open = int(boundary.get("expected_open_boundary_count", 1))
     qa = dict(resolution_payload.get("qa") or {})
     overlap = _exterior_overlap_fraction(open_geometry, domain_xy.exterior)
+    delivered_membership = _delivered_open_boundary_membership_report(
+        manifest,
+        exterior_xy,
+        exterior_segment_kinds,
+        hard_anchor_vertex_indices,
+        open_boundaries,
+        resolution_payload,
+    )
     failures: list[str] = []
     _require_metric(failures, bool(domain_xy.is_valid and domain_xy.area > 0.0), "wet_domain_invalid")
     _require_metric(failures, len(open_boundaries) == expected_open, "open_boundary_count_mismatch")
@@ -794,17 +942,7 @@ def _validate_adaptive_boundary_evidence(
         _require_metric(failures, int(qa["wet_component_count"]) == 1, "wet_component_count_not_one")
     if "resolved_domain_valid" in qa:
         _require_metric(failures, bool(qa["resolved_domain_valid"]), "upstream_domain_invalid")
-    policy_text = " ".join(
-        str(value).lower()
-        for key in ("required_revalidation", "build_policy")
-        for value in boundary.get(key, [])
-    )
-    requires_overlap_gate = bool(
-        str(manifest["case_id"]) == "long_island_sound"
-        or "exterior overlap" in policy_text
-    )
-    if expected_open and requires_overlap_gate:
-        _require_metric(failures, overlap >= 0.98, "open_boundary_exterior_overlap_below_0_98")
+    failures.extend(delivered_membership["failure_taxonomy"])
 
     evidence_paths: dict[str, Path] = {}
     case_specific: dict[str, Any] = {}
@@ -937,6 +1075,8 @@ def _validate_adaptive_boundary_evidence(
         "topology_compensation": topology_compensation.report,
         "open_boundary_count": len(open_boundaries),
         "independent_open_boundary_exterior_overlap_fraction": overlap,
+        "independent_open_boundary_exterior_overlap_role": "diagnostic_only_source_curve_to_chord_comparison",
+        "delivered_open_boundary_membership": delivered_membership,
         "upstream_qa": qa,
         "case_specific": case_specific,
     }
@@ -1208,6 +1348,9 @@ def _load_adaptive_geometry(
         domain_xy,
         open_geometry,
         holes_xy,
+        exterior_xy,
+        segment_kinds,
+        tuple(hard_exterior),
         open_boundaries,
         compensation,
     )
