@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from .open_exterior import (
     GRID_BOUNDARY_GATE_POLICIES,
     validate_grid_boundary_gate,
@@ -24,6 +26,8 @@ from .quality_policy import (
     public_policy_binding,
 )
 from .sms_2dm import read_2dm
+from .tge_topology import ALGORITHM_ID as TGE_ALGORITHM_ID
+from .tge_topology import audit_tge_boundary_junctions
 
 
 STAGES = {
@@ -46,6 +50,7 @@ FINAL_COMPANIONS = {
     "mesh_review_map": "mesh_review_map.png",
     "mesh_review_map_manifest": "mesh_review_map_manifest.json",
 }
+TGE_SOURCE_AUDIT_NAME = "fvcom_tge_source_bound_audit.json"
 DEFAULT_MESHER_POLICY = {
     "candidate_id": "gmsh_frontal_delaunay_6",
     "backend": "gmsh",
@@ -91,6 +96,50 @@ def _portable_boundary_audit(value: Any) -> Any:
     if isinstance(value, list):
         return [_portable_boundary_audit(item) for item in value]
     return value
+
+
+def _portable_tge_audit(value: Any) -> Any:
+    """Remove workstation paths while retaining exact TGE source hashes."""
+
+    if isinstance(value, dict):
+        return {
+            key: _portable_tge_audit(item)
+            for key, item in value.items()
+            if key != "source_path"
+        }
+    if isinstance(value, list):
+        return [_portable_tge_audit(item) for item in value]
+    return value
+
+
+def _audit_mesh_tge(mesh: Any, tge_source: str | Path | None = None) -> dict[str, Any]:
+    return audit_tge_boundary_junctions(
+        len(mesh.nodes_lonlat),
+        np.asarray(mesh.triangles, dtype=int) - 1,
+        [
+            np.asarray(chain, dtype=int) - 1
+            for chain in mesh.open_boundary_chains
+        ],
+        tge_source_path=tge_source,
+    )
+
+
+def _quality_tge_failures(
+    quality: dict[str, Any],
+    mesh: Any,
+) -> tuple[list[str], dict[str, Any]]:
+    """Recompute and verify the algorithm-bound TGE gate in mesh quality."""
+
+    expected = _audit_mesh_tge(mesh)
+    recorded = quality.get("fvcom_tge_boundary_junction_gate")
+    if not isinstance(recorded, dict):
+        return ["fvcom_tge_boundary_junction_gate_missing"], expected
+    failures: list[str] = []
+    if recorded != expected:
+        failures.append("fvcom_tge_boundary_junction_gate_mismatch")
+    if not bool(expected.get("passed")):
+        failures.append("fvcom_tge_boundary_cell_sum_above_four")
+    return failures, expected
 
 
 def _root(project: str | Path) -> Path:
@@ -396,6 +445,7 @@ def publish(
     failures: list[str],
     open_exterior_source: str | Path | None = None,
     boundary_resolution_source: str | Path | None = None,
+    tge_source: str | Path | None = None,
     boundary_gate_policy: str = "strict",
     basemap_provider: str = "topo",
 ) -> dict[str, Any]:
@@ -443,6 +493,10 @@ def publish(
     regional_debt: list[dict[str, Any]] = []
     quality_advisories: dict[str, Any] = {}
     submission_failures: list[str] = []
+    algorithm_tge_gate: dict[str, Any] | None = None
+    source_tge_audit: dict[str, Any] | None = None
+    source_tge_audit_path: Path | None = None
+    source_tge_record: dict[str, Any] | None = None
     if selected_mesh is not None:
         if selected_mesh.is_symlink() or not selected_mesh.is_file():
             raise ValueError("terminal mesh is not a regular file")
@@ -466,6 +520,11 @@ def publish(
         quality_findings = list(
             map(str, quality_document.get("all_quality_findings", []))
         )
+        tge_quality_failures, algorithm_tge_gate = _quality_tge_failures(
+            quality_document,
+            terminal_mesh_document,
+        )
+        quality_findings.extend(tge_quality_failures)
         quality_classified = classify_failure_codes(quality_findings, policy)
         quality_ready = not quality_classified["benchmark_baseline"]
         if bool(quality_document.get("benchmark_grid_baseline_ready")) != quality_ready:
@@ -479,6 +538,19 @@ def publish(
                 if forcing_status in {"unknown", "missing", "pending"}
                 else "open_boundary_forcing_incompatible"
             )
+        if tge_source is None:
+            all_findings.append("fvcom_tge_source_binding_missing")
+        else:
+            source_tge_audit = _portable_tge_audit(
+                _audit_mesh_tge(terminal_mesh_document, tge_source)
+            )
+            source_tge_audit["mesh_sha256"] = sha256_file(selected_mesh)
+            source_tge_audit_path = root / "08_audit" / TGE_SOURCE_AUDIT_NAME
+            _atomic_json(source_tge_audit_path, source_tge_audit)
+            if source_tge_audit["source_binding"].get("passed") is not True:
+                all_findings.append("fvcom_tge_source_binding_mismatch")
+            if int(source_tge_audit.get("fatal_cell_sum_above_four_count", 0)):
+                all_findings.append("fvcom_tge_boundary_cell_sum_above_four")
         classified = classify_failure_codes(all_findings, policy)
         benchmark_failures = list(classified["benchmark_baseline"])
         benchmark_ready = not benchmark_failures
@@ -533,6 +605,21 @@ def publish(
             if not source.is_file() or not _inside(source, root):
                 raise ValueError(f"{key} must be a project-local regular file")
             _verified_copy(source, final_dir / final_name)
+        if source_tge_audit_path is not None and source_tge_audit is not None:
+            source_tge_hash = _verified_copy(
+                source_tge_audit_path,
+                final_dir / TGE_SOURCE_AUDIT_NAME,
+            )
+            source_tge_record = {
+                "path": f"final/{TGE_SOURCE_AUDIT_NAME}",
+                "sha256": source_tge_hash,
+                "mesh_sha256": source_tge_audit["mesh_sha256"],
+                "source_sha256": source_tge_audit["source_binding"][
+                    "source_sha256"
+                ],
+                "algorithm_id": source_tge_audit["algorithm_id"],
+                "passed": bool(source_tge_audit["passed"]),
+            }
     else:
         mesh_hash = None
         benchmark_failures = sorted(set(all_findings))
@@ -555,6 +642,18 @@ def publish(
         "boundary_gate_policy": boundary_gate_policy,
         "selected_stage_hashes": manifest.get("selected_artifacts", {}),
         "open_exterior_audit": open_audit,
+        "fvcom_tge_boundary_junction_gate": (
+            {
+                "algorithm_id": algorithm_tge_gate["algorithm_id"],
+                "passed": bool(algorithm_tge_gate["passed"]),
+                "fatal_cell_sum_above_four_count": int(
+                    algorithm_tge_gate["fatal_cell_sum_above_four_count"]
+                ),
+            }
+            if algorithm_tge_gate is not None
+            else None
+        ),
+        "fvcom_tge_source_bound_audit": source_tge_record,
         "failure_taxonomy": list(dict.fromkeys(benchmark_failures)),
         "regional_refinement_debt": regional_debt,
         "quality_advisories": quality_advisories,
@@ -562,7 +661,17 @@ def publish(
     }
     _atomic_json(final_dir / "fvcom_grid_status.json", status)
     _atomic_json(root / "project_status.json", status)
-    _append_command(root, "publish", {"mesh_sha256": mesh_hash, "submission_eligible": derived_submission_eligible})
+    _append_command(
+        root,
+        "publish",
+        {
+            "mesh_sha256": mesh_hash,
+            "submission_eligible": derived_submission_eligible,
+            "tge_source_audit_sha256": (
+                source_tge_record["sha256"] if source_tge_record else None
+            ),
+        },
+    )
     return status
 
 
@@ -607,10 +716,35 @@ def validate(
         if "raw_mesh.2dm" not in manifest.get("selected_artifacts", {}):
             failures.append("raw_mesh_provenance_missing")
         path = root / mesh["path"]
+        mesh_document = None
         if not path.is_file() or sha256_file(path) != mesh.get("sha256"):
             failures.append("final_mesh_hash_stale")
+        else:
+            mesh_document = read_2dm(path)
         quality_path = root / "final" / FINAL_COMPANIONS["mesh_quality"]
         boundary_path = root / "final" / FINAL_COMPANIONS["boundary_nodes"]
+        if not quality_path.is_file():
+            failures.append("fvcom_tge_boundary_junction_gate_missing")
+        else:
+            quality_document = _read(quality_path)
+            if quality_document.get("quality_policy") != policy_binding:
+                failures.append("mesh_quality_policy_missing_or_stale")
+            if mesh_document is not None:
+                tge_failures, expected_tge = _quality_tge_failures(
+                    quality_document,
+                    mesh_document,
+                )
+                failures.extend(tge_failures)
+                status_tge = status.get("fvcom_tge_boundary_junction_gate")
+                expected_summary = {
+                    "algorithm_id": expected_tge["algorithm_id"],
+                    "passed": bool(expected_tge["passed"]),
+                    "fatal_cell_sum_above_four_count": int(
+                        expected_tge["fatal_cell_sum_above_four_count"]
+                    ),
+                }
+                if status_tge != expected_summary:
+                    failures.append("fvcom_tge_boundary_junction_gate_mismatch")
         map_audit = validate_standard_mesh_review_map(
             root / "final" / FINAL_COMPANIONS["mesh_review_map"],
             root / "final" / FINAL_COMPANIONS["mesh_review_map_manifest"],
@@ -619,6 +753,50 @@ def validate(
             boundary_nodes_path=boundary_path,
         )
         failures.extend(map_audit["failure_taxonomy"])
+        source_record = status.get("fvcom_tge_source_bound_audit")
+        source_required = bool(
+            status.get("submission_eligible") is True
+            or require_submission_ready
+        )
+        if not isinstance(source_record, dict):
+            if source_required:
+                failures.append("fvcom_tge_source_binding_missing")
+        else:
+            source_path = root / str(source_record.get("path", ""))
+            if (
+                not _inside(source_path, root)
+                or not source_path.is_file()
+                or source_path.is_symlink()
+                or sha256_file(source_path) != source_record.get("sha256")
+            ):
+                failures.append("fvcom_tge_source_audit_hash_stale")
+            else:
+                source_audit = _read(source_path)
+                source_binding = source_audit.get("source_binding", {})
+                source_matches = bool(
+                    source_audit.get("algorithm_id") == TGE_ALGORITHM_ID
+                    and source_audit.get("passed") is True
+                    and source_binding.get("passed") is True
+                    and source_binding.get("status") == "source_bound"
+                    and source_record.get("source_sha256")
+                    == source_binding.get("source_sha256")
+                    and source_record.get("mesh_sha256") == mesh.get("sha256")
+                    and source_audit.get("mesh_sha256") == mesh.get("sha256")
+                    and int(
+                        source_audit.get("fatal_cell_sum_above_four_count", -1)
+                    )
+                    == 0
+                )
+                if mesh_document is not None:
+                    source_matches = bool(
+                        source_matches
+                        and int(source_audit.get("node_count", -1))
+                        == len(mesh_document.nodes_lonlat)
+                        and int(source_audit.get("element_count", -1))
+                        == len(mesh_document.triangles)
+                    )
+                if not source_matches:
+                    failures.append("fvcom_tge_source_binding_mismatch")
     if require_benchmark_ready:
         if status.get("benchmark_grid_baseline_ready") is not True:
             failures.append("project_not_benchmark_ready")

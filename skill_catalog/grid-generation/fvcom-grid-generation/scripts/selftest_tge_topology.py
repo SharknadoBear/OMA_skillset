@@ -10,6 +10,10 @@ import tempfile
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from fvcom_grid_generation.quality import evaluate_mesh_quality  # noqa: E402
+
 _MODULE_PATH = (
     Path(__file__).resolve().parent
     / "fvcom_grid_generation"
@@ -39,6 +43,41 @@ def main() -> int:
     passing = audit_tge_boundary_junctions(4, triangles, [[1]])
     assert passing["passed"]
     assert not passing["tge_would_pstop"]
+    assert passing["exterior_node_ids_1based"] == [1, 2, 3, 4]
+    assert passing["open_boundary_chains_node_ids_1based"] == [[2]]
+    assert passing["open_boundary_node_ids_1based"] == [2]
+    assert passing["boundary_node_isonb_1based"][1] == {
+        "node_id_1based": 2,
+        "isonb": 2,
+    }
+
+    plural = audit_tge_boundary_junctions(4, triangles, [[1], [3]])
+    assert plural["passed"]
+    assert plural["open_boundary_chain_count"] == 2
+    assert plural["open_cell_sum_equal_four_count"] == 2
+
+    closed = audit_tge_boundary_junctions(4, triangles, [])
+    assert closed["passed"]
+    assert closed["open_boundary_node_count"] == 0
+
+    nodes = np.asarray(
+        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        dtype=float,
+    )
+    central_failure = evaluate_mesh_quality(
+        nodes,
+        np.ones(4, dtype=float),
+        triangles + 1,
+        np.asarray([1, 2], dtype=int),
+        {"boundary_constraint_recovered": True},
+        open_boundary_chains=[[1, 2]],
+        require_open_boundary=True,
+        expected_open_boundary_count=1,
+    )
+    assert not central_failure["fvcom_tge_boundary_junction_gate"]["passed"]
+    assert "fvcom_tge_boundary_cell_sum_above_four" in central_failure[
+        "failure_taxonomy"
+    ]
 
     with tempfile.TemporaryDirectory(prefix="tge_source_") as temp:
         source = Path(temp) / "tge.F"
@@ -62,6 +101,16 @@ def main() -> int:
         assert bound["passed"]
         assert bound["source_binding"]["status"] == "source_bound"
         assert len(bound["source_binding"]["source_sha256"]) == 64
+        mismatch = Path(temp) / "mismatched_tge.F"
+        mismatch.write_text("ISONB = 0\n", encoding="utf-8")
+        rejected = audit_tge_boundary_junctions(
+            4,
+            triangles,
+            [[1]],
+            tge_source_path=mismatch,
+        )
+        assert not rejected["passed"]
+        assert rejected["source_binding"]["status"] == "mismatch"
     print("selftest_tge_topology: PASS")
     return 0
 

@@ -317,20 +317,28 @@ def test_target_size_p95_and_maximum_gates() -> None:
             for value in report.get("regional_refinement_debt", [])
         }
 
-    passing = _quality(np.ones(2, dtype=float))
+    def closed_quality(values: np.ndarray | None) -> dict:
+        return _quality(
+            values,
+            require_open_boundary=False,
+            open_boundary_nodes=np.empty(0, dtype=int),
+            open_boundary_chains=[],
+        )
+
+    passing = closed_quality(np.ones(2, dtype=float))
     assert "target_size_l_over_h_p95_above_threshold" not in debt_codes(passing)
     assert "target_size_l_over_h_max_above_threshold" not in debt_codes(passing)
 
-    p95_failure = _quality(np.full(2, 0.8, dtype=float))
+    p95_failure = closed_quality(np.full(2, 0.8, dtype=float))
     assert p95_failure["benchmark_grid_baseline_ready"]
     assert "target_size_l_over_h_p95_above_threshold" in debt_codes(p95_failure)
     assert "target_size_l_over_h_max_above_threshold" not in debt_codes(p95_failure)
 
-    maximum_failure = _quality(np.full(2, 0.6, dtype=float))
+    maximum_failure = closed_quality(np.full(2, 0.6, dtype=float))
     assert "target_size_l_over_h_p95_above_threshold" in debt_codes(maximum_failure)
     assert "target_size_l_over_h_max_above_threshold" in debt_codes(maximum_failure)
 
-    missing = _quality(None)
+    missing = closed_quality(None)
     assert "missing_target_size_error_diagnostic" in debt_codes(missing)
 
 

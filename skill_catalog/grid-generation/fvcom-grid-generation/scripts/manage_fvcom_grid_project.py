@@ -53,6 +53,14 @@ def parser() -> argparse.ArgumentParser:
     publication.add_argument("--open-exterior-source", type=Path)
     publication.add_argument("--boundary-resolution-source", type=Path)
     publication.add_argument(
+        "--tge-source",
+        type=Path,
+        help=(
+            "Exact FVCOM TGE.F used for the source-bound submission audit; "
+            "required for submission eligibility."
+        ),
+    )
+    publication.add_argument(
         "--boundary-gate-policy",
         choices=GRID_BOUNDARY_GATE_POLICIES,
         default="strict",
@@ -102,6 +110,7 @@ def main() -> int:
             failures=args.failure,
             open_exterior_source=args.open_exterior_source,
             boundary_resolution_source=args.boundary_resolution_source,
+            tge_source=args.tge_source,
             boundary_gate_policy=args.boundary_gate_policy,
             basemap_provider=args.basemap_provider,
         )

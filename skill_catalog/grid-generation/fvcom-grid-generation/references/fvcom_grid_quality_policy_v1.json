@@ -1,7 +1,7 @@
 {
   "schema_version": "fvcom_grid_quality_policy_v1",
-  "policy_id": "benchmark-first-2026-08-30",
-  "description": "Ordered FVCOM benchmark-grid policy: absolute invariants, valence, superthin debt, regional refinement debt, then descriptive advisories.",
+  "policy_id": "benchmark-first-2026-09-06-tge-v2",
+  "description": "Ordered FVCOM benchmark-grid policy: absolute invariants, exact TGE boundary-junction compatibility, valence, superthin debt, regional refinement debt, then descriptive advisories.",
   "priority_order": [
     "absolute_structural_invariants",
     "valence_debt",
@@ -69,6 +69,14 @@
             "open_exterior_not_downstream_eligible"
           ],
           "failure_prefixes": ["open_exterior:"]
+        },
+        {
+          "id": "fvcom_tge_boundary_junction",
+          "failure_codes": [
+            "fvcom_tge_boundary_junction_gate_missing",
+            "fvcom_tge_boundary_junction_gate_mismatch",
+            "fvcom_tge_boundary_cell_sum_above_four"
+          ]
         },
         {
           "id": "bathymetry_and_serialization",
@@ -144,7 +152,10 @@
       "open_boundary_cyclicity_unknown",
       "cyclic_obc_not_self_describing_in_sms_2dm",
       "project_provenance_incomplete",
-      "final_mesh_hash_mismatch"
+      "final_mesh_hash_mismatch",
+      "fvcom_tge_source_binding_missing",
+      "fvcom_tge_source_binding_mismatch",
+      "fvcom_tge_source_audit_hash_stale"
     ],
     "required_status": {
       "benchmark_grid_baseline_ready": true,
@@ -164,6 +175,7 @@
       "valence_debt",
       "superthin_debt",
       "boundary_and_open_exterior",
+      "fvcom_tge_boundary_junction",
       "bathymetry_and_serialization"
     ],
     "metric_paths": {

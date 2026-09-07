@@ -23,6 +23,7 @@ from fvcom_grid_generation.grid_project import (
 from fvcom_grid_generation.open_exterior import sha256_file, validate_open_exterior_contract
 from fvcom_grid_generation.quality_policy import public_policy_binding
 from fvcom_grid_generation.sms_2dm import write_2dm
+from fvcom_grid_generation.tge_topology import audit_tge_boundary_junctions
 
 
 def write(path: Path, value: str) -> Path:
@@ -210,7 +211,7 @@ def reviewed_resolution_fixture(root: Path) -> Path:
 
 
 def mesh_fixture(path: Path, *, open_boundary: bool = True) -> Path:
-    chains = [[1, 2]] if open_boundary else []
+    chains = [[2]] if open_boundary else []
     return write_2dm(
         path,
         np.asarray(
@@ -231,6 +232,7 @@ def companions(
     *,
     benchmark_ready: bool = True,
     findings: list[str] | None = None,
+    include_tge: bool = True,
 ) -> dict[str, Path]:
     findings = list(findings or [])
     quality = {
@@ -244,6 +246,14 @@ def companions(
         "failure_taxonomy": findings if not benchmark_ready else [],
         "regional_refinement_debt": [],
     }
+    if include_tge:
+        quality["fvcom_tge_boundary_junction_gate"] = (
+            audit_tge_boundary_junctions(
+                4,
+                np.asarray([[0, 1, 2], [0, 2, 3]], dtype=int),
+                [[1]],
+            )
+        )
     values = {
         "mesh_quality": write(
             root / "08_audit" / "_work" / "quality.json",
@@ -255,6 +265,27 @@ def companions(
         "roundtrip_audit": write(root / "08_audit" / "_work" / "roundtrip.json", "{}"),
     }
     return values
+
+
+def tge_source_fixture(root: Path, *, compatible: bool = True) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    source = root / ("tge.F" if compatible else "mismatched_tge.F")
+    source.write_text(
+        (
+            """
+            ISONB = 0
+            ISONB(NV(I,2)) = 1
+            ISONB(I_OBC_N(I))=2
+            IF(SUM(ISONB(NV(I,1:3))) == 4) THEN
+            ELSE IF(SUM(ISONB(NV(I,1:3))) > 4) THEN
+            END IF
+            """
+            if compatible
+            else "ISONB = 0\n"
+        ),
+        encoding="utf-8",
+    )
+    return source
 
 
 def gmsh6_candidate(raw_mesh: Path, *, candidate_id: str = "gmsh_frontal_delaunay_6") -> Path:
@@ -405,8 +436,99 @@ def main() -> None:
         assert reviewed_status["open_exterior_audit"]["passed"] is True
         assert str(base) not in json.dumps(reviewed_status["open_exterior_audit"])
 
+        missing_tge = base / "missing_tge"
+        missing_contract = role_contract_fixture(base / "missing_tge_contract")
+        init_project(missing_tge, "missing_tge")
+        missing_mesh = mesh_fixture(
+            missing_tge / "06_raw_mesh" / "_work" / "gmsh6" / "raw_mesh.2dm"
+        )
+        promote(
+            missing_tge,
+            "06_raw_mesh",
+            missing_mesh,
+            "raw_mesh.2dm",
+            generator_manifest=gmsh6_candidate(missing_mesh),
+        )
+        try:
+            publish(
+                missing_tge,
+                mesh=missing_tge / "06_raw_mesh" / "raw_mesh.2dm",
+                companions=companions(missing_tge, include_tge=False),
+                fvcom_ready=True,
+                submission_eligible=False,
+                obc_status="pass",
+                forcing_status="compatible",
+                failures=[],
+                open_exterior_source=missing_contract,
+                basemap_provider="offline",
+            )
+        except ValueError as exc:
+            assert "benchmark decision contradicts" in str(exc)
+        else:
+            raise AssertionError("mesh quality without a TGE gate was accepted")
+
+        benchmark_only = base / "benchmark_only"
+        benchmark_contract = role_contract_fixture(base / "benchmark_contract")
+        init_project(benchmark_only, "benchmark_only")
+        benchmark_mesh = mesh_fixture(
+            benchmark_only / "06_raw_mesh" / "_work" / "gmsh6" / "raw_mesh.2dm"
+        )
+        promote(
+            benchmark_only,
+            "06_raw_mesh",
+            benchmark_mesh,
+            "raw_mesh.2dm",
+            generator_manifest=gmsh6_candidate(benchmark_mesh),
+        )
+        benchmark_status = publish(
+            benchmark_only,
+            mesh=benchmark_only / "06_raw_mesh" / "raw_mesh.2dm",
+            companions=companions(benchmark_only),
+            fvcom_ready=True,
+            submission_eligible=False,
+            obc_status="pass",
+            forcing_status="compatible",
+            failures=[],
+            open_exterior_source=benchmark_contract,
+            basemap_provider="offline",
+        )
+        assert benchmark_status["benchmark_grid_baseline_ready"] is True
+        assert benchmark_status["submission_eligible"] is False
+        assert benchmark_status["submission_failure_taxonomy"] == [
+            "fvcom_tge_source_binding_missing"
+        ]
+        assert validate(
+            benchmark_only,
+            require_benchmark_ready=True,
+        )["passed"]
+        mismatched_source = tge_source_fixture(
+            base / "mismatched_source",
+            compatible=False,
+        )
+        mismatch_status = publish(
+            benchmark_only,
+            mesh=benchmark_only / "06_raw_mesh" / "raw_mesh.2dm",
+            companions=companions(benchmark_only),
+            fvcom_ready=True,
+            submission_eligible=False,
+            obc_status="pass",
+            forcing_status="compatible",
+            failures=[],
+            open_exterior_source=benchmark_contract,
+            tge_source=mismatched_source,
+            basemap_provider="offline",
+        )
+        assert mismatch_status["submission_failure_taxonomy"] == [
+            "fvcom_tge_source_binding_mismatch"
+        ]
+        assert not validate(
+            benchmark_only,
+            require_submission_ready=True,
+        )["passed"]
+
         ready = base / "ready"
         current_contract = role_contract_fixture(base / "current_project_contract")
+        compatible_tge = tge_source_fixture(base / "compatible_tge")
         init_project(ready, "ready")
         publish(
             ready,
@@ -443,12 +565,16 @@ def main() -> None:
             forcing_status="compatible",
             failures=[],
             open_exterior_source=current_contract,
+            tge_source=compatible_tge,
             basemap_provider="offline",
         )
         assert validate(ready, require_benchmark_ready=True)["passed"]
         assert validate(ready, require_submission_ready=True)["passed"]
         assert (ready / "08_audit" / "mesh_review_map.png").is_file()
         assert (ready / "final" / "mesh_review_map_manifest.json").is_file()
+        assert (
+            ready / "final" / "fvcom_tge_source_bound_audit.json"
+        ).is_file()
 
         rejected = base / "cleanroom"
         init_project(rejected, "cleanroom")

@@ -74,6 +74,13 @@ as subworkflow calls that did not occur.
 
 For every new complete grid, initialize the standardized portable project first. Keep attempts under each stage's `_work/`, promote one hash-bound selection to its canonical stage name, and publish any terminal mesh at the stable path `final/fvcom_grid.2dm`. The filename does not imply readiness. Use `validate --require-benchmark-ready` before a first benchmark and `validate --require-submission-ready` before submission.
 
+Every mesh-quality evaluation embeds the algorithm-bound TGE junction gate.
+Publication may remain benchmark-only without local FVCOM source, but
+submission eligibility requires `publish --tge-source /path/to/TGE.F`. The
+manager re-runs the gate on the exact selected serialized mesh, writes
+`fvcom_tge_source_bound_audit.json`, and makes a missing, mismatched, or stale
+source audit blocking for `validate --require-submission-ready`.
+
 ```powershell
 python scripts/manage_fvcom_grid_project.py init --project runs/my_project --name my_project
 python scripts/run_mesher_portfolio_case.py --case-manifest runs/my_project/05_mesh_intent/case_manifest.json --output-dir runs/my_project/06_raw_mesh/_work/gmsh6
@@ -336,7 +343,8 @@ Hard anchors and all boundary nodes not explicitly handled by the kind-aware edi
 - `fvcom_grid_manifest.json`
 - `mesh_quality.json`
 - `mesh_conditioning.json`
-- `fvcom_tge_boundary_junction_gate` embedded in `mesh_quality.json` and the conditioning report, with a separate source-bound audit JSON before submission
+- `fvcom_tge_boundary_junction_gate` embedded by the central quality evaluator in every `mesh_quality.json` and conditioning report
+- `fvcom_tge_source_bound_audit.json`, required and hash-checked before submission
 - `mesh_edit_ledger.json` (operation, source-node lineage, and local edit evidence)
 - `obc_remap_manifest.json` (original/delivered OBC lineage, source-arc position, redistribution status, and forcing compatibility)
 - `boundary_nodes.geojson` (input boundary-node package)
@@ -360,7 +368,7 @@ The v8 manifest records the size-field method and hydraulic-skeleton diagnostics
 
 ## Acceptance
 
-Emit separate policy decisions. `minimal_local_debt_closed` requires valence `<=8`, zero unique superthin triangles (`q<0.10` or minimum angle below `5°`), zero restricted-edge violations, no TGE cell sum above four, and no structural regression. `benchmark_grid_baseline_ready` additionally requires finite positive depths, positive areas, one intended connected manifold mesh, traversable preserved constraints and OBC/exterior lineage, node-cap compliance, exact 2DM roundtrip, and a passing TGE `ISONB` junction audit. `fvcom_ready` and `accepted` are compatibility aliases of that benchmark decision. Record ordinary angle tails, `q_l3_sigma`, area transition, bathymetric slope, `L/h`, boundary continuity, and nonstructural singly connected elements under `regional_refinement_debt`; they never veto the baseline. `submission_eligible` additionally requires forcing compatibility, self-describing OBC metadata, project provenance, exact final hashes, and an exact-source-bound repeat of the TGE gate when the FVCOM source is available. Retain every terminal mesh and status with `needs_review` when the baseline cannot close.
+Emit separate policy decisions. `minimal_local_debt_closed` requires valence `<=8`, zero unique superthin triangles (`q<0.10` or minimum angle below `5°`), zero restricted-edge violations, no TGE cell sum above four, and no structural regression. `benchmark_grid_baseline_ready` additionally requires finite positive depths, positive areas, one intended connected manifold mesh, traversable preserved constraints and OBC/exterior lineage, node-cap compliance, exact 2DM roundtrip, and a present, recomputed, passing TGE `ISONB` junction audit. `fvcom_ready` and `accepted` are compatibility aliases of that benchmark decision. Record ordinary angle tails, `q_l3_sigma`, area transition, bathymetric slope, `L/h`, boundary continuity, and nonstructural singly connected elements under `regional_refinement_debt`; they never veto the baseline. `submission_eligible` additionally requires forcing compatibility, self-describing OBC metadata, project provenance, exact final hashes, and a hash-valid exact-source-bound repeat of the TGE gate. Retain every terminal mesh and status with `needs_review` when the baseline cannot close.
 
 For the visual superthin experiment, additionally require strict global superthin-count reduction, non-increasing superthin severity, no new residual component outside the reviewed lineage neighborhood, unchanged existing boundary coordinates, and refreshed visual evidence after every accepted component. Report `visual_zero_superthin_pass` separately from FVCOM readiness; use `visual_zero_superthin_pass_forcing_remap_required` when an OBC insertion occurred.
 

@@ -61,6 +61,15 @@ def test_policy_contract_and_unique_assignment() -> None:
     exact = policy["_exact_code_buckets"]
     assert exact["node_valence_above_threshold"] == "benchmark_baseline"
     assert exact["superthin_elements_present"] == "benchmark_baseline"
+    assert exact["fvcom_tge_boundary_junction_gate_missing"] == (
+        "benchmark_baseline"
+    )
+    assert exact["fvcom_tge_boundary_junction_gate_mismatch"] == (
+        "benchmark_baseline"
+    )
+    assert exact["fvcom_tge_boundary_cell_sum_above_four"] == (
+        "benchmark_baseline"
+    )
     assert exact["adjacent_area_change_above_threshold"] == (
         "regional_refinement_debt"
     )
@@ -127,6 +136,13 @@ def test_bucket_decisions_and_unknown_fail_closed() -> None:
     assert submission["benchmark_baseline"] == []
     assert submission["submission_preconditions"] == [
         "open_boundary_forcing_missing"
+    ]
+    tge_submission = classify_failure_codes(
+        ["fvcom_tge_source_binding_missing"]
+    )
+    assert tge_submission["benchmark_baseline"] == []
+    assert tge_submission["submission_preconditions"] == [
+        "fvcom_tge_source_binding_missing"
     ]
 
 

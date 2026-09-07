@@ -9,6 +9,7 @@ import numpy as np
 
 from .metrics import compute_mesh_metrics
 from .quality_policy import apply_quality_policy, load_quality_policy
+from .tge_topology import audit_tge_boundary_junctions
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,19 @@ def evaluate_mesh_quality(
             if maximum > thresholds.max_size_error:
                 findings.append("target_size_l_over_h_max_above_threshold")
 
+    tge_open_chains = (
+        open_chains_zero
+        if open_chains_zero is not None
+        else ([open_zero] if open_zero else [])
+    )
+    tge_gate = audit_tge_boundary_junctions(
+        len(nodes_xy),
+        triangles,
+        tge_open_chains,
+    )
+    if not bool(tge_gate["passed"]):
+        findings.append("fvcom_tge_boundary_cell_sum_above_four")
+
     result = {
         "schema_version": "fvcom_mesh_quality_v3",
         "node_count": int(metrics["node_count"]),
@@ -166,6 +180,7 @@ def evaluate_mesh_quality(
         "constraint_integrity": integrity,
         "size_error_l_over_h": metrics.get("size_error_l_over_h"),
         "depths": depth_report,
+        "fvcom_tge_boundary_junction_gate": tge_gate,
         "all_quality_findings": sorted(set(findings)),
     }
     advisories = {

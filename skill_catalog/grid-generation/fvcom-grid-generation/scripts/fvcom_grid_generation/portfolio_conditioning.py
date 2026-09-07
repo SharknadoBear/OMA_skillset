@@ -58,7 +58,6 @@ from .regional_conditioning import (
 )
 from .size_field import recorded_size_interpolator
 from .sms_2dm import Mesh2DM, read_2dm, write_2dm
-from .tge_topology import audit_tge_boundary_junctions
 
 
 class UnsupportedCyclicOpenBoundaryError(ValueError):
@@ -618,15 +617,7 @@ def condition_portfolio_mesh(
     }
     quality["open_boundary_cyclicity_contract"] = cyclicity
     quality["serialized_roundtrip"] = roundtrip
-    tge_topology = audit_tge_boundary_junctions(
-        len(serialized_points),
-        np.asarray(serialized.triangles, dtype=int) - 1,
-        [
-            np.asarray(chain, dtype=int) - 1
-            for chain in serialized.open_boundary_chains
-        ],
-    )
-    quality["fvcom_tge_boundary_junction_gate"] = tge_topology
+    tge_topology = quality["fvcom_tge_boundary_junction_gate"]
     edge_size = _edge_size_continuity_audit(
         serialized_points,
         serialized_triangles,

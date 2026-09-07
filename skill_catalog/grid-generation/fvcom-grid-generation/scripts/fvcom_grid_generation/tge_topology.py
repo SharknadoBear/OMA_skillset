@@ -146,9 +146,21 @@ def audit_tge_boundary_junctions(
         "node_count": int(n_nodes),
         "element_count": int(len(triangles)),
         "exterior_edge_count": int(len(exterior_edges)),
+        "exterior_edges_node_ids_1based": [
+            [edge[0] + 1, edge[1] + 1] for edge in exterior_edges
+        ],
         "exterior_node_count": int(len(exterior_nodes)),
+        "exterior_node_ids_1based": [node + 1 for node in exterior_nodes],
         "open_boundary_chain_count": int(len(chains)),
+        "open_boundary_chains_node_ids_1based": [
+            [node + 1 for node in chain] for chain in chains
+        ],
         "open_boundary_node_count": int(len(open_nodes)),
+        "open_boundary_node_ids_1based": [node + 1 for node in open_nodes],
+        "boundary_node_isonb_1based": [
+            {"node_id_1based": node + 1, "isonb": int(isonb[node])}
+            for node in sorted(set(exterior_nodes) | set(open_nodes))
+        ],
         "open_boundary_nodes_not_exterior_1based": [
             node + 1 for node in open_nodes if node not in set(exterior_nodes)
         ],

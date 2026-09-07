@@ -21,6 +21,7 @@ publication verifies SHA-256 before atomic replacement.
   06_raw_mesh/raw_mesh_manifest.json
   07_conditioning/conditioned_mesh.2dm
   08_audit/final_audit.json
+  08_audit/fvcom_tge_source_bound_audit.json
   08_audit/mesh_review_map.png
   08_audit/mesh_review_map_manifest.json
   final/
@@ -77,6 +78,17 @@ status uses schema `fvcom_grid_delivery_v1` and records the bound quality-policy
 hash, benchmark readiness, regional debt, submission eligibility, OBC/forcing
 status, selected-stage hashes, and Class-1 failure taxonomy. A pre-mesh failure
 writes the status but never fabricates a 2DM or map.
+
+The central mesh-quality evaluator must embed a recomputable
+`fvcom_tge_boundary_junction_gate`; a missing, mismatched, or failing gate
+blocks benchmark readiness. To publish a submission-eligible grid, also pass
+`--tge-source /path/to/TGE.F`. Publication re-runs the exact ISONB cell-sum
+logic on the selected serialized mesh, removes workstation paths, stores the
+source and mesh hashes in `fvcom_tge_source_bound_audit.json`, and copies that
+immutable evidence into `final/`. `validate --require-submission-ready`
+rejects a missing, mismatched, or stale source-bound audit. Benchmark-only
+publication may omit `--tge-source` and remains explicitly ineligible for
+submission.
 
 Run `validate --require-benchmark-ready` before a first benchmark run. Run
 `validate --require-submission-ready` immediately before future job submission;
