@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/cambecc/earth",
+  "revision": "5f091f0c3b60aa38a996a886985bacb3673d16c3",
+  "files": {
+    "public/libs/earth/1.0.0/earth.js": {
+      "url": "https://raw.githubusercontent.com/cambecc/earth/5f091f0c3b60aa38a996a886985bacb3673d16c3/public/libs/earth/1.0.0/earth.js",
+      "bytes": 49814,
+      "sha256": "8e93641ad0bf259bb4642c38dcdf7213b2dfc9529ceab6df76a4fd164017290b"
+    },
+    "LICENSE.md": {
+      "url": "https://raw.githubusercontent.com/cambecc/earth/5f091f0c3b60aa38a996a886985bacb3673d16c3/LICENSE.md",
+      "bytes": 1083,
+      "sha256": "d622fa73753f64296bdbe99385df045350b33465e538f737b3dfa6bf99445a7f"
+    }
+  },
+  "adapted_sections": "earth.js animate/evolve/draw: particle lifecycle and color buckets. Original v001/v002 also adapted destination-in fading; v003 replaces that with OMA finite-age instanced WebGL2 segments and a Canvas fallback. Native FVCOM sampling, independent motion gain, step clock and RK2 are OMA implementations.",
+  "license": "MIT; full upstream notice embedded in each HTML"
+}
