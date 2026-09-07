@@ -15,6 +15,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mesh", required=True, help="Input SMS .2dm mesh")
     parser.add_argument("--nodestring", type=int, required=True, help="Nodestring id to inspect")
     parser.add_argument("--default-coeff", type=float, default=0.0025, help="Initial sponge damping coefficient")
+    parser.add_argument(
+        "--radius-scale",
+        type=float,
+        default=3.0,
+        help="Radius as a multiple of the local median OBC edge length",
+    )
     parser.add_argument("--output", default=None, help="Optional JSON output path")
     return parser
 
@@ -22,7 +28,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     mesh = parse_2dm(args.mesh)
-    result = estimate_sponge(mesh, args.nodestring, default_coeff=args.default_coeff)
+    result = estimate_sponge(
+        mesh,
+        args.nodestring,
+        default_coeff=args.default_coeff,
+        radius_scale=args.radius_scale,
+    )
     text = json.dumps(result, indent=2)
     print(text)
     if args.output:
@@ -32,4 +43,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

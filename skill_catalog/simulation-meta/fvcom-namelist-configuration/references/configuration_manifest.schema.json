@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fvcom_namelist_configuration_manifest_v1",
+  "type": "object",
+  "required": ["schema", "status", "case_id", "stage", "artifact_root", "hashes", "timing", "numerics", "file_checks", "warnings", "blocking_reasons", "resume_token"],
+  "properties": {
+    "schema": {"const": "fvcom_namelist_configuration_manifest_v1"},
+    "status": {"enum": ["provisional_ready", "ready", "blocked"]},
+    "case_id": {"type": "string", "minLength": 1},
+    "stage": {"enum": ["smoke", "canary", "spinup", "benchmark", "production", "full"]},
+    "artifact_root": {"type": "string", "minLength": 1},
+    "hashes": {"type": "object", "additionalProperties": {"type": "string"}},
+    "timing": {"type": "object"},
+    "numerics": {"type": "object"},
+    "file_checks": {"type": "array", "items": {"type": "object"}},
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "blocking_reasons": {"type": "array", "items": {"type": "string"}},
+    "resume_token": {"type": "string", "minLength": 1}
+  },
+  "additionalProperties": false
+}

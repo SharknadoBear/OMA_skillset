@@ -122,7 +122,7 @@ def _fill_gaps(df: pd.DataFrame) -> pd.DataFrame:
             t0 = df.loc[i0, "time"]
             t1 = df.loc[i1, "time"]
             print(f"  [fill_gaps] WARNING: gap of {n} steps ({n*6} min) "
-                  f"from {t0} to {t1} — left as NaN")
+                  f"from {t0} to {t1} - left as NaN")
 
     # Linear interpolation for all gaps; limit= caps it at _MAX_GAP_STEPS
     df["water_level"] = (df["water_level"]
@@ -167,7 +167,7 @@ def fetch_noaa_waterlevel(station_id: str,
     * The CO-OPS API limits 6-minute water_level to 31-day windows.
       This function chunks automatically by calendar month.
     * Per-month CSVs are cached in ``cache_dir`` as
-      ``noaa_{station_id}_{YYYYMM}.csv``.  Re-download is skipped if the
+      ``noaa_{station_id}_{product}_{YYYYMM}.csv``. Re-download is skipped if the
       file exists.
     * A 0.5-second pause is inserted between successive API calls to avoid
       throttling (mirrors MATLAB tena_coops_getAPIdata pause(0.5)).
@@ -178,12 +178,12 @@ def fetch_noaa_waterlevel(station_id: str,
 
     chunks = list(_month_chunks(t_start, t_end))
     print(f"Fetching {len(chunks)} monthly chunks for station {station_id} "
-          f"({t_start} → {t_end})")
+          f"({t_start} -> {t_end})")
 
     all_frames = []
     for i, (begin, end) in enumerate(chunks):
         yyyymm = begin[:6].replace(" ", "")[:6]   # 'YYYYMM'
-        cache_file = cache_dir / f"noaa_{station_id}_{yyyymm}.csv"
+        cache_file = cache_dir / f"noaa_{station_id}_{product}_{yyyymm}.csv"
 
         if cache_file.exists():
             df_chunk = pd.read_csv(cache_file, parse_dates=["time"])
@@ -205,6 +205,8 @@ def fetch_noaa_waterlevel(station_id: str,
             "application":  "WaterPACT_DRE",
             "format":       "json",
         }
+        if product == "predictions":
+            params["interval"] = "6"
         resp = requests.get(COOPS_API_BASE, params=params, timeout=30)
         resp.raise_for_status()
         payload = resp.json()
@@ -214,7 +216,7 @@ def fetch_noaa_waterlevel(station_id: str,
             raise RuntimeError(
                 f"CO-OPS API error for {station_id} {yyyymm}: {msg}")
 
-        records = payload.get("data", [])
+        records = payload.get("predictions" if product == "predictions" else "data", [])
         if not records:
             print(f"  [{i+1:02d}/{len(chunks)}] {yyyymm}  WARNING: empty response")
             _time.sleep(0.5)
@@ -239,7 +241,7 @@ def fetch_noaa_waterlevel(station_id: str,
         _time.sleep(0.5)
 
     if not all_frames:
-        raise RuntimeError("No data retrieved — check station ID and date range.")
+        raise RuntimeError("No data retrieved - check station ID and date range.")
 
     df = pd.concat(all_frames, ignore_index=True)
     df = df.sort_values("time").drop_duplicates(subset="time").reset_index(drop=True)

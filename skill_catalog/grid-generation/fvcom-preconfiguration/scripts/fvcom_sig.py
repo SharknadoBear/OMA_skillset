@@ -72,7 +72,7 @@ def sigma_text(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Write an FVCOM sigma-coordinate configuration file.")
     parser.add_argument("--out", required=True, help="Output _sig.dat file")
-    parser.add_argument("--levels", type=int, default=41, help="NUMBER OF SIGMA LEVELS")
+    parser.add_argument("--levels", type=int, default=10, help="NUMBER OF SIGMA LEVELS")
     parser.add_argument("--type", default="UNIFORM", choices=sorted(SIGMA_TYPES), help="Sigma coordinate type")
     parser.add_argument("--sigma-power", type=float, default=1.0)
     parser.add_argument("--du", type=float, default=1.0)
@@ -108,7 +108,7 @@ def main() -> int:
         "sig_file": str(out),
         "levels": args.levels,
         "sigma_type": args.type.upper(),
-        "notes": "FVCOM counts NUMBER OF SIGMA LEVELS as KB; this tool defaults to 41 for the flume branch.",
+        "notes": "FVCOM counts NUMBER OF SIGMA LEVELS as KB; the simulation workflow defaults to 10 uniform levels.",
     }
     if args.manifest:
         Path(args.manifest).write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -118,4 +118,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

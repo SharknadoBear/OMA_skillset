@@ -1,6 +1,6 @@
 ---
 name: noaa-coops-tides
-description: Fetch and inspect NOAA CO-OPS station observations including water level, temperature, salinity, and station metadata. Use when Codex needs a generic Python toolbox for estimate-first API planning, monthly cache products, time-series QA, harmonic analysis, and optional legacy model-time compatibility.
+description: Discover, fetch, and inspect NOAA CO-OPS water-level, prediction, temperature, salinity, and current-profile observations. Use for wet-domain station screening, monthly scalar caches, resumable seven-day all-bin current downloads, QC, vector/depth averaging, and harmonic-ready time series.
 ---
 
 # NOAA CO-OPS Tides
@@ -10,9 +10,10 @@ Use this skill as a self-contained Python toolbox for external data access. Keep
 ## Source And Toolbox
 
 - Primary source: NOAA CO-OPS API observations.
-- Toolbox focus: water level, temperature, salinity, station metadata, harmonic analysis, and time-series cache products.
+- Toolbox focus: water level, predictions, temperature, salinity, current profiles, station/deployment/bin metadata, harmonic analysis, and time-series cache products.
 - Main packaged scripts:
 - `scripts/noaa_tides.py`
+- `scripts/coops_currents.py`: discover water-level/current stations inside a projected wet 2DM, classify profiler orientation, download `currents` in API-compliant seven-day `bin=0` chunks, and produce east/north depth-integrated currents.
 - `scripts/screen_tidal_stations.py`: screen a residual-boundary contract against tidal CO-OPS stations within a bounded radius. A station is eligibility evidence only; it never creates an OBC automatically and never substitutes a river gauge.
 - Standard estimate hook: `scripts/estimate_data_request.py`.
 - Standard finishing gate: `scripts/check_download_health.py`.
@@ -40,6 +41,18 @@ python scripts/check_download_health.py --request request.json --run-dir runs/ca
 
 7. Surface the health report to Bear only when important caveats exist, such as missing requested coverage, empty variables, all-NaN fields, finite coverage below 95 percent, obvious gaps, or failed diagnostic plots.
 
+For FVCOM validation, discover stations against the actual wet mesh rather than a rectangular bbox alone:
+
+```bash
+python scripts/coops_currents.py discover --mesh fvcom_grid.2dm --mesh-crs EPSG:32615 --period-start 2025-04-01T00:00:00Z --period-end 2025-05-01T00:00:00Z --output station_inventory.json
+```
+
+Download an eligible downward-looking profiler in resumable seven-day all-bin chunks:
+
+```bash
+python scripts/coops_currents.py fetch --station g06010 --period-start 2025-04-01T00:00:00Z --period-end 2025-05-01T00:00:00Z --cache-dir observations/currents/g06010/cache --output observations/currents/g06010/depth_mean.csv --manifest observations/currents/g06010/manifest.json
+```
+
 Metadata-only residual screening is bounded inventory work rather than an observation download. Run it directly against the hash-bound boundary contract and retained wet-domain package:
 
 ```bash
@@ -52,6 +65,10 @@ Require `tidal=true`, water-level or prediction products, datum evidence, and me
 
 - Treat this as a generic data connector; do not make a downstream model file the default output.
 - Keep downloads source-bounded and request-bounded. Do not bulk-download whole collections unless the user explicitly approves.
+- The Data API requires `bin=0` all-bin current requests to span no more than seven days. Cache each chunk, verify station metadata and bin IDs, and deduplicate overlapping endpoints when resuming.
+- Treat CO-OPS current direction as degrees relative to true north and convert flow-toward vectors with `east=speed*sin(direction)` and `north=speed*cos(direction)`. Metric API current speeds are converted from cm/s to m/s and the conversion is written to the manifest.
+- Quantitative depth-integrated validation is limited to downward-looking profilers. Retain side-looking stations in discovery output with an exclusion reason.
+- For downward profiles, derive layer interfaces from adjacent valid bin-depth midpoints. Extrapolate the shallowest vector to the surface and deepest valid vector to the bed only when the deployment water depth bounds the bins; record excluded bins, extrapolation, finite-bin fraction, and thickness weights for every timestamp.
 - Do Python plotting and health reports locally. If Kestrel is used, use it for remote download/storage staging, then download compact evidence or products back for local checks.
 - Keep legacy model-specific functions and file conventions available as deprecated compatibility aliases where they already exist, but prefer generic names in new docs, manifests, tests, and examples.
 - Do not store credentials, personal tokens, passwords, OTPs, or unsupported source-access claims in scripts, logs, metadata, or examples.
@@ -63,3 +80,4 @@ Require `tidal=true`, water-level or prediction products, datum evidence, and me
 - Test `estimate_data_request.py` with local, Kestrel, and unknown-estimate cases.
 - Test `check_download_health.py` on a tiny cached or synthetic artifact and confirm JSON plus at least one plot for plottable data.
 - Run `python scripts/selftest_station_screen.py` and confirm tidal/product/datum/connectivity filtering and river-gauge rejection.
+- Run `python scripts/selftest_coops_currents.py` and confirm seven-day chunking, speed/direction conversion, orientation filtering, bin QC, and known-vector vertical weighting.

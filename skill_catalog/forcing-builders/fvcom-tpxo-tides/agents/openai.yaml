@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM TPXO Tides"
-  short_description: "Build FVCOM TPXO tide forcing"
-  default_prompt: "Use $fvcom-tpxo-tides to interpolate TPXO harmonic elevations to FVCOM open-boundary nodes and prepare tidal elevation forcing."
+  short_description: "Build gated FVCOM TPXO elevation forcing"
+  default_prompt: "Use $fvcom-tpxo-tides to verify exact OBC-node order, reconstruct all TPXO9v5 constituents with astronomical and nodal corrections, and write validated FVCOM elevation forcing plus diagnostics."

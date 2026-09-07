@@ -564,12 +564,10 @@ def build_boundary_resolution(
             force=sampling_processed >= sampling_total,
         )
 
-    resolved_domain = Polygon(outer_nodes, holes=island_chains)
-    if not resolved_domain.is_valid:
-        resolved_domain = resolved_domain.buffer(0)
-    resolved_domain = _select_polygon(resolved_domain, source_domain.representative_point())
-    if not isinstance(resolved_domain, Polygon) or resolved_domain.is_empty:
-        raise ValueError("Resolved boundary nodes do not form a valid wet-domain polygon")
+    resolved_domain, resolved_domain_construction = _build_resolved_domain_from_serialized_chains(
+        outer_nodes,
+        island_chains,
+    )
 
     sampled_open_geometries = [
         LineString(item["nodes"] + ([item["nodes"][0]] if item["is_closed"] and item["nodes"][0] != item["nodes"][-1] else []))
@@ -646,6 +644,7 @@ def build_boundary_resolution(
         "open_arc_repair": repair_report,
         "open_boundary_lineage": open_lineage,
         "topology_actions": action_report,
+        "resolved_domain_construction": resolved_domain_construction,
         "resolved_islands": resolved_records,
         "chains": chain_summaries,
     }
@@ -742,6 +741,7 @@ def build_boundary_resolution(
             "longitude_origin": projection.longitude_origin,
             "coordinate_policy": "native_longitudes_transformed_directly_without_longitude_warping",
         },
+        "resolved_domain_construction": resolved_domain_construction,
         "qa": {
             "open_boundary_node_count": open_count,
             "expected_obc_count": expected_obc_count,
@@ -750,6 +750,10 @@ def build_boundary_resolution(
             "island_boundary_node_count": island_count,
             "total_boundary_node_count": int(len(node_records)),
             "resolved_island_count": int(len(resolved_islands)),
+            "resolved_domain_hole_count": int(len(resolved_domain.interiors)),
+            "resolved_domain_exterior_conflict_chain_count": int(
+                resolved_domain_construction["exterior_conflict_chain_count"]
+            ),
             "source_island_count": int(len(islands_xy)),
             "topology_absolute_area_change_fraction": topology_area_fraction,
             "protected_mission_operation_count": int(action_report["protected_operation_count"]),
@@ -3072,6 +3076,89 @@ def _deduplicate_ring(coords: list[tuple[float, float]]) -> list[tuple[float, fl
     if len(out) > 1 and np.linalg.norm(np.asarray(out[0]) - np.asarray(out[-1])) <= 1.0e-7:
         out.pop()
     return out
+
+
+def _build_resolved_domain_from_serialized_chains(
+    outer_nodes: list[tuple[float, float]],
+    island_chains: list[list[tuple[float, float]]],
+) -> tuple[Polygon, dict[str, Any]]:
+    """Build the reference wet polygon without clipping complete island chains.
+
+    Boundary sampling can move the exact serialized exterior landward of a
+    source island.  Such a complete island remains in ``boundary_nodes`` so
+    Grid Generation can perform its hash-audited exterior-conflict
+    compensation.  It must not be included in the reference polygon before
+    validity repair: an exterior-crossing island can overlap a valid interior
+    island and a blanket ``buffer(0)`` then dissolves both, making the
+    reference-hole count disagree with the compensated chain count.
+
+    Eligible strictly interior chains are unioned before becoming holes.  That
+    retains the established representation for overlapping/sub-resolution
+    chains, which Grid Generation may merge only under its own spacing and
+    lineage gates.  No chain is clipped and no distance tolerance is used.
+    """
+    shell = Polygon(outer_nodes)
+    if shell.is_empty or not shell.is_valid or not isinstance(shell, Polygon):
+        raise ValueError("Serialized outer boundary nodes do not form a valid polygon")
+
+    eligible: list[Polygon] = []
+    excluded: list[dict[str, Any]] = []
+    for index, chain in enumerate(island_chains, start=1):
+        candidate = Polygon(chain)
+        if candidate.is_empty or not candidate.is_valid or candidate.area <= 0.0:
+            raise ValueError(f"Serialized island chain {index} does not form a valid polygon")
+        if not shell.contains(candidate):
+            excluded.append(
+                {
+                    "chain_index_one_based": int(index),
+                    "relation": (
+                        "touches_serialized_exterior"
+                        if shell.boundary.intersects(candidate)
+                        else "crosses_or_extends_outside_serialized_exterior"
+                    ),
+                    "area_m2": float(candidate.area),
+                }
+            )
+            continue
+        eligible.append(candidate)
+
+    merged = unary_union(eligible) if eligible else GeometryCollection()
+    if isinstance(merged, Polygon):
+        reference_holes = [merged]
+    else:
+        reference_holes = [
+            part
+            for part in getattr(merged, "geoms", [])
+            if isinstance(part, Polygon) and not part.is_empty
+        ]
+    if any(not shell.contains(part) for part in reference_holes):
+        raise ValueError("Resolved island union is not strictly inside the serialized exterior")
+
+    resolved_domain = Polygon(
+        shell.exterior.coords,
+        holes=[list(part.exterior.coords) for part in reference_holes],
+    )
+    if resolved_domain.is_empty or not resolved_domain.is_valid:
+        raise ValueError(
+            "Serialized exterior and strictly contained island chains do not form a valid wet-domain polygon"
+        )
+    if list(resolved_domain.exterior.coords) != list(shell.exterior.coords):
+        raise ValueError("Resolved-domain construction changed serialized exterior coordinates or order")
+
+    report = {
+        "schema_version": "fvcom_resolved_domain_construction_v1",
+        "policy": (
+            "exact_serialized_exterior; complete exterior-conflicting island chains retained in "
+            "boundary_nodes but excluded from the reference-domain holes; no clipping or tolerance"
+        ),
+        "source_island_chain_count": int(len(island_chains)),
+        "strictly_contained_chain_count": int(len(eligible)),
+        "exterior_conflict_chain_count": int(len(excluded)),
+        "reference_hole_count": int(len(reference_holes)),
+        "interior_union_merge_delta": int(len(eligible) - len(reference_holes)),
+        "exterior_conflicts": excluded,
+    }
+    return resolved_domain, report
 
 
 def _append_node_chain(records, summaries, chain_id, coords, kinds, sizes, projection) -> None:

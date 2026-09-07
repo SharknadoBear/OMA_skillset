@@ -58,6 +58,7 @@ from .regional_conditioning import (
 )
 from .size_field import recorded_size_interpolator
 from .sms_2dm import Mesh2DM, read_2dm, write_2dm
+from .tge_topology import audit_tge_boundary_junctions
 
 
 class UnsupportedCyclicOpenBoundaryError(ValueError):
@@ -617,6 +618,15 @@ def condition_portfolio_mesh(
     }
     quality["open_boundary_cyclicity_contract"] = cyclicity
     quality["serialized_roundtrip"] = roundtrip
+    tge_topology = audit_tge_boundary_junctions(
+        len(serialized_points),
+        np.asarray(serialized.triangles, dtype=int) - 1,
+        [
+            np.asarray(chain, dtype=int) - 1
+            for chain in serialized.open_boundary_chains
+        ],
+    )
+    quality["fvcom_tge_boundary_junction_gate"] = tge_topology
     edge_size = _edge_size_continuity_audit(
         serialized_points,
         serialized_triangles,
@@ -655,6 +665,7 @@ def condition_portfolio_mesh(
         and int(final_audit["count_valence_above_8"]) == 0
         and roundtrip["passed"]
         and final_audit["core_passed"]
+        and tge_topology["passed"]
     )
     policy_document = load_quality_policy()
     all_findings = list(map(str, quality.get("all_quality_findings", [])))
@@ -667,6 +678,8 @@ def condition_portfolio_mesh(
         )
     if not bool(obc_manifest["forcing_compatible"]):
         all_findings.append("open_boundary_forcing_incompatible")
+    if not bool(tge_topology["passed"]):
+        all_findings.append("fvcom_tge_boundary_cell_sum_above_four")
     if not bool(edge_size["passed"]):
         all_findings.extend(
             f"edge_size_continuity:{value}"
@@ -708,7 +721,7 @@ def condition_portfolio_mesh(
 
     status = "pass" if benchmark_ready else "needs_review"
     report = {
-        "schema_version": "fvcom_portfolio_conditioning_v3",
+        "schema_version": "fvcom_portfolio_conditioning_v4",
         "status": status,
         "minimal_local_debt_closed": minimal_local_debt_closed,
         "benchmark_grid_baseline_ready": benchmark_ready,
@@ -718,6 +731,7 @@ def condition_portfolio_mesh(
         "regional_refinement_debt": quality["regional_refinement_debt"],
         "quality_advisories": quality["quality_advisories"],
         "submission_failure_taxonomy": submission_failures,
+        "fvcom_tge_boundary_junction_gate": tge_topology,
         "quality_policy": quality["quality_policy"],
         "policy": {
             "name": effective_profile,
@@ -734,6 +748,7 @@ def condition_portfolio_mesh(
                     "terminal-global-audit-or-rollback",
                     "immutable-bathymetry-resampling",
                     "serialized-quality-audit",
+                    "fvcom-tge-isonb-cell-sum-gate",
                 ]
                 if effective_profile == "minimal-topology-v1"
                 else [
@@ -744,6 +759,7 @@ def condition_portfolio_mesh(
                     "terminal-global-audit-or-rollback",
                     "immutable-bathymetry-resampling",
                     "serialized-quality-audit",
+                    "fvcom-tge-isonb-cell-sum-gate",
                 ]
             ),
             "boundary_edit_policy": (

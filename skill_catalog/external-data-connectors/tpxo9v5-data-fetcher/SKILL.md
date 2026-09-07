@@ -120,6 +120,9 @@ python scripts/extract_tpxo9v5.py interpolate --source-dir runs/case/raw \
 Point CSV files must contain `longitude` and `latitude` columns. A target NetCDF may
 instead be supplied with `--target-grid`, `--target-lon-var`, and
 `--target-lat-var`; its coordinates are flattened without assuming a model layout.
+When a point CSV also contains `node_id`, `target_id`, or `id`, preserve it as the
+`target_id(point)` variable in exact input-row order. Downstream model builders use
+that identifier as an order-integrity gate; never sort point requests implicitly.
 
 5. Run or repeat the finishing gate:
 
@@ -132,6 +135,8 @@ python scripts/check_download_health.py --input runs/case/tpxo_subset.nc \
 
 - Discover constituents from `con`; match requested names case-insensitively and
   fail when any requested constituent is absent.
+- With no `--constituents` option, export every discovered constituent in source
+  order. A downstream scenario may impose an expected-count gate.
 - Preserve separate elevation, U, and V staggered grids. Record their native spans
   and the actual extracted span.
 - Interpolate native complex coefficients, never phase angles directly. Export
@@ -171,6 +176,8 @@ downstream forcing builder or `$u-tide-tool-instruction` for those tasks.
 - `scripts/extract_tpxo9v5.py`: subset or interpolate and safely clean staged raw
   files after success.
 - `scripts/check_download_health.py`: independently validate a generated product.
+- `scripts/selftest_tpxo9v5.py`: synthetic 22-constituent, phasor-wrap,
+  nearest-wet fallback, target-identifier, and order tests.
 
 ## Validation
 

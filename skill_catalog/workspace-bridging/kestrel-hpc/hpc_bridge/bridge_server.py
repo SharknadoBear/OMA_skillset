@@ -21,6 +21,7 @@ IDENTITY = ROOT / "bridge_identity.json"
 COMMANDS = ROOT / "commands"
 PROCESSED = COMMANDS / "processed"
 RESULTS = ROOT / "results"
+DEFAULT_COMMAND_TIMEOUT_SECONDS = 3600.0
 
 
 def ensure_dirs() -> None:
@@ -77,6 +78,7 @@ def connect() -> paramiko.SSHClient:
     if hasattr(opts, "digests") and "hmac-sha2-256" in opts.digests:
         opts.digests = ["hmac-sha2-256"] + [d for d in opts.digests if d != "hmac-sha2-256"]
     transport.connect(username=user, password=password)
+    transport.set_keepalive(60)
     client._transport = transport  # Paramiko exposes no public setter for this path.
     print("Connected. Watching JSON command files.")
     return client
@@ -102,10 +104,33 @@ def move_processed(path: Path) -> None:
 
 
 def exec_command(client: paramiko.SSHClient, command: str, timeout: float | None) -> dict:
-    stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-    out = stdout.read().decode("utf-8", "replace")
-    err = stderr.read().decode("utf-8", "replace")
-    exit_status = stdout.channel.recv_exit_status()
+    effective_timeout = timeout if timeout is not None else DEFAULT_COMMAND_TIMEOUT_SECONDS
+    if effective_timeout <= 0:
+        raise ValueError("command timeout must be positive")
+
+    stdin, stdout, stderr = client.exec_command(command, timeout=effective_timeout)
+    # Closing the write side makes accidental input-reading commands receive EOF
+    # instead of blocking this single-worker bridge indefinitely.
+    stdin.close()
+    channel = stdout.channel
+    deadline = time.monotonic() + effective_timeout
+    out_chunks: list[bytes] = []
+    err_chunks: list[bytes] = []
+    while True:
+        while channel.recv_ready():
+            out_chunks.append(channel.recv(65536))
+        while channel.recv_stderr_ready():
+            err_chunks.append(channel.recv_stderr(65536))
+        if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+            break
+        if time.monotonic() >= deadline:
+            channel.close()
+            raise TimeoutError(f"remote command exceeded {effective_timeout:g} seconds")
+        time.sleep(0.05)
+
+    exit_status = channel.recv_exit_status()
+    out = b"".join(out_chunks).decode("utf-8", "replace")
+    err = b"".join(err_chunks).decode("utf-8", "replace")
     return {
         "status": "ok",
         "exit_status": exit_status,

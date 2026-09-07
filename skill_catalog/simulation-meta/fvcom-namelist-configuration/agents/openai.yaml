@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM Namelist Configuration"
+  short_description: "Configure audited FVCOM tide-only runs"
+  default_prompt: "Use $fvcom-namelist-configuration to create and validate a tide-only FVCOM 4.3.1 namelist and cell-based station file."

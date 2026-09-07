@@ -1,4 +1,4 @@
 interface:
   display_name: "TPXO9v5 Data Fetcher"
-  short_description: "Fetch and interpolate TPXO9v5 harmonics."
-  default_prompt: "Use $tpxo9v5-data-fetcher to preflight rclone, stage authorized files, subset or interpolate TPXO9v5 harmonics, and health-check the result."
+  short_description: "Stage and interpolate registered TPXO9v5 harmonics"
+  default_prompt: "Use $tpxo9v5-data-fetcher to preflight registered access, stage authorized files, preserve ordered target IDs, export all discovered constituents by default, and health-check the model-neutral harmonic product."

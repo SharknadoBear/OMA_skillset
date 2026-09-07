@@ -62,11 +62,12 @@ def write_elevation_obc(out_path: str | Path,
         )
 
     # Time representations
-    mjd_floor = np.floor(time_mjd).astype(np.int32)
-    mjd_ms    = np.round((time_mjd - mjd_floor) * 86400000).astype(np.int32)
+    total_mjd_ms = np.rint(np.asarray(time_mjd, dtype=np.float64) * 86400000.0).astype(np.int64)
+    mjd_floor = np.floor_divide(total_mjd_ms, 86400000).astype(np.int32)
+    mjd_ms = np.remainder(total_mjd_ms, 86400000).astype(np.int32)
 
     # Time strings: "YYYY/MM/DD HH:MM:SS.ffffff"  (DateStrLen = 26)
-    dt64         = MJD_EPOCH + (time_mjd * 86400).astype("int64") * np.timedelta64(1, "s")
+    dt64         = MJD_EPOCH + np.rint(total_mjd_ms / 1000.0).astype("int64") * np.timedelta64(1, "s")
     time_str_arr = np.zeros((ntime, 26), dtype="S1")
     for i, t in enumerate(dt64):
         s = str(t).replace("T", " ") + ".000000"   # 'YYYY-MM-DD HH:MM:SS.ffffff'
@@ -96,13 +97,14 @@ def write_elevation_obc(out_path: str | Path,
         v.long_name = "internal mode iteration number"
         v[:]        = np.arange(1, ntime + 1, dtype=np.int32)
 
-        # time (float MJD)
-        v           = nc.createVariable("time", "f4", ("time",))
+        # time (double MJD). Float32 cannot uniquely represent a six-minute
+        # interval near modern MJD values, so model forcing time is always f8.
+        v           = nc.createVariable("time", "f8", ("time",))
         v.long_name = "time"
         v.units     = "days since 1858-11-17 00:00:00"
         v.format    = "modified julian day (MJD)"
         v.time_zone = "UTC"
-        v[:]        = time_mjd.astype(np.float32)
+        v[:]        = time_mjd.astype(np.float64)
 
         # Itime (integer days)
         v           = nc.createVariable("Itime", "i4", ("time",))

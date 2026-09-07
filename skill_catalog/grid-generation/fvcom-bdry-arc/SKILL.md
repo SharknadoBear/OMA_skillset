@@ -199,6 +199,7 @@ Progress never substitutes for the final scientific manifest.
 ```powershell
 python scripts/selftest_bdry_arc.py
 python scripts/selftest_open_exterior_contract.py
+python scripts/selftest_resolved_domain_serialization.py
 python -m compileall scripts
 python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .
 ```

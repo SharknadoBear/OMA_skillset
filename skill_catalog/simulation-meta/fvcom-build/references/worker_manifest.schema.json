@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "fvcom_build_worker_manifest_v1",
+  "type": "object",
+  "required": ["schema", "status", "artifact_root", "hashes", "provenance", "warnings", "blocking_reasons", "resume_token"],
+  "properties": {
+    "schema": {"const": "fvcom_build_worker_manifest_v1"},
+    "status": {"enum": ["ready", "blocked_authentication", "blocked_source", "blocked_compile", "blocked_physics_change_required"]},
+    "artifact_root": {"type": "string", "minLength": 1},
+    "hashes": {"type": "object", "additionalProperties": {"type": "string"}},
+    "provenance": {"type": "object"},
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "blocking_reasons": {"type": "array", "items": {"type": "string"}},
+    "resume_token": {"type": "string", "minLength": 1}
+  },
+  "additionalProperties": false
+}

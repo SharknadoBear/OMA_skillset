@@ -43,7 +43,9 @@ def parse_constituents(value: str | None) -> list[str] | None:
     return list(dict.fromkeys(parsed)) or None
 
 
-def load_points_csv(path: str | Path) -> tuple[np.ndarray, np.ndarray, tuple[int, ...]]:
+def load_points_csv(
+    path: str | Path,
+) -> tuple[np.ndarray, np.ndarray, tuple[int, ...], list[str] | None]:
     with open(path, newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         lookup = {name.lower(): name for name in (reader.fieldnames or [])}
@@ -54,7 +56,17 @@ def load_points_csv(path: str | Path) -> tuple[np.ndarray, np.ndarray, tuple[int
         raise ValueError("Point CSV contains no rows.")
     lon = np.asarray([float(row[lookup["longitude"]]) for row in rows], dtype=float)
     lat = np.asarray([float(row[lookup["latitude"]]) for row in rows], dtype=float)
-    return lon, lat, (lon.size,)
+    id_column = next(
+        (lookup[name] for name in ("node_id", "target_id", "id") if name in lookup),
+        None,
+    )
+    target_ids = [row[id_column].strip() for row in rows] if id_column else None
+    if target_ids is not None:
+        if any(not value for value in target_ids):
+            raise ValueError("Point identifier values must be non-empty.")
+        if len(set(target_ids)) != len(target_ids):
+            raise ValueError("Point identifier values must be unique.")
+    return lon, lat, (lon.size,), target_ids
 
 
 def load_target_grid(
@@ -174,10 +186,11 @@ def main() -> None:
     target_lon: np.ndarray | None = None
     target_lat: np.ndarray | None = None
     target_shape: tuple[int, ...] | None = None
+    target_ids: list[str] | None = None
     if args.mode == "subset":
         bbox = tuple(float(value) for value in args.bbox)
     elif args.points:
-        target_lon, target_lat, target_shape = load_points_csv(args.points)
+        target_lon, target_lat, target_shape, target_ids = load_points_csv(args.points)
         bbox = target_bbox(target_lon, target_lat)
     else:
         target_lon, target_lat, target_shape = load_target_grid(
@@ -232,6 +245,7 @@ def main() -> None:
             target_lat,
             target_shape,
             metadata,
+            target_ids=target_ids,
         )
 
     health = validate_product(destination)

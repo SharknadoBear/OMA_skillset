@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM Tidal Validation"
+  short_description: "Validate FVCOM tides and depth-mean currents."
+  default_prompt: "Use $fvcom-tidal-validation to compare FVCOM station output with NOAA water levels, predictions, and eligible current profiles."

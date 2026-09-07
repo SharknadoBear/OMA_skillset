@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM Simulation"
+  short_description: "Orchestrate complete FVCOM simulation studies."
+  default_prompt: "Use $fvcom-simulation to build, stabilize, benchmark, run, and validate an FVCOM case from my science request."

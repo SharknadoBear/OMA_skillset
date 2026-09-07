@@ -6,7 +6,9 @@ by capability family rather than by the older broad project-stage folders.
 
 ## Catalog Layout
 
-- `common-core/`: shared FVCOM support utilities, currently `fvcom-common`.
+- `simulation-meta/`: complete FVCOM workflow orchestration, build,
+  namelist, stability/run-control, and benchmark skills. `fvcom-simulation` is
+  the scriptless scenario router; specialist packages own all mechanics.
 - `external-data-connectors/`: source-specific data acquisition and conversion
   capabilities, such as the model-neutral `hycom-fetcher`, `argo-fetcher`, and the
   NCEI-first, era-routing `cfsv2-fetcher`/`cfsr-fetcher` pair and resilient
@@ -27,8 +29,8 @@ by capability family rather than by the older broad project-stage folders.
   Expanse, Constance, and configured cloud VM execution environments, including
   Codex and Copilot-facing variants where staged.
 - `visual-analysis/`: active structured-grid POM, staggered-grid ROMS, and
-  sparse curvilinear EFDC map and movie post-processing, plus staged future
-  scientific-analysis work.
+  sparse curvilinear EFDC map and movie post-processing, plus FVCOM tidal
+  validation and staged scientific-analysis work.
 
 ## Installing Skills
 
@@ -169,6 +171,11 @@ usable skill families at different maturity levels:
   bridge workflow for multi-command sessions. It should be treated as the
   primary Kestrel access skill for controlled compile, transfer, job-monitoring,
   and compact-output retrieval tasks.
+- `simulation-meta/fvcom-simulation` is the scriptless parent workflow for
+  accepted-then-fresh tide-only and benchmark studies. Its sibling skills own
+  Kestrel build lineage, FVCOM 4.3.1 namelists, immutable stability attempts,
+  and rank/node Pareto analysis. `fvcom-common` was removed because it had no
+  skill entrypoint and duplicated the TPXO builder utilities byte-for-byte.
 - `workspace-bridging/expanse-hpc` mirrors the named-session JSON bridge
   architecture for SDSC Expanse, supports password-or-agent authentication
   followed by TOTP, and documents Expanse-specific Slurm, Lmod, project,
@@ -215,9 +222,8 @@ usable skill families at different maturity levels:
   matrices on structured or FVCOM-native grids, applies source-aware sign and
   unit gates, writes safe combined or split files, and produces mandatory
   scientific QA plus a namelist fragment.
-- `common-core/` and the remaining `forcing-builders/` entries remain less mature
-  catalog families and should be expanded only through explicit skill development
-  work.
+- Remaining preliminary `forcing-builders/` entries should be expanded only
+  through explicit skill development work.
 
 See `../Memory/memo_v003.html` for the planning rationale and the script mapping
 from the original staging folders into the catalog.

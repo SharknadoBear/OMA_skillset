@@ -158,6 +158,7 @@ def write_point_product(
     target_latitude: np.ndarray,
     target_shape: tuple[int, ...],
     metadata: dict[str, Any],
+    target_ids: Iterable[str] | None = None,
 ) -> Path:
     """Write harmonics interpolated to arbitrary flattened targets."""
 
@@ -173,6 +174,14 @@ def write_point_product(
         raise ValueError("All output fields must have the same constituent ordering.")
     lon = np.asarray(target_longitude, dtype=float).ravel()
     lat = np.asarray(target_latitude, dtype=float).ravel()
+    ids = None if target_ids is None else [str(value) for value in target_ids]
+    if ids is not None:
+        if len(ids) != lon.size:
+            raise ValueError("target_ids length must match the flattened target coordinates.")
+        if any(not value.strip() for value in ids):
+            raise ValueError("target_ids must be non-empty when supplied.")
+        if len(set(ids)) != len(ids):
+            raise ValueError("target_ids must be unique and preserve caller order.")
     try:
         with nc4.Dataset(partial, "w", format="NETCDF4") as ds:
             _set_global_attributes(ds, {**metadata, "target_shape": list(target_shape)})
@@ -184,6 +193,10 @@ def write_point_product(
             lat_var.units = "degrees_north"
             lon_var[:] = lon
             lat_var[:] = lat
+            if ids is not None:
+                id_var = ds.createVariable("target_id", str, ("point",))
+                id_var.long_name = "caller-supplied target identifier in original row order"
+                id_var[:] = np.asarray(ids, dtype=object)
             for field, values, flags in field_list:
                 prefix = "elevation" if field.name == "elevation" else field.name
                 if field.name in {"u", "v"}:

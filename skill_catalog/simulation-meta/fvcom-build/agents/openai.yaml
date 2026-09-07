@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM Build"
+  short_description: "Build and freeze reproducible FVCOM binaries"
+  default_prompt: "Use $fvcom-build to audit, compile, smoke-test, and freeze an FVCOM executable on Kestrel with complete lineage evidence."

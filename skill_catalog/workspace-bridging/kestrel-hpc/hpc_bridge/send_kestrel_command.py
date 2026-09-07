@@ -122,7 +122,13 @@ def main() -> int:
     if args.action == "exec":
         if not args.args:
             raise SystemExit("exec requires a command string")
-        payload = {"action": "exec", "command": " ".join(args.args)}
+        if args.timeout <= 0:
+            raise SystemExit("--timeout must be positive")
+        payload = {
+            "action": "exec",
+            "command": " ".join(args.args),
+            "timeout": args.timeout,
+        }
     elif args.action == "upload":
         if len(args.args) != 2:
             raise SystemExit("upload requires local_path remote_path")
@@ -135,7 +141,8 @@ def main() -> int:
         payload = {"action": "stop"}
 
     result_path = write_command(payload)
-    result = wait_result(result_path, args.timeout)
+    # Leave a short grace interval for the bridge to serialize the timeout result.
+    result = wait_result(result_path, args.timeout + 30.0)
     return print_result(result)
 
 

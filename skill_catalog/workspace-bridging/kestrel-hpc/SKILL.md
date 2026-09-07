@@ -50,6 +50,18 @@ Set-Location "<session-dir>"
 .\start_bridge_window.ps1
 ```
 
+When launching the interactive bridge from automation on Windows, start PowerShell directly with the session as its working directory. Do not route the command through `wt.exe`, a Windows Terminal profile/action string, or a constructed tab title; those forms can reinterpret `-d` and OneDrive paths and report `0x80070002` even when the script exists.
+
+```powershell
+Start-Process -WorkingDirectory "<session-dir>" -FilePath "powershell.exe" `
+  -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ".\start_bridge_window.ps1") `
+  -WindowStyle Normal
+```
+
+The bridge enables a 60-second SSH transport keepalive after authentication. Leave a healthy, purpose-matched bridge open while its active workflow still needs Kestrel; stop and replace it only when it is stale, malfunctioning, or no longer in scope.
+
+Pass an explicit `--timeout` suited to each remote command. The bridge closes remote stdin immediately, so commands must be noninteractive and accidental stdin readers terminate at EOF. Protect shell metacharacters across both the local PowerShell and remote POSIX-shell layers; for grep alternation, prefer repeated `-e` arguments over an unquoted `|`. If results stop advancing, inspect the oldest queued command before adding more work and replace a wedged bridge without touching independent Slurm jobs.
+
 Verify identity before every operation:
 
 ```powershell

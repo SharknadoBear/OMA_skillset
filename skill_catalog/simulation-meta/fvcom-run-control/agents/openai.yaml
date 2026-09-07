@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM Run Control"
+  short_description: "Control immutable FVCOM runs and stability."
+  default_prompt: "Use $fvcom-run-control to initialize, stabilize, audit, and report an FVCOM run without changing its physics."
