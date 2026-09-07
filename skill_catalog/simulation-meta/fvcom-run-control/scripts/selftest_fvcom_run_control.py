@@ -8,10 +8,17 @@ from pathlib import Path
 import netCDF4 as nc4
 import numpy as np
 
-from fvcom_run_control import audit_run, build_parser, create_attempt, derive_controls, evaluate_preparation_join, record_command, render_report, stability_plan
+from fvcom_run_control import align_external_step, audit_run, build_parser, create_attempt, derive_controls, evaluate_preparation_join, record_command, render_report, stability_plan
 
 
 def main() -> int:
+    assert align_external_step(1.3, 4, 360) == 1.2
+    assert align_external_step(1.2, 1, 360) == 1.2
+    assert align_external_step(0.9, 2, 360) == 0.9
+    aligned = stability_plan({"extstep_seconds": 1.2, "isplit": 4,
+                              "time_alignment": {"quantum_seconds": 360}})
+    for a in aligned["attempts"]:
+        assert 3600 % (round(a["extstep_seconds"] * 10) * a["isplit"]) == 0
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         mesh = root / "tiny.2dm"
@@ -150,12 +157,24 @@ def main() -> int:
         for index in range(3):
             path = root / f"worker_{index}.json"
             path.write_text(json.dumps({
-                "schema": f"worker_{index}_v1", "status": "ready", "artifact_root": f"role_{index}",
+                "schema": f"worker_{index}_v1", "worker": ["grid", "tpxo", "configuration_build"][index],
+                "status": "ready", "artifact_root": f"role_{index}",
                 "hashes": {"artifact": str(index) * 64}, "provenance": {}, "warnings": [],
                 "blocking_reasons": [], "resume_token": f"role:{index}:ready",
             }), encoding="utf-8")
             manifests.append(path)
         assert evaluate_preparation_join(manifests)["ready"]
+        original = json.loads(manifests[1].read_text())
+        manifests[1].write_text(json.dumps(dict(original, blocking_reasons=["unresolved scientific input"])))
+        assert not evaluate_preparation_join(manifests)["ready"]
+        manifests[1].write_text(json.dumps(dict(original, worker="grid")))
+        try:
+            evaluate_preparation_join(manifests)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("duplicate preparation roles accepted")
+        manifests[1].write_text(json.dumps(original))
         blocked = json.loads(manifests[1].read_text(encoding="utf-8"))
         blocked["status"] = "blocked"
         blocked["blocking_reasons"] = [{"code": "registered_source_locator_required"}]

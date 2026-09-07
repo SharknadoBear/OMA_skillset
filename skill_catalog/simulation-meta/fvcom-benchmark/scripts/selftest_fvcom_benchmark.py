@@ -27,6 +27,34 @@ def main() -> int:
     assert result["least_node_hour"]["ranks"] in {104, 208, 416}
     assert result["extension_required"]
     assert all(item["additional_repeats"] == 0 for item in result["pareto_neighborhood_repeat_plan"])
+    focused_plan = make_plan(ranks=[52, 104, 156, 208], repeats=1, extend=False, max_ranks=416)
+    focused_records = [r for r in records if r["ranks"] in (52, 104, 156, 208) and r["repeat"] == 1]
+    focused = analyze(focused_records, focused_plan)
+    assert focused["speedup_reference"]["ranks"] == 52
+    assert focused["layouts"][0]["speedup"] == 1.0
+    assert focused["layouts"][0]["parallel_efficiency"] == 1.0
+    assert focused["layouts"][1]["speedup"] == 39 / 24
+    assert not focused["extension_required"]
+    assert all(x["additional_repeats"] == 0 for x in focused["pareto_neighborhood_repeat_plan"])
+    singleton = analyze([r for r in records if r["ranks"] == 416 and r["repeat"] == 1], make_plan(ranks=[416], repeats=1, extend=False))
+    assert singleton["layouts"][0]["speedup"] == 1.0 and not singleton["extension_required"]
+    for failure in ({"eligible": False}, {"fatal_marker_present": True}, {"slurm_state": "FAILED"}, {"wall_seconds": 0, "fvcom_iterations": 0}):
+        checked = analyze(focused_records + [dict(focused_records[0], **failure)], focused_plan)
+        assert checked["failed_run_count"] == 1
+        assert checked["eligible_run_count"] == len(focused_records)
+    try:
+        analyze([r for r in records if r["ranks"] == 416], focused_plan)
+    except ValueError as exc:
+        assert "absent" in str(exc)
+    else:
+        raise AssertionError("unplanned layout entered performance selection")
+    for invalid in ([52, 52], [0, 104], []):
+        try:
+            make_plan(ranks=invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid rank selection accepted")
     resumed = resume_plan(plan, [records[0]])
     assert not resumed["plan_complete"]
     assert not any(item["ranks"] == 1 and item["repeat"] == 1 for item in resumed["pending"])
@@ -55,7 +83,7 @@ def main() -> int:
             "&NML_CASE\n START_DATE = '2025-04-01 00:00:00',\n END_DATE = '2025-04-02 00:00:00',\n/\n"
             "&NML_STARTUP\n STARTUP_TYPE = 'hotstart',\n STARTUP_FILE = 'restart.nc',\n/\n"
             "&NML_IO\n INPUT_DIR = 'old',\n OUTPUT_DIR = 'old',\n/\n"
-            "&NML_INTEGRATION\n EXTSTEP_SECONDS = 1.2,\n/\n",
+            "&NML_INTEGRATION\n EXTSTEP_SECONDS = 1.2,\n ISPLIT = 4,\n/\n",
             encoding="utf-8",
         )
         rendered = render_jobs(plan_path, nml, root / "jobs", "/scratch/case/input", "/scratch/fvcom",
@@ -87,8 +115,8 @@ def main() -> int:
             raise AssertionError("invalid Slurm walltime was accepted")
         stdout = root / "stdout.log"
         stdout.write_text(
-            " !   71999 2025-04-01T23:59:58.800000 0000:00:00:00 0.0100 |=================== |\n"
-            " !   72000 2025-04-02T00:00:00.000000 0000:00:00:00 0.0100 |====================|\n"
+            " !   17999 2025-04-01T23:59:55.200000 0000:00:00:00 0.0100 |=================== |\n"
+            " !   18000 2025-04-02T00:00:00.000000 0000:00:00:00 0.0100 |====================|\n"
             " TADA!\n",
             encoding="utf-8",
         )
@@ -100,7 +128,8 @@ def main() -> int:
             encoding="utf-8",
         )
         collected = collect_record(stdout, sacct, nml, 104, 1, 1, "a", "b", "c", None, None)
-        assert collected["eligible"] and collected["fvcom_iterations"] == 72000
+        assert collected["eligible"] and collected["fvcom_iterations"] == 18000
+        assert collected["internal_step_seconds"] == 4.8 and collected["last_logged_iint"] == 18000
         assert collected["queue_seconds"] == 10 and collected["peak_memory_mb"] > 239
         assert collected["io_seconds"] is None and collected["io_measurement_method"] == "unavailable"
     print(json.dumps({"status": "pass", "pareto_knee": result["pareto_knee"]}))

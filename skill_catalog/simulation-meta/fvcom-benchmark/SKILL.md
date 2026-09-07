@@ -15,6 +15,10 @@ python scripts/fvcom_benchmark.py plan --output benchmark_plan.json
 
 The default matrix is `1,2,4,8,13,26,52,104,156,208,312,416` ranks on current 104-core Kestrel CPU nodes. Execute sequentially to reduce cross-job interference. If median throughput improves at 416, add one 104-rank node at a time until two consecutive layouts are slower. Repeat the Pareto-neighborhood layouts three times.
 
+Honor an explicitly bounded campaign with `plan --ranks 52 104 156 208 --repeats 1 --no-extend --max-ranks 416`. Here `--repeats` controls the Pareto-neighborhood target; the initial matrix always contains one replicate. Pass `--plan benchmark_plan.json` to `analyze` to preserve those bounds. Independent high-rank probes are compatibility evidence, not timing records; a failed probe must not prevent other probes. Add successfully probed ranks to a new immutable plan revision before their full benchmark.
+
+Query the actual MPI tag bound on a compute node before interpreting a messaging failure. The frozen FVCOM `genmap.F` may construct rank-dependent tags outside that bound; record the source expression, actual failed tag, module environment, and whether integration began. Do not classify it as a mesh or hydrodynamic failure or change source/environment inside an existing benchmark lineage.
+
 After a stable restart and exact 24-hour hotstart namelist exist, render immutable job directories. Rendering reserves whole nodes, holds the science namelist and output cadence constant, and changes only ranks/nodes:
 
 ```powershell
@@ -40,6 +44,8 @@ bytes or an iteration-time residual as measured I/O time. If the frozen binary
 cannot be instrumented compatibly, retain a null I/O fraction, report the disk
 byte counters, and state the instrumentation limitation.
 
+Iteration counts refer to the internal `IINT` loop: divide the segment duration by `EXTSTEP_SECONDS * ISPLIT`. Retain both controls and the last logged `IINT`; dividing by the external step alone misreports seconds per iteration.
+
 After collecting one JSON record per run, analyze them:
 
 ```powershell
@@ -47,6 +53,8 @@ python scripts/fvcom_benchmark.py analyze --records benchmark_records.jsonl --ou
 ```
 
 Each successful record includes ranks, nodes, queue seconds, wall seconds, simulated seconds, FVCOM iterations, peak memory, I/O seconds, `TADA!`, final-time status, executable/restart/input hashes, and repeat index. Reject non-identical science hashes. Compute seconds/iteration, simulated-days/day, node-hours, speedup, parallel efficiency, and I/O fraction. Report the fastest median layout, least-node-hour median layout, nondominated layouts, and a normalized-distance Pareto knee. A queue-time observation is reported but excluded from model throughput.
+
+Speedup is relative to the lowest successfully measured rank. With no serial run, disclose that rank and report relative efficiency as speedup divided by the rank-count ratio; never fabricate a one-rank runtime. Single-replicate reports carry no sampling uncertainty estimate.
 
 Do not tune physics or output cadence for a benchmark. A failed run remains evidence but cannot enter performance selection.
 

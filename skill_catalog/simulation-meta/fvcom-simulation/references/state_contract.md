@@ -2,7 +2,7 @@
 
 `project_status.json` uses `simulation_project_status_v1` with `case_id`, `state`, `updated_at`, `active_grid_case`, `active_attempt`, `workflow_status`, `scientific_assessment`, `blocking_reasons`, and an append-only `history` array. A transition appends the prior state and evidence; it never erases prior attempts.
 
-Every initial worker returns this common envelope. A role may use a more specific
+Each of the three preparation roles returns this common envelope, including a role performed directly by the simulation lead when agent slots are limited. A role may use a more specific
 `schema`/`schema_version` identifier, but all fields below and their semantics are
 mandatory:
 
@@ -27,5 +27,5 @@ mandatory:
 - Verify all hashes before reusing a completed stage.
 - If a hash changed, do not overwrite or silently resume; create a new attempt or re-enter the earliest invalidated state.
 - Only one stability job may be active.
-- The executable hash is frozen before attempt 0001 and must be identical across both Galveston grid cases.
+- The executable hash is frozen before the first submitted attempt and must be identical across the accepted/fresh pair.
 - Accepted and fresh grid artifacts have independent roots and forcing products even when deterministic generation yields identical bytes.

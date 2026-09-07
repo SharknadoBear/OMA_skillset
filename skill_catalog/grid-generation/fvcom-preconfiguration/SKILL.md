@@ -102,3 +102,5 @@ python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_valida
 
 For a project mesh, also run `selftest_fvcom_preconfig.py` with known node,
 element, OBC, and sigma counts.
+
+For diagnosed noncyclic endpoint-only TGE failures, return the exact delivery and sidecars to the Grid-owned `repair_fvcom_tge_endpoints.py` command. Require its passing source-bound result, then rebuild this package and all tidal forcing against the returned OBC order. Keep the repair implementation in Grid.

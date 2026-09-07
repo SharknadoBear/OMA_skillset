@@ -5,10 +5,20 @@ import json
 import numpy as np
 import pandas as pd
 
-from coops_currents import depth_average, seven_day_chunks, speed_direction_to_uv
+from coops_currents import current_period_coverage, depth_average, seven_day_chunks, speed_direction_to_uv
 
 
 def main() -> int:
+    start, end = "2025-04-01T00:00:00Z", "2025-05-01T00:00:00Z"
+    historic = {"deployments": {"deployments": [{"deployed": "2023-07-20 17:57:00", "retrieved": "2023-09-17 18:54:00"}]}}
+    assert current_period_coverage(historic, start, end)["status"] == "no_overlap"
+    overlapping = {"deployments": {"deployments": [{"deployed": "2025-04-15", "retrieved": "2025-06-01"}]}}
+    assert current_period_coverage(overlapping, start, end)["overlap"] is True
+    future = {"deployments": {"deployments": [{"deployed": end, "retrieved": "2025-06-01"}]}}
+    assert current_period_coverage(future, start, end)["overlap"] is False
+    assert current_period_coverage({}, start, end)["status"] == "unknown"
+    ongoing = {"deployments": {"first_good_data": "2006-01-01", "last_good_data": "2026-01-01", "deployments": []}}
+    assert current_period_coverage(ongoing, start, end)["overlap"] is True
     chunks = seven_day_chunks("2025-04-01T00:00:00Z", "2025-05-01T00:00:00Z")
     assert len(chunks) == 5
     assert all((b - a) <= pd.Timedelta(days=7) for a, b in chunks)

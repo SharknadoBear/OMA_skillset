@@ -198,11 +198,16 @@ def collect_record(stdout_path: Path, sacct_path: Path, namelist_path: Path,
     start = parse_datetime(namelist_value(nml, "START_DATE"))
     end = parse_datetime(namelist_value(nml, "END_DATE"))
     extstep = float(namelist_value(nml, "EXTSTEP_SECONDS"))
+    isplit = int(namelist_value(nml, "ISPLIT"))
+    internal_step = extstep * isplit
     simulated_seconds = (end - start).total_seconds()
     if abs(simulated_seconds - 86400.0) > 1.0:
         raise ValueError("benchmark evidence namelist does not span exactly 24 hours")
-    if ranks < 1 or nodes < 1 or repeat < 1 or extstep <= 0:
-        raise ValueError("ranks, nodes, repeat, and EXTSTEP_SECONDS must be positive")
+    if ranks < 1 or nodes < 1 or repeat < 1 or not math.isfinite(internal_step) or extstep <= 0 or isplit < 1:
+        raise ValueError("ranks, nodes, repeat, EXTSTEP_SECONDS, and ISPLIT must be positive and finite")
+    iterations = simulated_seconds / internal_step
+    if not math.isclose(iterations, round(iterations), rel_tol=0, abs_tol=1e-7):
+        raise ValueError("benchmark duration must be an exact internal-step multiple")
 
     rows = list(csv.DictReader(sacct_path.read_text(encoding="utf-8-sig").splitlines(), delimiter="|"))
     if not rows:
@@ -232,8 +237,10 @@ def collect_record(stdout_path: Path, sacct_path: Path, namelist_path: Path,
         "ranks": ranks, "nodes": nodes, "repeat": repeat,
         "queue_seconds": queue_seconds, "wall_seconds": float(elapsed_raw),
         "simulated_seconds": simulated_seconds,
-        "fvcom_iterations": int(round(simulated_seconds / extstep)),
-        "extstep_seconds": extstep, "last_logged_iint": last_iint,
+        "fvcom_iterations": int(round(iterations)),
+        "iteration_definition": "internal FVCOM IINT steps",
+        "extstep_seconds": extstep, "isplit": isplit, "internal_step_seconds": internal_step,
+        "last_logged_iint": last_iint,
         "peak_memory_mb": peak_memory_bytes / 1024.0**2,
         "max_disk_read_mb_per_task": max_disk_read_bytes / 1024.0**2,
         "max_disk_write_mb_per_task": max_disk_write_bytes / 1024.0**2,
@@ -254,14 +261,24 @@ def collect_record(stdout_path: Path, sacct_path: Path, namelist_path: Path,
     return record
 
 
-def make_plan(cores_per_node: int = 104) -> dict[str, Any]:
+def make_plan(cores_per_node: int = 104, ranks: list[int] | None = None,
+              repeats: int = 3, extend: bool = True,
+              max_ranks: int | None = None) -> dict[str, Any]:
+    selected = DEFAULT_RANKS if ranks is None else ranks
+    if cores_per_node < 1 or repeats < 1 or not selected or any(r < 1 for r in selected):
+        raise ValueError("cores, repeats, and ranks must be positive")
+    if len(set(selected)) != len(selected):
+        raise ValueError("benchmark ranks must be unique")
+    if max_ranks is not None and (max_ranks < 1 or max(selected) > max_ranks):
+        raise ValueError("benchmark rank exceeds max_ranks")
     return {
         "schema": "fvcom_benchmark_plan_v1", "generated_at": now(),
         "segment_simulated_hours": 24, "execution": "sequential",
         "cores_per_node": cores_per_node,
-        "layouts": [{"ranks": r, "nodes": math.ceil(r / cores_per_node), "repeat": 1} for r in DEFAULT_RANKS],
-        "extension": {"rank_increment": cores_per_node, "stop_after_consecutive_slower": 2},
-        "pareto_neighborhood_repeats": 3,
+        "layouts": [{"ranks": r, "nodes": math.ceil(r / cores_per_node), "repeat": 1} for r in sorted(selected)],
+        "extension": {"enabled": extend, "max_ranks": max_ranks,
+                      "rank_increment": cores_per_node, "stop_after_consecutive_slower": 2},
+        "pareto_neighborhood_repeats": repeats,
     }
 
 
@@ -311,27 +328,39 @@ def load_records(path: Path) -> list[dict[str, Any]]:
 def enrich(record: dict[str, Any]) -> dict[str, Any]:
     r = dict(record)
     ranks, nodes = int(r["ranks"]), int(r["nodes"])
-    wall = float(r["wall_seconds"])
+    wall = float(r.get("wall_seconds", 0))
     sim = float(r.get("simulated_seconds", 86400.0))
-    iterations = int(r["fvcom_iterations"])
+    iterations = int(r.get("fvcom_iterations", 0))
     raw_io = r.get("io_seconds")
     io_s = float(raw_io) if raw_io is not None else None
+    valid_numbers = ranks > 0 and nodes > 0 and iterations > 0 and all(math.isfinite(x) and x > 0 for x in (wall, sim))
+    eligible = (valid_numbers and r.get("eligible") is not False
+                and not r.get("fatal_marker_present", False)
+                and r.get("slurm_state", "COMPLETED") == "COMPLETED"
+                and bool(r.get("tada")) and bool(r.get("final_timestamp_present"))
+                and int(r.get("exit_code", 0)) == 0)
     r.update({
         "ranks": ranks, "nodes": nodes,
-        "seconds_per_iteration": wall / iterations,
-        "simulated_days_per_day": sim / wall,
-        "node_hours": nodes * wall / 3600.0,
+        "seconds_per_iteration": wall / iterations if valid_numbers else None,
+        "simulated_days_per_day": sim / wall if valid_numbers else None,
+        "node_hours": nodes * wall / 3600.0 if valid_numbers else None,
         "io_fraction": io_s / wall if io_s is not None and wall else None,
-        "eligible": bool(r.get("tada")) and bool(r.get("final_timestamp_present")) and int(r.get("exit_code", 0)) == 0,
+        "eligible": eligible,
     })
     return r
 
 
-def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
+def analyze(records: list[dict[str, Any]], plan: dict[str, Any] | None = None) -> dict[str, Any]:
     if not records:
         raise ValueError("no benchmark records")
     enriched = [enrich(r) for r in records]
     eligible = [r for r in enriched if r["eligible"]]
+    if plan is not None:
+        if plan.get("schema") != "fvcom_benchmark_plan_v1":
+            raise ValueError("invalid benchmark plan")
+        allowed = {(int(x["ranks"]), int(x["nodes"])) for x in plan["layouts"]}
+        if any((x["ranks"], x["nodes"]) not in allowed for x in eligible):
+            raise ValueError("eligible benchmark layout is absent from the supplied plan; record an immutable plan revision")
     if not eligible:
         raise ValueError("no eligible TADA/final-time records")
     lineage_keys = ["executable_sha256", "restart_sha256", "input_bundle_sha256", "simulated_start", "simulated_end"]
@@ -357,11 +386,12 @@ def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
             ),
         }
         layouts.append(item)
-    serial = next((x for x in layouts if x["ranks"] == 1), None)
-    baseline = serial["wall_seconds_median"] if serial else layouts[0]["wall_seconds_median"] * layouts[0]["ranks"]
+    reference = layouts[0]
+    baseline = reference["wall_seconds_median"]
     for x in layouts:
         x["speedup"] = baseline / x["wall_seconds_median"]
-        x["parallel_efficiency"] = x["speedup"] / x["ranks"]
+        x["speedup_reference_ranks"] = reference["ranks"]
+        x["parallel_efficiency"] = x["speedup"] / (x["ranks"] / reference["ranks"])
     fastest = max(layouts, key=lambda x: (x["simulated_days_per_day_median"], -x["node_hours_median"]))
     cheapest = min(layouts, key=lambda x: (x["node_hours_median"], -x["simulated_days_per_day_median"]))
     pareto = []
@@ -391,27 +421,39 @@ def analyze(records: list[dict[str, Any]]) -> dict[str, Any]:
         neighborhood.add(ordered[knee_index + 1]["ranks"])
     neighborhood.update(x["ranks"] for x in pareto)
     repeat_plan = []
+    target_repeats = int((plan or {}).get("pareto_neighborhood_repeats", 3))
+    if target_repeats < 1:
+        raise ValueError("pareto_neighborhood_repeats must be positive")
     for item in ordered:
         if item["ranks"] in neighborhood:
             repeat_plan.append({
-                "ranks": item["ranks"], "nodes": item["nodes"], "target_repeats": 3,
+                "ranks": item["ranks"], "nodes": item["nodes"], "target_repeats": target_repeats,
                 "eligible_repeats": item["repeat_count"],
-                "additional_repeats": max(0, 3 - item["repeat_count"]),
+                "additional_repeats": max(0, target_repeats - item["repeat_count"]),
             })
     slower = 0
     for prev, cur in zip(ordered[:-1], ordered[1:]):
         slower = slower + 1 if cur["simulated_days_per_day_median"] <= prev["simulated_days_per_day_median"] else 0
-    extend = ordered[-1]["ranks"] >= 416 and slower < 2 and ordered[-1]["simulated_days_per_day_median"] > ordered[-2]["simulated_days_per_day_median"]
+    policy = (plan or {}).get("extension", {})
+    increment = int(policy.get("rank_increment", 104))
+    next_ranks = ordered[-1]["ranks"] + increment
+    extend = (len(ordered) > 1 and policy.get("enabled", True)
+              and ordered[-1]["ranks"] >= 416 and slower < 2
+              and ordered[-1]["simulated_days_per_day_median"] > ordered[-2]["simulated_days_per_day_median"]
+              and (policy.get("max_ranks") is None or next_ranks <= int(policy["max_ranks"])))
     return {
         "schema": "fvcom_benchmark_summary_v1", "generated_at": now(),
         "eligible_run_count": len(eligible), "failed_run_count": len(enriched) - len(eligible),
         "layouts": layouts, "fastest": {"ranks": fastest["ranks"], "nodes": fastest["nodes"]},
+        "speedup_reference": {"ranks": reference["ranks"], "nodes": reference["nodes"],
+                              "wall_seconds": baseline, "measured": True,
+                              "interpretation": "serial" if reference["ranks"] == 1 else "relative_to_lowest_measured_rank"},
         "least_node_hour": {"ranks": cheapest["ranks"], "nodes": cheapest["nodes"]},
         "pareto": [{"ranks": x["ranks"], "nodes": x["nodes"]} for x in pareto],
         "pareto_knee": {"ranks": knee["ranks"], "nodes": knee["nodes"]},
         "pareto_neighborhood_repeat_plan": repeat_plan,
         "extension_required": extend,
-        "next_extension_ranks": ordered[-1]["ranks"] + 104 if extend else None,
+        "next_extension_ranks": next_ranks if extend else None,
         "lineage": {k: eligible[0].get(k) for k in lineage_keys},
     }
 
@@ -428,7 +470,10 @@ def main() -> int:
     p = argparse.ArgumentParser(description="FVCOM benchmark planner and analyzer")
     sub = p.add_subparsers(dest="command", required=True)
     q = sub.add_parser("plan"); q.add_argument("--output", required=True); q.add_argument("--cores-per-node", type=int, default=104)
+    q.add_argument("--ranks", nargs="+", type=int); q.add_argument("--repeats", type=int, default=3)
+    q.add_argument("--no-extend", action="store_true"); q.add_argument("--max-ranks", type=int)
     q = sub.add_parser("analyze"); q.add_argument("--records", required=True); q.add_argument("--output", required=True); q.add_argument("--csv")
+    q.add_argument("--plan", help="Apply the recorded repeat and extension policy")
     q = sub.add_parser("resume"); q.add_argument("--plan", required=True); q.add_argument("--records", required=True); q.add_argument("--output", required=True)
     q = sub.add_parser("collect")
     q.add_argument("--stdout", required=True); q.add_argument("--sacct", required=True)
@@ -446,9 +491,10 @@ def main() -> int:
     q.add_argument("--attempt", type=int, default=1)
     args = p.parse_args()
     if args.command == "plan":
-        result = make_plan(args.cores_per_node)
+        result = make_plan(args.cores_per_node, args.ranks, args.repeats, not args.no_extend, args.max_ranks)
     elif args.command == "analyze":
-        result = analyze(load_records(Path(args.records)))
+        result = analyze(load_records(Path(args.records)),
+                         json.loads(Path(args.plan).read_text(encoding="utf-8-sig")) if args.plan else None)
         if args.csv:
             write_csv(Path(args.csv), result["layouts"])
     elif args.command == "resume":

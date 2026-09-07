@@ -164,9 +164,11 @@ def validate_request(request: Mapping[str, Any]) -> Tuple[datetime, datetime, in
         raise ConfigError("physics.formulation must be three_dimensional_barotropic")
     temperature = float(physics.get("temperature_c", 20.0))
     salinity = float(physics.get("salinity_psu", 30.0))
-    layers = int(physics.get("sigma_layers", 10))
+    layers = int(physics.get("sigma_levels", physics.get("sigma_layers", 10)))
+    if "sigma_levels" in physics and "sigma_layers" in physics and int(physics["sigma_layers"]) != layers:
+        raise ConfigError("sigma_levels conflicts with legacy sigma_layers (which counts levels)")
     if layers != 10:
-        raise ConfigError("this scenario requires exactly ten sigma layers")
+        raise ConfigError("this scenario requires exactly ten sigma levels (nine layers)")
     return start, end, spinup, temperature, salinity, layers
 
 
@@ -217,6 +219,13 @@ def configuration_values(
     analysis_start, _, _, temperature, salinity, _ = validate_request(request)
     extstep, isplit = validate_numerics(numerics)
     start, end, restart_at, hotstart = stage_times(request, stage)
+    internal_step = extstep * isplit
+    intervals = {"station/forcing cadence": 360, "full-grid cadence": 10800,
+                 "stage duration": (end - start).total_seconds(), "tidal ramp": 172800}
+    for label, seconds in intervals.items():
+        steps = seconds / internal_step
+        if not math.isclose(steps, round(steps), rel_tol=0, abs_tol=1e-7):
+            raise ConfigError(f"{label} ({seconds}s) is not divisible by internal step {internal_step:g}s; derive time-aligned controls before submission")
     grid_edge_read = bindings["grid_edge_read_from_file"]
     if hotstart and not grid_edge_read:
         raise ConfigError("hot-start benchmark and production stages require a frozen grid-edge file")
@@ -581,7 +590,7 @@ def station_rows(data: Any) -> List[Mapping[str, Any]]:
 def preconfiguration_sigma_layers(data: Any) -> Any:
     if not isinstance(data, Mapping):
         return None
-    direct = data.get("sigma_layers", data.get("n_sigma_layers"))
+    direct = data.get("sigma_levels", data.get("sigma_layers", data.get("n_sigma_layers")))
     if direct is not None:
         return direct
     sigma = data.get("sigma")
@@ -668,7 +677,7 @@ def manifest(
             pre = load_json(preconfig_manifest)
             layers = preconfiguration_sigma_layers(pre)
             if layers != 10:
-                blocking.append("preconfiguration manifest does not report ten sigma layers")
+                blocking.append("preconfiguration manifest does not report ten sigma levels (nine layers)")
             hashes["preconfiguration_manifest_sha256"] = sha256(preconfig_manifest)
     status = "provisional_ready" if provisional and not blocking else "ready" if not blocking else "blocked"
     result = {

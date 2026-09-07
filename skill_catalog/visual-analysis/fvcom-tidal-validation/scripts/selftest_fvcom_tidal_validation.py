@@ -66,6 +66,19 @@ def main() -> int:
         assert incomplete["station_policy_evidence"]["missing_eligible_stations"] == [
             {"station_id": "g06010", "role": "current"}
         ]
+        inventory_path.write_text(json.dumps({'stations': []}), encoding='utf-8')
+        empty = validate([], [], root / 'empty', root / 'empty.html',
+                         list(FREQUENCIES_CPH), lineage_path, inventory_path)
+        assert empty['workflow_status'] == 'invalid', 'No station coverage cannot complete validation'
+        inventory_path.write_text(json.dumps({'stations': [
+            {'id':'wl001', 'role':'water_level', 'eligible':True},
+            {'id':'historic', 'role':'current', 'eligible':False,
+             'exclusion_reason':'no_deployment_overlap_requested_period'}
+        ]}), encoding='utf-8')
+        water_only = validate([water_path], [], root / 'water_only', root / 'water_only.html',
+                              list(FREQUENCIES_CPH), lineage_path, inventory_path)
+        assert water_only['workflow_status'] == 'validation_complete'
+        assert 'Galveston' not in (root / 'water_only.html').read_text()
         print(json.dumps({"status": "pass", "unresolved_count": len(unresolved)}))
     return 0
 

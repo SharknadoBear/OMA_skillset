@@ -6,11 +6,21 @@ import datetime as dt
 import hashlib
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
 import netCDF4 as nc4
 import numpy as np
+
+# Installed skills and the simulation-meta source catalog both use sibling skills.
+_script_path = Path(__file__).resolve()
+for _run_control in (_script_path.parents[2] / "fvcom-run-control" / "scripts",
+                     _script_path.parents[3] / "simulation-meta" / "fvcom-run-control" / "scripts"):
+    if (_run_control / "fvcom_time_anchor.py").is_file():
+        sys.path.insert(0, str(_run_control))
+        break
+from fvcom_time_anchor import resolve_anchor, anchored_times, read_iint, finite_array, check_file_clock
 
 
 def sha256(path: Path) -> str:
@@ -76,18 +86,18 @@ def load_stack(paths: list[Path]) -> tuple[list[str], np.ndarray, dict[str, np.n
                 reference_names = names
             elif names != reference_names:
                 raise ValueError(f"station order differs across NetCDF stacks: {path}")
-            iint = np.asarray(ds["iint"][:], dtype=np.int64)
+            iint = read_iint(ds)
             if iint.ndim != 1 or not len(iint):
                 raise ValueError(f"{path} has no station records")
             iint_parts.append(iint)
             for field in fields:
-                data = np.asarray(ds[field][:], dtype=np.float64)
+                data = finite_array(ds[field]).astype(np.float64)
                 if data.shape != (len(iint), len(names)):
                     raise ValueError(f"{path}:{field} shape {data.shape} does not match time/station dimensions")
                 fields[field].append(data)
             quantization = None
             if "time" in ds.variables and len(ds["time"][:]) == len(iint):
-                raw = np.asarray(ds["time"][:], dtype=np.float64)
+                raw = finite_array(ds["time"]).astype(np.float64)
                 raw_delta = (raw - raw[0]) * 86400.0
                 exact_delta = (iint - iint[0]).astype(np.float64)
                 quantization = {"raw_time_dtype": str(ds["time"].dtype), "raw_relative_seconds": raw_delta.tolist(),
@@ -103,6 +113,10 @@ def load_stack(paths: list[Path]) -> tuple[list[str], np.ndarray, dict[str, np.n
     all_fields = {name: values[order] for name, values in all_fields.items()}
     unique, first = np.unique(all_iint, return_index=True)
     if len(unique) != len(all_iint):
+        for index in np.flatnonzero(np.diff(all_iint) == 0):
+            for field, values in all_fields.items():
+                if not np.array_equal(values[index], values[index + 1]):
+                    raise ValueError(f"conflicting {field} at duplicate iint {all_iint[index]}")
         all_iint = unique
         all_fields = {name: values[first] for name, values in all_fields.items()}
     if np.any(np.diff(all_iint) <= 0):
@@ -123,7 +137,8 @@ def write_csv(path: Path, columns: list[str], rows: list[list[Any]]) -> None:
 
 
 def condense(netcdf_paths: list[Path], mapping_path: Path, namelist_path: Path,
-             output_dir: Path, manifest_path: Path) -> dict[str, Any]:
+             output_dir: Path, manifest_path: Path, *, time_anchor: dict[str, Any] | None = None,
+             startup_restart_path: Path | None = None) -> dict[str, Any]:
     if not netcdf_paths:
         raise ValueError("at least one --station-netcdf is required")
     mapping = json.loads(mapping_path.read_text(encoding="utf-8-sig"))
@@ -147,11 +162,14 @@ def condense(netcdf_paths: list[Path], mapping_path: Path, namelist_path: Path,
         raise ValueError("ISPLIT must be a positive integer")
     isplit = int(isplit_value)
     internal_step = extstep * isplit
-    iint_origin = int(iint[0])
-    offsets = (iint - iint_origin).astype(np.float64) * internal_step
-    timestamps = [start + dt.timedelta(seconds=float(value)) for value in offsets]
-    if abs((timestamps[-1] - expected_end).total_seconds()) > max(1.0e-6, extstep * 0.51):
-        raise ValueError(f"station output ends at {iso_time(timestamps[-1])}, expected {iso_time(expected_end)}")
+    anchor = resolve_anchor(values, namelist_path, startup_restart=startup_restart_path, supplied=time_anchor)
+    iint_origin = anchor["iint_at_start"]
+    timestamps = anchored_times(iint, anchor, internal_step)
+    if timestamps[0] != start or timestamps[-1] != expected_end:
+        raise ValueError(f"station coverage is {iso_time(timestamps[0])} through {iso_time(timestamps[-1])}; expected {iso_time(start)} through {iso_time(expected_end)}")
+    for path in netcdf_paths:
+        with nc4.Dataset(path) as ds:
+            check_file_clock(ds, anchored_times(read_iint(ds), anchor, internal_step))
     output_dir.mkdir(parents=True, exist_ok=True)
     index_by_name = {name: index for index, name in enumerate(names)}
     products = []
@@ -183,7 +201,8 @@ def condense(netcdf_paths: list[Path], mapping_path: Path, namelist_path: Path,
                 )
     result = {
         "schema": "fvcom_station_condensation_v1", "status": "ready", "generated_at": utcnow(),
-        "time_reconstruction": {"method": "START_DATE + (iint - first_iint) * EXTSTEP_SECONDS * ISPLIT",
+        "time_reconstruction": {"method": "START_DATE + (iint - startup_iint) * EXTSTEP_SECONDS * ISPLIT",
+                                "time_anchor": anchor,
                                 "start_utc": iso_time(start), "end_utc": iso_time(timestamps[-1]),
                                 "expected_end_utc": iso_time(expected_end), "extstep_seconds": extstep,
                                 "isplit": isplit, "internal_step_seconds": internal_step,
@@ -205,9 +224,12 @@ def main() -> int:
     parser.add_argument("--run-namelist", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--startup-restart-netcdf", type=Path)
+    parser.add_argument("--time-anchor", type=Path, help="Audited anchor JSON; rechecked against actual startup restart")
     args = parser.parse_args()
     result = condense([Path(item) for item in args.station_netcdf], Path(args.station_mapping), Path(args.run_namelist),
-                      Path(args.output_dir), Path(args.manifest))
+                      Path(args.output_dir), Path(args.manifest), startup_restart_path=args.startup_restart_netcdf,
+                      time_anchor=json.loads(args.time_anchor.read_text(encoding="utf-8-sig")) if args.time_anchor else None)
     print(json.dumps(result, indent=2))
     return 0
 

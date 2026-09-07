@@ -185,6 +185,9 @@ def evaluate_preparation_join(manifest_paths: list[Path]) -> dict[str, Any]:
     }
     workers = []
     tokens = []
+    role_aliases = {"grid": "grid", "grid_preconfiguration": "grid", "tpxo": "tpxo",
+                    "tpxo_forcing": "tpxo", "configuration_build": "configuration_build",
+                    "namelist_build": "configuration_build"}
     for path in manifest_paths:
         value = json.loads(path.read_text(encoding="utf-8"))
         missing = sorted(required - set(value))
@@ -192,6 +195,9 @@ def evaluate_preparation_join(manifest_paths: list[Path]) -> dict[str, Any]:
             raise ValueError(f"{path} is missing common worker fields: {missing}")
         if not (value.get("schema") or value.get("schema_version")):
             raise ValueError(f"{path} has no schema identifier")
+        role = role_aliases.get(value.get("worker"))
+        if role is None:
+            raise ValueError(f"{path} has no recognized preparation worker role")
         token = (
             json.dumps(value["resume_token"], sort_keys=True, separators=(",", ":"))
             if isinstance(value["resume_token"], (dict, list)) else str(value["resume_token"])
@@ -206,13 +212,15 @@ def evaluate_preparation_join(manifest_paths: list[Path]) -> dict[str, Any]:
         workers.append({
             "manifest": str(path), "manifest_sha256": sha256(path),
             "schema": value.get("schema") or value.get("schema_version"),
-            "worker": value.get("worker") or Path(value["artifact_root"]).name,
+            "worker": role,
             "status": value["status"], "hash_count": len(value["hashes"]),
             "blocking_reasons": value["blocking_reasons"], "resume_token": token,
         })
     if len(set(tokens)) != len(tokens):
         raise ValueError("initial-worker resume tokens must be unique")
-    not_ready = [item for item in workers if item["status"] != "ready" or item["hash_count"] == 0]
+    if {x["worker"] for x in workers} != {"grid", "tpxo", "configuration_build"}:
+        raise ValueError("preparation requires one manifest for each of grid, tpxo, configuration_build")
+    not_ready = [item for item in workers if item["status"] != "ready" or item["hash_count"] == 0 or item["blocking_reasons"]]
     blocker_text = json.dumps(not_ready, sort_keys=True).lower()
     user_gate = any(word in blocker_text for word in ("authorization", "authentication", "credential", "locator", "password", "otp"))
     return {
@@ -262,7 +270,19 @@ def triangle_altitudes(xy: list[tuple[float, float]]) -> tuple[float, float]:
     return min(alts), twice_area / 2.0
 
 
-def derive_controls(mesh: Path, source_crs: str | None = None, metric_crs: str | None = None) -> dict[str, Any]:
+def align_external_step(extstep: float, isplit: int, quantum_seconds: float) -> float:
+    """Round downward on the 0.1-s lattice to divide the requested time quantum."""
+    ticks = round(quantum_seconds * 10)
+    if isplit < 1 or ticks < 1 or not math.isclose(ticks / 10, quantum_seconds, abs_tol=1e-9):
+        raise ValueError("time quantum must be positive and representable in 0.1 seconds")
+    for candidate in range(math.floor(extstep * 10 + 1e-10), 0, -1):
+        if ticks % (candidate * isplit) == 0:
+            return candidate / 10
+    raise ValueError("no positive 0.1-second external step divides the time quantum with this ISPLIT")
+
+
+def derive_controls(mesh: Path, source_crs: str | None = None, metric_crs: str | None = None,
+                    time_quantum_seconds: float | None = None) -> dict[str, Any]:
     nodes, elems, chains = parse_2dm(mesh)
     if source_crs and metric_crs and source_crs != metric_crs:
         try:
@@ -294,6 +314,17 @@ def derive_controls(mesh: Path, source_crs: str | None = None, metric_crs: str |
         raise ValueError("derived EXTSTEP is below 0.1 s")
     internal_limit = min(10.0 * ext, min_adv)
     isplit = max(1, int(math.floor(internal_limit / ext + 1e-12)))
+    unaligned_ext = ext
+    unaligned_isplit = isplit
+    if time_quantum_seconds is not None:
+        while True:
+            try:
+                ext = align_external_step(unaligned_ext, isplit, time_quantum_seconds)
+                break
+            except ValueError:
+                if isplit == 1:
+                    raise
+                isplit -= 1
     sponge = []
     for i, chain in enumerate(chains, 1):
         lengths = [math.dist(nodes[a][:2], nodes[b][:2]) for a, b in zip(chain[:-1], chain[1:])]
@@ -314,6 +345,10 @@ def derive_controls(mesh: Path, source_crs: str | None = None, metric_crs: str |
         "wave_cfl_safety_factor": 0.5, "advective_velocity_m_s": 2.0,
         "extstep_seconds": ext, "isplit": isplit,
         "internal_step_seconds": ext * isplit,
+        "time_alignment": {"quantum_seconds": time_quantum_seconds,
+                           "unaligned_extstep_seconds": unaligned_ext,
+                           "unaligned_isplit": unaligned_isplit,
+                           "method": "largest_no_greater_0.1s_step_dividing_quantum" if time_quantum_seconds else "not_requested"},
         "limiting_wave_element": limiting_wave, "limiting_advective_element": limiting_adv,
         "sponge": sponge,
     }
@@ -347,17 +382,28 @@ def stability_plan(controls: dict[str, Any]) -> dict[str, Any]:
         if item not in ordered:
             ordered.append(item)
     attempts = []
+    quantum = controls.get("time_alignment", {}).get("quantum_seconds")
+    actual_seen = set()
     for idx, (em, isp, rm, cm) in enumerate(ordered):
+        candidate_ext = max(0.1, math.floor(float(controls["extstep_seconds"]) * em * 10 + 1e-12) / 10)
+        if quantum is not None:
+            candidate_ext = align_external_step(candidate_ext, isp, quantum)
+        actual_key = (candidate_ext, isp, rm, cm)
+        if actual_key in actual_seen:
+            continue
+        actual_seen.add(actual_key)
+        idx = len(attempts)
         attempts.append({
             "index": idx, "attempt_id": f"attempt_{idx:04d}",
             "extstep_multiplier": em,
-            "extstep_seconds": max(0.1, math.floor(float(controls["extstep_seconds"]) * em * 10 + 1e-12) / 10),
+            "extstep_seconds": candidate_ext,
             "isplit": isp, "sponge_radius_multiplier": rm,
             "sponge_coefficient_multiplier": cm,
         })
     return {
         "schema": "fvcom_stability_plan_v1", "generated_at": utcnow(),
         "controls_sha256": hashlib.sha256(json.dumps(controls, sort_keys=True).encode()).hexdigest(),
+        "time_quantum_seconds": quantum,
         "attempt_count": len(attempts), "attempts": attempts,
     }
 
@@ -774,6 +820,8 @@ def build_parser() -> argparse.ArgumentParser:
     q = sub.add_parser("controls")
     q.add_argument("--mesh", required=True); q.add_argument("--output", required=True)
     q.add_argument("--source-crs"); q.add_argument("--metric-crs")
+    q.add_argument("--time-quantum-seconds", type=float,
+                   help="Common divisor of stage durations and output intervals; April campaign uses 360")
     q = sub.add_parser("plan")
     q.add_argument("--controls", required=True); q.add_argument("--output", required=True)
     q = sub.add_parser("attempt")
@@ -811,7 +859,7 @@ def main() -> int:
     elif args.command == "controls":
         if bool(args.source_crs) != bool(args.metric_crs):
             raise ValueError("--source-crs and --metric-crs must be supplied together")
-        result = derive_controls(Path(args.mesh), args.source_crs, args.metric_crs); write_json(Path(args.output), result)
+        result = derive_controls(Path(args.mesh), args.source_crs, args.metric_crs, args.time_quantum_seconds); write_json(Path(args.output), result)
     elif args.command == "plan":
         result = stability_plan(load_data(Path(args.controls))); write_json(Path(args.output), result)
     elif args.command == "attempt":

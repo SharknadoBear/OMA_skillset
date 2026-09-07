@@ -23,13 +23,15 @@ python scripts/fvcom_run_control.py controls --mesh fvcom_grid.2dm --source-crs 
 
 The external step uses `0.5 * minimum_element_altitude / sqrt(g * local_max_depth)` and is rounded downward to 0.1 seconds. Supply source and metric CRS together when the delivered 2DM serializes lon/lat even though FVCOM DAT files are projected. `ISPLIT` keeps the internal step within ten external steps and the conservative `0.5 * altitude / 2 m/s` advective limit. Each OBC radius is three times its median boundary-edge length; the baseline coefficient is 0.0025.
 
+Pass `--time-quantum-seconds 360` for the April six-minute-output experiment. FVCOM advances fixed internal steps and requires output/restart intervals to be exact step multiples. The helper lowers the external step to the largest 0.1-second value whose internal step divides this common time quantum; if necessary it first lowers ISPLIT until a solution exists. It records the original CFL-derived proposal and never raises either control. The stability plan preserves this alignment and deduplicates actual controls. For other schedules supply their common time quantum. The namelist stage gate independently rejects incompatible durations and cadences. Columbia's 1.3 s / ISPLIT 4 proposal fails this gate; 1.2 s / 4 passes without relaxing CFL.
+
 Append every material local or Kestrel operation to the non-secret provenance ledger. Never place a password or OTP in this command:
 
 ```powershell
 python scripts/fvcom_run_control.py record --project PROJECT --kind preprocessing --command "fvcom_2dm_to_dat.py ..." --artifact input/base/preconfiguration_manifest.json
 ```
 
-At the three-worker barrier, validate exactly three role manifests through their common typed envelope (role-specific schema names are allowed):
+At the preparation barrier, validate exactly three role manifests through their common typed envelope (role-specific schema names are allowed):
 
 ```powershell
 python scripts/fvcom_run_control.py join --manifest gridding/worker_manifest.json --manifest forcing/shared_source/worker_manifest.json --manifest run/build/worker_manifest.json --output preparation_join.json
@@ -66,6 +68,14 @@ The root report includes preparation manifests, observation preflight, stability
 
 Stable requires exit code zero, `TADA!`, expected final timestamp evidence, and readable required NetCDF/restart files. Blowup text, fatal input, timeout, NaN, corrupt output, premature time, or missing TADA fails. Keep one stability job active at a time. Never edit the frozen executable or use validation skill scores to choose an attempt.
 
+## Production Output Gate
+
+Use `scripts/audit_fvcom_production.py` in the scientific NumPy/NetCDF4 environment before declaring monthly production complete. Supply logs, exit code, exact namelist/mapping, every station and full-grid stack, final restart, and `--lineage input_freeze.json`. For relocated inputs supply `--startup-restart-netcdf` pointing to the actual frozen startup restart. The `fvcom_input_freeze_v1` file map must include its SHA-256, mapping hash and run namelist hash.
+
+Require 7,201 station and 241 full-grid records for the April endpoint-inclusive experiment, at exact 360/10,800-second cadences. The shared `fvcom_time_anchor.py` reads the startup record's IINT at START_DATE; it never assigns an arbitrary first output record to that date. Full-grid and restart Times, Itime and Itime2 must agree independently. Float32 MJD is checked at its actual precision. Equal stack-boundary duplicates are permitted; shifted, conflicting, missing, masked or nonfinite records fail.
+
+The audit checks flag-enabled full-grid/station variables, all present known physical state fields, and the frozen 3-D restart's velocity, vertical velocity (`ww`/`omega`), temperature/salinity and turbulence state. Optional 3-D output fields may be absent when their namelist flags are false. The final restart must end at the exact requested time and IINT. A passing report records rule version `startup_anchor_exact_clock_3d_v1` and the externally verified time anchor for tidal validation.
+
 ## Terminal Rules
 
 Stop for `user_stopped` or after every planned attempt has terminal evidence and none is stable. The latter is `scope_exhausted` only when the report identifies why a grid, forcing formulation, or source change is outside the authorized stability controls.
@@ -74,6 +84,8 @@ Stop for `user_stopped` or after every planned attempt has terminal evidence and
 
 ```powershell
 python scripts/selftest_fvcom_run_control.py
+python scripts/selftest_audit_fvcom_production.py
+python scripts/selftest_fvcom_time_anchor.py
 python -m compileall scripts
 python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .
 ```

@@ -15,7 +15,7 @@ physics:
   formulation: three_dimensional_barotropic
   temperature_c: 20
   salinity_psu: 30
-  sigma_layers: 10
+  sigma_levels: 10 # legacy sigma_layers also counts levels
 ```
 
 An artifact-bindings JSON object supplies attempt-specific names:
@@ -59,6 +59,6 @@ FVCOM 4.3.1 input definitions are authoritative for field spelling. Important gr
 
 ## File gate
 
-A final configuration requires readable grid, depth, Coriolis, sigma, sponge, OBC-node, elevation-forcing, and station files. Set `grid_edge_read_from_file=false` only for the first cold smoke that will generate the named adjacency artifact into its attempt workspace. After that stable smoke, freeze the generated file and set the binding to `true`; subsequent cold canary/spin-up stages and all hot-start benchmark/production stages then require and reuse it. Hot starts with the binding set to false are rejected. The preconfiguration manifest must report ten sigma layers and hashes consistent with the selected files.
+A final configuration requires readable grid, depth, Coriolis, sigma, sponge, OBC-node, elevation-forcing, and station files. Set `grid_edge_read_from_file=false` only for the first cold smoke that will generate the named adjacency artifact into its attempt workspace. After that stable smoke, freeze the generated file and set the binding to `true`; subsequent cold canary/spin-up stages and all hot-start benchmark/production stages then require and reuse it. Hot starts with the binding set to false are rejected. The preconfiguration manifest must report ten sigma levels (nine layers) and hashes consistent with the selected files.
 
 The configuration manifest records the namelist/station/template hashes, stage, timing, numerics, all file checks, warnings, blocking reasons, and a resume token.

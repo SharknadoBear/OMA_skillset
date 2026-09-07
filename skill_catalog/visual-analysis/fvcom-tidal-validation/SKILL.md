@@ -15,7 +15,7 @@ Run locally after `$kestrel-hpc` retrieves compact station output. Do not instal
 - Current CSV contains UTC `time`, `model_u`, `model_v`, `observed_u`, and `observed_v` in m/s. Admit only downward-looking all-bin profiles prepared by `$noaa-coops-tides`; compare their documented vertically weighted vector with FVCOM `ua/va`.
 - Force all available TPXO constituents. Harmonic validation uses request order as scientific priority, retains one representative per frequency cluster separated by the Rayleigh limit `1/T`, and labels its amplitude/phase as a cluster diagnostic. Report omitted aliases such as P1 relative to K1 and K2 relative to S2 rather than claiming that either pair is independently resolved.
 
-Condense every retrieved FVCOM station stack before joining observations. Use `scripts/condense_fvcom_station.py` with the exact station mapping and run namelist. FVCOM station `iint` counts internal steps, so reconstruct UTC as `START_DATE + (iint - first_iint) * EXTSTEP_SECONDS * ISPLIT`; do not use FVCOM station `time` directly because its float32 MJD values are too coarse to represent six-minute samples reliably near modern dates. The condenser must match station IDs and their order exactly, require readable `zeta`, `ua`, and `va`, reach `END_DATE`, and hash every product.
+Condense each retrieved station stack using the exact station mapping, immutable run namelist, and verified startup restart. For hotstart, reconstruct UTC as `START_DATE + (iint - startup_iint) * EXTSTEP_SECONDS * ISPLIT`, where `startup_iint` comes from the startup record at START_DATE and is bound to its SHA-256; explicit coldstart uses zero. Use `--startup-restart-netcdf` for relocated inputs. A supplied audited anchor is rechecked against the actual startup restart. Reject missing startup semantics/evidence, masked or nonfinite required station fields, and conflicting duplicate records. Floating MJD time is a precision-aware consistency check. Require exact requested endpoints and the production audit's cadence/count checks before validation. The shared reader lives in `fvcom-run-control/scripts/fvcom_time_anchor.py`.
 
 ```powershell
 python scripts/condense_fvcom_station.py --station-netcdf galveston_station_timeseries.nc --station-mapping station_mapping.json --run-namelist galveston_run.nml --output-dir output/case/condensed --manifest output/case/condensed/manifest.json
@@ -39,7 +39,9 @@ a matching validation table. Preserve the envelope-discovered but wet-domain-
 excluded gauges and non-downward profiler reasons in the final HTML rather than
 silently reducing the station count.
 
-Set `workflow_status=validation_complete` when the comparison is complete and reproducible. Set `scientific_assessment` independently to `diagnostic-pass`, `diagnostic-advisory`, or `invalid`. For the first two Galveston cases, thresholds are informational and cannot trigger tuning or prevent workflow completion.
+For a complete hash-bound production project, invoke `scripts/run_case_validation.py --project PROJECT --grid-case GRID_CASE --attempt run/GRID_CASE/attempts/PRODUCTION`. Add `--observation-manifest` when observations belong to a variant-specific directory. The runner requires `fvcom_input_freeze_v1`, the frozen executable binding, actual forcing constituent order, eligible station inventory, and a passing `fvcom-run-control` production audit with rule version `startup_anchor_exact_clock_3d_v1`. It verifies actual input/output hashes and the startup restart before condensing, joining and validating. Results use a new immutable analysis directory; `--check-only` verifies prerequisites without claiming completion. Run locally in the scientific NumPy/NetCDF4/pandas/matplotlib environment.
+
+Set `workflow_status=validation_complete` when the comparison is complete and reproducible. Set `scientific_assessment` independently to `diagnostic-pass`, `diagnostic-advisory`, or `invalid`. For initial accepted/fresh regional tests, thresholds are informational and cannot trigger tuning or prevent workflow completion. If no eligible current profiles exist for the requested period, retain the inventory and explicitly report current validation unavailable; never substitute incompatible instruments. Missing required water-level comparisons remains a blocker.
 
 ## Validation
 
@@ -47,6 +49,7 @@ Set `workflow_status=validation_complete` when the comparison is complete and re
 python scripts/selftest_fvcom_tidal_validation.py
 python scripts/selftest_condense_fvcom_station.py
 python scripts/selftest_prepare_validation_tables.py
+python scripts/selftest_run_case_validation.py
 python -m compileall scripts
 python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .
 ```

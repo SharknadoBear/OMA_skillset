@@ -14,7 +14,7 @@ physics:
   formulation: three_dimensional_barotropic
   temperature_c: optional number
   salinity_psu: optional number
-  sigma_layers: optional positive integer
+  sigma_levels: 10 # ten interfaces, nine layers; legacy sigma_layers also counts levels
 tpxo:
   constituents: all_available
 observations:
@@ -26,11 +26,22 @@ kestrel:
   account: hindcastra
   partition: auto
 resume_from: optional state or attempt token
+benchmark: # optional explicit override of the exploratory default
+  ranks: [52, 104, 156, 208]
+  probe_ranks: [312, 416]
+  probe_simulated_hours: 1
+  segment_simulated_hours: 24
+  repeats: 1
+  max_ranks: 416
+  extend: false
+  production_objective: fastest # or pareto_knee, least_node_hour
 ```
 
 Dates must be UTC and analysis end is exclusive. Defaults for an unspecified Galveston test are analysis `[2025-04-01T00:00:00Z, 2025-05-01T00:00:00Z)`, seven spin-up days, a forcing start of `2025-03-25T00:00:00Z`, and six-minute forcing/station cadence.
 
-## Fixed project layout
+Default new projects to `Workspace/fvcom-simulation/<case_id>`. Explicit and historical roots remain valid. `physics.sigma_layers` is a legacy alias for the number of sigma levels; when both aliases are provided they must agree. Do not change the physical vertical grid during a terminology migration.
+
+## Internal project layout
 
 ```text
 <project>/

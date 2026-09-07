@@ -100,6 +100,49 @@ def current_metadata(station: str) -> dict[str, Any]:
     return {"deployments": deployments, "bins": bins.get("bins", []), "units": bins.get("units")}
 
 
+def current_period_coverage(metadata: dict[str, Any], start: str, end: str) -> dict[str, Any]:
+    """Screen documented deployment dates against the requested half-open period."""
+    begin, finish = pd.Timestamp(start), pd.Timestamp(end)
+    if begin.tzinfo is None or finish.tzinfo is None or finish <= begin:
+        raise ValueError("current period must have explicit timezones and increasing endpoints")
+    begin, finish = begin.tz_convert("UTC"), finish.tz_convert("UTC")
+    def stamp(value):
+        if value is None or str(value).strip().lower() in ("", "none", "null", "nan"):
+            return None
+        try:
+            value = pd.Timestamp(value)
+            if pd.isna(value):
+                return None
+            return value.tz_localize("UTC") if value.tzinfo is None else value.tz_convert("UTC")
+        except (TypeError, ValueError):
+            return None
+    payload = metadata.get("deployments", metadata)
+    if not isinstance(payload, dict):
+        return {"status": "unknown", "overlap": None, "intervals": []}
+    first, last = stamp(payload.get("first_good_data")), stamp(payload.get("last_good_data"))
+    intervals, uncertain = [], False
+    for row in payload.get("deployments", []):
+        lower, upper = stamp(row.get("deployed")), stamp(row.get("retrieved"))
+        if lower is None:
+            uncertain = True
+            continue
+        if upper is None:
+            upper = last
+        if upper is None or upper < lower:
+            uncertain = True
+            continue
+        intervals.append((lower, upper))
+    if not intervals and first is not None and last is not None and last >= first:
+        intervals = [(first, last)]
+        uncertain = False
+    overlap = any(lower < finish and upper >= begin for lower, upper in intervals)
+    status = "overlap" if overlap else "unknown" if uncertain or not intervals else "no_overlap"
+    return {"status": status, "overlap": True if overlap else None if status == "unknown" else False,
+            "period_start": begin.isoformat(), "period_end": finish.isoformat(),
+            "intervals": [{"start": lower.isoformat(), "end": upper.isoformat()} for lower, upper in intervals],
+            "method": "deployment intervals, falling back to documented first/last good data; metadata dates interpreted in UTC"}
+
+
 def discover(mesh: Path, mesh_crs: str, start: str, end: str) -> dict[str, Any]:
     from pyproj import Transformer
     nodes, tris = parse_mesh(mesh)
@@ -133,9 +176,15 @@ def discover(mesh: Path, mesh_crs: str, start: str, end: str) -> dict[str, Any]:
                     meta = current_metadata(sid)
                     orientation = str(meta["deployments"].get("orientation", "")).lower()
                     item.update({"orientation": orientation, "water_depth_m": meta["deployments"].get("measured_depth") or meta["deployments"].get("depth"), "sensor_depth_m": meta["deployments"].get("sensor_depth"), "bins": meta["bins"], "metadata_units": meta["units"]})
+                    coverage = current_period_coverage(meta, start, end)
+                    item["period_coverage"] = coverage
                     if orientation != "down":
                         item["eligible"] = False
                         item["exclusion_reason"] = f"orientation_{orientation or 'unknown'}_not_depth_integrated"
+                    elif inside and coverage["status"] != "overlap":
+                        item["eligible"] = False
+                        item["exclusion_reason"] = ("no_deployment_overlap_requested_period" if coverage["status"] == "no_overlap"
+                                                    else "current_period_metadata_unknown_requires_data_probe")
                 except Exception as exc:
                     item["eligible"] = False
                     item["exclusion_reason"] = f"metadata_error:{type(exc).__name__}:{exc}"

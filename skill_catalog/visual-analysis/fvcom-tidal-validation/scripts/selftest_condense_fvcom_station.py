@@ -28,6 +28,14 @@ def main() -> int:
             "&NML_INTEGRATION\n EXTSTEP_SECONDS = 1.2,\n ISPLIT = 2,\n/\n",
             encoding="utf-8",
         )
+        with namelist.open("a", encoding="utf-8") as stream:
+            stream.write("STARTUP_TYPE = 'hotstart',\nSTARTUP_FILE = 'startup.nc',\nINPUT_DIR = '.',\n")
+        with nc4.Dataset(root / "startup.nc", "w") as ds:
+            ds.createDimension("time", 1); ds.createDimension("DateStrLen", 26)
+            ds.createVariable("iint", "i4", ("time",))[:] = [500000]
+            ds.createVariable("Itime", "i4", ("time",))[:] = [60766]
+            ds.createVariable("Itime2", "i4", ("time",))[:] = [0]
+            ds.createVariable("Times", "S1", ("time", "DateStrLen"))[0] = np.asarray(list("2025-04-01T00:00:00.000000"), dtype="S1")
         station = root / "station.nc"
         with nc4.Dataset(station, "w") as ds:
             ds.createDimension("time", 3); ds.createDimension("station", 2); ds.createDimension("namelen", 20)

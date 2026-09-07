@@ -38,7 +38,23 @@ def template(values):
 
 
 def main() -> int:
+    levels_request = dict(REQUEST, physics=dict(REQUEST["physics"], sigma_levels=10))
+    assert fn.validate_request(levels_request)[-1] == 10
+    conflict_request = dict(REQUEST, physics=dict(REQUEST["physics"], sigma_levels=11))
+    try:
+        fn.validate_request(conflict_request)
+    except fn.ConfigError:
+        pass
+    else:
+        raise AssertionError("conflicting vertical-grid aliases accepted")
     numerical = {"extstep_seconds": 0.5, "isplit": 10}
+    try:
+        fn.configuration_values(REQUEST, BINDINGS, {"extstep_seconds": 1.3, "isplit": 4}, "smoke")
+    except fn.ConfigError as exc:
+        assert "not divisible" in str(exc)
+    else:
+        raise AssertionError("Columbia incompatible fixed-step output schedule accepted")
+    fn.configuration_values(REQUEST, BINDINGS, {"extstep_seconds": 1.2, "isplit": 4}, "smoke")
     values, timing = fn.configuration_values(REQUEST, BINDINGS, numerical, "spinup")
     assert timing["start_utc"] == "2025-03-25T00:00:00Z"
     assert timing["end_utc"] == "2025-04-01T00:00:00Z"

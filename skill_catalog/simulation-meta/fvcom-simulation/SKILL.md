@@ -14,24 +14,24 @@ Read [simulation request contract](references/simulation_request_v1.md) before i
 - `barotropic_tide`: prepare, stabilize, benchmark, run, and validate a tide-only FVCOM case.
 - `benchmark`: use a validated restart and scientifically identical 24-hour segments to compare Kestrel layouts. Do not interpret a benchmark as a validated simulation.
 
-Default the project to `Workspace/Simulation/fvcom-simulation/projects/<case_id>` and its Kestrel mirror to `/scratch/yhuang168/FVCOM_Simulation/<case_id>`. Use the fixed project layout in the request contract. Attempts are immutable; resume a complete stage or create the next numbered attempt.
+Default new projects to `Workspace/fvcom-simulation/<case_id>` and their Kestrel mirror to `/scratch/yhuang168/FVCOM_Simulation/<case_id>`. Preserve explicit project roots and existing archives. Use the internal project layout in the request contract. Attempts are immutable; resume a complete stage or create the next numbered attempt.
 
 ## Initialize
 
-1. Parse the prompt as `simulation_request_v1`. Preserve explicit dates and settings. For the Galveston tide default use 2025-04-01 through 2025-05-01 UTC for analysis, seven spin-up days beginning 2025-03-25, 20 C, 30 PSU, ten uniform sigma layers, all TPXO constituents, and all eligible NOAA CO-OPS stations inside the retained wet domain.
+1. Parse the prompt as `simulation_request_v1`. Preserve explicit dates, benchmark policy, and settings. For the April 2025 tide experiment use 2025-04-01 through 2025-05-01 UTC for analysis, seven spin-up days beginning 2025-03-25, 20 C, 30 PSU, ten uniform sigma levels (nine layers), all TPXO constituents, and all eligible NOAA CO-OPS stations inside the retained wet domain.
 2. Invoke `$fvcom-run-control` to initialize the project, provenance ledger, `project_status.json`, `commands.jsonl`, and `report.html`.
 3. Ask the human only for secure Password+OTP entry after `$kestrel-hpc` displays its credential window. Never receive a password or OTP in chat or write it to an artifact.
 4. Preserve accepted inputs. Hash and freeze an accepted mesh package before creating project-owned copies or derivatives.
 
-## Exactly Three Initial Workers
+## Three Initial Preparation Roles
 
-Launch exactly three subagents concurrently and require each to return a typed role manifest satisfying the common worker envelope in the state contract:
+Prepare three independent roles and require each to return a typed role manifest satisfying the common worker envelope in the state contract. Use three concurrent workers when slots permit. When the simulation lead is itself a child agent with only two child slots available, it performs configuration/build and delegates grid and TPXO. Three complete role manifests remain mandatory regardless of thread count:
 
 1. **Grid worker** invokes `$fvcom-grid-generation` for a fresh case, or verifies and freezes an accepted delivery. It later invokes `$fvcom-preconfiguration` after the join.
 2. **TPXO worker** invokes `$tpxo9v5-data-fetcher` to inventory and stage a registered, padded, model-neutral harmonic product. It does not create FVCOM forcing before the exact OBC contract exists.
 3. **Configuration/build worker** invokes `$fvcom-namelist-configuration` for a provisional configuration and `$fvcom-build`, which in turn uses `$kestrel-hpc` for the remote source audit and build.
 
-The parent remains the sole coordinator. Do not add a fourth initial worker, split one role across hidden workers, or let workers overwrite one another's artifact roots.
+The simulation lead remains the sole coordinator. Do not create hidden workers or let roles overwrite one another's artifact roots. A campaign parent owns shared skill edits and installs; workers report defects and use the recorded installed version.
 
 ## Join and Preparation Gate
 
@@ -39,7 +39,7 @@ Wait for all three manifests. Advance only when each is `ready`, hashes are pres
 
 For each grid case in `accepted_t6v6`, then `fresh_reproduction` order:
 
-1. Invoke `$fvcom-preconfiguration` with the complete grid-delivery contract and the passing source-bound TGE junction audit. Require metric `_grd.dat`, positive-down depth, per-node geodetic latitude in `_cor.dat`, exact plural-OBC identity/order, ten uniform sigma layers, and a hash-bound manifest. Its independent TGE/source check must agree cell-for-cell with the Grid gate.
+1. Invoke `$fvcom-preconfiguration` with the complete grid-delivery contract and the passing source-bound TGE junction audit. Require metric `_grd.dat`, positive-down depth, per-node geodetic latitude in `_cor.dat`, exact plural-OBC identity/order, ten uniform sigma levels (nine layers), and a hash-bound manifest. Its independent TGE/source check must agree cell-for-cell with the Grid gate.
 2. Return the exact OBC nodes to the TPXO worker. Invoke `$fvcom-tpxo-tides` to create the monotonic six-minute UTC elevation forcing for the complete run window. Require all discovered constituents; Galveston expects 22 and a different count blocks until explained.
 3. Invoke `$noaa-coops-tides` to discover water-level and current stations inside the actual wet polygon. Quantitative current validation admits only downward-looking all-bin profiles; record why side-looking instruments are excluded.
 4. Invoke `$fvcom-namelist-configuration` to generate the final namelist and cell-based station file. Reject any surface, atmospheric-pressure, river, temperature/salinity OBC, mean-flow, wave, ice, biology, sediment, or particle forcing.
@@ -48,6 +48,8 @@ For each grid case in `accepted_t6v6`, then `fresh_reproduction` order:
 ## Numerical Controls and Stability
 
 Invoke `$fvcom-run-control` to derive the initial external step from the minimum element altitude and local gravity-wave speed at CFL 0.5, rounded down to 0.1 s. Choose `ISPLIT` so the initial internal step is no more than ten external steps and no more than the 2 m/s conservative advective limit. Set each OBC sponge radius to three local median boundary-edge lengths and coefficient to 0.0025.
+
+Before freezing controls, align the internal step to all requested stage/output/restart times. For this six-minute-output experiment invoke controls with `--time-quantum-seconds 360`; retain the unaligned proposal as evidence. Require the independent namelist timing gate to pass for every stage and retry.
 
 Run, one job at a time through `$kestrel-hpc`: input smoke, three-day canary including the full ramp, and seven-day spin-up. An attempt is stable only when `srun` succeeds, the debug log reaches `TADA!`, the requested final timestamp exists, and required NetCDF/restart files are readable.
 
@@ -65,14 +67,16 @@ Update root `report.html` after every attempt. Never tune validation metrics, ch
 
 After a stable spin-up, invoke `$fvcom-benchmark` and `$kestrel-hpc` for sequential, identical 24-hour restart segments at ranks `1,2,4,8,13,26,52,104,156,208,312,416` on 104-core CPU nodes. Extend by 104 ranks while performance improves until two successive layouts are slower. Repeat the Pareto neighborhood three times. Report fastest, least-node-hour, and Pareto-knee layouts; use the knee for the 30-day run unless the request chooses another objective.
 
-Invoke `$fvcom-tidal-validation` after retrieving condensed station output locally. Compare model elevation with both NOAA GMT/MSL observations and astronomical predictions. Mean-align only over the common period and record the offset; never imply equal vertical datums. Total water level is mandatory but non-scoring for a tide-only model. Compare `ua/va` only with vertically weighted downward-looking all-bin profiles. Force all constituents but interpret only one-month-resolvable harmonics.
+An explicit request overrides that exploratory default. For a focused campaign, record ranks, repeats, maximum rank, extension policy, and production objective in the request and benchmark plan; pass that plan to analysis. Without a serial benchmark, use the lowest successfully measured rank as the speedup/efficiency reference. Do not infer a serial time. Treat high-rank compatibility probes separately from performance records: independently test each requested rank, record actual compute-environment `MPI_TAG_UB`, and promote only successful probes to full 24-hour benchmarks. One failed probe must not hold other requested probes or valid production layouts. Communication failures do not authorize changes to a frozen model source or MPI environment.
+
+Before monthly completion invoke `$fvcom-run-control`'s production audit with the frozen startup restart and input file map. Require exact startup-anchored IINT coverage, independent full-grid/restart clocks, required finite unmasked 3-D restart state, expected cadence/count, and rule version `startup_anchor_exact_clock_3d_v1`. Then invoke `$fvcom-tidal-validation`'s regional runner on retrieved station outputs and exact case manifests. Compare model elevation with both NOAA GMT/MSL observations and astronomical predictions. Mean-align only over the common period and record the offset; never imply equal vertical datums. Total water level is mandatory but non-scoring for a tide-only model. Compare `ua/va` only with vertically weighted downward-looking all-bin profiles. Force all constituents but interpret only one-month-resolvable harmonics.
 
 Use two independent terminal fields:
 
 - `workflow_status=validation_complete` when every comparison is reproducible and scientifically valid.
 - `scientific_assessment=diagnostic-pass|diagnostic-advisory|invalid` for the physical result.
 
-Informational research thresholds cannot tune or block the first two Galveston workflows.
+For initial accepted/fresh regional tests, informational research thresholds cannot trigger tuning or prevent otherwise complete, reproducible validation. If no eligible current observations exist in the requested period, explicitly report current validation unavailable and retain the station inventory; do not substitute an incompatible instrument. Missing required water-level data or invalid comparison preparation remains a documented blocker.
 
 ## Terminal States
 

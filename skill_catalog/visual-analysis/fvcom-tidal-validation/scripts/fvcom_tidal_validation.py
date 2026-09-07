@@ -229,7 +229,7 @@ def validate(water_files: list[Path], current_files: list[Path], output_dir: Pat
             (str(item["id"]), str(item["role"]))
             for item in inventory.get("stations", []) if item.get("eligible")
         }
-        required_roles = {role for _, role in eligible}
+        required_roles |= {role for _, role in eligible}
         delivered = (
             {(item["station_id"], "water_level") for item in water_results}
             | {(item["station_id"], "current") for item in current_results}
@@ -279,7 +279,7 @@ def validate(water_files: list[Path], current_files: list[Path], output_dir: Pat
     result = {
         "schema": "fvcom_tidal_validation_v1", "generated_at": now(),
         "workflow_status": workflow, "scientific_assessment": assessment,
-        "threshold_policy": "informational_only_first_two_runs; never a stability-tuning or completion gate",
+        "threshold_policy": "informational_for_initial_regional_accepted_and_fresh_runs; never a stability-tuning or completion gate",
         "informational_thresholds": threshold_values,
         "lineage": lineage, "lineage_manifest": str(lineage_path),
         "lineage_manifest_sha256": file_sha256(lineage_path),
@@ -301,7 +301,7 @@ def validate(water_files: list[Path], current_files: list[Path], output_dir: Pat
         + html.escape(json.dumps(station_policy_evidence, indent=2)) + "</pre>"
         if station_policy_evidence is not None else ""
     )
-    report_path.write_text("<!doctype html><html><head><meta charset='utf-8'><title>FVCOM tidal validation</title><style>body{font-family:system-ui;margin:2rem;max-width:1200px}pre{background:#f5f5f5;padding:1rem;overflow:auto}details{margin:1rem 0}</style></head><body><h1>FVCOM tidal validation</h1><p>Workflow: <b>" + workflow + "</b>; scientific assessment: <b>" + assessment + "</b>.</p><p>Thresholds are informational for the first two Galveston cases and never control stability tuning or workflow completion. NOAA/model mean offsets are disclosed and are not datum conversions.</p><h2>Frozen lineage</h2><pre>" + html.escape(json.dumps(lineage, indent=2)) + "</pre>" + station_section + "".join(sections) + "</body></html>", encoding="utf-8")
+    report_path.write_text("<!doctype html><html><head><meta charset='utf-8'><title>FVCOM tidal validation</title><style>body{font-family:system-ui;margin:2rem;max-width:1200px}pre{background:#f5f5f5;padding:1rem;overflow:auto}details{margin:1rem 0}</style></head><body><h1>FVCOM tidal validation</h1><p>Workflow: <b>" + workflow + "</b>; scientific assessment: <b>" + assessment + "</b>.</p><p>Thresholds are informational for initial regional accepted and fresh cases and never control stability tuning or workflow completion. NOAA/model mean offsets are disclosed and are not datum conversions.</p><h2>Frozen lineage</h2><pre>" + html.escape(json.dumps(lineage, indent=2)) + "</pre>" + station_section + "".join(sections) + "</body></html>", encoding="utf-8")
     return result
 
 
