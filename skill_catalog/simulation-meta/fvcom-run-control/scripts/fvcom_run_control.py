@@ -495,19 +495,24 @@ def attempt_sbatch(args: argparse.Namespace, aid: str, stage: str | None) -> str
     module_setup = ""
     if modules:
         module_setup = "module purge\n" + "\n".join(f"module load {name}" for name in modules) + "\n"
+    cpu_bind = getattr(args, "cpu_bind", None)
+    if cpu_bind not in (None, "cores", "none"):
+        raise ValueError("unsupported CPU binding")
+    bind_option = f" --cpu-bind={cpu_bind}" if cpu_bind else ""
+    exclusive_directive = "#SBATCH --exclusive\n" if getattr(args, "exclusive", False) else ""
     return f"""#!/bin/bash
 #SBATCH --job-name={args.grid_case}_{aid}{suffix}
 #SBATCH --account={args.account}
 #SBATCH --partition={args.partition}
 #SBATCH --nodes={int(args.nodes)}
 #SBATCH --ntasks={int(args.ranks)}
-#SBATCH --time={args.walltime}
+{exclusive_directive}#SBATCH --time={args.walltime}
 #SBATCH --output=stdout.log
 #SBATCH --error=stderr.log
 set -euo pipefail
 {module_setup}module -t list 2>&1
 cd \"$SLURM_SUBMIT_DIR\"
-srun --ntasks={int(args.ranks)} {args.remote_executable} --casename={args.case_name}
+srun{bind_option} --ntasks={int(args.ranks)} {args.remote_executable} --casename={args.case_name}
 """
 
 
@@ -583,6 +588,9 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
         "run_dir": str(run_dir.relative_to(project)),
         "namelist_input_dir": attempt_input_reference, "namelist_output_dir": ".",
         "modules": list(getattr(args, "module", None) or []),
+        "execution_layout": {"ranks": int(args.ranks), "nodes": int(args.nodes),
+                             "cpu_bind": getattr(args, "cpu_bind", None),
+                             "exclusive": bool(getattr(args, "exclusive", False))},
         "attempt_sponge_sha256": sha256(attempt_spg),
         "plan_sha256": sha256(plan_path), "status": "prepared",
     }
@@ -834,6 +842,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--remote-executable", required=True); q.add_argument("--case-name", default="galveston")
     q.add_argument("--account", default="hindcastra"); q.add_argument("--partition", default="standard")
     q.add_argument("--nodes", type=int, default=1); q.add_argument("--ranks", type=int, default=104)
+    q.add_argument("--cpu-bind", choices=["cores", "none"])
+    q.add_argument("--exclusive", action="store_true")
     q.add_argument("--walltime", default="01:00:00")
     q = sub.add_parser("audit")
     q.add_argument("--stdout", required=True); q.add_argument("--stderr")

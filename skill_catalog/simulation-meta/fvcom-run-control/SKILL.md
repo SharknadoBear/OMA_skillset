@@ -57,6 +57,8 @@ The attempt command rewrites `INPUT_DIR` to the immutable attempt copy and `OUTP
 
 Always pass the frozen executable's recorded module-load request. The generated Slurm scripts purge the inherited environment, load that stack, and print the effective module list before `srun`. If a pre-submission audit invalidates an already-materialized attempt without running it, preserve that package and create a deterministic `--revision 1` (then 2, and so on) of the same strategy index; never silently overwrite it.
 
+For production selected from a benchmark, preserve the measured launch layout as well as ranks, nodes and modules. Use `--cpu-bind cores --exclusive` when the selected benchmark used explicit core binding and exclusive nodes. Verify `execution_layout` in the attempt manifest and the generated Slurm script before submission; an unspecified scheduler default is not evidence of matching the measured binding.
+
 5. After `$kestrel-hpc` retrieves logs and products, audit the attempt and refresh the report:
 
 ```powershell

@@ -63,17 +63,20 @@ def main() -> int:
         assert "OUTPUT_DIR = '.'" in attempt_nml
         assert created["namelist_input_dir"] == "../../../../input/accepted_t6v6/attempts/attempt_0000"
         assert (project / created["input_dir"] / "tiny_spg.dat").read_text(encoding="ascii").count("0.002500") == 2
+        assert created["execution_layout"]["cpu_bind"] is None
+        assert not created["execution_layout"]["exclusive"]
         staged_project = root / "staged_project"
         staged = create_attempt(Namespace(
             project=str(staged_project), plan=str(plan_file), index=0, grid_case="fresh_reproduction",
             base_input=str(base_input), base_namelist=None,
             stage_namelist=[f"smoke={base_nml}", f"canary={base_nml}", f"spinup={base_nml}"],
-            revision=1, module=["intel/2023.2.0", "netcdf-fortran/4.6.1-intel"],
+            revision=1, module=["intel/2023.2.0", "netcdf-fortran/4.6.1-intel"], cpu_bind="cores", exclusive=True,
             remote_executable="/scratch/fvcom", case_name="tiny", account="test",
             partition="debug", nodes=1, ranks=1, walltime="00:05:00",
         ))
         assert staged["stage_order"] == ["smoke", "canary", "spinup"]
         assert staged["revision"] == 1
+        assert staged["execution_layout"] == {"ranks": 1, "nodes": 1, "cpu_bind": "cores", "exclusive": True}
         assert staged["namelist_input_dir"] == "../../../../../input/fresh_reproduction/attempts/attempt_0000_r001"
         for stage in staged["stage_order"]:
             stage_dir = staged_project / staged["stages"][stage]["run_dir"]
@@ -82,6 +85,7 @@ def main() -> int:
             assert (stage_dir / "job.sbatch").is_file()
             sbatch = (stage_dir / "job.sbatch").read_text(encoding="utf-8")
             assert "module purge" in sbatch and "module load intel/2023.2.0" in sbatch
+            assert "#SBATCH --exclusive\n" in sbatch and "srun --cpu-bind=cores --ntasks=1 " in sbatch
         log = root / "stdout.log"
         log.write_text(
             "END_DATE = 2025-04-01 00:00:00\n! IEND = 1\n"
