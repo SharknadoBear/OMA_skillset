@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM Velocity Tracer Movie"
-  short_description: "Explore FVCOM currents with shaded maps and particle trails"
-  default_prompt: "Use $fvcom-velocity-tracer-movie to build an offline HTML current viewer from my FVCOM output."
+  short_description: "Explore FVCOM currents and export snapshot GIFs offline"
+  default_prompt: "Use $fvcom-velocity-tracer-movie to build an offline HTML current viewer with snapshot GIF export from my FVCOM output."

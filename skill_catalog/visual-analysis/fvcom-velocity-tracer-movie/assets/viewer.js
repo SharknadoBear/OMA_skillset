@@ -24,6 +24,7 @@ try {
   const tick=1/60;let activeTime=0,accumulator=0,stallCount=0,emissionsEnabled=true;
   let particles=[],last=0,drag=null,loopCount=0,frameTimes=[],drawTimes=[],shader=null;
   let resetCount=0,selectionMs=[],lastUI=0,visible=false;
+  let exporting=false,exportStatus=null,deferredResize=false;
   const palette=[[10,27,55],[18,68,107],[19,123,133],[79,165,123],[196,185,102],[236,113,70]];
   function color(t){const q=Math.max(0,Math.min(1,t))*5,i=Math.min(4,Math.floor(q)),a=q-i;return palette[i].map((v,k)=>Math.round(v*(1-a)+palette[i+1][k]*a));}
   function project(x,y){return [x*scale+ox,oy-y*scale];}
@@ -34,43 +35,10 @@ try {
   function clear(){trails.clear(activeTime);resetCount++;}
   function reseed(){engine.setViewport(viewport());particles=Array.from({length:density},()=>{const p=engine.spawn();p.age=engine.random()*8;return p;});clear();}
   function fit(){const b=engine.box;scale=Math.min((width-90)/(b[2]-b[0]),(height-250)/(b[3]-b[1]));ox=width/2-(b[0]+b[2])/2*scale;oy=(height-100)/2+(b[1]+b[3])/2*scale;}
-  function compile(gl,type,source){const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(s));return s;}
-  function initGL(){
-    if(new URLSearchParams(location.search).has("no-webgl"))return null;
-    const gl=shade.getContext("webgl2",{alpha:true,antialias:true,preserveDrawingBuffer:true});if(!gl)return null;
-    const vs=`#version 300 es
-      in vec2 pos; in vec2 velA; in vec2 velB; in float wet;
-      uniform vec2 size; uniform vec3 view; uniform float alpha;
-      out vec2 velocity; flat out float valid;
-      void main(){vec2 p=vec2(pos.x*view.x+view.y,view.z-pos.y*view.x);gl_Position=vec4(p.x/size.x*2.-1.,1.-p.y/size.y*2.,0.,1.);velocity=mix(velA,velB,alpha);valid=wet;}`;
-    const fs=`#version 300 es
-      precision highp float; in vec2 velocity; flat in float valid; uniform float vmax; out vec4 pixel;
-      vec3 colors(float x){float q=clamp(x,0.,1.)*5.;
-      vec3 a=vec3(10,27,55),b=vec3(18,68,107),c=vec3(19,123,133),d=vec3(79,165,123),e=vec3(196,185,102),f=vec3(236,113,70);
-      if(q<1.)return mix(a,b,q)/255.;if(q<2.)return mix(b,c,q-1.)/255.;if(q<3.)return mix(c,d,q-2.)/255.;if(q<4.)return mix(d,e,q-3.)/255.;return mix(e,f,q-4.)/255.;}
-      void main(){if(valid<.5)discard;pixel=vec4(colors(sqrt(length(velocity)/vmax)),.83);}`;
-    const program=gl.createProgram();gl.attachShader(program,compile(gl,gl.VERTEX_SHADER,vs));gl.attachShader(program,compile(gl,gl.FRAGMENT_SHADER,fs));gl.linkProgram(program);
-    if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(program));
-    gl.useProgram(program);const buffers={};
-    function buffer(name,size,values,dynamic=false){const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferData(gl.ARRAY_BUFFER,values,dynamic?gl.DYNAMIC_DRAW:gl.STATIC_DRAW);const loc=gl.getAttribLocation(program,name);gl.enableVertexAttribArray(loc);gl.vertexAttribPointer(loc,size,gl.FLOAT,false,0,0);buffers[name]=b;}
-    const positions=new Float32Array(meta.elements*6);
-    for(let i=0;i<data.tri.length;i++){const n=data.tri[i];positions[2*i]=data.xy[2*n];positions[2*i+1]=data.xy[2*n+1];}
-    buffer("pos",2,positions);buffer("velA",2,engine.A,true);buffer("velB",2,engine.B,true);buffer("wet",1,new Float32Array(meta.elements*3),true);
-    const uniforms={};for(const name of ["size","view","alpha","vmax"])uniforms[name]=gl.getUniformLocation(program,name);
-    const ext=gl.getExtension("WEBGL_debug_renderer_info");
-    return {gl,program,buffers,uniforms,renderer:ext?gl.getParameter(ext.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER)};
-  }
-  function upload(){if(!shader)return;const {gl,buffers}=shader;for(const [name,a] of [["velA",engine.A],["velB",engine.B]]){gl.bindBuffer(gl.ARRAY_BUFFER,buffers[name]);gl.bufferData(gl.ARRAY_BUFFER,a,gl.DYNAMIC_DRAW);}
-    const wet=new Float32Array(meta.elements*3);for(let c=0;c<meta.elements;c++)wet.fill(engine.mask[c],c*3,c*3+3);
-    gl.bindBuffer(gl.ARRAY_BUFFER,buffers.wet);gl.bufferData(gl.ARRAY_BUFFER,wet,gl.DYNAMIC_DRAW);
-  }
-  function drawShade(){if(!shader)return;const {gl,uniforms:u}=shader;gl.viewport(0,0,shade.width,shade.height);gl.clearColor(0,0,0,0);gl.clear(gl.COLOR_BUFFER_BIT);if(!$("shading").checked)return;
-    gl.uniform2f(u.size,width,height);gl.uniform3f(u.view,scale,ox,oy);gl.uniform1f(u.alpha,engine.alpha(time));gl.uniform1f(u.vmax,meta.vmax);gl.drawArrays(gl.TRIANGLES,0,meta.elements*3);
-  }
+  function upload(){shader?.upload();}
+  function drawShade(){shader?.draw(trailView(),time,$("shading").checked);}
   function drawMap(){map.clearRect(0,0,width,height);map.lineWidth=.8;
-    for(let type=0;type<2;type++){map.beginPath();map.strokeStyle=type?"#a5c1cc66":"#a9c3cf99";map.setLineDash(type?[4,5]:[]);
-      for(let i=0;i<data.boundaryType.length;i++)if(data.boundaryType[i]===type){const a=data.boundary[i*2],b=data.boundary[i*2+1];map.moveTo(...project(data.xy[a*2],data.xy[a*2+1]));map.lineTo(...project(data.xy[b*2],data.xy[b*2+1]));}map.stroke();}
-    map.setLineDash([]);const desired=100/scale,power=Math.pow(10,Math.floor(Math.log10(desired))),distance=[1,2,5,10].map(x=>x*power).filter(x=>x<=desired).pop()||power;
+    drawMeshBoundary(map,data,trailView());const desired=100/scale,power=Math.pow(10,Math.floor(Math.log10(desired))),distance=[1,2,5,10].map(x=>x*power).filter(x=>x<=desired).pop()||power;
     $("scale").style.width=distance*scale+"px";$("scale").textContent=distance>=1000?(distance/1000)+" km":Math.round(distance)+" m";
   }
   function resize(reset=false){width=innerWidth;height=innerHeight;dpr=Math.min(2,devicePixelRatio||1);for(const c of [shade,coast]){c.width=Math.round(width*dpr);c.height=Math.round(height*dpr);}trails.resize(width,height,dpr);map.setTransform(dpr,0,0,dpr,0,0);if(reset)fit();reseed();drawMap();drawShade();}
@@ -83,6 +51,7 @@ try {
     if(engine.blockedGap)$("notice").textContent="Playback stopped at a missing-data interval. Choose another source snapshot to continue.";
     else if(!shader)$("notice").textContent="WebGL2 shading unavailable. Particle trails and the mesh map remain active.";
     else $("notice").textContent="";
+    $("export-gif").disabled=mode!=="snapshot"||exporting;$("export-gif").title=mode!=="snapshot"?"Select Snapshot to export a GIF":"Export the visible snapshot";
     $("speed").disabled=false;$("duration").disabled=mode!=="continuous";
     $("motion-note").textContent=mode==="continuous"&&visualSpeed!==1?"Illustrative particle motion ×"+visualSpeed:"";
     $("tail").value=tail;$("tail-value").textContent=tail+" s";$("speed").value=visualSpeed;$("speed-value").textContent=visualSpeed+"×";
@@ -124,7 +93,7 @@ try {
     for(let k=0;k<3;k++){const n=data.tri[c*3+k];lon+=data.geo[n*2]*weights[k];lat+=data.geo[n*2+1]*weights[k];}
     $("hover").textContent=lat.toFixed(4)+"°, "+lon.toFixed(4)+"°  ·  element "+(c+1)+"\nNative: "+Math.hypot(...native).toFixed(3)+" m/s  ["+native.map(x=>x.toFixed(3)).join(", ")+"] · "+(meta.vector_basis==="east-north"?"east/north":"grid x/y")+"\nDisplay: "+Math.hypot(...display).toFixed(3)+" m/s  ["+display.map(x=>x.toFixed(3)).join(", ")+"] · grid x/y";
   };
-  addEventListener("resize",()=>resize(true));
+  addEventListener("resize",()=>{if(exporting)deferredResize=true;else resize(true);});
   document.addEventListener("visibilitychange",()=>{last=0;});
   function stepParticles(seconds,t,continuous,wallStart,wallSeconds,tickEnd){
     for(const p of particles){
@@ -141,8 +110,7 @@ try {
     const tickEnd=activeTime+dt;trails.history.expire(activeTime-trails.epoch,tail);
     if(mode==="snapshot") {
       // A display gain, explicitly separate from physical time in snapshot mode.
-      const gain=12/Math.max(scale*meta.vmax*.125,1e-9)*visualSpeed;
-      stepParticles(dt*gain,time,false,activeTime,dt,tickEnd);
+      advanceSnapshot(engine,particles,trails,{...trailView(),visualSpeed,time,tail,vmax:meta.vmax},activeTime,dt,emissionsEnabled);
     } else {
       const rate=(meta.times.at(-1)-meta.times[0])/duration;let remaining=dt*rate,wallOffset=0;
       while(remaining>1e-7) {
@@ -154,7 +122,7 @@ try {
         if(time>=meta.times[engine.b]-1e-7){engine.setTime(time,true);upload();if(engine.maskChanged)clear();}
       }
     }
-    particles.forEach(p=>p.age+=dt);
+    if(mode!=="snapshot")particles.forEach(p=>p.age+=dt);
     activeTime=tickEnd;
   }
   function skipStall(elapsed){
@@ -178,19 +146,52 @@ try {
     else {accumulator+=elapsed;while(accumulator>=tick-1e-10){animate(tick);accumulator=Math.max(0,accumulator-tick);if(engine.blockedGap&&mode==="continuous"){playing=false;accumulator=0;break;}}}
     if(mode==="continuous")drawShade();drawTrails();
   }
-  function frame(now){if(last&&playing&&!drag&&!document.hidden){const elapsed=(now-last)/1000,before=performance.now();advance(elapsed);drawTimes.push(performance.now()-before);frameTimes.push(elapsed*1000);if(frameTimes.length>1800){frameTimes.shift();drawTimes.shift();}}
+  function frame(now){if(last&&playing&&!exporting&&!drag&&!document.hidden){const elapsed=(now-last)/1000,before=performance.now();advance(elapsed);drawTimes.push(performance.now()-before);frameTimes.push(elapsed*1000);if(frameTimes.length>1800){frameTimes.shift();drawTimes.shift();}}
     last=now;if(now-lastUI>150){updateUI();lastUI=now;}requestAnimationFrame(frame);
   }
   $("subtitle").textContent=meta.layer.replaceAll("_"," ")+" currents · "+meta.nodes.toLocaleString()+" nodes · "+meta.elements.toLocaleString()+" triangles";
   $("about-data").textContent=meta.timestamps[0]+" through "+meta.timestamps.at(-1)+". "+meta.timestamps.length+" native records. "+meta.boundary_label+". CRS: "+meta.crs+". Original vector basis: "+meta.vector_basis+". Color scale: square root, 0–"+meta.vmax+" m/s. "+(meta.invalid_geographic_arrays?"Invalid geographic arrays were replaced by a projection of native x/y. ":"")+"No wind field is included.";
   const legend=$("legend-bar").getContext("2d");for(let x=0;x<260;x++){legend.fillStyle="rgb("+color(x/259).join(",")+")";legend.fillRect(x,0,1,14);}$("legend-ticks").replaceChildren(...[0,.25,.5,.75,1].map(t=>{const e=document.createElement("span");e.textContent=(t*t*meta.vmax).toFixed(t?2:0);return e;}));
-  try{shader=initGL();}catch(e){console.warn("Shading fallback:",e.message);shader=null;}
+  try{shader=createFieldRenderer(shade,engine,data,meta,new URLSearchParams(location.search).has("no-webgl"));if(!shader.available)shader=null;}catch(e){console.warn("Shading fallback:",e.message);shader=null;}
   shade.addEventListener("webglcontextlost",e=>{e.preventDefault();shader=null;updateUI();});
   if(!shader){$("shading").checked=false;$("shading").disabled=true;}
   upload();resize(true);updateUI();$("loading").remove();visible=true;
   const loadMs=performance.now()-started;
-  function metrics(){const sorted=frameTimes.slice().sort((a,b)=>a-b),p=i=>sorted.length?sorted[Math.floor((sorted.length-1)*i)]:null;return {ready:visible,loadMs,renderer:shader?shader.renderer:"Canvas fallback",webgl:!!shader,mode,time,playing,visualSpeed,trailDuration:tail,playbackDuration:duration,activeTime,stallCount,...trails.metrics(activeTime,tail),particles:particles.length,frames:frameTimes.length,medianFPS:p(.5)?1000/p(.5):null,p95FrameMs:p(.95),meanDrawMs:drawTimes.reduce((a,b)=>a+b,0)/(drawTimes.length||1),selectionMs:selectionMs.slice(),resetCount,loopCount,stats:{...engine.stats},memory:performance.memory?{used:performance.memory.usedJSHeapSize,total:performance.memory.totalJSHeapSize}:null};}
-  window.fvcomTracer={engine,data,meta,trails,metrics,select,setMode,project,unproject,setPlaying,setDuration,setVisualSpeed,setTrailDuration,
+  function metrics(){const sorted=frameTimes.slice().sort((a,b)=>a-b),p=i=>sorted.length?sorted[Math.floor((sorted.length-1)*i)]:null;return {ready:visible,gifExport:{busy:exporting,...exportStatus},loadMs,renderer:shader?shader.backend:"Canvas fallback",webgl:!!shader,mode,time,playing,visualSpeed,trailDuration:tail,playbackDuration:duration,activeTime,stallCount,...trails.metrics(activeTime,tail),particles:particles.length,frames:frameTimes.length,medianFPS:p(.5)?1000/p(.5):null,p95FrameMs:p(.95),meanDrawMs:drawTimes.reduce((a,b)=>a+b,0)/(drawTimes.length||1),selectionMs:selectionMs.slice(),resetCount,loopCount,stats:{...engine.stats},memory:performance.memory?{used:performance.memory.usedJSHeapSize,total:performance.memory.totalJSHeapSize}:null};}
+  async function exportGif(options={}){
+    if(mode!=="snapshot")throw Error("Select Snapshot to export a GIF");
+    if(exporting)throw Error("A GIF export is already running");
+    const state={time,density,tail,visualSpeed,shading:!!shader&&$("shading").checked,forceCanvas:trails.backend!=="WebGL2 instanced",view:trailView(),bounds:viewport()};
+    const wasPlaying=playing;exporting=true;setPlaying(false);
+    try{const result=await renderSnapshotGif(data,meta,state,{...options,onProgress:p=>{exportStatus=p;options.onProgress?.(p);}});
+      exportStatus={phase:"complete",bytes:result.blob.size,elapsedMs:result.report.elapsed_ms,report:result.report};return result;
+    }catch(error){exportStatus={phase:error.name==="AbortError"?"cancelled":"failed",error:error.message};throw error;}
+    finally{exporting=false;if(deferredResize){deferredResize=false;resize(false);}setPlaying(wasPlaying);}
+  }
+  let gifAbort=null,gifURLs=[];
+  function releaseGif(){for(const url of gifURLs)URL.revokeObjectURL(url);gifURLs=[];$("gif-preview").removeAttribute("src");$("gif-result").hidden=true;}
+  function gifDimensions(){const w=+$("gif-width").value;$("gif-dimensions").textContent=w+" \u00d7 "+Math.round(w*height/width)+" pixels \u00b7 "+(w/300).toFixed(1)+" inches wide at 300 pixels/inch. GIF has no physical DPI metadata.";}
+  for(const id of ["gif-width","gif-duration","gif-fps"])$(id).oninput=gifDimensions;
+  $("export-gif").onclick=()=>{$("gif-field").textContent=meta.title+" \u00b7 "+iso(time)+" \u00b7 "+meta.layer.replaceAll("_"," ");gifDimensions();$("gif-dialog").showModal();};
+  $("gif-close").onclick=()=>{$("gif-dialog").close();};
+  $("gif-dialog").addEventListener("cancel",()=>gifAbort?.abort());
+  $("gif-dialog").addEventListener("close",()=>{gifAbort?.abort();releaseGif();});
+  $("gif-cancel").onclick=()=>gifAbort?.abort();
+  $("gif-start").onclick=async()=>{
+    releaseGif();gifAbort=new AbortController();$("gif-start").disabled=true;$("gif-cancel").hidden=false;$("gif-progress").hidden=false;
+    for(const id of ["gif-width","gif-duration","gif-fps"])$(id).disabled=true;
+    try{
+      const {blob,report}=await exportGif({width:+$("gif-width").value,duration:+$("gif-duration").value,fps:+$("gif-fps").value,signal:gifAbort.signal,
+        onProgress:p=>{$("gif-progress").value=p.fraction;$("gif-status").textContent=({preparing:"Preparing map",warming:"Preparing particle tails",encoding:"Encoding frames",complete:"Complete"})[p.phase]+" \u00b7 "+Math.round(p.fraction*100)+"%";}});
+      if(!$("gif-dialog").open)return;
+      const url=URL.createObjectURL(blob),reportURL=URL.createObjectURL(new Blob([JSON.stringify(report,null,2)],{type:"application/json"}));gifURLs=[url,reportURL];
+      const name=meta.title.replace(/[^a-z0-9]+/gi,"_").replace(/^_|_$/g,"")+"_"+meta.layer+"_"+report.timestamp_utc.replace(/[-:]/g,"").replace(".000","")+"_"+report.width+"x"+report.height;
+      $("gif-preview").src=url;$("gif-download").href=url;$("gif-download").download=name+".gif";$("gif-report").href=reportURL;$("gif-report").download=name+".json";$("gif-result").hidden=false;
+      $("gif-status").textContent=(blob.size/1024**2).toFixed(1)+" MiB \u00b7 "+(report.elapsed_ms/1000).toFixed(1)+" seconds to generate"+(report.dropped_segments?" \u00b7 History capacity reached; effective trails "+report.effective_history_seconds.toFixed(2)+" s":"");
+    }catch(error){$("gif-status").textContent=error.name==="AbortError"?"Export cancelled. Your snapshot is unchanged.":"Export failed: "+error.message;}
+    finally{gifAbort=null;$("gif-start").disabled=false;$("gif-cancel").hidden=true;$("gif-progress").hidden=true;for(const id of ["gif-width","gif-duration","gif-fps"])$(id).disabled=false;}
+  };
+  window.fvcomTracer={engine,data,meta,trails,metrics,exportGif,select,setMode,project,unproject,setPlaying,setDuration,setVisualSpeed,setTrailDuration,
     resetMetrics:()=>{frameTimes=[];drawTimes=[];selectionMs=[];},
     testAdvance:dt=>{advance(dt);updateUI();},
     setEmissionEnabled:value=>{emissionsEnabled=!!value;},

@@ -37,3 +37,7 @@ Mesh boundary edges have one incident element. They include island outlines, phy
 The color scale is fixed over the whole selected interval. Both Galveston review products use 0–1.6 m/s and square-root normalization, including their first-day maxima while resolving weak interior flow. Pale tails provide direction; the scalar legend provides speed. Values above a user-selected maximum saturate at the final color but remain available numerically.
 
 Continuous mode is a first-draft, three-hour-output interpolation for visual exploration. It cannot recover unresolved tidal variability or establish validated Lagrangian trajectories. No wind, diffusion, vertical particle movement, or particle mass is modeled.
+
+## Snapshot presentation GIFs
+
+Export uses the same native-triangle shader and shared snapshot integrator as the viewer, with independent reproducible particles. The selected scientific timestamp stays fixed. High-resolution output increases pixel density while retaining logical viewport scale, so visual acceleration does not change with output width. A 60 Hz integration clock is sampled at 10 or 20 FPS after a trail-duration warm-up. GIF palette quantization approximates colors with at most 255 opaque entries; velocities, the numeric legend, and map geometry are unscaled. These are illustrative presentation animations, not particle-tracking outputs. See [gif_export.md](gif_export.md).

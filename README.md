@@ -31,7 +31,7 @@ by capability family rather than by the older broad project-stage folders.
 - `visual-analysis/`: active structured-grid POM, staggered-grid ROMS, and
   sparse curvilinear EFDC map and movie post-processing, FVCOM tidal
   validation, and `fvcom-velocity-tracer-movie` offline HTML current shading
-  and finite-age particle trails with independent visual-speed controls, plus
+  and finite-age particle trails with independent visual-speed controls and offline snapshot GIF export, plus
   staged scientific-analysis work.
 
 ## Installing Skills

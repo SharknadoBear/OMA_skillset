@@ -1,0 +1,4 @@
+# Keep validated package bytes and pinned vendor checksums stable on Windows.
+* text eol=lf
+# The pinned upstream license intentionally ends with a blank line.
+assets/GIFENC_LICENSE.txt whitespace=-blank-at-eof
