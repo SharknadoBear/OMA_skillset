@@ -34,7 +34,7 @@ class TrailRenderer {
     this.backend="Canvas2D";this.reason="";
     if(!forceCanvas)try{this.initGL();}catch(error){this.reason=String(error.message);this.toCanvas();}
     else this.toCanvas();
-    if(this.gl)this.canvas.addEventListener("webglcontextlost",e=>{e.preventDefault();this.reason="Trail graphics context lost";this.toCanvas();if(this.lastDraw)this.draw(...this.lastDraw);});
+    if(this.gl)this.canvas.addEventListener("webglcontextlost",e=>{if(this.disposed)return;e.preventDefault();this.reason="Trail graphics context lost";this.toCanvas();if(this.lastDraw)this.draw(...this.lastDraw);});
   }
   toCanvas(){
     if(this.gl||!this.canvas.getContext("2d")){const replacement=this.canvas.cloneNode(false);this.canvas.replaceWith(replacement);this.canvas=replacement;}
@@ -115,6 +115,7 @@ class TrailRenderer {
     for(let i=31;i>=0;i--)if(count[i]){const age=(Math.floor(i/4)+.5)/8,w=(Math.exp(-3*age)-Math.exp(-3))/(1-Math.exp(-3)),c=this.palette[i%4];ctx.strokeStyle=`rgba(${c[0]},${c[1]},${c[2]},${c[3]*w})`;ctx.stroke(paths[i]);}
   }
   metrics(now,tail){return {trailBackend:this.backend,trailFallbackReason:this.reason,...this.history.metrics(now-this.epoch,tail)};}
+  dispose(){this.disposed=true;if(this.gl){this.gl.deleteBuffer(this.buffer);this.gl.deleteProgram(this.program);this.gl.getExtension("WEBGL_lose_context")?.loseContext();}this.canvas.width=this.canvas.height=1;this.history.clear();}
   alphaPixels(){const n=this.canvas.width*this.canvas.height,a=new Uint8Array(n*4);
     if(this.gl)this.gl.readPixels(0,0,this.canvas.width,this.canvas.height,this.gl.RGBA,this.gl.UNSIGNED_BYTE,a);else a.set(this.ctx.getImageData(0,0,this.canvas.width,this.canvas.height).data);
     let nonzero=0,max=0,sum=0;for(let i=3;i<a.length;i+=4){if(a[i])nonzero++;max=Math.max(max,a[i]);sum+=a[i];}return {nonzero,max,sum};

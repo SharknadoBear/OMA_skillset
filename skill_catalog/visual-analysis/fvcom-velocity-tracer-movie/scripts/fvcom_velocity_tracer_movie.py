@@ -301,7 +301,7 @@ def prepare(inputs, start=None, end=None, layer="depth_average", crs=None, vecto
                 speed_range_mps=[float(speed.min()), float(speed.max())],
                 smoothing="area_weighted_connected_wet_vertex_fans_then_native_barycentric",
                 temporal_interpolation="linear_components_with_common_wet_mask",
-                upstream_revision=UPSTREAM, renderer_revision="finite_age_v003", display_defaults=dict(particles=3000, tail_seconds=3, continuous_tail_seconds=1, visual_speed=1, lifetime_seconds=8, playback_seconds=60, trail_history_limit_bytes=64*1024*1024, continuous_motion="independent_visual_multiplier"))
+                upstream_revision=UPSTREAM, renderer_revision="snapshot_gif_v004", display_defaults=dict(particles=3000, tail_seconds=3, continuous_tail_seconds=1, visual_speed=1, lifetime_seconds=8, playback_seconds=60, trail_history_limit_bytes=64*1024*1024, continuous_motion="independent_visual_multiplier"))
     return arrays, info
 
 
@@ -343,6 +343,9 @@ def write_html(arrays, info, output, title="FVCOM current atlas", vmax=None):
     metadata["vmax"] = float(vmax if vmax is not None else max(info["speed_range_mps"][1], .01))
     if not np.isfinite(metadata["vmax"]) or metadata["vmax"] <= 0:
         raise ValueError("vmax must be positive and finite")
+    metadata["gif_export"] = dict(mode="snapshot", width=2400, duration_seconds=5, fps=20,
+        max_pixels=8000000, max_duration_seconds=10, intended_ppi=300,
+        encoder=json.loads((PACKAGE / "references/gifenc_provenance.json").read_text(encoding="utf-8")))
     metadata["arrays"] = {}
     blocks = []
     for name, a in arrays.items():
@@ -355,6 +358,11 @@ def write_html(arrays, info, output, title="FVCOM current atlas", vmax=None):
                     "@@DATA@@": "\n".join(blocks), "@@META@@": json.dumps(metadata, separators=(",", ":")).replace("<", "\\u003c"),
                     "@@ENGINE@@": (PACKAGE / "assets/tracer_engine.js").read_text(encoding="utf-8"),
                     "@@TRAILS@@": (PACKAGE / "assets/trail_renderer.js").read_text(encoding="utf-8"),
+                    "@@FIELD@@": (PACKAGE / "assets/field_renderer.js").read_text(encoding="utf-8"),
+                    "@@GIFENC@@": (PACKAGE / "assets/gifenc.js").read_text(encoding="utf-8"),
+                    "@@GIF_WORKER@@": (PACKAGE / "assets/gif_worker.js").read_text(encoding="utf-8"),
+                    "@@GIF_EXPORT@@": (PACKAGE / "assets/gif_export.js").read_text(encoding="utf-8"),
+                    "@@GIF_LICENSE@@": html.escape((PACKAGE / "assets/GIFENC_LICENSE.txt").read_text(encoding="utf-8")),
                     "@@VIEWER@@": (PACKAGE / "assets/viewer.js").read_text(encoding="utf-8"),
                     "@@LICENSE@@": html.escape((PACKAGE / "assets/EARTH_LICENSE.txt").read_text(encoding="utf-8"))}
     for key, content in replacements.items():

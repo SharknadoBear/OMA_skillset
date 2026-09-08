@@ -1,0 +1,18 @@
+{
+  "project": "https://github.com/mattdesl/gifenc",
+  "version": "1.0.3",
+  "revision": "15e2c3e65ed03c977b42fec48de59b05ee9b9f54",
+  "license": "MIT",
+  "files": {
+    "gifenc.js": {
+      "upstream_path": "dist/gifenc.js",
+      "sha256": "ab1ff6a05a05ddb85f642ae4c3f96d9e69e56fcfc472982172b088344e0fdb59",
+      "bytes": 22617
+    },
+    "GIFENC_LICENSE.txt": {
+      "upstream_path": "LICENSE.md",
+      "sha256": "47bc590c39d8ccccfc544875a9faebf44bafa828ef20315b396b5d0629f0cfd6",
+      "bytes": 1083
+    }
+  }
+}

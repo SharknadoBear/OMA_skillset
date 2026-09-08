@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; worker-src blob:; connect-src 'none'">
 <title>@@TITLE@@</title><style>@@STYLE@@</style></head>
 <body>
 <main id="map" aria-label="Interactive current field">
@@ -14,7 +14,7 @@
 <section id="controls" aria-label="Playback controls">
 <div class="control-top"><div class="modes"><button id="snapshot" class="active">Snapshot</button><button id="continuous">Continuous <small>TRIAL</small></button></div><time id="timestamp"></time></div>
 <div class="timeline"><button id="prev" aria-label="Previous snapshot">‹</button><button id="play" aria-label="Pause animation">Pause</button><input id="time" type="range" min="0" max="8" step="1" value="0" aria-label="Model time"><button id="next" aria-label="Next snapshot">›</button></div>
-<div class="control-bottom"><span id="time-note"></span><span id="motion-note"></span><button id="settings-button">Appearance</button><button id="about-button">About this field</button></div>
+<div class="control-bottom"><span id="time-note"></span><span id="motion-note"></span><button id="settings-button">Appearance</button><button id="export-gif">Export GIF</button><button id="about-button">About this field</button></div>
 <div id="settings" hidden>
 <label>Particles <input id="density" type="range" min="500" max="8000" step="500" value="3000"><output id="density-value">3000</output></label>
 <label>Trail duration <input id="tail" type="range" min=".2" max="8" step=".1" value="3"><output id="tail-value">3 s</output></label>
@@ -24,13 +24,27 @@
 <div id="history-note" role="status"></div>
 </div></section>
 </main>
+<dialog id="gif-dialog" aria-labelledby="gif-heading">
+<button id="gif-close" aria-label="Close GIF export">Close</button><h2 id="gif-heading">Export snapshot GIF</h2>
+<p id="gif-field"></p><p>The visible map and scientific labels will be included. Controls and hover information are excluded.</p>
+<div class="gif-options">
+<label>Width <select id="gif-width"><option>1200</option><option>1800</option><option selected>2400</option></select> px</label>
+<label>Duration <input id="gif-duration" type="number" min="3" max="10" step="1" value="5"> seconds</label>
+<label>Frame rate <select id="gif-fps"><option>10</option><option selected>20</option></select> FPS</label>
+</div><p id="gif-dimensions"></p><p>Forward playback repeats with a visible restart. The field timestamp stays fixed.</p>
+<button id="gif-start">Generate GIF</button> <button id="gif-cancel" hidden>Cancel export</button>
+<progress id="gif-progress" max="1" value="0" hidden></progress><p id="gif-status" role="status" aria-live="polite"></p>
+<div id="gif-result" hidden><img id="gif-preview" alt="Exported current snapshot animation"><p><a id="gif-download">Download GIF</a> &middot; <a id="gif-report">Download settings JSON</a></p></div>
+</dialog>
 <dialog id="about"><button id="close-about">Close</button><h2>Reading the current field</h2><div id="about-data"></div>
 <p>Snapshot tails depict an accelerated flow through one fixed field. Continuous mode interpolates the changing field on its model clock. Visual speed independently multiplies particle travel: 1× uses the model velocity, while other values are illustrative motion. Playback duration controls the field clock. These particles are not validated Lagrangian trajectories.</p>
 <p>Trail duration is the maximum age in active playback seconds. Trails fade smoothly to zero and expire completely. Pause freezes their age. Colors and hover velocities always show the unscaled field.</p>
 <p>Water shading and motion use area-weighted connected wet neighborhoods and barycentric interpolation on the native triangles. Native element values remain available in the hover readout. Interpolated speed is calculated from interpolated components.</p>
 <p>Map edges are reconstructed from the model mesh. Solid boundaries are pale; supplied open boundary edges are dashed. Pan by dragging and zoom with the wheel or buttons.</p>
-<h3>Earth attribution</h3><p>Particle lifecycle and color batching adapted from Cameron Beccario’s Earth project, revision 5f091f0c3b60aa38a996a886985bacb3673d16c3. Finite-age WebGL2 trails and the Canvas fallback are OMA implementations.</p><pre>@@LICENSE@@</pre></dialog>
+<h3>Earth attribution</h3><p>Particle lifecycle and color batching adapted from Cameron Beccario’s Earth project, revision 5f091f0c3b60aa38a996a886985bacb3673d16c3. Finite-age WebGL2 trails and the Canvas fallback are OMA implementations.</p><pre>@@LICENSE@@</pre><h3>GIF encoder attribution</h3><p>gifenc 1.0.3 by Matt DesLauriers, MIT. Bundled for offline snapshot export.</p><pre>@@GIF_LICENSE@@</pre></dialog>
 @@DATA@@
 <script id="metadata" type="application/json">@@META@@</script>
-<script>@@ENGINE@@</script><script>@@TRAILS@@</script><script>@@VIEWER@@</script>
+<script>@@ENGINE@@</script><script>@@TRAILS@@</script><script>@@FIELD@@</script>
+<script id="gifenc-source" type="text/plain">@@GIFENC@@</script><script id="gif-worker-source" type="text/plain">@@GIF_WORKER@@</script>
+<script>@@GIF_EXPORT@@</script><script>@@VIEWER@@</script>
 </body></html>
