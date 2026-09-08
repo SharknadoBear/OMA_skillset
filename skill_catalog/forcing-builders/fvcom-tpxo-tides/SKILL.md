@@ -25,6 +25,12 @@ acceptance still requires case-specific tide validation.
   `Re{f exp[i(V+u)] A exp(-ig)}` using UTide's astronomical argument `V` and
   time-varying nodal amplitude/phase corrections `f,u`, evaluated at each OBC
   node latitude. Do not silently fall back to an uncorrected harmonic sum.
+- Use UTide flags `[False, False, False, False]` for exact-time nodal and
+  astronomical evaluation. The first flag set to true freezes nodal `f,u` at
+  the record midpoint. Require `utide_exact_time_nodal_v1`, the flags, UTide
+  version and builder SHA-256 in the manifest and matching NetCDF attributes.
+  Preserve older products as historical evidence; a corrected forcing method
+  requires new spin-up/restart, benchmarks, production and validation.
 - Build a strictly monotonic, inclusive UTC axis. Write FVCOM MJD time as float64;
   float32 cannot reliably distinguish six-minute steps at present-day dates.
 - Write atomically and publish source, point-order, forcing, and diagnostics hashes.
@@ -39,6 +45,8 @@ acceptance still requires case-specific tide validation.
   mapping, UTide reconstruction, atomic FVCOM output, diagnostics, and manifest.
 - `scripts/selftest_fvcom_tpxo_tides.py`: offline 22-constituent, phase-wrap,
   time/order, unit-conversion, and dry-source fallback tests.
+- `scripts/selftest_nodal_time.py`: full-window, 22-constituent regression against
+  an independent cosine expansion, plus invariance across reconstruction windows.
 - `scripts/tpxo_tides.py`: legacy direct-source loading and reconstruction helpers;
   do not use it to bypass the model-neutral connector in production.
 - `scripts/grid_utils.py`: FVCOM OBC node reading and time conversion helpers.
@@ -80,6 +88,7 @@ For packaging checks only:
 ```powershell
 python -m compileall scripts
 python scripts/selftest_fvcom_tpxo_tides.py
+python scripts/selftest_nodal_time.py
 python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .
 ```
 

@@ -19,6 +19,8 @@ from build_fvcom_tides import (
     load_boundary_points,
     load_harmonics,
     parse_utc,
+    validate_forcing,
+    RECONSTRUCTION_RULE_VERSION,
 )
 from prepare_obc_points import ordered_nodes_sha256, prepare
 
@@ -127,6 +129,10 @@ def run() -> None:
         assert report["status"] == "ready"
         assert report["constituent_count"] == 22 and report["time_count"] == 11
         with nc4.Dataset(args.output) as ds:
+            assert ds.reconstruction_rule_version == RECONSTRUCTION_RULE_VERSION
+            assert json.loads(ds.utide_ngflags_json) == [False, False, False, False]
+            assert ds.builder_sha256 == report['hashes']['builder_sha256']
+            assert ds.utide_version == report['provenance']['utide_version']
             assert np.dtype(ds["time"].dtype).itemsize == 8
             assert np.array_equal(ds["obc_nodes"][:], [42, 7])
             assert ds["elevation"].shape == (11, 2)
@@ -140,6 +146,16 @@ def run() -> None:
             amplitude = np.asarray(ds["elevation_amplitude"][0], dtype=float)
             assert np.allclose(amplitude, 0.1, atol=1e-6), "millimetres must convert to metres"
         assert json.loads(Path(args.report).read_text(encoding="utf-8"))["health"]["status"] == "pass"
+        original_forcing = Path(args.output).read_bytes()
+        _, short_mjd = build_time_axis(args.start, args.end, 6)
+        for attribute, bad_value in [('reconstruction_rule_version', 'midpoint'),
+                                     ('utide_ngflags_json', '[true, false, false, false]'),
+                                     ('builder_sha256', '0' * 64)]:
+            with nc4.Dataset(args.output, 'a') as ds:
+                ds.setncattr(attribute, bad_value)
+            assert validate_forcing(args.output, load_boundary_points(points_csv), short_mjd, 360)['status'] == 'fail'
+            Path(args.output).write_bytes(original_forcing)
+        assert validate_forcing(args.output, load_boundary_points(points_csv), short_mjd, 360)['status'] == 'pass'
         full_times, full_mjd = build_time_axis(
             parse_utc("2025-03-25T00:00:00Z"),
             parse_utc("2025-05-01T00:00:00Z"),

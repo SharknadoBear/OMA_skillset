@@ -113,11 +113,20 @@ def fixture(project: Path, mixed: bool, runner, audit_script: Path, skill_dir: P
     # establishes that record at June 1 midnight; 1500*4.8 is not a UTC origin.
     startup = inputs / "startup.nc"
     state_file(startup, [STARTUP_IINT], [START], complete=True)
-    (inputs / "region_tide.nc").write_bytes(b"synthetic forcing source hash fixture")
+    nodal_rule = "utide_exact_time_nodal_v1"
+    nodal_flags = [False, False, False, False]
+    builder_hash = hashlib.sha256(b"synthetic nodal builder provenance fixture").hexdigest()
+    with nc.Dataset(inputs / "region_tide.nc", "w") as tide:
+        tide.reconstruction_rule_version = nodal_rule
+        tide.utide_ngflags_json = json.dumps(nodal_flags)
+        tide.builder_sha256 = builder_hash
+        tide.utide_version = "synthetic-test"
     exe = hashlib.sha256(b"synthetic frozen executable").hexdigest()
     write(project / "run/build/executable_reuse_binding.json", {"status": "frozen", "executable_sha256": exe})
     write(project / "request.json", {"case_id": "synthetic_regional", "period": {"analysis_start": "2024-06-01T00:00:00Z", "analysis_end": "2024-06-04T00:00:00Z"}, "tpxo": {"expected_constituent_count": 22}})
-    write(project / "forcing" / case / "forcing_manifest.json", {"status": "ready", "constituents": CONSTITUENTS, "hashes": {"forcing_sha256": sha256(inputs / "region_tide.nc")}})
+    write(project / "forcing" / case / "forcing_manifest.json", {"status": "ready", "constituents": CONSTITUENTS,
+          "hashes": {"forcing_sha256": sha256(inputs / "region_tide.nc"), "builder_sha256": builder_hash},
+          "provenance": {"reconstruction_rule_version": nodal_rule, "utide_ngflags": nodal_flags, "utide_version": "synthetic-test"}})
     files = {path.name: sha256(path) for path in inputs.iterdir()}
     bundle = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     write(attempt / "input_freeze.json", {"schema": "fvcom_input_freeze_v1", "executable_sha256": exe, "input_dir": str(inputs.relative_to(project)), "files": files, "input_bundle_sha256": bundle, "run_namelist_sha256": sha256(nml)})
@@ -248,6 +257,18 @@ def main():
         passed.append("audit_lineage_rejection")
         forcing_path = args.project / "forcing" / args.grid_case / "forcing_manifest.json"
         forcing_bytes = forcing_path.read_bytes()
+        for mutate, expected in [
+            (lambda f: f.pop("provenance"), "predates exact-time nodal"),
+            (lambda f: f["provenance"].update(utide_ngflags=[True,False,False,False]), "predates exact-time nodal"),
+            (lambda f: f["hashes"].update(builder_sha256="0"*64), "NetCDF and manifest disagree"),
+            (lambda f: f["provenance"].update(utide_version="another-version"), "NetCDF and manifest disagree"),
+        ]:
+            forcing = json.loads(forcing_bytes)
+            mutate(forcing);write(forcing_path, forcing)
+            rejects(lambda: verify_prerequisites(args), expected)
+            assert not output.exists()
+            forcing_path.write_bytes(forcing_bytes)
+            passed.append("nodal_provenance_rejection_" + str(len(passed)))
         forcing = json.loads(forcing_bytes)
         forcing["constituents"][15] = "T2"
         write(forcing_path, forcing)

@@ -25,6 +25,10 @@ from grid_utils import datetime64_to_mjd, read_obc_nodes_dat
 SCHEMA = "fvcom_tpxo_tide_forcing_report_v1"
 PRODUCT_SCHEMA = "tpxo9v5_harmonics_v1"
 DEFAULT_EXPECTED_CONSTITUENTS = 22
+RECONSTRUCTION_RULE_VERSION = "utide_exact_time_nodal_v1"
+# UTide FUV flags: NodsatLint, NodsatNone, GwchLint, GwchNone.
+# NodsatLint=True freezes f,u at tref; exact-time reconstruction needs all False.
+UTIDE_NGFLAGS = (False, False, False, False)
 
 
 class GateError(RuntimeError):
@@ -340,7 +344,7 @@ def reconstruct_utide(
             frequencies,
             indices,
             float(node_latitude),
-            [True, False, False, False],
+            list(UTIDE_NGFLAGS),
             [],
         )
         half_coefficient = 0.5 * coefficient_m[:, node_index]
@@ -405,6 +409,12 @@ def validate_forcing(
 ) -> dict[str, Any]:
     problems: list[str] = []
     with nc4.Dataset(path) as ds:
+        if getattr(ds, "reconstruction_rule_version", None) != RECONSTRUCTION_RULE_VERSION:
+            problems.append("Forcing lacks the exact-time nodal reconstruction rule.")
+        if getattr(ds, "utide_ngflags_json", None) != json.dumps(list(UTIDE_NGFLAGS)):
+            problems.append("Forcing does not declare exact-time UTide nodal/astronomical flags.")
+        if getattr(ds, "builder_sha256", None) != sha256_file(__file__):
+            problems.append("Forcing builder hash differs from the validating builder.")
         nodes = np.asarray(ds["obc_nodes"][:], dtype=np.int32)
         time_dtype = np.dtype(ds["time"].dtype)
         time = np.asarray(ds["time"][:], dtype=float)
@@ -464,6 +474,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         )
     times, mjd = build_time_axis(args.start, args.end, args.interval_minutes)
     elevation = reconstruct_utide(harmonics.coefficient_m, harmonics.names, times, points.latitude)
+    import utide
+    builder_sha = sha256_file(__file__)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary_output = output.with_name(f".{output.name}.partial")
     if temporary_output.exists():
@@ -475,6 +487,10 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         ds.obc_points_sha256 = sha256_file(points_path)
         ds.obc_order_sha256 = boundary_order_sha256(points)
         ds.astronomical_reconstruction = "UTide astronomical argument V with time-varying nodal f,u"
+        ds.reconstruction_rule_version = RECONSTRUCTION_RULE_VERSION
+        ds.utide_ngflags_json = json.dumps(list(UTIDE_NGFLAGS))
+        ds.utide_version = utide.__version__
+        ds.builder_sha256 = builder_sha
         ds.phase_convention = "TPXO Greenwich phase lag; coefficient=A*exp(-i*g)"
         ds.time_coverage_start = args.start.isoformat().replace("+00:00", "Z")
         ds.time_coverage_end = args.end.isoformat().replace("+00:00", "Z")
@@ -502,6 +518,7 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "obc_order_sha256": boundary_order_sha256(points),
             "forcing_sha256": sha256_file(output),
             "diagnostics_sha256": sha256_file(diagnostics),
+            "builder_sha256": builder_sha,
         },
         "provenance": {
             "source_product_schema": PRODUCT_SCHEMA,
@@ -510,6 +527,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             "coefficient_convention": "A*exp(-i*Greenwich_phase_lag)",
             "astronomical_argument": "UTide V",
             "nodal_handling": "UTide time-varying f and u, evaluated at each OBC-node latitude",
+            "reconstruction_rule_version": RECONSTRUCTION_RULE_VERSION,
+            "utide_ngflags": list(UTIDE_NGFLAGS),
+            "utide_version": utide.__version__,
             "time_standard": "UTC",
             "time_coverage_start": args.start.isoformat().replace("+00:00", "Z"),
             "time_coverage_end": args.end.isoformat().replace("+00:00", "Z"),

@@ -10,6 +10,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
+import netCDF4 as nc4
 
 _script_path = Path(__file__).resolve()
 for _run_control in (_script_path.parents[2] / "fvcom-run-control" / "scripts",
@@ -132,6 +133,19 @@ def verify_prerequisites(args: argparse.Namespace) -> dict[str, Any]:
     elevation_name = nml.get("OBC_ELEVATION_FILE")
     if elevation_name not in files or forcing.get("hashes", {}).get("forcing_sha256") != files[elevation_name]:
         raise ValueError("forcing manifest does not bind the actual run elevation file")
+    provenance = forcing.get("provenance", {})
+    rule = "utide_exact_time_nodal_v1"
+    flags = [False, False, False, False]
+    if provenance.get("reconstruction_rule_version") != rule or provenance.get("utide_ngflags") != flags:
+        raise ValueError("forcing predates exact-time nodal reconstruction; preserve it and rebuild dependent stages")
+    builder_hash = digest(forcing.get("hashes", {}).get("builder_sha256"))
+    with nc4.Dataset(input_dir / elevation_name) as tide:
+        if (getattr(tide, "reconstruction_rule_version", None) != rule
+                or getattr(tide, "utide_ngflags_json", None) != json.dumps(flags)
+                or getattr(tide, "builder_sha256", None) != builder_hash
+                or not provenance.get("utide_version")
+                or getattr(tide, "utide_version", None) != provenance["utide_version"]):
+            raise ValueError("forcing NetCDF and manifest disagree on exact-time nodal reconstruction provenance")
     audit_path = args.production_audit.resolve() if args.production_audit else attempt / "production_audit.json"
     audit = read(audit_path)
     if audit.get("status") != "passed" or audit.get("blocking_reasons") or audit.get("run_namelist_sha256") != nml_hash:
