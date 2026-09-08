@@ -82,6 +82,16 @@ manager re-runs the gate on the exact selected serialized mesh, writes
 `fvcom_tge_source_bound_audit.json`, and makes a missing, mismatched, or stale
 source audit blocking for `validate --require-submission-ready`.
 
+When forcing is generated after terminal-grid publication, use
+`manage_fvcom_grid_project.py join-forcing` to bind the terminal grid contract,
+ordered geographic OBC points, actual elevation NetCDF, and forcing-owner
+manifest in a new immutable certificate revision. This resolves only missing
+or incompatible forcing preconditions after actual node, coordinate, hash,
+time-encoding, finite-data and nodal-provenance checks pass. Preserve original
+quality, conditioning, source-order remapping, maps and source-bound TGE
+evidence; do not republish changed companions to mark forcing ready. See
+`references/grid_project_contract.md` for the command and revision contract.
+
 ```powershell
 python scripts/manage_fvcom_grid_project.py init --project runs/my_project --name my_project
 python scripts/run_mesher_portfolio_case.py --case-manifest runs/my_project/05_mesh_intent/case_manifest.json --output-dir runs/my_project/06_raw_mesh/_work/gmsh6

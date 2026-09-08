@@ -74,6 +74,16 @@ def parser() -> argparse.ArgumentParser:
     validation.add_argument("--project", required=True, type=Path)
     validation.add_argument("--require-submission-ready", action="store_true")
     validation.add_argument("--require-benchmark-ready", action="store_true")
+    forcing_join = sub.add_parser("join-forcing", help="Certify terminal-order forcing without replacing immutable grid companions")
+    forcing_join.add_argument("--project", required=True, type=Path)
+    forcing_join.add_argument("--grid-contract", required=True, type=Path)
+    forcing_join.add_argument("--obc-points", required=True, type=Path)
+    forcing_join.add_argument("--forcing", required=True, type=Path)
+    forcing_join.add_argument("--forcing-manifest", required=True, type=Path)
+    forcing_join.add_argument("--tge-source", required=True, type=Path)
+    forcing_join.add_argument("--open-exterior-source", type=Path)
+    forcing_join.add_argument("--boundary-resolution-source", type=Path)
+    forcing_join.add_argument("--revision", required=True, type=int)
     return root
 
 
@@ -114,6 +124,12 @@ def main() -> int:
             boundary_gate_policy=args.boundary_gate_policy,
             basemap_provider=args.basemap_provider,
         )
+    elif args.command == "join-forcing":
+        from fvcom_grid_generation.forcing_join import certify_terminal_forcing
+        result = certify_terminal_forcing(args.project, grid_contract=args.grid_contract,
+            obc_points=args.obc_points, forcing=args.forcing, forcing_manifest=args.forcing_manifest,
+            tge_source=args.tge_source, open_exterior_source=args.open_exterior_source,
+            boundary_resolution_source=args.boundary_resolution_source, revision=args.revision)
     else:
         result = validate(
             args.project,

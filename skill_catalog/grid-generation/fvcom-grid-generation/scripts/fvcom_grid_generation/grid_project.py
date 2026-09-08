@@ -713,6 +713,8 @@ def validate(
             failures.append("selected_artifact_hash_stale")
     mesh = status.get("mesh")
     if mesh:
+        if not (root / "final/fvcom_grid_status.json").is_file() or _read(root / "final/fvcom_grid_status.json") != status:
+            failures.append("delivery_status_files_disagree")
         if "raw_mesh.2dm" not in manifest.get("selected_artifacts", {}):
             failures.append("raw_mesh_provenance_missing")
         path = root / mesh["path"]
@@ -729,6 +731,15 @@ def validate(
             quality_document = _read(quality_path)
             if quality_document.get("quality_policy") != policy_binding:
                 failures.append("mesh_quality_policy_missing_or_stale")
+            quality_decision = classify_failure_codes(
+                quality_document.get("all_quality_findings", []), load_quality_policy()
+            )
+            if bool(status.get("benchmark_grid_baseline_ready")) != (not quality_decision["benchmark_baseline"]):
+                failures.append("delivery_quality_decision_mismatch")
+            if not status.get("terminal_forcing_certificate"):
+                unresolved = set(quality_decision["submission_preconditions"])
+                if not unresolved.issubset(set(status.get("submission_failure_taxonomy", []))) or (unresolved and status.get("submission_eligible")):
+                    failures.append("submission_findings_unresolved")
             if mesh_document is not None:
                 tge_failures, expected_tge = _quality_tge_failures(
                     quality_document,
@@ -802,6 +813,14 @@ def validate(
             failures.append("project_not_benchmark_ready")
         if not mesh:
             failures.append("benchmark_mesh_missing")
+    if status.get("terminal_forcing_certificate"):
+        from .forcing_join import verify_terminal_forcing_join
+        try:
+            verify_terminal_forcing_join(root, status)
+            if _read(root / "final/fvcom_grid_status.json") != status:
+                failures.append("terminal_forcing_delivery_status_mismatch")
+        except (ValueError, KeyError, OSError, TypeError, IndexError, AttributeError, RuntimeError):
+            failures.append("terminal_forcing_certificate_invalid")
     if require_submission_ready:
         if (
             status.get("submission_eligible") is not True

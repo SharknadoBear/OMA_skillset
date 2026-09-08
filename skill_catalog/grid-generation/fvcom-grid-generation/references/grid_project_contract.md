@@ -95,3 +95,43 @@ Run `validate --require-benchmark-ready` before a first benchmark run. Run
 it additionally requires forcing/remap compatibility, complete provenance, and
 an exact final-mesh hash. Class-2/3 debt does not independently block either
 decision. A stable filename alone is never sufficient.
+
+## Forcing generated for the published terminal mesh
+
+Conditioning may resample an OBC, so a historical source-order remapping
+finding can remain in the immutable quality report even after new forcing
+has been generated directly for the terminal node order. Complete this late
+join through the owning manager:
+
+```text
+python scripts/manage_fvcom_grid_project.py join-forcing --project runs/case --grid-contract runs/case/final/grid_delivery_contract.json --obc-points forcing/obc_points.csv --forcing forcing/case_tides.nc --forcing-manifest forcing/forcing_manifest.json --tge-source build/tge.F --open-exterior-source runs/case/03_boundary/open_exterior_contract.json --revision 1
+```
+
+Each positive revision must be unused. The manager first requires the existing
+benchmark, publication and source-bound TGE gates to pass. It independently
+checks the terminal mesh and contract, exact plural OBC chain order, point
+coordinates, owner hashes and ready status, actual NetCDF node IDs, finite
+unmasked elevations in meters, matching UTC MJD/integer/string time encodings,
+coverage/cadence, and exact-time nodal provenance. It archives the forcing,
+points, owner manifest, previous delivery status and a hash-bound certificate
+under `08_audit/forcing_joins/vNNN/`.
+
+The exact TGE source is copied into the certificate revision; its hash must
+match the original source-bound audit. The literal TGE check is recomputed
+on each validation. Boundary evidence stays at its original project-local
+location so relative dependencies keep their meaning. Pass the original
+open-exterior source and, for a reviewed Adaptive-v2 gate,
+`--boundary-resolution-source`. The owning boundary validator reopens that
+evidence and its dependencies and must reproduce the published decision.
+
+Only `open_boundary_forcing_missing` and
+`open_boundary_forcing_incompatible` may be resolved by this certificate.
+Original quality findings and every frozen grid companion remain unchanged;
+the source-order remap is not reinterpreted as compatible. The effective
+submission decision is derived from the original findings plus the certified
+terminal-order forcing. An immutable delivery-status revision is retained;
+only the two current delivery-status files and command log are updated.
+Subsequent validation rechecks every bound artifact and actual forcing.
+Removing or changing the certificate, changing its inputs, or contradicting
+its decision in a mutable status file blocks submission. Other geometric,
+boundary or source failures must be resolved through their owning workflow.
