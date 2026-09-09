@@ -14,7 +14,7 @@ Use this skill as a self-contained Python toolbox for external data access. Keep
 - Main packaged scripts:
 - `scripts/noaa_tides.py`
 - `scripts/coops_currents.py`: discover water-level/current stations inside a projected wet 2DM, classify profiler orientation, download `currents` in API-compliant seven-day `bin=0` chunks, and produce east/north depth-integrated currents.
-- `scripts/screen_tidal_stations.py`: screen a residual-boundary contract against tidal CO-OPS stations within a bounded radius. A station is eligibility evidence only; it never creates an OBC automatically and never substitutes a river gauge.
+- `scripts/screen_tidal_stations.py`: screen a residual-boundary contract against tidal CO-OPS stations within a bounded radius. Query both NOAA water-level and tide-prediction catalogs, deduplicate station IDs with catalog provenance, and retain product, datum, harmonic and water-component eligibility checks. A station is eligibility evidence only; it never creates an OBC automatically and never substitutes a river gauge.
 - Standard estimate hook: `scripts/estimate_data_request.py`.
 - Standard finishing gate: `scripts/check_download_health.py`.
 

@@ -20,6 +20,7 @@ from shapely.ops import unary_union
 
 MDAPI = "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi"
 ELIGIBLE_PRODUCTS = {"water levels", "tide predictions"}
+INVENTORY_CATALOG_TYPES = ("waterlevels", "tidepredictions")
 
 
 def sha256_file(path: str | Path) -> str:
@@ -106,8 +107,22 @@ def _same_wet_component(wet_geometry, component_point: Point, station_point: Poi
 
 
 def _live_inventory() -> list[dict[str, Any]]:
-    payload = _request_json(f"{MDAPI}/stations.json?type=waterlevels")
-    return list(payload.get("stations") or [])
+    # NOAA's active water-level inventory omits prediction-only tidal sites.
+    # Preserve the first (water-level) record on overlap and retain both sources.
+    stations: dict[str, dict[str, Any]] = {}
+    for catalog_type in INVENTORY_CATALOG_TYPES:
+        url = f"{MDAPI}/stations.json?type={catalog_type}"
+        payload = _request_json(url)
+        for station in payload.get("stations") or []:
+            station_id = str(station.get("id") or "").strip()
+            if not station_id:
+                continue
+            if station_id not in stations:
+                stations[station_id] = {**station, "id": station_id, "inventory_sources": []}
+            provenance = {"catalog_type": catalog_type, "url": url}
+            if provenance not in stations[station_id]["inventory_sources"]:
+                stations[station_id]["inventory_sources"].append(provenance)
+    return list(stations.values())
 
 
 def _live_station_details(station: dict[str, Any]) -> dict[str, Any]:
@@ -182,6 +197,7 @@ def screen_stations(
                 "distance_km": distance_km,
                 "tidal": tidal,
                 "products": sorted(products),
+                "inventory_sources": station.get("inventory_sources", []),
                 "datums_available": datum_ok,
                 "harmonic_constituents_available": harmonic_ok,
                 "same_retained_wet_component": hydraulic,
@@ -214,10 +230,12 @@ def screen_stations(
             "provider": "NOAA CO-OPS",
             "metadata_api": MDAPI,
             "inventory_mode": "offline_fixture" if fixture_json else "live_metadata_api",
+            "inventory_catalog_types": [] if fixture_json else list(INVENTORY_CATALOG_TYPES),
+            "inventory_station_count": len(inventory),
         },
         "policy": {
             "radius_km": float(radius_km),
-            "station_type": "NOAA_COOPS_tidal_water_level_only",
+            "station_type": "NOAA_COOPS_tidal_water_level_or_prediction",
             "river_gauges_allowed": False,
             "station_is_eligibility_not_automatic_obc": True,
             "hydraulic_connectivity_rule": "same_retained_wet_component",
