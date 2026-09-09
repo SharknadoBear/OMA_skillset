@@ -69,6 +69,16 @@ class SourceOpenBoundary:
     exterior_segment_indices: tuple[int, ...]
 
 
+def _open_boundary_node_indices(boundary: SourceOpenBoundary, count: int) -> list[int]:
+    """Return traversal nodes, including the closing endpoint for a cyclic chain."""
+    indices = list(boundary.exterior_segment_indices)
+    if not indices:
+        return []
+    if boundary.orientation == "reverse":
+        return [(indices[0] + 1) % count, *indices]
+    return [indices[0], *[(index + 1) % count for index in indices]]
+
+
 @dataclass(frozen=True)
 class PreparedCase:
     manifest: dict[str, Any]
@@ -113,18 +123,10 @@ def source_open_boundary_lonlat(
     count = len(exterior)
     parts: list[LineString] = []
     for boundary in open_boundaries:
-        indices = list(boundary.exterior_segment_indices)
+        indices = _open_boundary_node_indices(boundary, count)
         if not indices:
             continue
-        xy = np.vstack(
-            [
-                exterior[int(indices[0]) % count],
-                *[
-                    exterior[(int(segment_index) + 1) % count]
-                    for segment_index in indices
-                ],
-            ]
-        )
+        xy = exterior[np.asarray(indices, dtype=int)]
         lonlat = unproject_points(xy, projection)
         parts.append(LineString(lonlat))
     if not parts:
@@ -769,6 +771,80 @@ def _coordinate_sha256(values: np.ndarray) -> str:
     return hashlib.sha256(array.tobytes(order="C")).hexdigest()
 
 
+def _open_boundaries_from_adaptive_chains(
+    manifest: dict[str, Any],
+    resolution_payload: dict[str, Any],
+    exterior_source_node_ids: list[int],
+    segment_kinds: tuple[str, ...],
+) -> tuple[SourceOpenBoundary, ...]:
+    """Bind OBC identity and traversal to exact Adaptive-v2 source sequences."""
+    boundary = manifest["boundary"]
+    declared = list(boundary.get("open_boundaries") or [])
+    records = list(resolution_payload.get("open_boundary_chains") or [])
+    expected = int(boundary.get("expected_open_boundary_count", 1))
+    if len(declared) != expected or len(records) != expected:
+        raise ValueError("Adaptive OBC source/declaration count mismatch")
+    count = len(exterior_source_node_ids)
+    positions = {int(node): index for index, node in enumerate(exterior_source_node_ids)}
+    if len(positions) != count or len(segment_kinds) != count:
+        raise ValueError("Adaptive exterior source-node indices are not unique/aligned")
+    by_id = {str(int(record["obc_id"])): record for record in records}
+    if len(by_id) != len(records) or any(int(value) < 0 for value in by_id):
+        raise ValueError("Adaptive source OBC IDs are not unique/nonnegative")
+    if len({str(record["id"]) for record in declared}) != len(declared):
+        raise ValueError("Declared OBC IDs are not unique")
+    output: list[SourceOpenBoundary] = []
+    used_ids: set[str] = set()
+    covered: list[int] = []
+    for declaration in declared:
+        source_id = str(declaration.get("source_obc_id", declaration["id"]))
+        if source_id not in by_id and "source_obc_id" not in declaration and expected == 1:
+            source_id = next(iter(by_id))  # A sole legacy display label is unambiguous.
+        if source_id not in by_id or source_id in used_ids:
+            raise ValueError("Declared source_obc_id is missing, duplicate or ambiguous")
+        used_ids.add(source_id)
+        record = by_id[source_id]
+        cyclic = bool(record.get("is_closed", False))
+        if bool(declaration.get("cyclic", False)) != cyclic:
+            raise ValueError("Declared/source OBC cyclicity mismatch")
+        source_nodes = list(record.get("node_sequence_zero_based") or [])
+        if int(record.get("node_count", -1)) != len(source_nodes):
+            raise ValueError("Adaptive OBC node_count differs from exact source sequence")
+        try:
+            nodes = [positions[int(node)] for node in source_nodes]
+        except KeyError as error:
+            raise ValueError("Adaptive OBC references a missing exterior source node") from error
+        if cyclic and len(nodes) > 1 and nodes[0] == nodes[-1]:
+            nodes.pop()
+        if len(nodes) < (3 if cyclic else 2) or len(set(nodes)) != len(nodes):
+            raise ValueError("Adaptive OBC source sequence is empty, too short or repeated")
+        requested_orientation = str(declaration.get("orientation", "source")).lower()
+        if requested_orientation == "reverse":
+            nodes.reverse()
+        elif requested_orientation not in {"source", "preserve_source_order"}:
+            raise ValueError("Unsupported Adaptive OBC orientation")
+        pairs = list(zip(nodes, nodes[1:] + (nodes[:1] if cyclic else [])))
+        forward = all(right == (left + 1) % count for left, right in pairs)
+        reverse = all(right == (left - 1) % count for left, right in pairs)
+        if not forward and not reverse:
+            raise ValueError("Adaptive OBC source sequence is not contiguous on the exterior")
+        indices = tuple(left if forward else right for left, right in pairs)
+        if cyclic and len(indices) != count:
+            raise ValueError("Cyclic Adaptive OBC does not cover the complete exterior")
+        if not cyclic and len(indices) >= count:
+            raise ValueError("Noncyclic Adaptive OBC covers the complete exterior")
+        output.append(SourceOpenBoundary(
+            chain_id=str(declaration["id"]), kind=str(declaration.get("kind", "ocean_exchange")),
+            cyclic=cyclic, orientation="source" if forward else "reverse",
+            exterior_segment_indices=indices,
+        ))
+        covered.extend(indices)
+    open_segments = {index for index, kind in enumerate(segment_kinds) if kind == "open"}
+    if len(covered) != len(set(covered)) or set(covered) != open_segments:
+        raise ValueError("Adaptive OBC sequences do not cover open exterior segments exactly once")
+    return tuple(output)
+
+
 def _delivered_open_boundary_membership_report(
     manifest: dict[str, Any],
     exterior_xy: np.ndarray,
@@ -816,8 +892,9 @@ def _delivered_open_boundary_membership_report(
         if len(indices) != len(set(indices)):
             chain_failures.append("duplicate_segment_index")
         if indices and all(0 <= value < segment_count for value in indices):
+            step = -1 if boundary.orientation == "reverse" else 1
             if any(
-                right != (left + 1) % segment_count
+                right != (left + step) % segment_count
                 for left, right in zip(indices, indices[1:])
             ):
                 chain_failures.append("segment_sequence_not_contiguous")
@@ -830,7 +907,7 @@ def _delivered_open_boundary_membership_report(
 
         node_indices: list[int] = []
         if indices and all(0 <= value < segment_count for value in indices):
-            node_indices = [indices[0], *[(value + 1) % segment_count for value in indices]]
+            node_indices = _open_boundary_node_indices(boundary, segment_count)
             if boundary.cyclic and node_indices[-1] == node_indices[0]:
                 node_indices = node_indices[:-1]
         hard_count = int(sum(value in hard_set for value in node_indices))
@@ -1264,12 +1341,16 @@ def _load_adaptive_geometry(
     exterior_vertex_kinds: list[str] = []
     exterior_targets: list[float] = []
     exterior_hard_values: list[bool] = []
+    exterior_source_node_ids: list[int] = []
     for group_index, (_chain_id, group) in enumerate(grouped):
         array = _ring_xy([[point.x, point.y] for point in group.geometry])
         loop_arrays.append(array)
         loop_target_arrays.append(np.asarray(group["target_spacing_m"], dtype=float))
         loop_chain_ids.append(str(_chain_id))
         if group_index == 0:
+            if "node_index_zero_based" not in group:
+                raise ValueError("Adaptive boundary_nodes lacks exact source node indices")
+            exterior_source_node_ids = [int(value) for value in group["node_index_zero_based"]]
             exterior_vertex_kinds = [
                 str(value).lower() for value in group["boundary_kind"].tolist()
             ]
@@ -1322,10 +1403,8 @@ def _load_adaptive_geometry(
         else "land"
         for index in range(len(exterior_vertex_kinds))
     )
-    open_boundaries = _open_boundaries_from_runs(
-        manifest,
-        _contiguous_segment_runs(segment_kinds),
-        exterior_xy,
+    open_boundaries = _open_boundaries_from_adaptive_chains(
+        manifest, resolution_payload, exterior_source_node_ids, segment_kinds,
     )
     resolved_open = gpd.read_file(
         gpkg, layer="resolved_open_boundary"
