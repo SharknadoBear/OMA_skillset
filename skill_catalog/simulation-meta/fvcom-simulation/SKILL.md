@@ -46,6 +46,7 @@ For each grid case in `accepted_t6v6`, then `fresh_reproduction` order:
 3. Invoke `$noaa-coops-tides` to discover water-level and current stations inside the actual wet polygon. Quantitative current validation admits only downward-looking all-bin profiles; record why side-looking instruments are excluded.
 4. Invoke `$fvcom-namelist-configuration` to generate the final namelist and cell-based station file. Reject any surface, atmospheric-pressure, river, temperature/salinity OBC, mean-flow, wave, ice, biology, sediment, or particle forcing.
 5. Recompute every file reference and hash. Do not submit a bundle whose mesh, OBC, forcing, namelist, executable, or station mapping disagrees.
+   Have Run Control verify staged runtime permissions, including FVCOM's writable `.fvcomtestfile` marker, before freezing a submission. Hash agreement alone does not establish that initialization can write its required runtime files.
 
 ## Numerical Controls and Stability
 
