@@ -20,6 +20,7 @@ tpxo:
 observations:
   provider: noaa_coops
   station_policy: all_available_inside_wet_domain
+  water_level_mapping_policy: strict_inside  # or containing_cell_or_nearest_wet_cell
   current_policy: downward_all_bin_profiles_only
 kestrel:
   source_dir: /home/yhuang168/FVCOM_source_agent_test

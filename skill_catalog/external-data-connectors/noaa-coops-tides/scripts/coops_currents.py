@@ -143,8 +143,11 @@ def current_period_coverage(metadata: dict[str, Any], start: str, end: str) -> d
             "method": "deployment intervals, falling back to documented first/last good data; metadata dates interpreted in UTC"}
 
 
-def discover(mesh: Path, mesh_crs: str, start: str, end: str) -> dict[str, Any]:
+def discover(mesh: Path, mesh_crs: str, start: str, end: str,
+             water_level_mapping_policy: str = "strict_inside") -> dict[str, Any]:
     from pyproj import Transformer
+    if water_level_mapping_policy not in {"strict_inside", "containing_cell_or_nearest_wet_cell"}:
+        raise ValueError("Unsupported water-level mapping policy")
     nodes, tris = parse_mesh(mesh)
     xs = [p[0] for p in nodes.values()]
     ys = [p[1] for p in nodes.values()]
@@ -171,6 +174,10 @@ def discover(mesh: Path, mesh_crs: str, start: str, end: str) -> dict[str, Any]:
                 continue
             inside = point_in_mesh(x, y, nodes, tris)
             item = {"id": sid, "name": station.get("name"), "role": role, "latitude": lat, "longitude": lon, "inside_geographic_envelope": True, "inside_wet_mesh": inside, "eligible": inside, "exclusion_reason": None if inside else "outside_actual_wet_mesh"}
+            if role == "water_level" and water_level_mapping_policy != "strict_inside":
+                item.update(eligible=True, exclusion_reason=None,
+                            mapping_required="containing_cell" if inside else "nearest_wet_cell_proxy",
+                            source_data_eligibility="pending_period_scalar_data_checks")
             if role == "current":
                 try:
                     meta = current_metadata(sid)
@@ -191,11 +198,12 @@ def discover(mesh: Path, mesh_crs: str, start: str, end: str) -> dict[str, Any]:
             inventory.append(item)
     counts = {
         "water_level_envelope": sum(x["role"] == "water_level" for x in inventory),
-        "water_level_strict_wet": sum(x["role"] == "water_level" and x["eligible"] for x in inventory),
+        "water_level_strict_wet": sum(x["role"] == "water_level" and x["inside_wet_mesh"] for x in inventory),
+        "water_level_eligible": sum(x["role"] == "water_level" and x["eligible"] for x in inventory),
         "current_envelope": sum(x["role"] == "current" for x in inventory),
         "current_downward_strict_wet": sum(x["role"] == "current" and x["eligible"] for x in inventory),
     }
-    return {"schema": "noaa_coops_validation_station_inventory_v1", "generated_at": now(), "mesh": str(mesh), "mesh_sha256": sha256(mesh), "mesh_crs": mesh_crs, "geographic_envelope": geographic_bounds, "period_start": start, "period_end": end, "selection_policy": "discover within mesh envelope; validation eligibility requires exact wet-triangle containment", "counts": counts, "stations": sorted(inventory, key=lambda x: (x["role"], x["id"]))}
+    return {"schema": "noaa_coops_validation_station_inventory_v1", "generated_at": now(), "mesh": str(mesh), "mesh_sha256": sha256(mesh), "mesh_crs": mesh_crs, "geographic_envelope": geographic_bounds, "period_start": start, "period_end": end, "selection_policy": "discover within regional mesh envelope; water mapping policy explicit; current eligibility requires wet containment, downward profiles and period overlap", "water_level_mapping_policy": water_level_mapping_policy, "counts": counts, "stations": sorted(inventory, key=lambda x: (x["role"], x["id"]))}
 
 
 def speed_direction_to_uv(speed_cm_s: np.ndarray, direction_deg: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -283,13 +291,14 @@ def main() -> int:
     sub = p.add_subparsers(dest="command", required=True)
     q = sub.add_parser("discover")
     q.add_argument("--mesh", required=True); q.add_argument("--mesh-crs", required=True)
+    q.add_argument("--water-level-mapping-policy", choices=["strict_inside", "containing_cell_or_nearest_wet_cell"], default="strict_inside")
     q.add_argument("--period-start", required=True); q.add_argument("--period-end", required=True); q.add_argument("--output", required=True)
     q = sub.add_parser("fetch")
     q.add_argument("--station", required=True); q.add_argument("--period-start", required=True); q.add_argument("--period-end", required=True)
     q.add_argument("--cache-dir", required=True); q.add_argument("--output", required=True); q.add_argument("--manifest", required=True)
     args = p.parse_args()
     if args.command == "discover":
-        result = discover(Path(args.mesh), args.mesh_crs, args.period_start, args.period_end); write_json(Path(args.output), result)
+        result = discover(Path(args.mesh), args.mesh_crs, args.period_start, args.period_end, args.water_level_mapping_policy); write_json(Path(args.output), result)
     else:
         result = fetch_currents(args.station, args.period_start, args.period_end, Path(args.cache_dir), Path(args.output), Path(args.manifest))
     print(json.dumps(result, indent=2, default=str))

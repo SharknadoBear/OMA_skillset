@@ -173,6 +173,7 @@ def condense(netcdf_paths: list[Path], mapping_path: Path, namelist_path: Path,
     output_dir.mkdir(parents=True, exist_ok=True)
     index_by_name = {name: index for index, name in enumerate(names)}
     products = []
+    diagnostic_products = []
     for station_id in expected_names:
         station = mapped[station_id]
         index = index_by_name[station_id]
@@ -183,10 +184,17 @@ def condense(netcdf_paths: list[Path], mapping_path: Path, namelist_path: Path,
         elif role == "current":
             path = output_dir / f"{station_id}_model_current.csv"
             write_csv(path, ["time", "model_u", "model_v"], [[iso_time(time), f"{fields['ua'][row, index]:.10g}", f"{fields['va'][row, index]:.10g}"] for row, time in enumerate(timestamps)])
+        elif role == "model_diagnostic" and station.get("validation_eligible") is False:
+            path = output_dir / f"{station_id}_model_diagnostic.csv"
+            write_csv(path, ["time", "model", "model_u", "model_v"], [[iso_time(time),
+                f"{fields['zeta'][row, index]:.10g}", f"{fields['ua'][row, index]:.10g}",
+                f"{fields['va'][row, index]:.10g}"] for row, time in enumerate(timestamps)])
         else:
             raise ValueError(f"unsupported station role {role!r} for {station_id}")
-        products.append({"station_id": station_id, "role": role, "path": str(path), "sha256": sha256(path),
-                         "cell_id": int(station["cell_id"]), "record_count": int(len(iint))})
+        destination = diagnostic_products if role == "model_diagnostic" else products
+        destination.append({"station_id": station_id, "role": role, "path": str(path), "sha256": sha256(path),
+                         "cell_id": int(station["cell_id"]), "record_count": int(len(iint)),
+                         "spatial_mapping": station.get("spatial_mapping")})
     raw_time_warnings = []
     for source in sources:
         diagnostic = source.get("time_diagnostic")
@@ -201,6 +209,7 @@ def condense(netcdf_paths: list[Path], mapping_path: Path, namelist_path: Path,
                 )
     result = {
         "schema": "fvcom_station_condensation_v1", "status": "ready", "generated_at": utcnow(),
+        "diagnostic_products": diagnostic_products,
         "time_reconstruction": {"method": "START_DATE + (iint - startup_iint) * EXTSTEP_SECONDS * ISPLIT",
                                 "time_anchor": anchor,
                                 "start_utc": iso_time(start), "end_utc": iso_time(timestamps[-1]),

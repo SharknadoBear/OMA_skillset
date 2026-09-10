@@ -223,8 +223,13 @@ def collect_record(stdout_path: Path, sacct_path: Path, namelist_path: Path,
     exit_code = int((primary.get("ExitCode") or "1:0").split(":", 1)[0])
     state = primary.get("State", "UNKNOWN").split("+", 1)[0]
     peak_memory_bytes = max((parse_scaled_bytes(row.get("MaxRSS")) for row in rows), default=0.0)
-    max_disk_read_bytes = max((parse_scaled_bytes(row.get("MaxDiskRead")) for row in rows), default=0.0)
-    max_disk_write_bytes = max((parse_scaled_bytes(row.get("MaxDiskWrite")) for row in rows), default=0.0)
+    def optional_counter(key: str) -> float | None:
+        # Blank allocation/extern rows are normal; only measured task values count.
+        values = [parse_scaled_bytes(row[key]) for row in rows if (row.get(key) or "").strip()]
+        return max(values) if values else None
+
+    max_disk_read_bytes = optional_counter("MaxDiskRead")
+    max_disk_write_bytes = optional_counter("MaxDiskWrite")
 
     progress = PROGRESS_RE.findall(stdout)
     last_iint = int(progress[-1][0]) if progress else None
@@ -242,8 +247,9 @@ def collect_record(stdout_path: Path, sacct_path: Path, namelist_path: Path,
         "extstep_seconds": extstep, "isplit": isplit, "internal_step_seconds": internal_step,
         "last_logged_iint": last_iint,
         "peak_memory_mb": peak_memory_bytes / 1024.0**2,
-        "max_disk_read_mb_per_task": max_disk_read_bytes / 1024.0**2,
-        "max_disk_write_mb_per_task": max_disk_write_bytes / 1024.0**2,
+        "max_disk_read_mb_per_task": None if max_disk_read_bytes is None else max_disk_read_bytes / 1024.0**2,
+        "max_disk_write_mb_per_task": None if max_disk_write_bytes is None else max_disk_write_bytes / 1024.0**2,
+        "disk_counter_availability": {"read": max_disk_read_bytes is not None, "write": max_disk_write_bytes is not None},
         "io_seconds": io_seconds, "io_measurement_method": io_method or "unavailable",
         "tada": "TADA!" in stdout, "final_timestamp_present": final_present,
         "fatal_marker_present": fatal,

@@ -5,6 +5,13 @@ description: Plan and analyze reproducible FVCOM Kestrel rank/node benchmarks fr
 
 # FVCOM Benchmark
 
+Preserve `MaxDiskRead` and `MaxDiskWrite` in terminal Slurm accounting. Missing
+columns or blank counters are unavailable (`null`), not measured zero. Report
+the maximum measured per-task byte counter separately from I/O duration; byte
+counters do not measure I/O time. A recorded station-only revision after certified
+spin-up may change the mapping and bound station file only; verify the original
+bundle first and use one identical revised bundle for all layouts and production.
+
 Use only after a stable, hash-bound restart exists. Invoke `$kestrel-hpc` for all job operations and `$fvcom-run-control` to audit completion. Every candidate must use the same executable, restart, input hashes, simulated 24-hour window, and output cadence.
 
 Create the initial plan:

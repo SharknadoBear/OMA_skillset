@@ -10,6 +10,9 @@ Run locally after `$kestrel-hpc` retrieves compact station output. Do not instal
 ## Inputs and Scientific Rules
 
 - Require exact model case/executable/input hashes and station mappings.
+- Support the request's explicit water-level proxy policy. Preserve original gauge and model-cell coordinates, geometric distance, depth, cell/node IDs, three-node weights and geometry-review hash through condensation, tables and reports. Outside status alone is neither a run nor closure blocker. Label cell-centroid proxies accurately; never tune their selection against agreement scores. Current spatial/profile/period gates remain unchanged.
+- Mixed mappings may retain `model_diagnostic` rows with `validation_eligible=false`. Audit every row against full NetCDF station order, retain their CSVs in `diagnostic_products`, and join NOAA tables only from water-level/current comparison `products`. Unknown roles or diagnostics claimed as NOAA comparisons remain invalid.
+- For cell-centroid comparisons, `audit_station_cell_sampling.py` checks exact source-node membership and equal weights, then compares station elevation with the three-node mean at shared IINTs after independent UTC/hash certification. The case validation runner requires the audited full-grid files and retains this result. Missing samples, changed connectivity or elevation disagreement fail the output sampling gate.
 - Water-level CSV contains UTC `time`, `model`, `observed`, and `predicted` columns. Align each comparison on common timestamps, subtract each series' common-period mean, and record the model-minus-reference mean offset. Do not label the offset a datum conversion.
 - NOAA total observed water level is mandatory but non-scoring because tide-only FVCOM omits atmospheric and river residuals. NOAA astronomical prediction is the primary tide comparison.
 - Current CSV contains UTC `time`, `model_u`, `model_v`, `observed_u`, and `observed_v` in m/s. Admit only downward-looking all-bin profiles prepared by `$noaa-coops-tides`; compare their documented vertically weighted vector with FVCOM `ua/va`.
@@ -34,9 +37,9 @@ python scripts/fvcom_tidal_validation.py validate --water station_water.csv --cu
 ```
 
 The report includes bias, MAE, centered RMSE, normalized centered RMSE (by reference standard deviation), correlation, vector RMSE, complex correlation and phase, constituent amplitude/phase, and tidal-current ellipse metrics. It records coverage, interpolation, datum, bin-weighting, and excluded-station evidence.
-When a station inventory is supplied, every eligible wet-domain station must have
+When a station inventory is supplied, every eligible comparison station must have
 a matching validation table. Preserve the envelope-discovered but wet-domain-
-excluded gauges and non-downward profiler reasons in the final HTML rather than
+excluded gauges, proxy geometry and non-downward profiler reasons in the final HTML rather than
 silently reducing the station count.
 
 For a complete hash-bound production project, invoke `scripts/run_case_validation.py --project PROJECT --grid-case GRID_CASE --attempt run/GRID_CASE/attempts/PRODUCTION`. Add `--observation-manifest` when observations belong to a variant-specific directory and `--forcing-manifest` for a revised forcing derivative. The runner requires `fvcom_input_freeze_v1`, the frozen executable binding, actual forcing constituent order, eligible station inventory, and a passing `fvcom-run-control` production audit with rule version `startup_anchor_exact_clock_3d_v1`. It verifies actual input/output hashes and the startup restart before condensing, joining and validating. Forcing must carry matching manifest/NetCDF `utide_exact_time_nodal_v1`, all-false UTide flags, version and builder hash; historical midpoint products cannot certify completion under the exact-time contract. Results use a new immutable analysis directory; `--check-only` verifies prerequisites without claiming completion. Run locally in the scientific NumPy/NetCDF4/pandas/matplotlib environment.

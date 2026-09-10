@@ -54,7 +54,7 @@ def clock(ds: nc.Dataset, times: list[dt.datetime]) -> None:
 
 def state_file(path: Path, steps, times: list[dt.datetime], *, complete: bool) -> None:
     with nc.Dataset(path, "w") as ds:
-        for name, size in (("time", len(times)), ("node", 2), ("nele", 2), ("siglay", 9), ("siglev", 10)):
+        for name, size in (("time", len(times)), ("node", 3), ("nele", 3), ("siglay", 9), ("siglev", 10)):
             ds.createDimension(name, size)
         ds.createVariable("iint", "i4", ("time",))[:] = steps
         clock(ds, times)
@@ -73,7 +73,7 @@ def state_file(path: Path, steps, times: list[dt.datetime], *, complete: bool) -
                 20 if name == "temp" else 30 if name == "salinity" else 1)
 
 
-def fixture(project: Path, mixed: bool, runner, audit_script: Path, skill_dir: Path):
+def fixture(project: Path, mixed: bool, runner, audit_script: Path, skill_dir: Path, diagnostics: bool = False):
     case = "independent_mesh"
     attempt = project / "run" / case / "production_001"
     inputs = project / "input" / case / "production_001"
@@ -82,10 +82,22 @@ def fixture(project: Path, mixed: bool, runner, audit_script: Path, skill_dir: P
         path.mkdir(parents=True)
     names = ["profileX9", "9933333"] if mixed else ["9933333", "9422222"]
     roles = ["current", "water_level"] if mixed else ["water_level", "water_level"]
+    if diagnostics:
+        names.insert(0, "offshore_diagnostic")
+        roles.insert(0, "model_diagnostic")
     mapping = {"status": "ready", "stations": [{"station_id": name, "role": role, "cell_id": i + 1} for i, (name, role) in enumerate(zip(names, roles))]}
+    if diagnostics:
+        mapping["stations"][0]["validation_eligible"] = False
+        mapping["stations"][-1]["spatial_mapping"] = {
+            "method": "nearest_wet_cell_centroid", "observation_longitude": -82.7,
+            "observation_latitude": 27.7, "model_longitude": -82.699,
+            "model_latitude": 27.7, "distance_m": 98.6,
+            "cell_id": len(names), "inside_wet_mesh": False,
+            "node_ids": [1, 2, 3], "node_weights": [1 / 3] * 3,
+            "sampling": "arithmetic_mean_of_three_nodal_elevations"}
     mapping_path = inputs / "station_mapping.json"
     write(mapping_path, mapping)
-    write(observation / "inventory.json", {"stations": [{"id": name, "role": role, "eligible": True} for name, role in zip(names, roles)]})
+    write(observation / "inventory.json", {"stations": [{"id": name, "role": role, "eligible": True} for name, role in zip(names, roles) if role != "model_diagnostic"]})
     write(observation / "observation_manifest.json", {"status": "ready", "station_inventory": str(observation / "inventory.json"), "hashes": {"station_inventory_sha256": sha256(observation / "inventory.json"), "station_mapping_sha256": sha256(mapping_path)}})
     times = pd.date_range("2024-06-01", "2024-06-04", freq="6min", tz="UTC")
     hours = np.arange(len(times)) / 10
@@ -97,7 +109,7 @@ def fixture(project: Path, mixed: bool, runner, audit_script: Path, skill_dir: P
             path = observation / "water_level" / f"{name}_noaa_waterlevel.csv"
             path.parent.mkdir(exist_ok=True)
             pd.DataFrame({"time": times[:-1], "observed": eta[:-1] + 0.3, "predicted": eta[:-1] + 0.1}).to_csv(path, index=False)
-        else:
+        elif role == "current":
             path = observation / "currents" / name / "depth_mean.csv"
             path.parent.mkdir(parents=True)
             pd.DataFrame({"time": times[:-1] + pd.Timedelta(minutes=3), "east_m_s": (u[:-1] + u[1:]) / 2, "north_m_s": (v[:-1] + v[1:]) / 2}).to_csv(path, index=False)
@@ -146,6 +158,11 @@ def fixture(project: Path, mixed: bool, runner, audit_script: Path, skill_dir: P
     full = attempt / "regional_0001.nc"
     state_file(full, np.arange(25) * 2250 + STARTUP_IINT,
                [START + dt.timedelta(hours=3 * index) for index in range(25)], complete=False)
+    if diagnostics:
+        with nc.Dataset(full, 'a') as ds:
+            ds.createDimension('three', 3)
+            ds.createVariable('nv', 'i4', ('three', 'nele'))[:] = np.array([[1, 3, 2]] * 3).T
+            ds['zeta'][:] = np.repeat(eta[::30, None], 3, axis=1)
     restart = attempt / "regional_restart.nc"
     state_file(restart, [55500], [END], complete=True)
     (attempt / "stdout.log").write_text(" ! 55500 2024-06-04T00:00:00.000000\nTADA!\n")
@@ -307,6 +324,35 @@ def main():
         assert summary["current"][0]["station_id"] == "profileX9"
         assert summary["current"][0]["metrics"]["vector_rmse"] < 1e-6
         passed.append("mixed_current_arbitrary_ids_exact_midpoint_alignment")
+        args, _, _ = fixture(root / "diagnostic_proxy", True, runner, audit_script, skill_dir, diagnostics=True)
+        result = run_validation(args)
+        assert result["workflow_status"] == "validation_complete"
+        output = args.project / "analysis" / args.grid_case / f"validation_{args.attempt.name}"
+        condensed = json.loads((output / "condensation_manifest.json").read_text())
+        assert len(condensed["products"]) == 2 and len(condensed["diagnostic_products"]) == 1
+        assert condensed["diagnostic_products"][0]["station_id"] == "offshore_diagnostic"
+        summary = json.loads((output / "validation_summary.json").read_text())
+        assert summary["spatial_mappings"][0]["station_id"] == '9933333'
+        assert summary["spatial_mappings"][0]["inside_wet_mesh"] is False
+        assert "cell-centroid proxy sampling" in (output / "validation_report.html").read_text().lower()
+        assert summary["current"][0]["station_id"] == "profileX9"
+        passed.append("mixed_diagnostic_comparison_order_and_proxy_provenance")
+        assert summary['cell_sampling_audit']['status'] == 'passed'
+        from audit_station_cell_sampling import audit_cell_sampling
+        station = args.attempt / 'regional_station_timeseries.nc'; full = args.attempt / 'regional_0001.nc'
+        mapping = json.loads((args.project / 'input' / args.grid_case / 'production_001/station_mapping.json').read_text())
+        with nc.Dataset(full, 'a') as ds:
+            ds['zeta'][0, 0] += .03
+        rejects(lambda: audit_cell_sampling([station], [full], mapping), 'three-node mean')
+        with nc.Dataset(full, 'a') as ds:
+            ds['zeta'][0, 0] -= .03
+            ds['iint'][0] += 1
+        rejects(lambda: audit_cell_sampling([station], [full], mapping), 'identical station IINT')
+        with nc.Dataset(full, 'a') as ds:
+            ds['iint'][0] -= 1
+            ds['nv'][0, 2] = 2
+        rejects(lambda: audit_cell_sampling([station], [full], mapping), 'native full-grid connectivity')
+        passed.append('proxy_cell_mean_clock_and_connectivity_fail_closed')
     print(json.dumps({"status": "passed", "tests_passed": len(passed), "tests": passed,
                       "runner_module": str(Path(runner.__file__).resolve()), "runner_sha256": sha256(Path(runner.__file__)),
                       "audit_module": str(audit_script), "audit_sha256": sha256(audit_script),

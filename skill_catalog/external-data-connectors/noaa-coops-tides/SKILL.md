@@ -41,7 +41,7 @@ python scripts/check_download_health.py --request request.json --run-dir runs/ca
 
 7. Surface the health report to Bear only when important caveats exist, such as missing requested coverage, empty variables, all-NaN fields, finite coverage below 95 percent, obvious gaps, or failed diagnostic plots.
 
-For FVCOM validation, discover stations against the actual wet mesh rather than a rectangular bbox alone:
+For FVCOM validation, retain actual wet-mesh containment evidence. The default water-level policy is `strict_inside`. When explicitly requested, use `--water-level-mapping-policy containing_cell_or_nearest_wet_cell`: outside water-level gauges within the regional search envelope remain source-data candidates for downstream cell-centroid proxy review. Keep `inside_wet_mesh=false` truthful, and verify requested-period observations/predictions separately. Current eligibility retains strict spatial, downward-looking profile and period gates. This policy does not relax residual-boundary screening.
 
 ```bash
 python scripts/coops_currents.py discover --mesh fvcom_grid.2dm --mesh-crs EPSG:32615 --period-start 2025-04-01T00:00:00Z --period-end 2025-05-01T00:00:00Z --output station_inventory.json

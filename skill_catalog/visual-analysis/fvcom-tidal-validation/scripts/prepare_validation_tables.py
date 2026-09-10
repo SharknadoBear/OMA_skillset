@@ -93,6 +93,7 @@ def prepare(condensation_manifest: Path, observation_root: Path, output_dir: Pat
         write_frame(combined, output_path)
         products.append({
             "station_id": station_id, "role": role, "path": str(output_path), "sha256": sha256(output_path),
+            "spatial_mapping": model_product.get("spatial_mapping"),
             "rows": int(len(combined)), "coverage_start": combined["time"].iloc[0].isoformat(),
             "coverage_end": combined["time"].iloc[-1].isoformat(), "alignment_method": method,
             "model_source": str(model_path), "model_source_sha256": sha256(model_path),

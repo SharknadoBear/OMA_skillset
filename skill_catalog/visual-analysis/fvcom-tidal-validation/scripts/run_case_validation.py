@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import importlib
 import json
 import re
@@ -99,8 +100,10 @@ def verify_prerequisites(args: argparse.Namespace) -> dict[str, Any]:
     keys = [(str(row["station_id"]), str(row["role"])) for row in station_rows]
     if mapping.get("status") != "ready" or not keys or len({x[0] for x in keys}) != len(keys):
         raise ValueError("station mapping must be ready with unique station IDs")
-    if any(role not in {"water_level", "current"} for _, role in keys):
+    if any(role not in {"water_level", "current", "model_diagnostic"} for _, role in keys):
         raise ValueError("unsupported station role in frozen mapping")
+    if any(row.get("validation_eligible") is not False for row in station_rows if row["role"] == "model_diagnostic"):
+        raise ValueError("Model diagnostics must be explicitly excluded from NOAA comparisons")
     if not any(role == "water_level" for _, role in keys):
         raise ValueError("at least one required water-level comparison is mandatory")
     observation_path = args.observation_manifest.resolve() if args.observation_manifest else project / "analysis/observations/observation_manifest.json"
@@ -119,7 +122,8 @@ def verify_prerequisites(args: argparse.Namespace) -> dict[str, Any]:
                 raise ValueError(f"observation evidence changed: {name}")
     inventory = read(inventory_path)
     eligible = {(str(row["id"]), str(row["role"])) for row in inventory.get("stations", []) if row.get("eligible")}
-    if eligible != set(keys):
+    comparison_keys = {(station_id, role) for station_id, role in keys if role in {"water_level", "current"}}
+    if eligible != comparison_keys:
         raise ValueError("frozen mapping and eligible period-screened station inventory disagree")
     for key in ("period_start", "period_end"):
         if key in observation and parse_utc(observation[key]) != (start if key == "period_start" else end):
@@ -190,12 +194,24 @@ def verify_prerequisites(args: argparse.Namespace) -> dict[str, Any]:
     actual_outputs = {sha256(path) for path in station_paths}
     if actual_outputs != {digest(row["sha256"]) for row in audit["station_netcdf"]} or len(station_paths) != len(audit["station_netcdf"]):
         raise ValueError("retrieved station files differ from the audited production outputs")
+    from audit_station_cell_sampling import audit_cell_sampling
+    grid_paths = []
+    if any(row.get('spatial_mapping') for row in station_rows if row['role'] == 'water_level'):
+        for row in audit['full_grid_netcdf']:
+            path = Path(row['path'])
+            if not path.is_file():
+                path = attempt / PurePosixPath(row['path'].replace('\\', '/')).name
+            if sha256(path) != row['sha256']:
+                raise ValueError('Full-grid output differs from production audit')
+            grid_paths.append(path)
+    sampling = audit_cell_sampling(station_paths, grid_paths, mapping)
     return dict(project=project, attempt=attempt, request=request, request_path=request_path,
                 namelist=namelist, input_dir=input_dir, freeze=freeze, freeze_path=freeze_path,
                 executable_hash=executable_hash, binding_path=binding_path, mapping_path=mapping_path,
                 inventory_path=inventory_path, observation_path=observation_path, observation=observation,
                 forcing_path=forcing_path, constituents=constituents, audit_path=audit_path,
-                station_paths=station_paths, station_keys=keys, start=start, end=end, time_anchor=anchor)
+                station_paths=station_paths, station_keys=keys, start=start, end=end, time_anchor=anchor,
+                cell_sampling_audit=sampling)
 
 
 def run_validation(args: argparse.Namespace) -> dict[str, Any]:
@@ -234,7 +250,8 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
     tables_path = output / "validation_tables_manifest.json"
     tables = prepare(condensed_path, context["observation_path"].parent, output / "tables", tables_path)
     products = {(row["station_id"], row["role"]): Path(row["path"]) for row in tables["products"]}
-    if set(products) != set(context["station_keys"]):
+    comparison_keys = [key for key in context["station_keys"] if key[1] in {"water_level", "current"}]
+    if set(products) != set(comparison_keys):
         raise ValueError("prepared tables differ from exact mapped station roles")
     water = [products[key] for key in context["station_keys"] if key[1] == "water_level"]
     currents = [products[key] for key in context["station_keys"] if key[1] == "current"]
@@ -245,8 +262,18 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
     availability = "available" if currents else "unavailable_no_eligible_period_screened_profiles"
     result["current_validation_availability"] = availability
     result["threshold_policy"] = "informational_for_initial_regional_accepted_and_fresh_tests; never a stability-tuning gate"
+    result['cell_sampling_audit'] = context['cell_sampling_audit']
+    result["spatial_mappings"] = [{"station_id": row["station_id"], **row["spatial_mapping"]}
+        for row in tables["products"] if row.get("spatial_mapping")]
     write(output / "validation_summary.json", result)
     report = report_path.read_text(encoding="utf-8").replace("first two Galveston cases", "initial regional accepted/fresh cases")
+    if result["spatial_mappings"]:
+        rows = ''.join('<tr>' + ''.join('<td>' + html.escape(str(value)) + '</td>' for value in
+            [r['station_id'], r['method'], r['observation_longitude'], r['observation_latitude'],
+             r['model_longitude'], r['model_latitude'], r['distance_m'], r['cell_id']]) + '</tr>'
+            for r in result['spatial_mappings'])
+        note = '<h2>Water-level sampling locations</h2><p>Cell-centroid proxy sampling: cell output is the mean of three nodal elevations. Outside gauges use a fixed nearest-water cell selected from geometry before agreement statistics. Distance and basin representativeness are scientific advisories, not run gates.</p><table><tr><th>Gauge</th><th>Method</th><th>Gauge lon</th><th>Gauge lat</th><th>Model lon</th><th>Model lat</th><th>Distance m</th><th>Cell</th></tr>' + rows + '</table>'
+        report = report.replace('</body>', note + '</body>')
     if not currents:
         report = report.replace("</body>", "<p>Current validation is unavailable: no eligible downward-looking profiles overlap this period in the retained wet domain. Inventory and exclusion evidence are preserved above.</p></body>")
     report_path.write_text(report, encoding="utf-8")

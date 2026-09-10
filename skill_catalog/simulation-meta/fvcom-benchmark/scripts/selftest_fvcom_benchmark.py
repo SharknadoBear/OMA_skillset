@@ -132,6 +132,19 @@ def main() -> int:
         assert collected["internal_step_seconds"] == 4.8 and collected["last_logged_iint"] == 18000
         assert collected["queue_seconds"] == 10 and collected["peak_memory_mb"] > 239
         assert collected["io_seconds"] is None and collected["io_measurement_method"] == "unavailable"
+        assert collected["max_disk_read_mb_per_task"] == 255.93
+        original = sacct.read_text()
+        for replacement, expected in [("0|0", 0.0), ("|", None)]:
+            sacct.write_text(original.replace("255.93M|250.72M", replacement))
+            missing = collect_record(stdout, sacct, nml, 104, 1, 1, "a", "b", "c", None, None)
+            assert missing["max_disk_read_mb_per_task"] == expected
+            assert missing["disk_counter_availability"]["read"] == (expected is not None)
+        lines = [line.split('|') for line in original.splitlines()]
+        columns = [j for j,k in enumerate(lines[0]) if k not in {"MaxDiskRead", "MaxDiskWrite"}]
+        sacct.write_text('\n'.join('|'.join(row[j] for j in columns) for row in lines)+'\n')
+        absent = collect_record(stdout, sacct, nml, 104, 1, 1, "a", "b", "c", None, None)
+        assert absent["max_disk_read_mb_per_task"] is None and absent["max_disk_write_mb_per_task"] is None
+        assert absent["eligible"] and absent["wall_seconds"] == collected["wall_seconds"]
     print(json.dumps({"status": "pass", "pareto_knee": result["pareto_knee"]}))
     return 0
 

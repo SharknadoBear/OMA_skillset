@@ -18,7 +18,7 @@ Default new projects to `Workspace/fvcom-simulation/<case_id>` and their Kestrel
 
 ## Initialize
 
-1. Parse the prompt as `simulation_request_v1`. Preserve explicit dates, benchmark policy, and settings. For the April 2025 tide experiment use 2025-04-01 through 2025-05-01 UTC for analysis, seven spin-up days beginning 2025-03-25, 20 C, 30 PSU, ten uniform sigma levels (nine layers), all TPXO constituents, and all eligible NOAA CO-OPS stations inside the retained wet domain.
+1. Parse the prompt as `simulation_request_v1`. Preserve explicit dates, benchmark policy, and settings. For the April 2025 tide experiment use 2025-04-01 through 2025-05-01 UTC for analysis, seven spin-up days beginning 2025-03-25, 20 C, 30 PSU, ten uniform sigma levels (nine layers), all TPXO constituents, and the requested NOAA station mapping policy. An explicit `observations.water_level_mapping_policy` overrides the legacy inside-only station policy for water levels only.
 2. Invoke `$fvcom-run-control` to initialize the project, provenance ledger, `project_status.json`, `commands.jsonl`, and `report.html`.
 3. Ask the human only for secure Password+OTP entry after `$kestrel-hpc` displays its credential window. Never receive a password or OTP in chat or write it to an artifact.
 4. Preserve accepted inputs. Hash and freeze an accepted mesh package before creating project-owned copies or derivatives.
@@ -43,7 +43,7 @@ For each grid case in `accepted_t6v6`, then `fresh_reproduction` order:
 2. Return the exact OBC nodes to the TPXO worker. Invoke `$fvcom-tpxo-tides` to create the monotonic six-minute UTC elevation forcing for the complete run window. Require all discovered constituents; Galveston expects 22 and a different count blocks until explained.
    Require matching manifest/NetCDF `utide_exact_time_nodal_v1` provenance, UTide flags all false, version and builder hash. A nodal-method correction supersedes all forcing-dependent stages, including spin-up and restart benchmarks; preserve the old evidence and rerun with new immutable artifacts.
    If a standardized grid was published before terminal-order forcing existed, complete Grid Generation's `join-forcing` certificate revision and require `validate --require-submission-ready` to pass. Do not overwrite frozen grid-quality/remapping companions or clear their original findings to certify new forcing.
-3. Invoke `$noaa-coops-tides` to discover water-level and current stations inside the actual wet polygon. Quantitative current validation admits only downward-looking all-bin profiles; record why side-looking instruments are excluded.
+3. Invoke `$noaa-coops-tides` to discover regional water-level and current stations, retaining exact wet-polygon membership as evidence. With `water_level_mapping_policy=containing_cell_or_nearest_wet_cell`, outside water-level gauges use documented geometry-selected cell-centroid proxies; outside status and distance are not execution gates and do not require remeshing. Select before agreement statistics, preserve original gauge coordinates and report distance, basin/depth review and sampling method. Currents still require exact wet membership and downward-looking all-bin profiles; record instrument and period exclusions.
 4. Invoke `$fvcom-namelist-configuration` to generate the final namelist and cell-based station file. Reject any surface, atmospheric-pressure, river, temperature/salinity OBC, mean-flow, wave, ice, biology, sediment, or particle forcing.
 5. Recompute every file reference and hash. Do not submit a bundle whose mesh, OBC, forcing, namelist, executable, or station mapping disagrees.
    Have Run Control verify staged runtime permissions, including FVCOM's writable `.fvcomtestfile` marker, before freezing a submission. Hash agreement alone does not establish that initialization can write its required runtime files.
@@ -73,6 +73,15 @@ After a stable spin-up, invoke `$fvcom-benchmark` and `$kestrel-hpc` for sequent
 An explicit request overrides that exploratory default. For a focused campaign, record ranks, repeats, maximum rank, extension policy, and production objective in the request and benchmark plan; pass that plan to analysis. Without a serial benchmark, use the lowest successfully measured rank as the speedup/efficiency reference. Do not infer a serial time. Treat high-rank compatibility probes separately from performance records: independently test each requested rank, record actual compute-environment `MPI_TAG_UB`, and promote only successful probes to full 24-hour benchmarks. One failed probe must not hold other requested probes or valid production layouts. Communication failures do not authorize changes to a frozen model source or MPI environment.
 
 Before monthly completion invoke `$fvcom-run-control`'s production audit with the frozen startup restart and input file map. Require exact startup-anchored IINT coverage, independent full-grid/restart clocks, required finite unmasked 3-D restart state, expected cadence/count, and rule version `startup_anchor_exact_clock_3d_v1`. Then invoke `$fvcom-tidal-validation`'s regional runner on retrieved station outputs and exact case manifests. Compare model elevation with both NOAA GMT/MSL observations and astronomical predictions. Mean-align only over the common period and record the offset; never imply equal vertical datums. Total water level is mandatory but non-scoring for a tide-only model. Compare `ua/va` only with vertically weighted downward-looking all-bin profiles. Force all constituents but interpret only one-month-resolvable harmonics.
+
+When adding observation output after a successful spin-up, preserve the certified
+spin-up bundle/restart and create an explicit station-only derivative before the
+first restart benchmark. Retain prior diagnostic rows and append comparisons;
+only the mapping and station file may change. Bind the two-file revision and use
+one identical revised bundle for every benchmark/probe and production. Existing
+restart benchmarks validate the output revision; it does not require repeating
+cold stability solely for changed station locations. Keep diagnostics separate
+from comparison eligibility and never choose proxies by validation agreement.
 
 Use two independent terminal fields:
 

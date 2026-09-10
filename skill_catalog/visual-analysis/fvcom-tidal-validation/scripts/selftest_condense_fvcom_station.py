@@ -62,6 +62,19 @@ def main() -> int:
             rows = list(csv.DictReader(stream))
         assert rows[-1]["time"].startswith("2025-04-01T00:12:00") and rows[-1]["model"] == "3"
         assert manifest["warnings"], "float32 MJD quantization should be disclosed"
+        mixed = json.loads(mapping.read_text())
+        mixed['stations'][0].update(role='model_diagnostic', validation_eligible=False)
+        mixed['stations'][1]['spatial_mapping'] = {'method':'nearest_wet_cell_centroid','distance_m':123.0}
+        mapping.write_text(json.dumps(mixed))
+        diagnostic = condense([station], mapping, namelist, root/'mixed', root/'mixed_manifest.json')
+        assert [p['station_id'] for p in diagnostic['products']] == ['8771341']
+        assert [p['station_id'] for p in diagnostic['diagnostic_products']] == ['g06010']
+        assert diagnostic['products'][0]['spatial_mapping']['distance_m'] == 123.0
+        mixed['stations'][0]['validation_eligible'] = True
+        mapping.write_text(json.dumps(mixed))
+        try: condense([station], mapping, namelist, root/'invalid_diagnostic', root/'invalid_manifest.json')
+        except ValueError as error: assert 'unsupported station role' in str(error)
+        else: raise AssertionError('A diagnostic marked eligible for comparison was accepted')
         mapping.write_text(json.dumps({
             "status": "ready",
             "stations": [
