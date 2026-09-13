@@ -55,6 +55,22 @@ def main() -> int:
     else:
         raise AssertionError("Columbia incompatible fixed-step output schedule accepted")
     fn.configuration_values(REQUEST, BINDINGS, {"extstep_seconds": 1.2, "isplit": 4}, "smoke")
+    # A mathematically exact two-day ramp must not gain one internal step
+    # from floating-point ceil (0.3 * 6 is slightly less than 1.8).
+    for ext, split, expected in ((0.3, 6, 96000), (0.6, 3, 96000),
+                                 (0.4, 6, 72000), (1.2, 4, 36000)):
+        for stage in ("smoke", "canary", "spinup"):
+            ramp_values, ramp_timing = fn.configuration_values(
+                REQUEST, BINDINGS, {"extstep_seconds": ext, "isplit": split}, stage)
+            assert ramp_values["NML_INTEGRATION"]["IRAMP"] == str(expected)
+            assert ramp_timing["ramp_internal_steps"] == expected
+            assert fn.audit_stage_values(ramp_values, stage) == []
+        for stage in ("benchmark", "production"):
+            hot_values, hot_timing = fn.configuration_values(
+                REQUEST, dict(BINDINGS, grid_edge_read_from_file=True),
+                {"extstep_seconds": ext, "isplit": split}, stage)
+            assert hot_values["NML_INTEGRATION"]["IRAMP"] == "0"
+            assert hot_timing["ramp_internal_steps"] == 0
     values, timing = fn.configuration_values(REQUEST, BINDINGS, numerical, "spinup")
     assert timing["start_utc"] == "2025-03-25T00:00:00Z"
     assert timing["end_utc"] == "2025-04-01T00:00:00Z"

@@ -229,7 +229,9 @@ def configuration_values(
     grid_edge_read = bindings["grid_edge_read_from_file"]
     if hotstart and not grid_edge_read:
         raise ConfigError("hot-start benchmark and production stages require a frozen grid-edge file")
-    ramp_steps = 0 if hotstart else int(math.ceil(2.0 * 86400.0 / (extstep * isplit)))
+    # Divisibility is already checked above; ceil can add a spurious step
+    # when binary arithmetic puts an exact integer ratio just above it.
+    ramp_steps = 0 if hotstart else int(round(172800 / internal_step))
     startup_file = bindings["restart_file"] if hotstart else "none"
     restart_on = stage not in {"smoke", "canary"}
     restart_first = (restart_at if not hotstart else end) if restart_on else end
