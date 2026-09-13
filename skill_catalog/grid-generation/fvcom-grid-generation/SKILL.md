@@ -76,6 +76,20 @@ as subworkflow calls that did not occur.
 
 For every new complete grid, initialize the standardized portable project first. Keep attempts under each stage's `_work/`, promote one hash-bound selection to its canonical stage name, and publish any terminal mesh at the stable path `final/fvcom_grid.2dm`. The filename does not imply readiness. Use `validate --require-benchmark-ready` before a first benchmark and `validate --require-submission-ready` before submission.
 
+An explicitly accepted retained grid whose historical construction payloads were
+removed under a recorded passing cleanup audit has a separate, narrow route:
+`scripts/certify_retained_grid_join.py --request retained_join_request.json
+--output-dir NEW_REVISION`, followed by `--verify NEW_REVISION/certificate.json`.
+Read [the retained join contract](references/retained_grid_join.md). It rechecks
+current topology, complete boundary coverage, quality, literal frozen-source TGE,
+preconfiguration and exact terminal forcing. It admits unchanged original
+coordinates/depths/connectivity and only diagnosed noncyclic endpoint trims.
+Historical display/source OBC aliases require an explicit bijection; original
+remaps remain immutable. This certificate supports accepted-input submission and
+discloses missing generation intermediates. It never certifies a fresh grid or
+claims the complete standardized project passed. Other geometry/connectivity
+repairs require their owning audited delivery route, not this compatibility path.
+
 Every mesh-quality evaluation embeds the algorithm-bound TGE junction gate.
 Publication may remain benchmark-only without local FVCOM source, but
 submission eligibility requires `publish --tge-source /path/to/TGE.F`. The
