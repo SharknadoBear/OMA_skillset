@@ -121,6 +121,9 @@ def verify_prerequisites(args: argparse.Namespace) -> dict[str, Any]:
             if sha256(resolve_project_path(project, value)) != digest(expected):
                 raise ValueError(f"observation evidence changed: {name}")
     inventory = read(inventory_path)
+    for key, expected in (("period_start", start), ("period_end", end)):
+        if key in inventory and parse_utc(inventory[key]) != expected:
+            raise ValueError("station inventory period differs from production request")
     eligible = {(str(row["id"]), str(row["role"])) for row in inventory.get("stations", []) if row.get("eligible")}
     comparison_keys = {(station_id, role) for station_id, role in keys if role in {"water_level", "current"}}
     if eligible != comparison_keys:
@@ -248,7 +251,7 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
     condense(context["station_paths"], context["mapping_path"], context["namelist"], output / "condensed", condensed_path,
              time_anchor=context["time_anchor"], startup_restart_path=Path(context["time_anchor"]["startup_restart_path"]))
     tables_path = output / "validation_tables_manifest.json"
-    tables = prepare(condensed_path, context["observation_path"].parent, output / "tables", tables_path)
+    tables = prepare(condensed_path, context["observation_path"].parent, output / "tables", tables_path, context["inventory_path"])
     products = {(row["station_id"], row["role"]): Path(row["path"]) for row in tables["products"]}
     comparison_keys = [key for key in context["station_keys"] if key[1] in {"water_level", "current"}]
     if set(products) != set(comparison_keys):

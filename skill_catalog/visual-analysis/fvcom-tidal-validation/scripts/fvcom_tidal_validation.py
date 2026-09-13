@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from water_level_support import paired, water_support
 
 
 # cycles per hour; forcing may contain more, but only named, Rayleigh-resolvable
@@ -166,11 +167,18 @@ def load_lineage(path: Path) -> dict[str, Any]:
 
 def plot_water(df: pd.DataFrame, output: Path, title: str) -> None:
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(11, 4))
-    for col, label in [("model", "FVCOM"), ("observed", "NOAA observed"), ("predicted", "NOAA predicted")]:
-        if col in df:
-            ax.plot(df["time"], df[col] - df[col].mean(), label=label, lw=0.8)
-    ax.set_ylabel("mean-removed water level (m)"); ax.set_title(title); ax.legend(ncol=3); fig.autofmt_xdate(); fig.tight_layout()
+    references = [ref for ref in ('predicted', 'observed') if len(paired(df, ref)) >= 3]
+    fig, axes = plt.subplots(len(references), 1, figsize=(11, 4*len(references)), squeeze=False)
+    for ax, ref in zip(axes[:, 0], references):
+        support = paired(df, ref)
+        # Both curves in each panel use the same reference-specific timestamps.
+        for col, label in [('model', 'FVCOM'), (ref, 'NOAA ' + ref)]:
+            values = support[col] - support[col].mean()
+            ax.plot(support['time'], values, label=label, lw=.8)
+        ax.set_ylabel('mean-removed water level (m)')
+        ax.set_title(title + (' — primary prediction comparison' if ref == 'predicted' else ' — total observation diagnostic'))
+        ax.legend()
+    fig.autofmt_xdate(); fig.tight_layout()
     fig.savefig(output, dpi=150); plt.close(fig)
 
 
@@ -191,22 +199,31 @@ def validate(water_files: list[Path], current_files: list[Path], output_dir: Pat
     water_results, current_results = [], []
     for path in water_files:
         df = common_frame(path, ["model", "observed", "predicted"])
-        finite = df.dropna(subset=["model", "observed", "predicted"])[["time", "model", "observed", "predicted"]]
-        if len(finite) < 3:
-            raise ValueError(f"insufficient water-level overlap: {path}")
+        station_id = path.stem.split('_', 1)[0]
+        support = water_support(df, station_id, station_inventory_path)
+        finite = paired(df, 'predicted')
         duration = (finite["time"].iloc[-1] - finite["time"].iloc[0]).total_seconds() / 3600
         resolved, unresolved = resolvability(constituents, duration)
-        datum_offsets = {"observed": float((finite["model"] - finite["observed"]).mean()), "predicted": float((finite["model"] - finite["predicted"]).mean())}
+        datum_offsets = {}
         metrics = {}
         harmonics = {}
         for ref in ("observed", "predicted"):
-            metrics[ref] = scalar_metrics(finite["model"].to_numpy(), finite[ref].to_numpy())
+            common = paired(df, ref)
+            if len(common) < 3:
+                datum_offsets[ref] = metrics[ref] = harmonics[ref] = None
+                continue
+            datum_offsets[ref] = float((common['model'] - common[ref]).mean())
+            metrics[ref] = scalar_metrics(common['model'].to_numpy(), common[ref].to_numpy())
+            ref_duration = (common['time'].iloc[-1] - common['time'].iloc[0]).total_seconds()/3600
+            ref_resolved, ref_unresolved = resolvability(constituents, ref_duration)
             harmonics[ref] = {
-                "model": harmonic_fit(finite["time"], finite["model"].to_numpy(), resolved),
-                "reference": harmonic_fit(finite["time"], finite[ref].to_numpy(), resolved),
+                'phase_origin_utc': common['time'].iloc[0].isoformat(),
+                'resolved_constituents': ref_resolved, 'unresolved': ref_unresolved,
+                "model": harmonic_fit(common["time"], common["model"].to_numpy(), ref_resolved),
+                "reference": harmonic_fit(common["time"], common[ref].to_numpy(), ref_resolved),
             }
-        image = output_dir / f"{path.stem}_water.png"; plot_water(finite, image, path.stem)
-        water_results.append({"station": path.stem, "station_id": path.stem.split("_", 1)[0], "source": str(path), "source_sha256": file_sha256(path), "coverage_start": finite["time"].iloc[0].isoformat(), "coverage_end": finite["time"].iloc[-1].isoformat(), "datum_alignment": "independent common-period mean removal; not a datum conversion", "model_minus_reference_mean_m": datum_offsets, "metrics": metrics, "resolved_constituents": resolved, "unresolved": unresolved, "harmonics": harmonics, "plot": image.name, "total_observation_scoring": False, "prediction_scoring": True})
+        image = output_dir / f"{path.stem}_water.png"; plot_water(df, image, path.stem)
+        water_results.append({"station": path.stem, "station_id": station_id, "source": str(path), "source_sha256": file_sha256(path), "coverage_start": finite["time"].iloc[0].isoformat(), "coverage_end": finite["time"].iloc[-1].isoformat(), "datum_alignment": "independent mean removal on each model/reference common support; not a datum conversion", "reference_support": support, "model_minus_reference_mean_m": datum_offsets, "metrics": metrics, "resolved_constituents": resolved, "unresolved": unresolved, "harmonics": harmonics, "plot": image.name, "total_observation_scoring": False, "prediction_scoring": True})
     for path in current_files:
         df = common_frame(path, ["model_u", "model_v", "observed_u", "observed_v"])
         finite = df.dropna(subset=["model_u", "model_v", "observed_u", "observed_v"])
@@ -291,6 +308,10 @@ def validate(water_files: list[Path], current_files: list[Path], output_dir: Pat
     sections = []
     for item in water_results:
         image_reference = Path(os.path.relpath(output_dir / item["plot"], report_path.parent)).as_posix()
+        diagnostic = item['reference_support']['observed']['status']
+        if diagnostic != 'available':
+            sections.append(f"<p>{html.escape(item['station'])}: total-water observation diagnostic {html.escape(diagnostic)}. No observation metrics were fabricated; astronomical predictions remain the primary comparison.</p>")
+        sections.append('<details><summary>Independent reference coverage and source evidence</summary><pre>' + html.escape(json.dumps(item['reference_support'], indent=2)) + '</pre></details>')
         sections.append(f"<h2>Water level: {html.escape(item['station'])}</h2><p>{html.escape(item['datum_alignment'])}</p><img src='{html.escape(image_reference)}' style='max-width:100%'><h3>Metrics and datum offsets</h3><pre>{html.escape(json.dumps({'offsets': item['model_minus_reference_mean_m'], 'metrics': item['metrics']}, indent=2))}</pre><details><summary>Resolvable harmonics and unresolved aliases</summary><pre>{html.escape(json.dumps({'resolved': item['resolved_constituents'], 'unresolved': item['unresolved'], 'harmonics': item['harmonics']}, indent=2))}</pre></details>")
     for item in current_results:
         image_reference = Path(os.path.relpath(output_dir / item["plot"], report_path.parent)).as_posix()

@@ -14,7 +14,7 @@ Run locally after `$kestrel-hpc` retrieves compact station output. Do not instal
 - Mixed mappings may retain `model_diagnostic` rows with `validation_eligible=false`. Audit every row against full NetCDF station order, retain their CSVs in `diagnostic_products`, and join NOAA tables only from water-level/current comparison `products`. Unknown roles or diagnostics claimed as NOAA comparisons remain invalid.
 - For cell-centroid comparisons, `audit_station_cell_sampling.py` checks exact source-node membership and equal weights, then compares station elevation with the three-node mean at shared IINTs after independent UTC/hash certification. The case validation runner requires the audited full-grid files and retains this result. Missing samples, changed connectivity or elevation disagreement fail the output sampling gate.
 - Water-level CSV contains UTC `time`, `model`, `observed`, and `predicted` columns. Align each comparison on common timestamps, subtract each series' common-period mean, and record the model-minus-reference mean offset. Do not label the offset a datum conversion.
-- NOAA total observed water level is mandatory but non-scoring because tide-only FVCOM omits atmospheric and river residuals. NOAA astronomical prediction is the primary tide comparison.
+- NOAA astronomical prediction is the primary tide comparison. Retain total observed water level as a non-scoring diagnostic on its own model/reference common timestamps. Missing observations must not discard valid prediction samples. With no paired observations, require the eligible station inventory to record `observation_eligible=false` and `observation_absence_evidence={path,sha256}` binding an HTTP200 NOAA water-level no-data response for the station and complete requested UTC period. Evidence paths are absolute or relative to the inventory. Keep the `observed` column empty, report the diagnostic unavailable and omit its metrics; never fabricate values or treat an access error as source absence. Partial diagnostics use their actual common support, with sample counts and reference-specific harmonic coverage.
 - Current CSV contains UTC `time`, `model_u`, `model_v`, `observed_u`, and `observed_v` in m/s. Admit only downward-looking all-bin profiles prepared by `$noaa-coops-tides`; compare their documented vertically weighted vector with FVCOM `ua/va`.
 - Force all available TPXO constituents. Harmonic validation uses request order as scientific priority, retains one representative per frequency cluster separated by the Rayleigh limit `1/T`, and labels its amplitude/phase as a cluster diagnostic. Report omitted aliases such as P1 relative to K1 and K2 relative to S2 rather than claiming that either pair is independently resolved.
 
@@ -25,6 +25,7 @@ python scripts/condense_fvcom_station.py --station-netcdf galveston_station_time
 ```
 
 Join condensed products to NOAA caches with `scripts/prepare_validation_tables.py`. Water levels use exact UTC timestamp matches. NOAA current profiles are normally centered three minutes between the model's six-minute records, so linearly interpolate model `ua/va` to the observation timestamps and disclose that alignment in the manifest.
+Pass `--station-inventory` when a comparison lacks total observations; the case runner passes its verified inventory automatically. Prediction and observation means, metrics and plotted curves use separate common supports. Missing required prediction coverage remains a blocker.
 
 ```powershell
 python scripts/prepare_validation_tables.py --condensation-manifest output/case/condensed/manifest.json --observation-root analysis/observations --output-dir analysis/case/tables --manifest analysis/case/tables_manifest.json
@@ -53,6 +54,7 @@ python scripts/selftest_fvcom_tidal_validation.py
 python scripts/selftest_condense_fvcom_station.py
 python scripts/selftest_prepare_validation_tables.py
 python scripts/selftest_run_case_validation.py
+python scripts/selftest_prediction_only_validation.py
 python -m compileall scripts
 python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .
 ```

@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from water_level_support import water_support
 
 
 def sha256(path: Path) -> str:
@@ -43,7 +44,7 @@ def write_frame(frame: pd.DataFrame, path: Path) -> None:
 
 
 def prepare(condensation_manifest: Path, observation_root: Path, output_dir: Path,
-            manifest_path: Path) -> dict[str, Any]:
+            manifest_path: Path, station_inventory_path: Path | None = None) -> dict[str, Any]:
     condensation = json.loads(condensation_manifest.read_text(encoding="utf-8-sig"))
     if condensation.get("status") != "ready":
         raise ValueError("condensation manifest is not ready")
@@ -54,14 +55,19 @@ def prepare(condensation_manifest: Path, observation_root: Path, output_dir: Pat
         station_id = str(model_product["station_id"])
         role = str(model_product["role"])
         model_path = Path(model_product["path"])
+        support = None
         if role == "water_level":
             observation_path = observation_root / "water_level" / f"{station_id}_noaa_waterlevel.csv"
             model = read_time_csv(model_path, ["model"])
             observation = read_time_csv(observation_path, ["observed", "predicted"])
             combined = model.merge(observation[["time", "observed", "predicted"]], on="time", how="inner")
-            combined = combined.dropna(subset=["model", "observed", "predicted"])
-            if len(combined) < 3:
-                raise ValueError(f"{station_id} has fewer than three exact water-level matches")
+            # Preserve the two reference supports independently. Missing diagnostic
+            # observations must not erase valid astronomical prediction samples.
+            support = water_support(combined, station_id, station_inventory_path)
+            combined = combined.loc[np.isfinite(combined['model']) &
+                (np.isfinite(combined['predicted']) | np.isfinite(combined['observed']))].copy()
+            if support['observed']['status'] != 'available':
+                warnings.append(f"{station_id}: total-water observation diagnostic {support['observed']['status']}; astronomical predictions remain primary.")
             output_path = output_dir / f"{station_id}_water.csv"
             method = "exact_utc_timestamp_inner_join"
         elif role == "current":
@@ -94,6 +100,7 @@ def prepare(condensation_manifest: Path, observation_root: Path, output_dir: Pat
         products.append({
             "station_id": station_id, "role": role, "path": str(output_path), "sha256": sha256(output_path),
             "spatial_mapping": model_product.get("spatial_mapping"),
+            "reference_support": support,
             "rows": int(len(combined)), "coverage_start": combined["time"].iloc[0].isoformat(),
             "coverage_end": combined["time"].iloc[-1].isoformat(), "alignment_method": method,
             "model_source": str(model_path), "model_source_sha256": sha256(model_path),
@@ -105,6 +112,8 @@ def prepare(condensation_manifest: Path, observation_root: Path, output_dir: Pat
         "schema": "fvcom_noaa_validation_tables_v1", "status": "ready", "generated_at": utcnow(),
         "condensation_manifest": str(condensation_manifest), "condensation_manifest_sha256": sha256(condensation_manifest),
         "observation_root": str(observation_root), "products": products, "warnings": warnings,
+        "station_inventory": str(station_inventory_path) if station_inventory_path else None,
+        "station_inventory_sha256": sha256(station_inventory_path) if station_inventory_path else None,
         "blocking_reasons": [], "resume_token": f"validation_tables:{sha256(condensation_manifest)}",
     }
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -118,8 +127,9 @@ def main() -> int:
     parser.add_argument("--observation-root", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--manifest", required=True)
+    parser.add_argument("--station-inventory")
     args = parser.parse_args()
-    result = prepare(Path(args.condensation_manifest), Path(args.observation_root), Path(args.output_dir), Path(args.manifest))
+    result = prepare(Path(args.condensation_manifest), Path(args.observation_root), Path(args.output_dir), Path(args.manifest), Path(args.station_inventory) if args.station_inventory else None)
     print(json.dumps(result, indent=2))
     return 0
 
