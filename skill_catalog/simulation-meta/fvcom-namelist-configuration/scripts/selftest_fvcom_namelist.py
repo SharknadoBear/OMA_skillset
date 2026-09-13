@@ -70,6 +70,34 @@ def main() -> int:
     assert parsed["NML_STARTUP"]["STARTUP_S_VALS"] == "30"
     assert parsed["NML_RESTART"]["RST_ON"] == "T"
     assert parsed["NML_NETCDF"]["NC_SUBDOMAIN_FILES"] == "'FVCOM'"
+    # Runtime regression: integer-looking seconds passed preflight but FVCOM
+    # rejected the restart stream before stepping. Equivalent decimal works.
+    bad_duration = {group: dict(items) for group, items in parsed.items()}
+    bad_duration["NML_RESTART"]["RST_OUT_INTERVAL"] = "'seconds=36'"
+    assert any("NML_RESTART.RST_OUT_INTERVAL" in p for p in fn.audit_values(bad_duration))
+    bad_duration["NML_RESTART"]["RST_OUT_INTERVAL"] = "'seconds=36.0'"
+    assert fn.audit_values(bad_duration) == []
+    for token in ("seconds=36.0", "seconds=36.", "seconds=.36E+2",
+                  "seconds=3.6e1", "seconds=3.6+1", "days=1.0", "cycles=10"):
+        assert fn.audit_duration_token(fn.q(token)) is None, token
+    for token in ("seconds=36", "days=1", "seconds=36E0", "seconds=3.6D1",
+                  "cycles=10.0", "cycles=1E1", "hours=1.0", "minutes=1.0",
+                  "Seconds=36.0", "seconds=.", "seconds=", "seconds=1.0 2.0"):
+        assert fn.audit_duration_token(fn.q(token)), token
+    for group, enabled, interval in (
+        ("NML_RESTART", "RST_ON", "RST_OUT_INTERVAL"),
+        ("NML_NETCDF", "NC_ON", "NC_OUT_INTERVAL"),
+        ("NML_NETCDF_AV", "NCAV_ON", "NCAV_OUT_INTERVAL"),
+        ("NML_NETCDF_SURFACE", "NCSF_ON", "NCSF_OUT_INTERVAL"),
+        ("NML_PHYSICS", "RECALCULATE_RHO_MEAN", "INTERVAL_RHO_MEAN"),
+        ("NML_STATION_TIMESERIES", "OUT_STATION_TIMESERIES_ON", "OUT_INTERVAL"),
+    ):
+        sample = {group: {enabled: "T", interval: "'seconds=36'"}}
+        assert fn.audit_duration_values(sample)
+        sample[group][interval] = "'seconds=36.0'"
+        assert fn.audit_duration_values(sample) == []
+        sample[group].update({enabled: "F", interval: "'unused'"})
+        assert fn.audit_duration_values(sample) == []
     smoke_values, smoke_timing = fn.configuration_values(REQUEST, BINDINGS, numerical, "smoke")
     assert smoke_values["NML_RESTART"]["RST_ON"] == "F"
     assert smoke_timing["restart_first_out_utc"] == smoke_timing["end_utc"]

@@ -531,8 +531,52 @@ def logical(value: str) -> Optional[bool]:
     return None
 
 
+def audit_duration_token(value: str) -> Optional[str]:
+    """Check a scalar IDEAL_TIME_STRING2TIME token, not a calendar date.
+
+    FVCOM 4.3.1 GET_VALUE recognizes reals by a literal decimal point;
+    its numeric alphabet includes E/e but excludes Fortran D/d exponents.
+    Keep this lexical check separate from physical cadence/alignment checks.
+    """
+    match = re.fullmatch(r"(seconds|days|cycles) *= *(.+?) *", scalar(value))
+    if match:
+        unit, number = match.groups()
+        if unit == "cycles":
+            valid = re.fullmatch(r"[+-]?[0-9]+", number)
+        else:
+            valid = re.fullmatch(
+                r"[+-]?(?:[0-9]+\.[0-9]*|\.[0-9]+)"
+                r"(?:[Ee][+-]?[0-9]+|[+-][0-9]+)?", number
+            )
+        if valid:
+            return None
+    return (
+        "FVCOM duration must use lowercase seconds/days with a decimal point "
+        "(for example seconds=36.0 or seconds=3.6e1), or cycles with an integer"
+    )
+
+
+def audit_duration_values(parsed: Mapping[str, Mapping[str, str]]) -> List[str]:
+    fields = (
+        ("NML_RESTART", "RST_ON", "RST_OUT_INTERVAL"),
+        ("NML_NETCDF", "NC_ON", "NC_OUT_INTERVAL"),
+        ("NML_NETCDF_AV", "NCAV_ON", "NCAV_OUT_INTERVAL"),
+        ("NML_NETCDF_SURFACE", "NCSF_ON", "NCSF_OUT_INTERVAL"),
+        ("NML_PHYSICS", "RECALCULATE_RHO_MEAN", "INTERVAL_RHO_MEAN"),
+        ("NML_STATION_TIMESERIES", "OUT_STATION_TIMESERIES_ON", "OUT_INTERVAL"),
+    )
+    problems = []
+    for group, enabled, key in fields:
+        values = parsed.get(group, {})
+        if logical(values.get(enabled, "")) is True:
+            problem = audit_duration_token(values.get(key, ""))
+            if problem:
+                problems.append(f"{group}.{key}: {problem}")
+    return problems
+
+
 def audit_values(parsed: Mapping[str, Mapping[str, str]]) -> List[str]:
-    problems: List[str] = []
+    problems: List[str] = audit_duration_values(parsed)
     flat = {key: value for group in parsed.values() for key, value in group.items()}
     for key in sorted(TRUE_KEYS):
         if logical(flat.get(key, "")) is not True:
