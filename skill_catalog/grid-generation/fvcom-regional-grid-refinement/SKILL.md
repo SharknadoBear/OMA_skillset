@@ -13,6 +13,12 @@ Read and follow `$fvcom-grid-generation` before generating a patch mesh. Its qua
 
 ## Inputs
 
+For an explicitly requested single missing interior solid-island representation,
+read [references/interior_island.md](references/interior_island.md) and use its
+separate supplied-source transaction/request. Do not pass new-hole fields to
+the topology-preserving request below, relabel CUSP as GSHHS, or reuse an
+unchanged-retained certificate after changing geometry.
+
 Require a configuration containing:
 
 - an existing SMS 2DM mesh or equivalent FVCOM grid/depth pair;
