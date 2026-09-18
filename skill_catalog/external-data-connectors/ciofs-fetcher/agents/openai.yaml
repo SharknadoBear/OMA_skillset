@@ -1,0 +1,4 @@
+interface:
+  display_name: "CIOFS Fetcher"
+  short_description: "Fetch and validate NOAA Cook Inlet point time series"
+  default_prompt: "Use $ciofs-fetcher to inventory, plan, fetch, and health-check bounded NOAA CIOFS point time series."

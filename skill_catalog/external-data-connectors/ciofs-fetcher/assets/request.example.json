@@ -1,0 +1,41 @@
+{
+  "schema_version": "ciofs_point_request_v1",
+  "start_utc": "2026-09-16T17:00:00Z",
+  "end_utc_exclusive": "2026-09-16T19:00:00Z",
+  "guidance": "nowcast",
+  "variables": ["currents", "salinity", "temperature", "water_level"],
+  "vertical_views": ["surface", "bottom", "index:3"],
+  "minimum_depth_m": 10,
+  "missing_policy": "error",
+  "min_completeness": 0.95,
+  "max_gap_hours": 6,
+  "max_workers": 4,
+  "timeout_seconds": 60,
+  "retries": 4,
+  "points": [
+    {
+      "id": "LNG",
+      "latitude": 60.695611,
+      "longitude": -151.670694,
+      "sampling": "bilinear",
+      "max_distance_m": 5000,
+      "required": true
+    },
+    {
+      "id": "LowerInlet",
+      "latitude": 59.600,
+      "longitude": -153.250,
+      "sampling": "nearest_wet",
+      "max_distance_m": 5000,
+      "required": true
+    },
+    {
+      "id": "AnchorageApproach",
+      "latitude": 61.160,
+      "longitude": -150.150,
+      "sampling": "nearest_wet",
+      "max_distance_m": 5000,
+      "required": true
+    }
+  ]
+}
