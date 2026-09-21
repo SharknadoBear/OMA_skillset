@@ -74,10 +74,36 @@ def identity_remap(contract, original, source_case, resolution):
         _require(source_id is not None and str(b['obc_id']) == str(source_id)
             and current in (display, str(source_id)) and len(matches) == len(sources) == 1,
             'retained source/display identity is not a unique bijection')
-        selection = matches[0].get('selection')
-        _require(selection == f'exact finalized Adaptive-v2 obc_id {source_id}'
-            or str(matches[0].get('source_obc_id', '')) == str(source_id),
-            'historical case does not explicitly select the source OBC identity')
+        case_row = matches[0]
+        selection = case_row.get('selection')
+        has_selection = 'selection' in case_row
+        has_source_id = 'source_obc_id' in case_row
+        if has_selection:
+            _require(selection == f'exact finalized Adaptive-v2 obc_id {source_id}',
+                'historical case has a contradictory explicit OBC selection')
+        if has_source_id:
+            _require(str(case_row['source_obc_id']) == str(source_id),
+                'historical case has a contradictory explicit source OBC identity')
+        if not has_selection and not has_source_id:
+            # A historical sole display label was explicitly supported by the
+            # Grid loader. Admit only a complete unchanged cyclic chain; audit()
+            # separately proves its full one-time exterior-edge coverage.
+            rows = original.get('chains', [])
+            _require(len(bounds) == len(cycles) == len(case_rows) == len(source_rows) == len(rows) == 1,
+                'implicit retained identity requires exactly one chain in every authority')
+            side = rows[0]
+            ids = b.get('node_ids', [])
+            _require(len(ids) >= 3 and len(set(ids)) == len(ids)
+                and hashlib.sha256(json.dumps(ids, separators=(',', ':')).encode('ascii')).hexdigest() == b.get('node_order_sha256'),
+                'implicit retained identity has invalid or stale ordered nodes')
+            _require(all(value is True for value in (b.get('cyclic'), cycle.get('cyclic'),
+                side.get('cyclic'), case_row.get('cyclic'), sources[0].get('is_closed'))),
+                'implicit retained identity requires consistent explicit cyclicity')
+            _require(side.get('nodestring_id') == b['nodestring_id']
+                and side.get('source_node_ids_1based') == side.get('delivered_node_ids_1based') == ids
+                and side.get('source_node_count') == side.get('delivered_node_count') == cycle.get('node_count') == len(ids)
+                and side.get('orientation_preserved') is True and side.get('source_sequence_retained_by_lineage') is True,
+                'implicit retained identity lacks exact unchanged source-order lineage')
         _require(cycle['nodestring_id'] == b['nodestring_id'], 'alias nodestring identity differs')
         if current == str(b['obc_id']): continue
         cycle['declared_open_boundary_id'] = str(b['obc_id'])
@@ -198,6 +224,16 @@ def audit(request_path):
     exterior = max(polygons, key=lambda p: p.area); holes = [p for p in polygons if p is not exterior]
     _require(exterior.is_valid and all(p.is_valid and exterior.contains(p) for p in holes)
         and all(not p.intersects(q) for i, p in enumerate(holes) for q in holes[i+1:]), 'invalid retained exterior/islands')
+    case_rows = _read(paths['source_case_manifest'])['boundary']['open_boundaries']
+    if len(case_rows) == 1 and 'selection' not in case_rows[0] and 'source_obc_id' not in case_rows[0]:
+        _require(len(boundaries) == 1 and boundaries[0].get('cyclic') is True,
+            'implicit retained identity requires one cyclic exterior chain')
+        exterior_chain = chains[polygons.index(exterior)]
+        exterior_edges = {tuple(sorted((a, b))) for a, b in zip(exterior_chain, exterior_chain[1:]+exterior_chain[:1])}
+        obc_chain = [int(node)-1 for node in boundaries[0]['node_ids']]
+        obc_edges = [tuple(sorted((a, b))) for a, b in zip(obc_chain, obc_chain[1:]+obc_chain[:1])]
+        _require(len(obc_edges) == len(exterior_edges) and set(obc_edges) == exterior_edges,
+            'implicit retained cyclic OBC does not cover the complete exterior exactly once')
     quality = evaluate_mesh_quality(xy, mesh.depths, mesh.triangles, np.empty(0, dtype=int),
         {'boundary_constraint_recovered': True, 'source': 'validated_delivered_boundary_sidecar'},
         constraint_chains=chains, open_boundary_chains=[list(map(int, x)) for x in mesh.open_boundary_chains],

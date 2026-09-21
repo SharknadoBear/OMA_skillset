@@ -282,8 +282,44 @@ def align_external_step(extstep: float, isplit: int, quantum_seconds: float) -> 
 
 
 def derive_controls(mesh: Path, source_crs: str | None = None, metric_crs: str | None = None,
-                    time_quantum_seconds: float | None = None) -> dict[str, Any]:
+                    time_quantum_seconds: float | None = None,
+                    grid_contract: Path | None = None) -> dict[str, Any]:
     nodes, elems, chains = parse_2dm(mesh)
+    boundaries = [(i, chain, False) for i, chain in enumerate(chains, 1)]
+    contract_binding = None
+    if grid_contract is not None:
+        contract = load_data(grid_contract)
+        if contract.get("schema_version") != "fvcom_grid_delivery_contract_v1":
+            raise ValueError("unsupported grid delivery contract")
+        if contract.get("mesh", {}).get("sha256") != sha256(mesh):
+            raise ValueError("grid contract mesh SHA-256 mismatch")
+        declarations = contract.get("open_boundaries")
+        if not isinstance(declarations, list) or not declarations:
+            raise ValueError("grid contract requires ordered open boundaries")
+        boundaries = []
+        seen = set()
+        for boundary in declarations:
+            ns = boundary.get("nodestring_id")
+            if type(ns) is not int or ns in seen or not 1 <= ns <= len(chains):
+                raise ValueError("grid contract has invalid or duplicate nodestring identity")
+            seen.add(ns)
+            chain = chains[ns - 1]
+            declared = boundary.get("node_ids")
+            if (not isinstance(declared, list) or any(type(n) is not int for n in declared)
+                    or declared != chain or len(set(chain)) != len(chain)):
+                raise ValueError("grid contract node order differs from unique SMS nodestring")
+            order_hash = hashlib.sha256(json.dumps(chain, separators=(",", ":")).encode("ascii")).hexdigest()
+            if boundary.get("node_order_sha256") != order_hash:
+                raise ValueError("grid contract node order SHA-256 mismatch")
+            cyclic = boundary.get("cyclic", False)
+            if type(cyclic) is not bool:
+                raise ValueError("grid contract cyclic must be a boolean")
+            if "cyclicity" in boundary and boundary["cyclicity"] != ("cyclic" if cyclic else "noncyclic"):
+                raise ValueError("grid contract cyclicity metadata disagrees")
+            if cyclic and len(chain) < 3:
+                raise ValueError("cyclic OBC requires at least three unique nodes")
+            boundaries.append((ns, chain, cyclic))
+        contract_binding = {"path": str(grid_contract), "sha256": sha256(grid_contract)}
     if source_crs and metric_crs and source_crs != metric_crs:
         try:
             from pyproj import Transformer
@@ -326,8 +362,16 @@ def derive_controls(mesh: Path, source_crs: str | None = None, metric_crs: str |
                     raise
                 isplit -= 1
     sponge = []
-    for i, chain in enumerate(chains, 1):
-        lengths = [math.dist(nodes[a][:2], nodes[b][:2]) for a, b in zip(chain[:-1], chain[1:])]
+    for i, chain, cyclic in boundaries:
+        edges = list(zip(chain[:-1], chain[1:]))
+        if cyclic:
+            closing = frozenset((chain[-1], chain[0]))
+            owners = sum(closing in (frozenset((a, b)), frozenset((b, c)), frozenset((c, a)))
+                         for _, a, b, c in elems)
+            if owners != 1:
+                raise ValueError("cyclic OBC closure must be a mesh boundary edge")
+            edges.append((chain[-1], chain[0]))
+        lengths = [math.dist(nodes[a][:2], nodes[b][:2]) for a, b in edges]
         if not lengths:
             raise ValueError(f"OBC chain {i} has fewer than two nodes")
         ordered = sorted(lengths)
@@ -336,6 +380,7 @@ def derive_controls(mesh: Path, source_crs: str | None = None, metric_crs: str |
         sponge.append({
             "obc_id": i, "node_count": len(chain), "median_edge_m": median,
             "radius_m": 3.0 * median, "coefficient": 0.0025,
+            **({"cyclic": cyclic, "edge_count": len(edges)} if grid_contract is not None else {}),
         })
     return {
         "schema": "fvcom_initial_controls_v1", "generated_at": utcnow(),
@@ -351,6 +396,7 @@ def derive_controls(mesh: Path, source_crs: str | None = None, metric_crs: str |
                            "method": "largest_no_greater_0.1s_step_dividing_quantum" if time_quantum_seconds else "not_requested"},
         "limiting_wave_element": limiting_wave, "limiting_advective_element": limiting_adv,
         "sponge": sponge,
+        **({"grid_contract": contract_binding} if contract_binding is not None else {}),
     }
 
 
@@ -828,6 +874,7 @@ def build_parser() -> argparse.ArgumentParser:
     q = sub.add_parser("controls")
     q.add_argument("--mesh", required=True); q.add_argument("--output", required=True)
     q.add_argument("--source-crs"); q.add_argument("--metric-crs")
+    q.add_argument("--grid-contract", help="Hash-bound grid delivery contract with exact OBC order and explicit cyclicity")
     q.add_argument("--time-quantum-seconds", type=float,
                    help="Common divisor of stage durations and output intervals; April campaign uses 360")
     q = sub.add_parser("plan")
@@ -869,7 +916,8 @@ def main() -> int:
     elif args.command == "controls":
         if bool(args.source_crs) != bool(args.metric_crs):
             raise ValueError("--source-crs and --metric-crs must be supplied together")
-        result = derive_controls(Path(args.mesh), args.source_crs, args.metric_crs, args.time_quantum_seconds); write_json(Path(args.output), result)
+        result = derive_controls(Path(args.mesh), args.source_crs, args.metric_crs, args.time_quantum_seconds,
+                                 Path(args.grid_contract) if args.grid_contract else None); write_json(Path(args.output), result)
     elif args.command == "plan":
         result = stability_plan(load_data(Path(args.controls))); write_json(Path(args.output), result)
     elif args.command == "attempt":
