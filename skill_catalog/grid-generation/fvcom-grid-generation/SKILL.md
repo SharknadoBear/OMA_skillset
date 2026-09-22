@@ -100,9 +100,13 @@ source audit blocking for `validate --require-submission-ready`.
 When forcing is generated after terminal-grid publication, use
 `manage_fvcom_grid_project.py join-forcing` to bind the terminal grid contract,
 ordered geographic OBC points, actual elevation NetCDF, and forcing-owner
-manifest in a new immutable certificate revision. This resolves only missing
+manifest in a new immutable certificate revision. This resolves missing
 or incompatible forcing preconditions after actual node, coordinate, hash,
-time-encoding, finite-data and nodal-provenance checks pass. Preserve original
+time-encoding, finite-data and nodal-provenance checks pass. For cyclic OBCs,
+the v2 certificate additionally certifies the mesh-plus-sidecar package after
+checking explicit cyclicity, exact identities/order and every topological
+boundary edge including closure; standalone SMS remains non-self-describing.
+Preserve original
 quality, conditioning, source-order remapping, maps and source-bound TGE
 evidence; do not republish changed companions to mark forcing ready. See
 `references/grid_project_contract.md` for the command and revision contract.

@@ -8,6 +8,8 @@ import numpy as np
 
 RULE='fvcom_terminal_forcing_certificate_v1'
 RESOLVABLE={'open_boundary_forcing_missing','open_boundary_forcing_incompatible'}
+CYCLIC_RULE='fvcom_terminal_forcing_certificate_v2'
+CYCLIC_PRECONDITION='cyclic_obc_not_self_describing_in_sms_2dm'
 
 def _read(path):return json.loads(Path(path).read_text(encoding='utf-8-sig'))
 def _hash(path):
@@ -31,7 +33,27 @@ def _audit_prerequisites(status,mesh,tge_source,open_exterior_source,boundary_re
     _require(boundary['passed'] and boundary==status['open_exterior_audit'],'published boundary evidence is missing, stale or changed')
     return tge
 
-def audit_terminal_forcing(mesh_path,contract_path,points_path,forcing_path,manifest_path,remap_path):
+def _audit_cyclic_sidecar(mesh,boundaries,mapped,cyclicity):
+    """Certify the ordered mesh-plus-sidecar loops, never standalone SMS."""
+    triangles=np.asarray(mesh.triangles,dtype=np.int64)  # SMS connectivity is one-based.
+    edges=np.sort(np.concatenate([triangles[:,[0,1]],triangles[:,[1,2]],triangles[:,[2,0]]]),axis=1)
+    unique,counts=np.unique(edges,axis=0,return_counts=True)
+    boundary_edges={tuple(edge) for edge in unique[counts==1]}
+    proofs=[]
+    for boundary,side,cycle in zip(boundaries,mapped,cyclicity):
+        _require(all(type(item.get('cyclic')) is bool for item in (boundary,side,cycle)),'cyclic sidecar flags must be explicit booleans')
+        if not boundary['cyclic']:continue
+        chain=list(map(int,boundary['node_ids']))
+        _require(len(chain)>=3 and len(set(chain))==len(chain),'cyclic sidecar requires at least three distinct nodes without repeated seam')
+        loop=list(zip(chain,chain[1:]+chain[:1]))
+        _require(all(tuple(sorted(edge)) in boundary_edges for edge in loop),'cyclic sidecar includes a missing or non-boundary edge, including closure')
+        proofs.append({'obc_id':str(boundary['obc_id']),'nodestring_id':boundary['nodestring_id'],
+                       'node_count':len(chain),'boundary_edge_count':len(loop),
+                       'closing_edge_1based':list(loop[-1]),'node_order_sha256':boundary['node_order_sha256']})
+    _require(proofs,'cyclic precondition requires an actual cyclic sidecar chain')
+    return {'passed':True,'rule':'ordered_cyclic_boundary_edges_v1','standalone_sms_self_describing':False,'chains':proofs}
+
+def audit_terminal_forcing(mesh_path,contract_path,points_path,forcing_path,manifest_path,remap_path,*,require_cyclic_sidecar=False):
     """Read actual IDs, geographic coordinates, time, finite data and owner hashes."""
     from .sms_2dm import read_2dm
     paths=[_regular(p) for p in (mesh_path,contract_path,points_path,forcing_path,manifest_path,remap_path)]
@@ -59,6 +81,7 @@ def audit_terminal_forcing(mesh_path,contract_path,points_path,forcing_path,mani
             _require(str(cycle['declared_open_boundary_id'])==str(boundary['obc_id']),'contract stable OBC identity differs from remap')
     ids=np.asarray([i for chain in chains for i in chain],dtype=np.int64)
     _require(len(ids)>0 and len(set(ids.tolist()))==len(ids) and ids.min()>0 and ids.max()<=len(mesh.nodes_lonlat),'invalid or duplicate terminal OBC IDs')
+    cyclic_proof=_audit_cyclic_sidecar(mesh,boundaries,mapped,cyclicity) if require_cyclic_sidecar else None
     with points_path.open(encoding='utf-8-sig',newline='') as stream:rows=list(csv.DictReader(stream))
     actual_ids=np.asarray([int(r['node_id']) for r in rows],dtype=np.int64)
     xy=np.asarray([[float(r['longitude']),float(r['latitude'])] for r in rows])
@@ -109,16 +132,20 @@ def audit_terminal_forcing(mesh_path,contract_path,points_path,forcing_path,mani
             'utide_version':provenance.get('utide_version'),'builder_sha256':hashes['builder_sha256'],
             'source_harmonics_sha256':hashes['source_harmonics_sha256'],'obc_points_sha256':hashes['obc_points_sha256'],'obc_order_sha256':order_hash}.items():
             _require(expected_value is not None and getattr(ds,attribute,None)==expected_value,'NetCDF forcing provenance mismatch: '+attribute)
-    return {'passed':True,'node_count':len(ids),'time_count':len(t),'obc_order_sha256':order_hash,
+    result={'passed':True,'node_count':len(ids),'time_count':len(t),'obc_order_sha256':order_hash,
             'forcing_sha256':hashes['forcing_sha256'],'mesh_sha256':_hash(mesh_path),'constituents':names,
             'source_order_compatibility_reinterpreted':False,'terminal_order_forcing_compatible':True}
+    if require_cyclic_sidecar:result['cyclic_sidecar_audit']=cyclic_proof
+    return result
 
 def verify_terminal_forcing_join(root,status):
     """Return resolved preconditions only after immutable evidence is rechecked."""
     root=Path(root).resolve();record=status['terminal_forcing_certificate']
     path=(root/record['path']).resolve()
     _require(path.is_relative_to(root) and not path.is_symlink() and _hash(path)==record['sha256'],'terminal forcing certificate missing, unsafe or stale')
-    cert=_read(path);_require(cert.get('schema_version')==RULE,'unsupported terminal forcing certificate')
+    cert=_read(path);_require(cert.get('schema_version') in (RULE,CYCLIC_RULE),'unsupported terminal forcing certificate')
+    cyclic=cert['schema_version']==CYCLIC_RULE
+    resolvable=RESOLVABLE|({CYCLIC_PRECONDITION} if cyclic else set())
     inputs={}
     for key,binding in cert['inputs'].items():
         target=(root/binding['path']).resolve()
@@ -132,7 +159,7 @@ def verify_terminal_forcing_join(root,status):
     _require(inputs['source_tge_audit']==(root/status['fvcom_tge_source_bound_audit']['path']).resolve(),'certificate source TGE binding mismatch')
     tge=_audit_prerequisites(status,inputs['mesh'],inputs['tge_source'],inputs.get('open_exterior_source'),inputs.get('boundary_resolution_source'))
     _require(tge==_read(inputs['source_tge_audit']),'recomputed TGE audit differs from immutable publication')
-    result=audit_terminal_forcing(inputs['mesh'],inputs['grid_contract'],inputs['obc_points'],inputs['forcing'],inputs['forcing_manifest'],inputs['obc_remap_manifest'])
+    result=audit_terminal_forcing(inputs['mesh'],inputs['grid_contract'],inputs['obc_points'],inputs['forcing'],inputs['forcing_manifest'],inputs['obc_remap_manifest'],require_cyclic_sidecar=cyclic)
     _require(result==cert['audit'],'terminal forcing certificate readback disagrees')
     previous=_read(inputs['previous_status'])
     permitted={'created_utc','forcing_status','submission_failure_taxonomy','submission_eligible','terminal_forcing_certificate'}
@@ -140,8 +167,8 @@ def verify_terminal_forcing_join(root,status):
     from .quality_policy import classify_failure_codes,load_quality_policy
     original=classify_failure_codes(_read(inputs['mesh_quality']).get('all_quality_findings',[]),load_quality_policy())
     findings=set(original['submission_preconditions'])|set(previous['submission_failure_taxonomy'])
-    resolved=sorted(findings & RESOLVABLE)
-    effective=sorted(findings-RESOLVABLE)
+    resolved=sorted(findings & resolvable)
+    effective=sorted(findings-resolvable)
     _require(cert['resolved_submission_preconditions']==resolved,'certificate attempts to resolve a different precondition')
     _require(not original['benchmark_baseline'] and previous['benchmark_grid_baseline_ready'] is True,'certificate cannot waive geometric baseline failures')
     _require(status['submission_failure_taxonomy']==effective and status['submission_eligible']==(not effective) and status['forcing_status']=='compatible','status disagrees with certificate-derived submission decision')
@@ -157,7 +184,12 @@ def certify_terminal_forcing(project,*,grid_contract,obc_points,forcing,forcing_
     baseline=validate(root,require_benchmark_ready=True,require_submission_ready=True)
     _require(not (set(baseline['failure_taxonomy'])-{'project_not_submission_ready'}),'grid/source/TGE validation must pass before forcing join: '+','.join(baseline['failure_taxonomy']))
     status=baseline['status'];_require(status['benchmark_grid_baseline_ready'] is True,'forcing join requires benchmark-ready grid')
-    _require(not (set(status['submission_failure_taxonomy'])-RESOLVABLE),'forcing join cannot waive other submission failures')
+    from .quality_policy import classify_failure_codes,load_quality_policy
+    original=classify_failure_codes(_read(root/'final'/FINAL_COMPANIONS['mesh_quality']).get('all_quality_findings',[]),load_quality_policy())
+    findings=set(original['submission_preconditions'])|set(status['submission_failure_taxonomy'])
+    cyclic=CYCLIC_PRECONDITION in findings
+    resolvable=RESOLVABLE|({CYCLIC_PRECONDITION} if cyclic else set())
+    _require(not (findings-resolvable),'forcing join cannot waive other submission failures')
     contract=_regular(grid_contract);_require(contract.is_relative_to(root),'grid contract must be project-local')
     mesh=root/status['mesh']['path']
     tge_source=_regular(tge_source)
@@ -165,7 +197,7 @@ def certify_terminal_forcing(project,*,grid_contract,obc_points,forcing,forcing_
     _require(all(path.is_relative_to(root) for path in boundary_inputs.values()),'boundary evidence manifests must remain project-local at their original locations')
     tge=_audit_prerequisites(status,mesh,tge_source,boundary_inputs.get('open_exterior_source'),boundary_inputs.get('boundary_resolution_source'))
     _require(tge==_read(root/status['fvcom_tge_source_bound_audit']['path']),'recomputed TGE differs from original audit')
-    result=audit_terminal_forcing(mesh,contract,obc_points,forcing,forcing_manifest,root/'final'/FINAL_COMPANIONS['obc_remap_manifest'])
+    result=audit_terminal_forcing(mesh,contract,obc_points,forcing,forcing_manifest,root/'final'/FINAL_COMPANIONS['obc_remap_manifest'],require_cyclic_sidecar=cyclic)
     # Every rejecting science/structural gate above runs before creating a revision.
     folder.mkdir(parents=True)
     inputs={'mesh':mesh,'grid_contract':contract,'project_manifest':root/'project_manifest.json',
@@ -175,16 +207,13 @@ def certify_terminal_forcing(project,*,grid_contract,obc_points,forcing,forcing_
     for key,source,name in [('obc_points',obc_points,'obc_points.csv'),('forcing',forcing,'elevation.nc'),('forcing_manifest',forcing_manifest,'forcing_manifest.json'),('tge_source',tge_source,'tge.F')]:
         target=folder/name;_verified_copy(Path(source).resolve(),target);inputs[key]=target
     previous=folder/'previous_status.json';_atomic_json(previous,status);inputs['previous_status']=previous
-    from .quality_policy import classify_failure_codes,load_quality_policy
-    original=classify_failure_codes(_read(inputs['mesh_quality']).get('all_quality_findings',[]),load_quality_policy())
-    findings=set(original['submission_preconditions'])|set(status['submission_failure_taxonomy'])
-    certificate={'schema_version':RULE,'revision':int(revision),'created_utc':datetime.now(timezone.utc).isoformat(),
+    certificate={'schema_version':CYCLIC_RULE if cyclic else RULE,'revision':int(revision),'created_utc':datetime.now(timezone.utc).isoformat(),
         'inputs':{key:{'path':path.relative_to(root).as_posix(),'sha256':_hash(path)} for key,path in inputs.items()},
-        'audit':result,'resolved_submission_preconditions':sorted(findings&RESOLVABLE),
+        'audit':result,'resolved_submission_preconditions':sorted(findings&resolvable),
         'preservation':'Original mesh, quality, source-order remap, maps and source TGE companions remain unchanged.'}
     path=folder/'certificate.json';_atomic_json(path,certificate)
     updated=dict(status);updated.update(created_utc=certificate['created_utc'],forcing_status='compatible',
-        submission_failure_taxonomy=sorted(findings-RESOLVABLE),submission_eligible=not bool(findings-RESOLVABLE),
+        submission_failure_taxonomy=sorted(findings-resolvable),submission_eligible=not bool(findings-resolvable),
         terminal_forcing_certificate={'path':path.relative_to(root).as_posix(),'sha256':_hash(path)})
     _atomic_json(folder/'delivery_status.json',updated)
     verify_terminal_forcing_join(root,updated)
