@@ -40,6 +40,7 @@ For a forward test, use a new UTC-stamped directory under Workspace/Preprocessin
 A coastal run produces final_status: review_pending with a hash-bound region_bpoly_scientific_review_request_v1. Never stop at review_pending or repair_required. Continue scientific review and any useful general repair. Offshore-orientation repair is the sole bounded exception: perform no more than one internal adjustment and stop with the typed S1 blocker if the second audit remains scientifically wrong. Otherwise, once valid geometry exists, finish with final_status: pass, either as a scientifically accepted delivery or accepted_best_effort with explicit warnings.
 
 Lake and island candidates may also be freely adjusted when their maps show an incomplete or scientifically unsuitable frame; they do not require the coastal hash-bound finalizer.
+Their native delivery freezes canonical geometry, a retained candidate and the final map. This provenance does not claim agent scientific acceptance: inspect the map and retain that review separately. Use a new run directory for revised geometry.
 
 ## Scientific review
 
@@ -142,5 +143,6 @@ Clean and best-effort deliveries both use final_status: pass; the review outcome
 ## Validation
 
     python scripts/selftest_region_bpoly.py
+    python scripts/selftest_noncoastal_freeze.py
     python -m compileall scripts
     python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .

@@ -3,11 +3,52 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .io import file_sha256, utc_now, write_json
+from .io import canonical_sha256, file_sha256, read_json, utc_now, write_json
 
 
 OUTPUT_PACKAGE_SCHEMA = "region_bpoly_output_package_v1"
 DELIVERY_MANIFEST_SCHEMA = "region_bpoly_delivery_manifest_v1"
+
+
+def _freeze_noncoastal_delivery(run_dir: Path, final: dict[str, Any]) -> None:
+    """Bind a resolved island/lake delivery without inventing a scientific review."""
+    map_path = Path(final.get("final_map_path") or run_dir / "region_bpoly_final_map.png").resolve()
+    candidate_path = (run_dir / "region_bpoly_geometry_candidate.json").resolve()
+    candidate = {
+        "schema_version": "region_bpoly_noncoastal_geometry_candidate_v1",
+        "name": final.get("name"),
+        "domain_type": final["domain_type"],
+        "region_bpoly": final["region_bpoly"],
+        "offshore_side_index": (final.get("offshore_boundary_artifacts") or {}).get("selected_side_index"),
+        "final_map": str(map_path),
+        "final_map_sha256": file_sha256(map_path) if map_path.is_file() else None,
+        "map_geography_usable": (final.get("final_map_basemap") or {}).get("geography_usable"),
+        "required_feature_coverage": final.get("qa", {}).get("ingredient_coverage"),
+        "delivery_warnings": final.get("delivery_warnings", []),
+        "scientific_review": None,
+        "review_policy": "Resolved geometry provenance only; agent map inspection remains required.",
+    }
+    # Keep the candidate outside intermediate/: execute-mode cleanup must not
+    # erase the evidence referenced by an accepted geometry freeze.
+    if candidate_path.exists():
+        if read_json(candidate_path) != candidate:
+            raise ValueError("Noncoastal geometry evidence is frozen; use a new run directory for a revision")
+    else:
+        write_json(candidate_path, candidate)
+    final["accepted_s1_geometry_freeze"] = {
+        "schema_version": "region_bpoly_accepted_geometry_freeze_v1",
+        "acceptance_route": "noncoastal_resolved_delivery",
+        "region_bpoly_sha256": canonical_sha256(final["region_bpoly"]),
+        "candidate_json": str(candidate_path),
+        "candidate_json_sha256": file_sha256(candidate_path),
+        "scientific_review_json": None,
+        "scientific_review_json_sha256": None,
+        "review_iteration": None,
+        "offshore_side_index": candidate["offshore_side_index"],
+        "final_map": candidate["final_map"],
+        "final_map_sha256": candidate["final_map_sha256"],
+        "downstream_geometry_repair_permitted": False,
+    }
 
 
 def _artifact_record(run_dir: Path, role: str, relative_path: str, required: bool) -> dict[str, Any]:
@@ -31,6 +72,10 @@ def write_standard_delivery(run_dir: Path, name: str, final: dict[str, Any], *, 
     manifest_path = run_dir / "region_bpoly_manifest.json"
     alias_name = f"{name}_region_bpoly.json"
 
+    noncoastal_pass = final.get("domain_type") in {"island", "lake"} and final.get("final_status") == "pass"
+    if noncoastal_pass:
+        _freeze_noncoastal_delivery(run_dir, final)
+
     write_json(feature_path, final.get("target_region_features", {}))
     final["target_region_features_path"] = str(feature_path)
     final["output_manifest_path"] = str(manifest_path)
@@ -43,6 +88,8 @@ def write_standard_delivery(run_dir: Path, name: str, final: dict[str, Any], *, 
         "offshore_boundary_artifacts": "offshore_boundary_artifacts.json",
         "manifest": "region_bpoly_manifest.json",
     }
+    if noncoastal_pass:
+        canonical_files["geometry_candidate"] = "region_bpoly_geometry_candidate.json"
     review = final.get("land_side_visual_review") or {}
     if final.get("domain_type") == "coastal" and final.get("final_status") == "pass":
         canonical_files["land_side_review"] = "region_bpoly_land_side_review.json"
@@ -69,6 +116,8 @@ def write_standard_delivery(run_dir: Path, name: str, final: dict[str, Any], *, 
         "final_map",
         "offshore_boundary_artifacts",
     }
+    if noncoastal_pass:
+        required_roles.add("geometry_candidate")
     if final.get("domain_type") == "coastal" and final.get("final_status") == "pass":
         required_roles.add("land_side_review")
         if review.get("effective_decision") == "pass" and review.get("review_map_path"):
