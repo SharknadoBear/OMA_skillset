@@ -121,6 +121,9 @@ domain map, one map per residual component, and a hash-bound pending decision.
 A simple shoreline-bracketed solid closure is eligible only when it creates no
 artificial bar, crosses no unrelated land, preserves the wet component, and
 conflicts with no protected feature.
+Island, archipelago and lake deliveries also use v2 under this default. They
+retain `role_assignment_enabled: false`: the version does not enable coastal
+residual roles or waive the explicit map decision, hard metrics or OBC count.
 
 When a reviewed residual is physically a continuation of an existing primary
 OBC, assign `primary_obc_extension` instead of creating a second OBC. The
@@ -199,6 +202,7 @@ Progress never substitutes for the final scientific manifest.
 ```powershell
 python scripts/selftest_bdry_arc.py
 python scripts/selftest_open_exterior_contract.py
+python scripts/selftest_noncoastal_open_exterior.py
 python scripts/selftest_resolved_domain_serialization.py
 python -m compileall scripts
 python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .

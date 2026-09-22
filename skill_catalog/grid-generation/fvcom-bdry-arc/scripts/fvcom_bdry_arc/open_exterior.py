@@ -458,7 +458,7 @@ def build_open_exterior_contract(
     metric_gate_pass = bool(diagnostic_pass and not structural_failures and coastline_coverage_pass)
     contract_schema = (
         "fvcom_open_exterior_contract_v2"
-        if role_contract_enabled
+        if residual_boundary_policy == "solid-default" and not report_only
         else "fvcom_open_exterior_contract_v1"
     )
     contract_failures = (
@@ -486,6 +486,8 @@ def build_open_exterior_contract(
         "report_only": report_only,
         "residual_boundary_policy": {
             "mode": residual_boundary_policy,
+            # Schema version is independent of coastal residual-role support.
+            "role_assignment_enabled": role_contract_enabled,
             "default_role": "solid_lagoon_closure" if role_contract_enabled else None,
             "station_is_eligibility_not_automatic_obc": True,
             "requested_obc_count_controls_secondary_obc": True,
