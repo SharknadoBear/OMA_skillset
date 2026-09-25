@@ -14,7 +14,7 @@ import netCDF4 as nc4
 import numpy as np
 
 from fvcom_time_anchor import (
-    MJD_EPOCH, anchored_times, audit_restart, check_file_clock, exact_clock,
+    MJD_EPOCH, anchored_times, audit_restart, check_file_clock, check_station_clock, exact_clock,
     iso, parse_utc, read_iint, resolve_anchor, restart_anchor, sha256,
 )
 
@@ -170,6 +170,40 @@ class TimeAnchorTests(unittest.TestCase):
             ds["time"][1] = raw + 2 * np.spacing(raw)
         with self.assertRaisesRegex(ValueError, "beyond its precision"):
             self.check_path(path, require_exact=False)
+
+    def test_iint_only_native_clock_omission_rejected(self):
+        path = self.write_nc("iint_only.nc", self.steps, self.times, exact=False, float_time=False)
+        with self.assertRaisesRegex(ValueError, "no native clock"):
+            self.check_path(path, require_exact=False)
+        with nc4.Dataset(path) as ds, self.assertRaisesRegex(ValueError, "missing time"):
+            check_station_clock(ds, self.times)
+
+    def test_station_requires_time_even_with_exact_clock(self):
+        path = self.write_nc("exact_only.nc", self.steps, self.times, float_time=False)
+        self.assertTrue(self.check_path(path)["exact_clock_verified"])
+        with nc4.Dataset(path) as ds, self.assertRaisesRegex(ValueError, "missing time"):
+            check_station_clock(ds, self.times)
+
+    def test_native_station_float_only_and_exact_clocks(self):
+        for exact in (False, True):
+            path = self.write_nc(f"station_{exact}.nc", self.steps, self.times, exact=exact)
+            with nc4.Dataset(path) as ds:
+                result = check_station_clock(ds, self.times)
+            self.assertTrue(result["native_time_verified"])
+            self.assertEqual(result["exact_clock_verified"], exact)
+
+    def test_station_time_mask_nan_dimensions_and_units_rejected(self):
+        for fault in ("mask", "nan", "dimension", "units", "shift"):
+            with self.subTest(fault=fault):
+                path = self.write_nc(f"station_bad_{fault}.nc", self.steps, self.times, exact=False)
+                with nc4.Dataset(path, "a") as ds:
+                    if fault == "mask": ds["time"][0] = -9999
+                    elif fault == "nan": ds["time"][0] = np.nan
+                    elif fault == "units": ds["time"].units = "seconds since 1858-11-17 00:00:00"
+                    elif fault == "shift": ds["time"][0] += 1
+                    else: ds.renameDimension("time", "unrelated_records")
+                with nc4.Dataset(path) as ds, self.assertRaises(ValueError):
+                    check_station_clock(ds, self.times)
 
     def test_masked_iint_rejected(self):
         path = self.write_nc("masked.nc", [75000, -9999, 75300], self.times)
