@@ -90,6 +90,21 @@ discloses missing generation intermediates. It never certifies a fresh grid or
 claims the complete standardized project passed. Other geometry/connectivity
 repairs require their owning audited delivery route, not this compatibility path.
 
+When a source-TGE failure is a connected noncyclic endpoint fan that the default
+single-pass endpoint rule cannot resolve, the explicit
+`repair_fvcom_tge_endpoints.py --endpoint-fan-max-steps N` option permits at most
+`N` sequential demotions (`1 <= N <= 4`, total across all chains). The omitted
+option retains the legacy rule. Every original fatal component must consist
+only of same-chain sum-five cells and have one initial endpoint anchor. Every
+demotion is a unique current endpoint and strictly decreases source-TGE fatal
+cells; unrelated, cyclic, ambiguous, detached, or exhausted cases are rejected.
+No geometry, depth, triangle, non-NS bytes, or untouched OBC order may change.
+Sequential products appear atomically in the result's `delivery/` only after
+serialized/source and final input-hash checks pass; rejected staged bytes are
+diagnostic evidence only. Require a geographic review of the prescribed-to-solid
+boundary-role delta. The corrected contract binds the selected bound and full
+step trace, which the retained join independently replays before admission.
+
 Every mesh-quality evaluation embeds the algorithm-bound TGE junction gate.
 Publication may remain benchmark-only without local FVCOM source, but
 submission eligibility requires `publish --tge-source /path/to/TGE.F`. The

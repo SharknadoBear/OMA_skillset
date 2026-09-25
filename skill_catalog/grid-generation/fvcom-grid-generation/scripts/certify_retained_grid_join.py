@@ -25,6 +25,8 @@ from fvcom_grid_generation.open_exterior import validate_grid_boundary_gate
 from fvcom_grid_generation.quality import evaluate_mesh_quality
 from fvcom_grid_generation.sms_2dm import read_2dm
 from fvcom_grid_generation.tge_topology import audit_tge_boundary_junctions
+import fvcom_tge_endpoint_fan
+from fvcom_tge_endpoint_fan import replay_endpoint_fan
 
 RULE = 'fvcom_retained_grid_join_certificate_v1'
 REQUIRED = {'grid_contract', 'original_mesh', 'original_boundary_nodes', 'original_publication_status',
@@ -164,12 +166,23 @@ def audit(request_path):
     boundaries = contract['open_boundaries']
     _require(len(boundaries) == len(mesh.open_boundary_chains), 'retained OBC chain count differs')
     endpoint_changes = []
+    extended_endpoint_change = False
     for b, old_chain, new_chain in zip(boundaries, old.open_boundary_chains, mesh.open_boundary_chains):
         a, z = list(map(int, old_chain)), list(map(int, new_chain))
         if a == z: continue
-        _require(b['cyclic'] is False and len(z) >= 2 and z in (a[1:], a[:-1], a[1:-1]),
-            'retained route only admits bounded noncyclic endpoint trims')
+        legacy_trim = z in (a[1:], a[:-1], a[1:-1])
+        _require(b['cyclic'] is False and len(z) >= 2 and (legacy_trim or 'endpoint_fan_trace' in companions),
+            'retained route requires bounded noncyclic endpoint trims or a complete endpoint-fan replay trace')
+        extended_endpoint_change |= not legacy_trim
         endpoint_changes.append({'nodestring_id': b['nodestring_id'], 'removed_node_ids': sorted(set(a)-set(z))})
+    endpoint_fan_replay = None
+    if 'endpoint_fan_trace' in companions:
+        trace = _read(companions['endpoint_fan_trace'])
+        endpoint_fan_replay = replay_endpoint_fan(trace, old, mesh, [b['cyclic'] for b in boundaries],
+            paths['tge_source'], _hash(paths['original_mesh']), _hash(mesh_path),
+            contract.get('source_delivery', {}).get('endpoint_fan_max_steps'))
+    _require(not extended_endpoint_change or endpoint_fan_replay is not None,
+        'extended endpoint change lacks an independently replayed trace')
     publication = _read(paths['original_publication_status'])
     _require(publication.get('mesh', {}).get('sha256') == _hash(paths['original_mesh']), 'retained source publication does not bind original mesh')
     _require(publication.get('obc_status') == 'pass', 'retained source OBC placement was not passing')
@@ -292,7 +305,7 @@ def audit(request_path):
         path = Path(temp)/'remap.json'; path.write_text(json.dumps(normalized, indent=2)+'\n', encoding='utf-8')
         forcing = audit_terminal_forcing(mesh_path, paths['grid_contract'], paths['obc_points'], paths['forcing'], paths['forcing_manifest'], path)
     return {'passed': True, 'scope': 'accepted_retained_geometry_preserved', 'dependencies': dependencies,
-        'endpoint_changes': endpoint_changes, 'identity_aliases': aliases, 'terminal_remap': normalized,
+        'endpoint_changes': endpoint_changes, 'endpoint_fan_replay': endpoint_fan_replay, 'identity_aliases': aliases, 'terminal_remap': normalized,
         'tge': tge, 'original_tge': original_tge, 'quality': quality, 'boundary': boundary, 'forcing': forcing,
         'limitations': ['Historical generation intermediates may be absent under the bound retention evidence; fresh-generation validation is not claimed.',
                        'Geometry, depths and connectivity are identical to retained original; only proven noncyclic OBC endpoint trims are admitted.']}
@@ -304,6 +317,11 @@ def verify(certificate_path):
     auditor = resolve(cert['auditor'], Path(certificate_path).parent)
     _require(auditor == _regular(Path(certificate_path).parent/'auditor.py')
         and _hash(auditor) == _hash(__file__), 'retained certificate requires its exact archived auditor version')
+    _require('endpoint_fan_planner' in cert, 'retained certificate requires its archived endpoint-fan planner')
+    planner = resolve(cert['endpoint_fan_planner'], Path(certificate_path).parent)
+    _require(planner == _regular(Path(certificate_path).parent/'fvcom_tge_endpoint_fan.py')
+        and _hash(planner) == _hash(fvcom_tge_endpoint_fan.__file__),
+        'retained certificate requires its exact archived endpoint-fan planner version')
     _require(cert.get('submission_ready') is True, 'retained certificate is not submission ready')
     request_path = resolve(cert['request'], Path(certificate_path).parent)
     result = audit(request_path)
@@ -318,8 +336,10 @@ def certify(request_path, output_dir):
     output_dir.mkdir(parents=True)
     auditor = output_dir/'auditor.py'
     auditor.write_bytes(Path(__file__).read_bytes())
+    planner = output_dir/'fvcom_tge_endpoint_fan.py'
+    planner.write_bytes(Path(fvcom_tge_endpoint_fan.__file__).read_bytes())
     certificate = {'schema_version': RULE, 'request': bind(request_path), 'audit': result,
-        'auditor': bind(auditor), 'submission_ready': True}
+        'auditor': bind(auditor), 'endpoint_fan_planner': bind(planner), 'submission_ready': True}
     path = output_dir/'certificate.json'
     path.write_text(json.dumps(certificate, indent=2)+'\n', encoding='utf-8')
     receipt = verify(path)

@@ -18,6 +18,7 @@ from pyproj import CRS, Transformer
 from fvcom_grid_generation.quality import evaluate_mesh_quality
 from fvcom_grid_generation.sms_2dm import read_2dm
 from fvcom_grid_generation.tge_topology import audit_tge_boundary_junctions
+from fvcom_tge_endpoint_fan import plan_endpoint_fan
 
 
 class RepairRejected(ValueError):
@@ -85,7 +86,7 @@ def rewrite_nodestrings(raw, replacements):
     return b"".join(output)
 
 
-def repair(grid_contract, boundary_nodes, obc_remap, tge_source, output_dir):
+def repair(grid_contract, boundary_nodes, obc_remap, tge_source, output_dir, *, endpoint_fan_max_steps=0):
     paths = {"grid_contract": Path(grid_contract).resolve(), "boundary_nodes": Path(boundary_nodes).resolve(),
         "obc_remap": Path(obc_remap).resolve(), "tge_source": Path(tge_source).resolve()}
     output = Path(output_dir).resolve()
@@ -93,6 +94,8 @@ def repair(grid_contract, boundary_nodes, obc_remap, tge_source, output_dir):
     output.mkdir(parents=True)
     result = {"schema_version": "fvcom_tge_endpoint_repair_v1", "status": "blocked", "changed": False,
         "input_paths": {key: str(path) for key, path in paths.items()}, "input_hashes": {}, "blocking_reasons": []}
+    pending_delivery = None
+    sequential_published = False
     try:
         result["input_hashes"] = {key: sha(path) for key, path in paths.items()}
         contract = json.loads(paths["grid_contract"].read_text(encoding="utf-8-sig"))
@@ -182,7 +185,17 @@ def repair(grid_contract, boundary_nodes, obc_remap, tge_source, output_dir):
         require(before["source_binding"]["passed"], "tge_source_mismatch", "Exact TGE source expressions are missing")
         require(set(before["exterior_node_ids_1based"]) == boundary_ids, "boundary_coverage_mismatch", "Sidecar must cover every and only topological boundary node")
         replacements, reclassified = {}, set()
-        if not before["passed"]:
+        fan_plan = None
+        if endpoint_fan_max_steps != 0:
+            other_failures = set(before_quality["failure_taxonomy"]) - {"fvcom_tge_boundary_cell_sum_above_four"}
+            require(not other_failures, "preexisting_mesh_failure", f"Unrelated hard mesh failures: {sorted(other_failures)}")
+            fan_plan = plan_endpoint_fan(len(xy), mesh.triangles-1, chains, cyclic,
+                paths["tge_source"], sha(mesh_path), endpoint_fan_max_steps)
+            for row, old, new in zip(declared, chains, fan_plan["delivered_chains"]):
+                if old != new:
+                    replacements[int(row["nodestring_id"])] = (old, new)
+                    reclassified.update(set(old) - set(new))
+        elif not before["passed"]:
             endpoint_owner = {}
             for i, chain in enumerate(chains):
                 for node in (chain[0], chain[-1]):
@@ -212,7 +225,14 @@ def repair(grid_contract, boundary_nodes, obc_remap, tge_source, output_dir):
             dump(output / "after_tge_audit.json", after)
             dump(output / "after_mesh_quality.json", after_quality)
             require(after["passed"] and after_quality["benchmark_grid_baseline_ready"], "postrepair_gate_failure", "Bounded endpoint correction did not pass all global gates")
-            candidate_path = output / "fvcom_grid.2dm"
+            product_output = output
+            if fan_plan is not None:
+                pending_delivery = output / "_pending_delivery"
+                pending_delivery.mkdir()
+                product_output = pending_delivery
+                dump(product_output / "after_tge_audit.json", after)
+                dump(product_output / "after_mesh_quality.json", after_quality)
+            candidate_path = product_output / "fvcom_grid.2dm"
             candidate_path.write_bytes(rewrite_nodestrings(raw, replacements))
             delivered = read_2dm(candidate_path)
             require(np.array_equal(mesh.nodes_lonlat, delivered.nodes_lonlat) and np.array_equal(mesh.depths, delivered.depths) and np.array_equal(mesh.triangles, delivered.triangles),
@@ -239,29 +259,58 @@ def repair(grid_contract, boundary_nodes, obc_remap, tge_source, output_dir):
                 cyc_contract["parent_boundary_contract_sha256"] = cyc_contract.pop("boundary_contract_sha256")
             for row in cyc_contract.get("chains", []):
                 row["node_count"] = len(delivered_ns[int(row["nodestring_id"])])
-            dump(output / "boundary_nodes.geojson", boundary)
-            dump(output / "obc_remap_manifest.json", remap)
+            dump(product_output / "boundary_nodes.geojson", boundary)
+            dump(product_output / "obc_remap_manifest.json", remap)
             parent_delivery = copy.deepcopy(contract.get("source_delivery"))
             contract["mesh"].update(path="fvcom_grid.2dm", sha256=sha(candidate_path))
             contract["source_delivery"] = {"parent_contract_path": str(paths["grid_contract"]), "parent_contract_sha256": sha(paths["grid_contract"]),
                 "parent_source_delivery": parent_delivery, "correction": "diagnosed_noncyclic_TGE_endpoint_reclassification",
                 "geometry_and_connectivity_unchanged": True, "forcing_compatibility": "invalidated_until_regenerated", "submission_eligible": False}
-            contract["delivery_artifacts"] = {name: {"path": filename, "sha256": sha(output / filename)} for name, filename in
+            contract["delivery_artifacts"] = {name: {"path": filename, "sha256": sha(product_output / filename)} for name, filename in
                 {"boundary_nodes": "boundary_nodes.geojson", "obc_remap": "obc_remap_manifest.json", "tge_audit": "after_tge_audit.json", "mesh_quality": "after_mesh_quality.json"}.items()}
-            dump(output / "grid_delivery_contract.json", contract)
+            if fan_plan is not None:
+                fan_trace = dict(fan_plan, terminal_mesh_sha256=sha(candidate_path))
+                dump(product_output / "endpoint_fan_trace.json", fan_trace)
+                contract["delivery_artifacts"]["endpoint_fan_trace"] = {"path": "endpoint_fan_trace.json", "sha256": sha(product_output / "endpoint_fan_trace.json")}
+                contract["source_delivery"]["correction"] = "diagnosed_noncyclic_TGE_sequential_endpoint_fan"
+                contract["source_delivery"]["endpoint_fan_max_steps"] = endpoint_fan_max_steps
+            dump(product_output / "grid_delivery_contract.json", contract)
             # Repeat the source-bound gate on the serialized result, not only arrays.
             serialized_audit = audit_tge_boundary_junctions(len(delivered.nodes_lonlat), delivered.triangles-1,
                 [np.asarray(delivered_ns[int(row["nodestring_id"])])-1 for row in declared], tge_source_path=paths["tge_source"])
             require(serialized_audit == after, "serialized_tge_mismatch", "Serialized TGE audit differs")
+            product_names = {"mesh": "fvcom_grid.2dm", "grid_contract": "grid_delivery_contract.json",
+                "boundary_nodes": "boundary_nodes.geojson", "obc_remap": "obc_remap_manifest.json",
+                "tge_audit": "after_tge_audit.json", "mesh_quality": "after_mesh_quality.json"}
+            if fan_plan is not None:
+                staged_hashes = {name: sha(product_output / filename) for name, filename in product_names.items()}
+                trace_sha256 = sha(product_output / "endpoint_fan_trace.json")
+                require(all(sha(path) == result["input_hashes"][name] for name, path in paths.items()),
+                    "inputs_changed_during_repair", "An input changed during the transaction")
+                # Publish the complete directory only after serialized/source and
+                # final input checks pass. A rejected stage never becomes delivery/.
+                product_output = output / "delivery"
+                pending_delivery.rename(product_output)
+                pending_delivery = None
+                sequential_published = True
+                result["endpoint_fan"] = {"rule": fan_plan["schema_version"], "max_steps": endpoint_fan_max_steps,
+                    "step_count": len(fan_plan["steps"]), "trace_path": str(product_output / "endpoint_fan_trace.json"),
+                    "trace_sha256": trace_sha256}
             result.update(status="ready", changed=True, decision="one_bounded_endpoint_reclassification",
                 reclassified_node_ids_1based=sorted(reclassified), geometry_depth_connectivity_exact=True, all_other_nodestrings_exact=True,
                 forcing_regeneration_required=True, submission_eligible=False,
-                output_paths={name: str(output / filename) for name, filename in {"mesh": "fvcom_grid.2dm", "grid_contract": "grid_delivery_contract.json",
-                    "boundary_nodes": "boundary_nodes.geojson", "obc_remap": "obc_remap_manifest.json", "tge_audit": "after_tge_audit.json", "mesh_quality": "after_mesh_quality.json"}.items()})
-            result["output_hashes"] = {name: sha(path) for name, path in result["output_paths"].items()}
-        require(all(sha(path) == result["input_hashes"][name] for name, path in paths.items()), "inputs_changed_during_repair", "An input changed during the transaction")
+                output_paths={name: str(product_output / filename) for name, filename in product_names.items()})
+            result["output_hashes"] = staged_hashes if sequential_published else {name: sha(path) for name, path in result["output_paths"].items()}
+        if not sequential_published:
+            require(all(sha(path) == result["input_hashes"][name] for name, path in paths.items()), "inputs_changed_during_repair", "An input changed during the transaction")
     except (RepairRejected, KeyError, ValueError, OSError) as exc:
         result.update(status="blocked", blocking_reasons=[{"code": getattr(exc, "code", "invalid_input"), "detail": str(exc)}])
+        if pending_delivery is not None and pending_delivery.exists():
+            rejected = output / "_rejected_delivery_diagnostic"
+            pending_delivery.rename(rejected)
+            dump(rejected / "DO_NOT_USE.json", {"status": "rejected_diagnostic_only", "production_adoption_authorized": False,
+                "blocking_reasons": result["blocking_reasons"]})
+            result["rejected_diagnostic_directory"] = str(rejected)
     dump(output / "repair_manifest.json", result)
     return result
 
@@ -270,8 +319,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("grid-contract", "boundary-nodes", "obc-remap", "tge-source", "output-dir"):
         parser.add_argument("--" + name, required=True, type=Path)
+    parser.add_argument("--endpoint-fan-max-steps", type=int, default=0,
+        help="Explicit opt-in total sequential endpoint-fan demotion bound (1..4); default 0 preserves the legacy one-pass rule")
     args = parser.parse_args()
-    result = repair(args.grid_contract, args.boundary_nodes, args.obc_remap, args.tge_source, args.output_dir)
+    result = repair(args.grid_contract, args.boundary_nodes, args.obc_remap, args.tge_source, args.output_dir,
+        endpoint_fan_max_steps=args.endpoint_fan_max_steps)
     print(json.dumps(result, indent=2))
     return 0 if result["status"] == "ready" else 2
 
