@@ -42,6 +42,63 @@ Numerical controls JSON supplies positive `extstep_seconds` and integer `isplit`
 
 Station JSON is either an array or `{"stations": [...]}`. Each station has `station_id`, `longitude`, `latitude`, `cell_id`, and `depth_m`. `cell_id` is one-based and refers to the final FVCOM element order.
 
+## Suitable water-level proxy candidates
+
+With `containing_cell_or_nearest_wet_cell`, the default remains containing cell,
+otherwise unrestricted nearest positive-depth centroid. If a geometry review
+rejects that nearest cell (for example, across a barrier into another basin),
+`prepare_station_mapping.py --proxy-candidates candidates.json` supports a
+predeclared set of suitable cells. The owning mapper selects the nearest centroid
+within that set using its projected-metre distance and cell-ID tie break. This
+option does not infer basin connectivity, choose from agreement statistics, or
+authorize remeshing. The reviewer supplies basin/coast/depth evidence before
+model-agreement inspection; the code checks the bindings and deterministic choice.
+
+```json
+{
+  "schema": "fvcom_waterlevel_proxy_candidates_v1",
+  "mesh_sha256": "<exact mesh hash>",
+  "grid_contract_sha256": "<exact delivery contract hash>",
+  "station_inventory_sha256": "<exact source-eligibility inventory hash>",
+  "metric_crs": "EPSG:32617",
+  "selection_basis": "geometry_only_before_agreement_statistics",
+  "model_agreement_used": false,
+  "stations": [{
+    "station_id": "example_station",
+    "observation_longitude": -81.0,
+    "observation_latitude": 27.0,
+    "candidate_cell_ids": [101, 102],
+    "basin_rationale": "Reviewed connected harbor cells; offshore cells across the barrier excluded.",
+    "geometry_evidence": [{"path": "basin_review.json", "sha256": "<exact evidence hash>"}]
+  }]
+}
+```
+
+Evidence paths may be absolute or relative to the candidate manifest. Every file
+must exist and match its hash. Candidate IDs must be unique integers referring
+to finite positive-mean-depth cells in the bound mesh. Gauge coordinates must
+exactly match the inventory. Constraints apply only to outside water-level
+gauges with eligible source data (or whose sole exclusion is wet containment);
+currents and containing-cell selections cannot be overridden.
+
+The new mapping method is `nearest_suitable_wet_cell_centroid`. It retains the
+original/model coordinates, depth, node IDs, equal three-node weights, distance,
+truthful containment and the complete `unrestricted_nearest` geometry. It also
+records `candidate_set_sha256`, candidate count, rationale and evidence bindings.
+The top-level mapping records `proxy_candidates_sha256`. An ordinary passed
+`fvcom_waterlevel_proxy_review_v1` still approves the exact final geometry; each
+constrained station's review record must additionally contain the matching
+`candidate_set_sha256`. Changed candidate lists or rationale invalidate that
+approval even if the selected cell happens to stay the same.
+
+Use `candidate_cell_ids: []` with the same evidence requirements when no suitable
+cell is available. The gauge is explicitly excluded as
+`no_suitable_wet_cell_candidate`, retaining the rejected nearest candidate and
+rationale. If no comparison stations remain, the mapper publishes a `blocked`
+mapping with that disposition, not a ready empty validation set. Other viable
+gauges and existing diagnostic rows remain separate. None of these decisions
+establishes scientific representativeness or alters source-data eligibility.
+
 ## Stage timing
 
 - `smoke`: cold start, one hour from spin-up start.

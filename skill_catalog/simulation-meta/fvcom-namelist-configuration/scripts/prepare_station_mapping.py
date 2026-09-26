@@ -124,10 +124,86 @@ def centroid_geometry(nodes, elements, mesh_crs: str, metric_crs: str | None):
     return cells, point_project, metric.to_string()
 
 
+def load_proxy_candidates(path, *, policy, mesh_hash, contract_path, inventory_path,
+                          inventory, cells, distance_crs):
+    """Verify predeclared geometry-only candidate sets without choosing a basin."""
+    from pyproj import CRS
+    from pyproj.exceptions import CRSError
+    path = Path(path).expanduser().resolve()
+    document = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(document, dict):
+        raise ValueError("Proxy candidates must be a JSON object")
+    try:
+        same_crs = bool(document.get("metric_crs")) and distance_crs is not None and (
+            CRS.from_user_input(document["metric_crs"]) == CRS.from_user_input(distance_crs))
+    except CRSError as exc:
+        raise ValueError("Invalid proxy candidate metric CRS") from exc
+    if (policy != "containing_cell_or_nearest_wet_cell"
+            or document.get("schema") != "fvcom_waterlevel_proxy_candidates_v1"
+            or document.get("mesh_sha256") != mesh_hash
+            or document.get("grid_contract_sha256") != sha256_file(contract_path)
+            or document.get("station_inventory_sha256") != sha256_file(inventory_path)
+            or document.get("selection_basis") != "geometry_only_before_agreement_statistics"
+            or document.get("model_agreement_used") is not False
+            or not same_crs):
+        raise ValueError("Proxy candidates must bind the exact mesh, inventory, contract, metric CRS and geometry-only policy")
+    records = document.get("stations")
+    if not isinstance(records, list):
+        raise ValueError("Proxy candidates require a stations list")
+    constrained = {}
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("Invalid proxy candidate station record")
+        station_id = str(record.get("station_id", "")).strip()
+        matches = [s for s in inventory.get("stations", []) if str(s.get("id", "")).strip() == station_id]
+        if not station_id or station_id in constrained or len(matches) != 1:
+            raise ValueError("Proxy candidates have duplicate or unknown station ID: " + station_id)
+        station = matches[0]
+        if (station.get("role") != "water_level"
+                or not (station.get("eligible") or station.get("exclusion_reason") == "outside_actual_wet_mesh")
+                or record.get("observation_longitude") != station.get("longitude")
+                or record.get("observation_latitude") != station.get("latitude")):
+            raise ValueError("Proxy candidates require eligible water-level source and exact gauge coordinates: " + station_id)
+        ids = record.get("candidate_cell_ids")
+        if (not isinstance(ids, list) or any(type(k) is not int or k not in cells for k in ids)
+                or len(ids) != len(set(ids))):
+            raise ValueError("Proxy candidate IDs must be unique finite positive-depth model cells: " + station_id)
+        rationale = record.get("basin_rationale")
+        evidence = record.get("geometry_evidence")
+        if not isinstance(rationale, str) or not rationale.strip() or not isinstance(evidence, list) or not evidence:
+            raise ValueError("Proxy candidates require basin rationale and hash-bound geometry evidence: " + station_id)
+        bindings = []
+        for item in evidence:
+            if not isinstance(item, dict) or not item.get("path") or not item.get("sha256"):
+                raise ValueError("Invalid proxy candidate geometry evidence binding: " + station_id)
+            evidence_path = Path(item["path"]).expanduser()
+            if not evidence_path.is_absolute():
+                evidence_path = path.parent / evidence_path
+            if not evidence_path.is_file() or sha256_file(evidence_path) != item["sha256"]:
+                raise ValueError("Proxy candidate geometry evidence missing or changed: " + station_id)
+            bindings.append({"path": str(evidence_path.resolve()), "sha256": item["sha256"]})
+        constrained[station_id] = dict(record, geometry_evidence=bindings)
+    return constrained, sha256_file(path)
+
+
+def proxy_geometry(cell_id, cells, project, longitude, latitude, distance_crs, inside):
+    x, y = project.transform(longitude, latitude)
+    cx, cy, depth, (clon, clat), node_ids = cells[cell_id]
+    return {"method": "containing_cell_centroid" if inside else "nearest_wet_cell_centroid",
+            "observation_longitude": longitude, "observation_latitude": latitude,
+            "model_longitude": clon, "model_latitude": clat,
+            "distance_m": math.hypot(cx-x, cy-y), "metric_crs": distance_crs,
+            "cell_id": cell_id, "node_ids": node_ids, "node_weights": [1/3]*3,
+            "depth_m": depth, "inside_wet_mesh": inside,
+            "sampling": "arithmetic_mean_of_three_nodal_elevations",
+            "selection_basis": "geometry_only_before_agreement_statistics"}
+
+
 def build(grid_contract: str | Path, station_inventory: str | Path, output: str | Path,
           water_level_mapping_policy: str | None = None, metric_crs: str | None = None,
           proxy_review: str | Path | None = None,
-          diagnostic_mapping: str | Path | None = None) -> dict[str, Any]:
+          diagnostic_mapping: str | Path | None = None,
+          proxy_candidates: str | Path | None = None) -> dict[str, Any]:
     contract_path = Path(grid_contract).expanduser().resolve()
     inventory_path = Path(station_inventory).expanduser().resolve()
     contract = json.loads(contract_path.read_text(encoding="utf-8-sig"))
@@ -156,10 +232,15 @@ def build(grid_contract: str | Path, station_inventory: str | Path, output: str 
         raise ValueError("Grid contract mesh counts do not match the file")
 
     mapped: list[dict[str, Any]] = []
-    excluded: list[dict[str, str]] = []
+    excluded: list[dict[str, Any]] = []
     cells = project = distance_crs = None
     if policy != "strict_inside":
         cells, project, distance_crs = centroid_geometry(nodes, elements, str(mesh_spec["coordinate_crs"]), metric_crs)
+    candidates, candidates_hash = {}, None
+    if proxy_candidates is not None:
+        candidates, candidates_hash = load_proxy_candidates(proxy_candidates, policy=policy,
+            mesh_hash=mesh_hash, contract_path=contract_path, inventory_path=inventory_path,
+            inventory=inventory, cells=cells, distance_crs=distance_crs)
     review = json.loads(Path(proxy_review).read_text(encoding="utf-8-sig")) if proxy_review else None
     if review and (review.get("schema") != "fvcom_waterlevel_proxy_review_v1" or review.get("status") != "passed" or review.get("mesh_sha256") != mesh_hash):
         raise ValueError("Proxy review must pass and bind this exact mesh")
@@ -179,6 +260,8 @@ def build(grid_contract: str | Path, station_inventory: str | Path, output: str 
             continue
         longitude = float(station["longitude"])
         latitude = float(station["latitude"])
+        constraint = candidates.get(station_id)
+        unrestricted = None
         point = station_coordinates(longitude, latitude, str(mesh_spec["coordinate_crs"]))
         try:
             cell_id, depth = locate(point, nodes, elements)
@@ -189,7 +272,18 @@ def build(grid_contract: str | Path, station_inventory: str | Path, output: str 
             inside = False
             x, y = project.transform(longitude, latitude)
             cell_id = min(cells, key=lambda k: ((cells[k][0]-x)**2+(cells[k][1]-y)**2, k))
+            if constraint is not None:
+                unrestricted = proxy_geometry(cell_id, cells, project, longitude, latitude, distance_crs, False)
+                if not constraint["candidate_cell_ids"]:
+                    excluded.append({"station_id": station_id, "reason": "no_suitable_wet_cell_candidate",
+                        "candidate_set_sha256": candidates_hash, "unrestricted_nearest": unrestricted,
+                        "basin_rationale": constraint["basin_rationale"], "geometry_evidence": constraint["geometry_evidence"]})
+                    continue
+                cell_id = min(constraint["candidate_cell_ids"],
+                              key=lambda k: ((cells[k][0]-x)**2+(cells[k][1]-y)**2, k))
             depth = cells[cell_id][2]
+        if inside and constraint is not None:
+            raise ValueError("Proxy candidate constraints apply only to outside water-level gauges: " + station_id)
         row = {
                 "station_id": station_id,
                 "longitude": longitude,
@@ -205,18 +299,18 @@ def build(grid_contract: str | Path, station_inventory: str | Path, output: str 
             row.update(longitude=clon, latitude=clat, depth_m=depth, validation_eligible=True,
                        observation_longitude=longitude, observation_latitude=latitude,
                        inside_wet_mesh=inside,
-                       spatial_mapping={"method": "containing_cell_centroid" if inside else "nearest_wet_cell_centroid",
-                           "observation_longitude": longitude, "observation_latitude": latitude,
-                           "model_longitude": clon, "model_latitude": clat,
-                           "distance_m": math.hypot(cx-x, cy-y), "metric_crs": distance_crs,
-                           "cell_id": cell_id, "node_ids": node_ids, "node_weights": [1/3]*3,
-                           "depth_m": depth, "inside_wet_mesh": inside,
-                           "sampling": "arithmetic_mean_of_three_nodal_elevations",
-                           "selection_basis": "geometry_only_before_agreement_statistics"})
+                       spatial_mapping=proxy_geometry(cell_id, cells, project, longitude, latitude, distance_crs, inside))
+            if constraint is not None:
+                row["spatial_mapping"].update(method="nearest_suitable_wet_cell_centroid",
+                    candidate_set_sha256=candidates_hash, candidate_cell_count=len(constraint["candidate_cell_ids"]),
+                    unrestricted_nearest=unrestricted, basin_rationale=constraint["basin_rationale"],
+                    geometry_evidence=constraint["geometry_evidence"])
             if not inside:
                 if review:
                     from pyproj import CRS
                     record = reviewed.get(station_id, {})
+                    if constraint is not None and record.get("candidate_set_sha256") != candidates_hash:
+                        raise ValueError("Proxy review must bind the exact candidate set: " + station_id)
                     required = {'cell_id', 'observation_longitude', 'observation_latitude',
                                 'model_longitude', 'model_latitude', 'node_ids', 'depth_m',
                                 'distance_m', 'selection_approved'}
@@ -236,7 +330,8 @@ def build(grid_contract: str | Path, station_inventory: str | Path, output: str 
                 else:
                     row["spatial_mapping"]["geometry_review_sha256"] = sha256_file(proxy_review)
         mapped.append(row)
-    if not mapped:
+    no_suitable_comparisons = not mapped and any(r["reason"] == "no_suitable_wet_cell_candidate" for r in excluded)
+    if not mapped and not no_suitable_comparisons:
         raise ValueError("No eligible stations mapped into the wet mesh")
     mapped.sort(key=lambda item: (str(item["role"]), str(item["station_id"])))
     if diagnostic_mapping:
@@ -251,7 +346,7 @@ def build(grid_contract: str | Path, station_inventory: str | Path, output: str 
         raise ValueError("Duplicate station ID in combined mapping")
     payload = {
         "schema": "fvcom_station_mapping_v1",
-        "status": "needs_proxy_review" if pending_reviews else "ready",
+        "status": "blocked" if no_suitable_comparisons else "needs_proxy_review" if pending_reviews else "ready",
         "grid_contract_sha256": sha256_file(contract_path),
         "mesh_sha256": mesh_hash,
         "station_inventory_sha256": sha256_file(inventory_path),
@@ -263,6 +358,10 @@ def build(grid_contract: str | Path, station_inventory: str | Path, output: str 
         "stations": mapped,
         "excluded": excluded,
     }
+    if proxy_candidates is not None:
+        payload["proxy_candidates_sha256"] = candidates_hash
+    if no_suitable_comparisons:
+        payload["blocking_reasons"] = ["No comparison stations remain after suitable-candidate exclusions"]
     destination = Path(output).expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     partial = destination.with_name(f".{destination.name}.partial")
@@ -280,9 +379,11 @@ def main() -> None:
     parser.add_argument("--metric-crs")
     parser.add_argument("--proxy-review")
     parser.add_argument("--diagnostic-mapping")
+    parser.add_argument("--proxy-candidates", help="Hash-bound geometry-only suitable cell sets for outside water-level gauges")
     args = parser.parse_args()
     print(json.dumps(build(args.grid_contract, args.station_inventory, args.output,
-        args.water_level_mapping_policy, args.metric_crs, args.proxy_review, args.diagnostic_mapping), indent=2, sort_keys=True))
+        args.water_level_mapping_policy, args.metric_crs, args.proxy_review, args.diagnostic_mapping,
+        args.proxy_candidates), indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
