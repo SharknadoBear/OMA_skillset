@@ -691,7 +691,7 @@ def main() -> None:
     quality_score = score_bpoly_quality(
         bpoly,
         ingredients,
-        request,
+        effective_request,
         domain_type,
         POLICY[domain_type],
         open_ref,

@@ -157,14 +157,20 @@ def discover(mesh: Path, mesh_crs: str, start: str, end: str,
     corners = [inverse.transform(x, y) for x in (mesh_bounds[0], mesh_bounds[2]) for y in (mesh_bounds[1], mesh_bounds[3])]
     geographic_bounds = (min(p[0] for p in corners), min(p[1] for p in corners), max(p[0] for p in corners), max(p[1] for p in corners))
     inventory = []
-    seen = set()
-    for kind, role in (("waterlevels", "water_level"), ("currents", "current"), ("historiccurrents", "current")):
+    seen: dict[tuple[str, str], dict[str, Any] | None] = {}
+    for kind, role in (("waterlevels", "water_level"), ("tidepredictions", "water_level"),
+                       ("currents", "current"), ("historiccurrents", "current")):
         for station in metadata_stations(kind):
             sid = str(station.get("id"))
             key = (sid, role)
+            source = {"catalog_type": kind, "url": f"{MDAPI}/stations.json?type={kind}&units=metric"}
             if key in seen:
+                prior = seen[key]
+                if prior is not None and source not in prior["inventory_sources"]:
+                    prior["inventory_sources"].append(source)
                 continue
-            seen.add(key)
+            # Retain first-catalog coordinates and existing screening behavior.
+            seen[key] = None
             try:
                 lon, lat = float(station["lng"]), float(station["lat"])
                 x, y = tx.transform(lon, lat)
@@ -174,6 +180,9 @@ def discover(mesh: Path, mesh_crs: str, start: str, end: str,
                 continue
             inside = point_in_mesh(x, y, nodes, tris)
             item = {"id": sid, "name": station.get("name"), "role": role, "latitude": lat, "longitude": lon, "inside_geographic_envelope": True, "inside_wet_mesh": inside, "eligible": inside, "exclusion_reason": None if inside else "outside_actual_wet_mesh"}
+            item["inventory_sources"] = [source]
+            if role == "water_level":
+                item["source_data_eligibility"] = "pending_period_scalar_data_checks"
             if role == "water_level" and water_level_mapping_policy != "strict_inside":
                 item.update(eligible=True, exclusion_reason=None,
                             mapping_required="containing_cell" if inside else "nearest_wet_cell_proxy",
@@ -196,6 +205,7 @@ def discover(mesh: Path, mesh_crs: str, start: str, end: str,
                     item["eligible"] = False
                     item["exclusion_reason"] = f"metadata_error:{type(exc).__name__}:{exc}"
             inventory.append(item)
+            seen[key] = item
     counts = {
         "water_level_envelope": sum(x["role"] == "water_level" for x in inventory),
         "water_level_strict_wet": sum(x["role"] == "water_level" and x["inside_wet_mesh"] for x in inventory),

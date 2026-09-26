@@ -43,6 +43,8 @@ python scripts/check_download_health.py --request request.json --run-dir runs/ca
 
 For FVCOM validation, retain actual wet-mesh containment evidence. The default water-level policy is `strict_inside`. When explicitly requested, use `--water-level-mapping-policy containing_cell_or_nearest_wet_cell`: outside water-level gauges within the regional search envelope remain source-data candidates for downstream cell-centroid proxy review. Keep `inside_wet_mesh=false` truthful, and verify requested-period observations/predictions separately. Current eligibility retains strict spatial, downward-looking profile and period gates. This policy does not relax residual-boundary screening.
 
+`coops_currents.py discover` queries both water-level and tide-prediction catalogs. It deduplicates by station ID and role, retains first-catalog coordinates, and records every contributing catalog in `inventory_sources`. Catalog membership identifies candidates, not requested-period data availability: prediction-only sites still require prediction coverage and documented observation availability before validation. An unavailable catalog is an acquisition failure, not evidence of no stations.
+
 ```bash
 python scripts/coops_currents.py discover --mesh fvcom_grid.2dm --mesh-crs EPSG:32615 --period-start 2025-04-01T00:00:00Z --period-end 2025-05-01T00:00:00Z --output station_inventory.json
 ```
@@ -82,3 +84,4 @@ Require `tidal=true`, water-level or prediction products, datum evidence, and me
 - Test `check_download_health.py` on a tiny cached or synthetic artifact and confirm JSON plus at least one plot for plottable data.
 - Run `python scripts/selftest_station_screen.py` and confirm tidal/product/datum/connectivity filtering and river-gauge rejection.
 - Run `python scripts/selftest_coops_currents.py` and confirm seven-day chunking, speed/direction conversion, orientation filtering, bin QC, and known-vector vertical weighting.
+- Run `python scripts/selftest_discovery_catalogs.py` and confirm prediction-only discovery, deduplicated catalog provenance, failed-catalog handling and unchanged current gates.

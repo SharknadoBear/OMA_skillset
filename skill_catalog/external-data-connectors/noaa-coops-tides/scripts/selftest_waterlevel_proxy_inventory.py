@@ -12,6 +12,7 @@ def main():
         mesh.write_text('MESH2D\nND 1 0 0 5\nND 2 1 0 5\nND 3 0 1 5\nE3T 1 1 2 3 1\n')
         catalogs = {
             'waterlevels': [{'id': 'water_in', 'lng': .2, 'lat': .2}, {'id': 'water_out', 'lng': .8, 'lat': .8}],
+            'tidepredictions': [],
             'currents': [{'id': 'current_in', 'lng': .2, 'lat': .2}, {'id': 'current_out', 'lng': .8, 'lat': .8}, {'id': 'current_up', 'lng': .2, 'lat': .2}, {'id': 'current_old', 'lng': .2, 'lat': .2}],
             'historiccurrents': []}
         def metadata(sid):

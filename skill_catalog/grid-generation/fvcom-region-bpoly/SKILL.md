@@ -31,6 +31,7 @@ Run:
 For a forward test, use a new UTC-stamped directory under Workspace/Preprocessing/fvcom-region-bpoly/runs/; do not reuse earlier case artifacts. Use --mode test --heuristic-mode memory --basemap-provider auto when complete visual evidence must be retained.
 
 - --heuristic-mode auto uses catalog memory in execute mode and bypasses it in test mode.
+- Memory-disabled runs also bypass catalog-specific scoring warnings and repair guidance. Explicit feature coverage, obstruction geometry, offshore references and map-usability checks still apply.
 - With no explicit or catalog geometry, `--place-discovery auto` performs one cached discovery operation and uses the result only as an initial visual seed. Extract the geographic target before scientific-purpose clauses such as `to simulate` or `to study`. If a compound waterbody name has no combined result, expand shared plural types (for example, `A and B Bays`) into component queries, require every component to resolve, union their raw extents, and record all attempts and selected components.
 - If lookup is unavailable or ambiguous, research or infer an initial frame and provide --discovery-bbox WEST SOUTH EAST NORTH with --discovery-label.
 - --basemap-provider auto is the normal policy. none/off still requires a real offline coastline.
@@ -144,5 +145,6 @@ Clean and best-effort deliveries both use final_status: pass; the review outcome
 
     python scripts/selftest_region_bpoly.py
     python scripts/selftest_noncoastal_freeze.py
+    python scripts/selftest_unknown_mode_scoring.py
     python -m compileall scripts
     python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .
