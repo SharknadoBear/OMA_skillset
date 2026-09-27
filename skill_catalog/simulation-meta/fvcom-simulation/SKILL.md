@@ -57,6 +57,8 @@ Before freezing controls, align the internal step to all requested stage/output/
 
 Run, one job at a time through `$kestrel-hpc`: input smoke, three-day canary including the full ramp, and seven-day spin-up. An attempt is stable only when `srun` succeeds, the debug log reaches `TADA!`, the requested final timestamp exists, and required NetCDF/restart files are readable.
 
+Use `$kestrel-hpc`'s bounded read-only reconciliation when a terminal job has disappeared from the active queue and an ID query reports `Invalid job id specified`. This is within the authorized audit and needs no separate approval. Preserve the consumed check and original evidence, allow only the claimed reconciliation, and keep holds for active, ambiguous, conflicting or otherwise failed queries. Do not create a replacement schedule or relax the scientific gates. Adopt any authorization/evidence contract revision explicitly, preserving frozen stage code and cumulative repair limits.
+
 On failure, let `$fvcom-run-control` create immutable attempts using only:
 
 1. external-step multipliers 0.75, 0.50, 0.25;

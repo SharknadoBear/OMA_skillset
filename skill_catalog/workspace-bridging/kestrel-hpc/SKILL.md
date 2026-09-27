@@ -186,6 +186,17 @@ which cc CC ftn gcc g++ gfortran mpicc mpifort
 
 ## Operational safeguards
 
+### Completed jobs missing from the active queue
+
+Within an already authorized job audit, reconcile a completed job's `squeue -j` response of `Invalid job id specified` without asking for separate approval. That error alone proves neither successful completion nor job failure. Preserve the original response and perform at most one bounded, read-only reconciliation:
+
+- Bind the exact submitted job ID, full job name, owner and run directory to the submission receipt. Require successful accounting retrieval, one matching main job record, and a terminal state; preserve job-step exit codes and disk/memory accounting. Check available owner/name/path fields against the receipt rather than accepting another job with a similar name.
+- Query the active queue once using the exact submitted job name and owner. Require a successful, empty reply with no stderr. Any active same-name entry, missing or mismatched accounting, nonterminal state, unexpected queue error or conflicting evidence keeps the audit on hold. Never interpret an empty stdout from a failed queue command as an empty queue.
+- Preserve separate immutable original and reconciliation observations, authorization scope, commands, claim/reservation and receipts. Claim this reconciliation before dispatch so resuming it reads the original result instead of issuing another scheduler query. A pending or failed bridge request requires original-request reconciliation, not a duplicate command.
+- This bounded reconciliation belongs to the authorized completion audit. It does not authorize recurring monitoring, a replacement completion schedule, rechecking older jobs, submission, cancellation or model changes. Once terminal status is established, continue the previously authorized retrieval and audit. Successful accounting still does not certify scientific outputs; terminal failures require their normal evidence-preserving classification.
+
+Interpret approval by the action and scope the user actually authorized, not by an exact button label or magic phrase. Preserve the verbatim user message separately from any normalized authorization decision. Do not rewrite a prior authorization or observation to satisfy a literal-string check. When an existing frozen controller requires an incompatible authorization format, retain its failed evidence and use an explicitly reviewed, hash-bound authorization contract revision; preserve all scientific gates, original request identity and cumulative repair limits.
+
 1. Inspect local changes and the exact remote command scope before connecting.
 2. Confirm identity and location with `hostname`, `whoami`, and `pwd`.
 3. Preserve unrelated remote work and upload only intended files.
