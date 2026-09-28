@@ -122,7 +122,12 @@ def exec_command(client: paramiko.SSHClient, command: str, timeout: float | None
         while channel.recv_stderr_ready():
             err_chunks.append(channel.recv_stderr(65536))
         if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
-            break
+            # Exit status can arrive before the final stream data.  Only EOF
+            # plus empty buffers establishes complete output capture.
+            if channel.eof_received:
+                break
+            if channel.closed:
+                raise EOFError("remote channel closed before output EOF; capture incomplete")
         if time.monotonic() >= deadline:
             channel.close()
             raise TimeoutError(f"remote command exceeded {effective_timeout:g} seconds")
