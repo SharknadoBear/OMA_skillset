@@ -19,6 +19,10 @@ Use Python 3.11+ with binary packages from `requirements.txt`; install using `py
 6. Record actual inspection: `python scripts/remora_regions.py review --delivery regions/region_delivery.json --decision accepted --rationale "..."`. Use `needs_revision` if unsuitable. Changed evidence invalidates review.
 7. Return `region_delivery.json`. Run `validate --delivery ... --require-reviewed` before downstream use. Several related regions do not imply generated nested grids.
 
+## Output ownership
+
+Use the caller's designated directory exactly. In the standard REMORA case workflow, return outputs under `CASE/attempts/attempt_NNN/01_regions/` and keep the source request alongside the other attempt requests. Do not create an alternative project folder or write generated files inside installed skills. Geographic plans and their reviews remain independently hash-bound when the parent gridding skill assembles its final package.
+
 ## Boundaries
 
 - v1 supports compact, non-polar, non-antimeridian four-sided regions. Report unsupported geography instead of distorting it.

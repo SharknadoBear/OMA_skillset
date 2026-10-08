@@ -67,14 +67,53 @@ class GridTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             connected_mask(m, [(0, 0), (4, 4)])
 
-    def test_volume_and_roughness(self):
+    def test_log_mean_and_roughness(self):
         h = np.array([[2, 100, 4, 50], [10, 40, 2, 90]], float)
         a = np.array([[1, 2, 3, 4], [5, 6, 7, 8]], float)
         m = np.ones(h.shape, bool)
         sm, r = smooth_depth(h, m, a)
         self.assertLessEqual(roughness(sm, m), 0.2 + 1e-8)
-        self.assertLess(abs(r["volume_relative_change"]), 1e-12)
+        self.assertLess(r["volume_relative_change"], 0)
+        self.assertAlmostEqual(float(np.sum(a*np.log(h))), float(np.sum(a*np.log(sm))), places=10)
         self.assertGreaterEqual(sm.min(), h.min())
+
+    def test_analytical_log_pair(self):
+        # Weighted mean of logarithms is fixed; final ratio is (1+r)/(1-r).
+        h=np.array([[2.,100.]])
+        for area in [np.array([[1.,1.]]), np.array([[1.,3.]])]:
+            mean=float(np.sum(area*np.log(h))/area.sum())
+            jump=np.log(1.5)
+            expected=np.exp([[mean-area[0,1]/area.sum()*jump,
+                              mean+area[0,0]/area.sum()*jump]])
+            sm,r=smooth_depth(h,np.ones_like(h,bool),area)
+            np.testing.assert_allclose(sm,expected,rtol=1e-13)
+            self.assertAlmostEqual(r['volume_relative_change'],float((np.sum(sm*area)-np.sum(h*area))/np.sum(h*area)))
+            self.assertEqual(r['space'],'natural_log_depth')
+
+    def test_acceptable_and_land_barriers(self):
+        h=np.array([[2.,2.1,1000.,100.]])
+        m=np.array([[True,True,False,True]])
+        sm,r=smooth_depth(h,m,np.ones_like(h))
+        np.testing.assert_array_equal(sm,h)
+        self.assertEqual(r['iterations'],0)
+        changed=np.array([[2.,100.,777.,5.,6.]])
+        mask=np.array([[True,True,False,True,True]])
+        sm,_=smooth_depth(changed,mask,np.ones_like(changed))
+        np.testing.assert_array_equal(sm[0,2:],changed[0,2:])
+        self.assertGreaterEqual(sm[mask].min(),2.)
+
+    def test_smoothing_invalid_inputs(self):
+        h=np.array([[2.,100.]])
+        m=np.ones_like(h,bool)
+        for invalid in [0.,-1.,np.nan,np.inf]:
+            with self.subTest(depth=invalid),self.assertRaises(ValueError):
+                smooth_depth(np.array([[invalid,10.]]),m,np.ones_like(h))
+            with self.subTest(area=invalid),self.assertRaises(ValueError):
+                smooth_depth(h,m,np.array([[invalid,1.]]))
+        with self.assertRaises(ValueError): smooth_depth(h,np.zeros_like(m),np.ones_like(h))
+        with self.assertRaises(ValueError): smooth_depth(h,m,np.ones((2,2)))
+        with self.assertRaises(ValueError): smooth_depth(h,m,np.ones_like(h),rmax=np.nan)
+        with self.assertRaises(ValueError): smooth_depth(h,m,np.ones_like(h),max_iterations=-1)
 
     def test_smoothing_failure(self):
         with self.assertRaises(ValueError):
@@ -147,6 +186,7 @@ class GridTests(unittest.TestCase):
             export_grid(path, a, h, m, p, {"geometry": f}, h)
             self.assertEqual(readback(path)["format"], "NETCDF3_64BIT_DATA")
             with Dataset(path, "r+") as d:
+                self.assertEqual(d.smoothing_space,"natural_log_depth")
                 d["mask_u"][2, 2] = 0
             with self.assertRaises(ValueError):
                 readback(path)

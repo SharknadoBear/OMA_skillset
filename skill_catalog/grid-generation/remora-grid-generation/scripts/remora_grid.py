@@ -261,6 +261,9 @@ def export_grid(path, a, h, mask, p, fitdoc, raw):
         ds.projection_wkt = fitdoc["geometry"]["crs_wkt"]
         ds.coordinate_note = "x/y are logical projected-grid metres; lon/lat describe geographic location"
         ds.numerical_levels = 1
+        ds.smoothing_method = "area_weighted_log_pair_projection_v1"
+        ds.smoothing_space = "natural_log_depth"
+        ds.smoothing_volume_policy = "report_only_no_rescaling"
         ds.source_policy = "Real source data; no missing wet bathymetry substitution"
         for key, val in p.items():
             if isinstance(val, (int, float)):
@@ -313,111 +316,7 @@ def export_grid(path, a, h, mask, p, fitdoc, raw):
             ds.createVariable(name, "f8", ())[...] = value
 
 
-def diagnostic_maps(out, a, h, raw, mask, initial, land, features, z_w):
-    out = Path(out)
-    paths = []
-    lo = a["lon_rho"]
-    la = a["lat_rho"]
-    full = [lo.min(), la.min(), lo.max(), la.max()]
-    views = [("overview", full)]
-    for k, f in enumerate(features):
-        x, y = f["point_lonlat"]
-        dy = f.get("review_radius_km", 12) / 111.32
-        dx = dy / np.cos(np.deg2rad(y))
-        views.append((f"feature_{k}", [x - dx, y - dy, x + dx, y + dy]))
-    for name, bounds in views:
-        fig, axs = plt.subplots(1, 3, figsize=(17, 8), layout="constrained")
-        panels = [
-            (initial.astype(float), "Initial wet mask", "Blues", 0, 1),
-            (
-                np.where(mask, h, np.nan),
-                "Final bathymetry (m)",
-                "viridis",
-                0,
-                min(60, float(h[mask].max())),
-            ),
-            (
-                np.where(mask, h - raw, np.nan),
-                "Smoothing change (m)",
-                "RdBu_r",
-                -max(1, float(np.max(np.abs(h[mask] - raw[mask])))),
-                max(1, float(np.max(np.abs(h[mask] - raw[mask])))),
-            ),
-        ]
-        for ax, (data, title, cmap, vmin, vmax) in zip(axs, panels):
-            setup_map(ax, land, bounds)
-            mesh = ax.pcolormesh(
-                lo,
-                la,
-                data,
-                cmap=cmap,
-                vmin=vmin,
-                vmax=vmax,
-                shading="nearest",
-                zorder=2,
-            )
-            local_land = land.cx[bounds[0] : bounds[2], bounds[1] : bounds[3]]
-            if not local_land.empty:
-                local_land.boundary.plot(ax=ax, color="black", linewidth=0.3, zorder=3)
-            changed = initial & ~mask
-            if changed.any():
-                ax.scatter(
-                    lo[changed],
-                    la[changed],
-                    s=4,
-                    c="#f000b0",
-                    label="Closed disconnected cells",
-                    zorder=4,
-                )
-            ax.set_title(title)
-            fig.colorbar(mesh, ax=ax, shrink=0.6)
-        fig.suptitle(
-            "Mask and bathymetry review: "
-            + name
-            + "\nMagenta: disconnected water cells changed to dry"
-        )
-        p = out / (name + "_mask_bathy.png")
-        fig.savefig(p, dpi=130)
-        plt.close(fig)
-        paths.append(p)
-    fig, axs = plt.subplots(1, 2, figsize=(14, 6), layout="constrained")
-    for ax, (k, title) in zip(
-        axs,
-        [
-            ("pm", "Cell width in xi (m)"),
-            ("orthogonality_error_deg", "Orthogonality deviation (degrees)"),
-        ],
-    ):
-        setup_map(ax, land, full)
-        value = 1 / a[k] if k == "pm" else a[k]
-        mesh = ax.pcolormesh(lo, la, value, shading="nearest")
-        fig.colorbar(mesh, ax=ax)
-        ax.set_title(title)
-    p = out / "geometry_quality.png"
-    fig.savefig(p, dpi=130)
-    plt.close(fig)
-    paths.append(p)
-    fig, axs = plt.subplots(2, 1, figsize=(12, 7), layout="constrained")
-    # Sections through the wettest row/column; dry segments are broken.
-    j = int(np.argmax(mask.sum(axis=1)))
-    i = int(np.argmax(mask.sum(axis=0)))
-    for ax, section, wet, x, title in [
-        (axs[0], z_w[:, j, :], mask[j], a["x_rho"][j] / 1000, f"eta={j}"),
-        (axs[1], z_w[:, :, i], mask[:, i], a["y_rho"][:, i] / 1000, f"xi={i}"),
-    ]:
-        for k in range(0, len(z_w), max(1, (len(z_w) - 1) // 20)):
-            ax.plot(x, np.where(wet, section[k], np.nan), color="#13688c", lw=0.6)
-        ax.set(
-            title="Vertical interfaces: " + title,
-            xlabel="Logical distance (km)",
-            ylabel="z (m)",
-        )
-        ax.grid(alpha=0.2)
-    p = out / "vertical_sections.png"
-    fig.savefig(p, dpi=150)
-    plt.close(fig)
-    paths.append(p)
-    return paths
+from review_maps import diagnostic_maps, feature_sections
 
 
 def build(fit_path, out):
@@ -491,6 +390,8 @@ def build(fit_path, out):
         req.get("protected_wet_features", []),
         z_w,
     )
+    section_report, section_maps = feature_sections(mapsdir, a, raw, h, mask, anchors, req.get("protected_wet_features", []))
+    maps.extend(section_maps)
     report = readback(grid)
     core = mask.copy()
     core[[0, -1], :] = False
@@ -501,6 +402,7 @@ def build(fit_path, out):
     )
     report.update(
         smoothing=smoothing,
+        feature_sections=section_report,
         haney_rx1_diagnostic=haney(z_w, mask),
         maximum_depth_change_m=float(np.max(np.abs(h[mask] - raw[mask]))),
         rms_depth_change_m=float(np.sqrt(np.mean((h[mask] - raw[mask]) ** 2))),
@@ -701,6 +603,12 @@ def main():
     v.add_argument("--delivery", required=True)
     v.add_argument("--require-reviewed", action="store_true")
     v.add_argument("--require-reader", action="store_true")
+    q = s.add_parser("finalize")
+    q.add_argument("--case-root", required=True)
+    q.add_argument("--delivery", required=True)
+    q.add_argument("--release-revision", required=True)
+    q = s.add_parser("validate-case")
+    q.add_argument("--delivery", required=True)
     a = p.parse_args()
     if a.command == "prepare":
         print(prepare(a.request, a.output_dir))
@@ -716,6 +624,13 @@ def main():
             "fit" if a.command == "review-fit" else "grid",
         )
         print("Review recorded")
+    elif a.command == "finalize":
+        from case_delivery import finalize
+        print(finalize(a.case_root, a.delivery, a.release_revision))
+    elif a.command == "validate-case":
+        from case_delivery import validate_case
+        validate_case(a.delivery)
+        print("Case delivery valid")
     else:
         validate_grid(a.delivery, a.require_reviewed, a.require_reader)
         print("Grid delivery valid")

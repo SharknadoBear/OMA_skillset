@@ -70,7 +70,9 @@ def main():
             },
         }
         write_json(root / "request.json", req)
-        case = root / "case"
+        case_root = root / "case"
+        case = case_root / "attempts/attempt_001"
+        write_json(case_root / "science_request.json", {"location":"Synthetic fixture","modeling_purpose":"CLI validation"})
         run(grid, "prepare", "--request", root / "request.json", "--output-dir", case)
         # Expected pause: producing maps alone must not satisfy visual review.
         run(
@@ -129,6 +131,14 @@ def main():
         )
         run(grid, "validate", "--delivery", gd, "--require-reviewed")
         run(grid, "validate", "--delivery", gd, "--require-reader", success=False)
+        run(grid, "finalize", "--case-root", case_root, "--delivery", gd, "--release-revision", "unpublished")
+        final = case_root / "final/case_delivery.json"
+        run(grid, "validate-case", "--delivery", final)
+        run(grid, "finalize", "--case-root", case_root, "--delivery", gd, "--release-revision", "unpublished", success=False)
+        run(grid, "finalize", "--case-root", root/"unrelated", "--delivery", gd, "--release-revision", "unpublished", success=False)
+        with Dataset(case_root / "final/remora_grid.nc", "r+") as ds:
+            ds["h"][2,2] = 900
+        run(grid, "validate-case", "--delivery", final, success=False)
         reg["objective"] = "changed intent"
         write_json(root / "region_request.json", reg)
         run(
@@ -149,13 +159,13 @@ def main():
                         "region build/review",
                         "fit/review-fit",
                         "build/review",
-                        "validate",
+                        "validate", "finalize", "validate-case",
                     ],
                     "error_paths": [
                         "unreviewed region",
                         "unreviewed fit",
                         "missing reader evidence",
-                        "changed source request",
+                        "changed source request", "final overwrite", "outside case directory", "modified final grid",
                     ],
                 }
             )

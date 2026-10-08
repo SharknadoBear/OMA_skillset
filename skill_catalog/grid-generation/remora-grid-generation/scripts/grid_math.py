@@ -222,22 +222,47 @@ def roughness(h, mask):
 
 
 def smooth_depth(h, mask, area, rmax=0.2, max_iterations=4000):
-    if not 0 < rmax < 1:
+    if not np.isfinite(rmax) or not 0 < rmax < 1:
         raise ValueError("rx0 target must lie between zero and one")
     h = np.array(h, float, copy=True)
+    mask = np.asarray(mask, bool)
+    area = np.asarray(area, float)
+    if h.ndim != 2 or h.shape != mask.shape or h.shape != area.shape or not mask.any():
+        raise ValueError("Expected matching two-dimensional arrays with wet cells")
+    if not np.isfinite(h[mask]).all() or np.any(h[mask] <= 0):
+        raise ValueError("Wet depth must be finite and positive before logarithms")
+    if not np.isfinite(area[mask]).all() or np.any(area[mask] <= 0):
+        raise ValueError("Wet cell areas must be finite and positive")
+    if not isinstance(max_iterations, (int, np.integer)) or max_iterations < 0:
+        raise ValueError("Iteration budget must be a nonnegative integer")
     start = float(np.sum(h[mask] * area[mask]))
-    q = (1 + rmax) / (1 - rmax)
+    u = np.zeros_like(h)
+    u[mask] = np.log(h[mask])
+    touched = np.zeros_like(mask)
+    limit = np.log1p(rmax) - np.log1p(-rmax)
+    floor = float(h[mask].min())
     for iteration in range(max_iterations + 1):
+        if iteration:
+            h[touched] = np.maximum(np.exp(u[touched]), floor)
         r = roughness(h, mask)
         if r <= rmax + 1e-8:
             return h, {
+                "method": "area_weighted_log_pair_projection_v1",
+                "space": "natural_log_depth",
+                "volume_policy": "report_only_no_rescaling",
+                "maximum_log_jump": float(limit),
                 "iterations": iteration,
                 "rx0": r,
+                "initial_volume_m3": start,
+                "final_volume_m3": float(np.sum(h[mask] * area[mask])),
                 "volume_relative_change": float(
                     (np.sum(h[mask] * area[mask]) - start) / start
                 ),
             }
-        # Disjoint red/black pairs; each redistribution preserves physical cell volume.
+        if iteration == max_iterations:
+            break
+        # Cyclic projections in log space. Each disjoint pair preserves its
+        # area-weighted log mean, not water volume. Never couple through land.
         for axis in (0, 1):
             for parity in (0, 1):
                 left = [slice(None), slice(None)]
@@ -246,17 +271,19 @@ def smooth_depth(h, mask, area, rmax=0.2, max_iterations=4000):
                 right[axis] = slice(parity + 1, h.shape[axis], 2)
                 left = tuple(left)
                 right = tuple(right)
-                a = h[left]
-                b = h[right]
+                a = u[left]
+                b = u[right]
                 A = area[left]
                 B = area[right]
-                bad = mask[left] & mask[right] & (np.abs(a - b) / (a + b) > rmax)
-                total = A * a + B * b
-                up = b > a
-                na = np.where(up, total / (A + q * B), q * total / (B + q * A))
-                nb = np.where(up, q * na, total / (B + q * A))
-                a[bad] = na[bad]
-                b[bad] = nb[bad]
+                bad = mask[left] & mask[right] & (np.abs(a - b) > limit)
+                touched[left] |= bad
+                touched[right] |= bad
+                aa, bb = A[bad], B[bad]
+                total = aa + bb
+                mean = (aa * a[bad] + bb * b[bad]) / total
+                jump = np.sign(a[bad] - b[bad]) * limit
+                a[bad] = mean + bb / total * jump
+                b[bad] = mean - aa / total * jump
     raise ValueError(
         f"Smoothing failed to reach rx0={rmax}; achieved {roughness(h,mask)}"
     )
