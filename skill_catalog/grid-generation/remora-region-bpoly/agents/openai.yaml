@@ -1,0 +1,4 @@
+interface:
+  display_name: "REMORA RegionBPoly"
+  short_description: "Define and visually review REMORA modeling regions"
+  default_prompt: "Use $remora-region-bpoly to define and visually review my REMORA region and any future nesting interests."

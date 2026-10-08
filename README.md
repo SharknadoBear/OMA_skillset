@@ -1,6 +1,6 @@
 # Agent Skill Development Catalog
 
-This folder is the planning and staging area for the FVCOM agent skillset. The
+This folder is the planning and staging area for the OMA coastal modeling skillset, including FVCOM and REMORA. The
 active high-level structure is `skill_catalog/`, which organizes future skills
 by capability family rather than by the older broad project-stage folders.
 
@@ -23,7 +23,8 @@ by capability family rather than by the older broad project-stage folders.
   source data or local inputs, including validated boundary water-level,
   temperature/salinity, and modular surface-flux forcing.
 - `grid-generation/`: regional-domain, boundary-arc, coastline-topology, and
-  future mesh/refinement skills for FVCOM preprocessing.
+  mesh/refinement skills for FVCOM, plus independent scientific region planning
+  and structured single-level grid generation for REMORA.
 - `memory-control/`: project-memory workflow skills, currently
   `brain-dumping` and `brain-refreshing`.
 - `workspace-bridging/`: skills that bridge local workspaces to Kestrel,
@@ -148,6 +149,25 @@ scientific workflow rules or remove validation guidance.
 ## Current Development State
 
 The catalog contains usable skill families at different maturity levels.
+
+The REMORA gridding workflow has two independently invocable skills under
+`skill_catalog/grid-generation/`; install both as sibling skill folders:
+
+| Skill | Responsibility | Validation |
+| --- | --- | --- |
+| `remora-region-bpoly` | Four-sided scientific regions, required features, optional parent/child interests, maps and recorded visual review | Polygon/hierarchy and artifact-integrity tests in `scripts/selftest.py` |
+| `remora-grid-generation` | Rotated orthogonal footprint, staggered coordinates/metrics, source bathymetry, mask correction, smoothing, vertical diagnostics and CDF5 NetCDF | Numerical/error-path tests, combined two-skill CLI test and a separate executable reader checker |
+
+Grid generation uses Python with prebuilt dependencies and requires no local
+C/C++ compiler. A complete request invokes the polygon stage and returns for
+visual review before fitting and building the grid. Existing reviewed region
+packages are also accepted. Region hierarchy describes future refinement
+interests; v1 generates one root grid and does not implement numerical nesting.
+The Delaware Bay release was exercised at 500 m with 40 layers and checked
+against a pinned REMORA executable on Kestrel using zero-step initialization.
+That reader check is distinct from scientific time-integration validation.
+Keep regional data, private execution receipts, and memory in the project
+workspace, outside these reusable packages.
 
 The October 2026 additions are standalone, model-neutral acquisition packages
 under `skill_catalog/external-data-connectors/`:

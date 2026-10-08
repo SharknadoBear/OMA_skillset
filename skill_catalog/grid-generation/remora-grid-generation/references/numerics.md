@@ -1,0 +1,13 @@
+# Numerical conventions
+
+- A local WGS84 transverse Mercator projection is conformal. Densify the four geographic polygon sides, fit an enclosing rotated rectangle, pad it and align its dimensions to spacing. Keep the original polygon. v1 limits the projected span to 1500 km and excludes polar/antimeridian geometry. https://proj.org/en/stable/operations/projections/tmerc.html
+- Generate every stagger directly in projected coordinates, then inverse-project. Measure cell-centered dx/dy between symmetric half-cell locations using WGS84 geodesics. pm=1/dx and pn=1/dy. Compute angle from the local xi tangent; do not assume zero on a rotated grid. Positive Jacobian, finite metrics and near-orthogonality are tested.
+- A wet candidate is outside shoreline land and has negative positive-up elevation. Minimum-depth clipping never turns a land cell wet. Missing elevation in shoreline water fails coverage. Explicit positive-down source fields are supported, with metadata sign checks.
+- Four-neighbor connectivity preserves the component containing all protected wet features; disagreeing features stop the build. With no anchors retain the largest boundary-connected component, or the largest component in a closed domain. Other wet components are recorded as dry edits. Important lagoons and narrow connections must be named before accepting automatic edits.
+- Red/black pair redistribution limits rx0=abs(h1-h2)/(h1+h2) while conserving each pair's area-weighted water volume. This conservation domain includes the rho halo; physical-interior volume change is reported separately. Only wet-wet pairs participate. Bound iterations and fail nonconvergence. Quantify maximum/RMS depth changes; smoothing is not a guarantee of pressure-gradient accuracy.
+- Reproduce REMORA Vtransform=2 and its theta_s=0, theta_b=0 limits. Diagnose actual layer thickness and the layer-aware Haney measure. It is a diagnostic, not the two-depth rx0 ratio.
+- REMORA derives staggered masks from mask_rho. Pinned source's psi mask is 1 with three/four wet neighbors, 2 with two adjacent wet neighbors, otherwise 0. It is not a binary four-cell product.
+
+Source reference: REMORA commit `8f1f606ece6d6d9fb3fe0954cc500e4c63fb79cc`; `Source/IO/REMORA_ReadFromInitNetcdf.cpp`, `Source/Initialization/REMORA_make_new_level.cpp`, and `Source/Utils/REMORA_DepthStretchTransform.H`. Verify actual runtime revision when changing reader compatibility.
+
+Emma reference: https://github.com/emmashie/remora-region-setup at `2343364061bee6bee466c0ff7c1d31aa04aefe0f`. Its processing sequence and grid variables informed the interface. No source runtime is copied; known elevation-sign, coverage and stretching-limit issues are avoided by independently tested mechanics.

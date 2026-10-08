@@ -1,0 +1,4 @@
+interface:
+  display_name: "REMORA Grid Generation"
+  short_description: "Build and visually validate structured REMORA grids"
+  default_prompt: "Use $remora-grid-generation to build a reviewed REMORA grid, invoking $remora-region-bpoly when a region plan is needed."
