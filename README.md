@@ -13,6 +13,7 @@ by capability family rather than by the older broad project-stage folders.
   capabilities, such as the model-neutral `hycom-fetcher`, `argo-fetcher`, and the
   NCEI-first, era-routing `cfsv2-fetcher`/`cfsr-fetcher` pair and resilient
   multi-mirror `hrrr-fetcher`,
+  ERA5 atmosphere, GLORYS12 ocean reanalysis, NOAA WAVEWATCH III waves,
   NOAA CO-OPS, USGS, CBOFS, DBOFS, SSCOFS, NYOFS, SJROFS, GloFAS, GSHHS,
   CUDEM, CUSP, NHD/NHM river products, and
   usSEABED, including model-neutral TPXO9v5 harmonic extraction.
@@ -146,8 +147,25 @@ scientific workflow rules or remove validation guidance.
 
 ## Current Development State
 
-The catalog is no longer just a planning skeleton; it now contains several
-usable skill families at different maturity levels:
+The catalog contains usable skill families at different maturity levels.
+
+The October 2026 additions are standalone, model-neutral acquisition packages
+under `skill_catalog/external-data-connectors/`:
+
+| Skill | Source and supported products | Runtime and validation |
+| --- | --- | --- |
+| `era5-fetcher` | CDS ERA5 hourly 10 m wind and mean sea-level pressure, bounded by a geographic box or ADCIRC mesh | Python 3.11.9; frozen requirements; offline `scripts/selftest_era5.py --output REPORT.json` |
+| `glorys-fetcher` | Copernicus GLORYS12 daily/monthly ocean fields, including water level, potential temperature, salinity and horizontal currents | Python 3.11; Copernicus Marine Toolbox 2.5.0 and frozen requirements; offline `scripts/selftest_glorys.py` |
+| `noaa-ww3-fetcher` | NOAA historical `multi_1` WAVEWATCH III monthly gridded fields and selected-station directional spectra | Python 3.10+ with requests, NumPy, rasterio/GDAL and netCDF4; local-fixture `scripts/test_fetcher.py` |
+
+Each package preserves bounded requests, source provenance, verified resume/cache
+behavior, native time/coordinate/mask conventions, and independent health checks.
+ERA5 requires local CDS credentials and accepted dataset licences; GLORYS uses
+local Copernicus Marine credentials. NOAA WW3 uses the public historical archive.
+Keep credentials, downloads and run evidence in the project outside the skill.
+Offline tests validate package behavior; authenticated live acquisition and source
+availability must be checked for each requested run. See each package's `SKILL.md`
+and request reference for its exact scope and invocation.
 
 - `external-data-connectors/` entries are maintained as installable skills with
   `SKILL.md` metadata, agent UI metadata, estimate-first routing hooks where
