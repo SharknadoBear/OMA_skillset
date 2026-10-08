@@ -1,0 +1,4 @@
+interface:
+  display_name: "ERA5 Fetcher"
+  short_description: "Download resumable regional ERA5 wind and pressure"
+  default_prompt: "Use $era5-fetcher to download and validate regional hourly ERA5 wind and pressure."
