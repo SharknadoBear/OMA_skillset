@@ -6,9 +6,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from remora_regions import setup_map
+from grid_math import vertical_section
 
 
-def diagnostic_maps(out, a, h, raw, mask, initial, land, features, z_w):
+def diagnostic_maps(out, a, h, raw, mask, initial, land, features, vertical_parameters):
     out = Path(out)
     paths = []
     lo, la = a["lon_rho"], a["lat_rho"]
@@ -71,10 +72,13 @@ def diagnostic_maps(out, a, h, raw, mask, initial, land, features, z_w):
 
     fig, axs = plt.subplots(2, 1, figsize=(12, 7), layout="constrained")
     j, i = int(np.argmax(mask.sum(axis=1))), int(np.argmax(mask.sum(axis=0)))
+    p = vertical_parameters
+    row = vertical_section(h, 0, j, p["N"], p["theta_s"], p["theta_b"], p["hc_m"])
+    column = vertical_section(h, 1, i, p["N"], p["theta_s"], p["theta_b"], p["hc_m"])
     for ax, section, wet, x, title in [
-        (axs[0], z_w[:,j,:], mask[j], a["x_rho"][j]/1000, f"eta={j}"),
-        (axs[1], z_w[:,:,i], mask[:,i], a["y_rho"][:,i]/1000, f"xi={i}")]:
-        for k in range(0, len(z_w), max(1, (len(z_w)-1)//20)):
+        (axs[0], row, mask[j], a["x_rho"][j]/1000, f"eta={j}"),
+        (axs[1], column, mask[:,i], a["y_rho"][:,i]/1000, f"xi={i}")]:
+        for k in range(0, len(section), max(1, (len(section)-1)//20)):
             ax.plot(x, np.where(wet, section[k], np.nan), color="#13688c", lw=.6)
         ax.set(title="Vertical interfaces: "+title, xlabel="Logical distance (km)", ylabel="z (m)")
         ax.grid(alpha=.2)

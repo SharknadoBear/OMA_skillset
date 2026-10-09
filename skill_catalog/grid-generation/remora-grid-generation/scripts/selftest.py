@@ -14,6 +14,8 @@ from grid_math import (
     roughness,
     depths,
     haney,
+    vertical_diagnostics,
+    vertical_section,
     staggered_masks,
     sample_netcdf,
 )
@@ -140,6 +142,37 @@ class GridTests(unittest.TestCase):
         self.assertGreater(
             haney(zw, np.ones(h.shape, bool)), roughness(h, np.ones(h.shape, bool))
         )
+
+    def test_blocked_vertical_matches_full_transform(self):
+        # Sharp eta jumps straddle block edges; land pairs must stay excluded.
+        h = np.geomspace(2., 1200., 77).reshape(11, 7)
+        h[3:6] *= 4
+        mask = np.ones(h.shape, bool)
+        mask[4:7, 2:4] = False
+        surface = np.linspace(-0.5, 1.2, h.size).reshape(h.shape)
+        for n, ts, tb in [(1, 0, 0), (8, 0, 2), (40, 6, 2)]:
+            _, zw, _ = depths(h, n, ts, tb, 20, surface)
+            for block_rows in [1, 3, 32]:
+                got = vertical_diagnostics(h, n, ts, tb, 20, surface, mask, block_rows)
+                self.assertEqual(got['minimum_layer_thickness_m'], float(np.diff(zw, axis=0).min()))
+                self.assertEqual(got['haney_rx1_diagnostic'], haney(zw, mask))
+            for axis, index in [(0, 0), (0, 10), (1, 0), (1, 6)]:
+                section = vertical_section(h, axis, index, n, ts, tb, 20, surface)
+                expected = zw[:, index, :] if axis == 0 else zw[:, :, index]
+                np.testing.assert_array_equal(section, expected)
+        self.assertEqual(vertical_diagnostics(np.ones((1, 1)), mask=np.ones((1, 1), bool))['haney_rx1_diagnostic'], 0.)
+
+    def test_blocked_vertical_rejects_invalid_inputs(self):
+        h = np.ones((4, 3))
+        for bad in [np.zeros_like(h), -h, h * np.nan, np.ones(3), np.ones((0, 3))]:
+            with self.assertRaises(ValueError): vertical_diagnostics(bad)
+        for size in [0, -1, 1.5]:
+            with self.assertRaises(ValueError): vertical_diagnostics(h, block_rows=size)
+        with self.assertRaises(ValueError): vertical_diagnostics(h, mask=np.ones((2, 2)))
+        with self.assertRaises(ValueError): vertical_diagnostics(h, zeta=-1.)
+        with self.assertRaises(ValueError): vertical_diagnostics(h, zeta=np.nan)
+        for axis, index in [(2, 0), (0, -1), (0, 4), (1, 3), (0, 1.5)]:
+            with self.assertRaises(ValueError): vertical_section(h, axis, index)
 
     def test_psi_masks_all_patterns(self):
         # Independent truth table from pinned REMORA branch definitions.

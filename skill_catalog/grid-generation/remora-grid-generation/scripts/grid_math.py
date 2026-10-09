@@ -344,6 +344,60 @@ def haney(z_w, mask):
     return worst
 
 
+def vertical_diagnostics(h, N=40, theta_s=6.0, theta_b=2.0, hc=20.0,
+                         zeta=0.0, mask=None, block_rows=32):
+    """Check the same vertical transform in row blocks with one-row overlap.
+
+    The overlap retains eta-neighbor Haney pairs at block boundaries. Repeated
+    xi pairs and layer thicknesses have no effect on the extrema. No full
+    three-dimensional coordinate array is retained.
+    """
+    h = np.asarray(h, dtype=float)
+    if h.ndim != 2 or not all(h.shape):
+        raise ValueError("Vertical diagnostics require a nonempty 2D depth field")
+    if not isinstance(block_rows, (int, np.integer)) or block_rows < 1:
+        raise ValueError("block_rows must be a positive integer")
+    surface = np.broadcast_to(np.asarray(zeta, dtype=float), h.shape)
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != h.shape:
+            raise ValueError("Vertical diagnostic mask shape mismatch")
+    minimum, worst = float("inf"), 0.0
+    for start in range(0, h.shape[0], block_rows):
+        end = min(start + block_rows + 1, h.shape[0])
+        local_h, local_surface = h[start:end], surface[start:end]
+        zr, zw, _ = depths(local_h, N, theta_s, theta_b, hc, local_surface)
+        thickness = np.diff(zw, axis=0)
+        if (not np.isfinite(zr).all() or not np.isfinite(zw).all()
+                or not np.allclose(zw[0], -local_h)
+                or not np.allclose(zw[-1], local_surface)
+                or np.any(thickness <= 0)):
+            raise ValueError("Invalid vertical transform")
+        minimum = min(minimum, float(thickness.min()))
+        if mask is not None:
+            worst = max(worst, haney(zw, mask[start:end]))
+        del zr, zw, thickness
+    result = {"minimum_layer_thickness_m": minimum}
+    if mask is not None:
+        result["haney_rx1_diagnostic"] = worst
+    return result
+
+
+def vertical_section(h, axis, index, N=40, theta_s=6.0, theta_b=2.0,
+                     hc=20.0, zeta=0.0):
+    """Return interface depths for one row (axis 0) or column (axis 1)."""
+    h = np.asarray(h)
+    if (h.ndim != 2 or axis not in (0, 1)
+            or not isinstance(index, (int, np.integer))
+            or not 0 <= index < h.shape[axis]):
+        raise ValueError("Invalid vertical section")
+    sl = (slice(index, index + 1), slice(None)) if axis == 0 else (
+        slice(None), slice(index, index + 1))
+    surface = np.broadcast_to(np.asarray(zeta, dtype=float), h.shape)
+    _, zw, _ = depths(h[sl], N, theta_s, theta_b, hc, surface[sl])
+    return zw[:, 0, :] if axis == 0 else zw[:, :, 0]
+
+
 def staggered_masks(mask):
     m = mask.astype("i4")
     u = m[:, :-1] * m[:, 1:]

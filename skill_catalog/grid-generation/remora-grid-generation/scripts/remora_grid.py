@@ -40,8 +40,8 @@ from grid_math import (
     connected_mask,
     roughness,
     smooth_depth,
-    depths,
-    haney,
+    vertical_diagnostics,
+    stretching,
     staggered_masks,
     GEOD,
 )
@@ -239,7 +239,7 @@ def anchor_indices(a, mask, features, spacing):
 
 def export_grid(path, a, h, mask, p, fitdoc, raw):
     ny, nx = h.shape
-    sr, sw, cr, cw = depths(h, p["N"], p["theta_s"], p["theta_b"], p["hc_m"])[2]
+    sr, sw, cr, cw = stretching(p["N"], p["theta_s"], p["theta_b"])
     dims = {
         "eta_rho": ny,
         "xi_rho": nx,
@@ -359,9 +359,8 @@ def build(fit_path, out):
         raise ValueError("Nonfinite classified depth")
     area = 1 / (a["pm"] * a["pn"])
     h, smoothing = smooth_depth(raw, mask, area, p["rx0_max"])
-    z_r, z_w, _ = depths(h, p["N"], p["theta_s"], p["theta_b"], p["hc_m"])
-    if np.any(np.diff(z_w, axis=0) <= 0):
-        raise ValueError("Nonpositive vertical layer thickness")
+    vertical = vertical_diagnostics(
+        h, p["N"], p["theta_s"], p["theta_b"], p["hc_m"], mask=mask)
     out.mkdir(parents=True, exist_ok=True)
     mapsdir = out / "maps"
     mapsdir.mkdir(exist_ok=True)
@@ -388,7 +387,7 @@ def build(fit_path, out):
         initial,
         land,
         req.get("protected_wet_features", []),
-        z_w,
+        p,
     )
     section_report, section_maps = feature_sections(mapsdir, a, raw, h, mask, anchors, req.get("protected_wet_features", []))
     maps.extend(section_maps)
@@ -403,7 +402,7 @@ def build(fit_path, out):
     report.update(
         smoothing=smoothing,
         feature_sections=section_report,
-        haney_rx1_diagnostic=haney(z_w, mask),
+        haney_rx1_diagnostic=vertical["haney_rx1_diagnostic"],
         maximum_depth_change_m=float(np.max(np.abs(h[mask] - raw[mask]))),
         rms_depth_change_m=float(np.sqrt(np.mean((h[mask] - raw[mask]) ** 2))),
         wet_cells=int(mask.sum()),
@@ -518,20 +517,14 @@ def readback(path):
         r = roughness(h, m.astype(bool))
         if r > d.rx0_max + 2e-8:
             raise ValueError("Excessive bathymetric roughness")
-        zr, zw, _ = depths(h, int(d.N), d.theta_s, d.theta_b, d.hc_m)
-        if (
-            not np.allclose(zw[0], -h)
-            or not np.allclose(zw[-1], 0)
-            or np.any(np.diff(zw, axis=0) <= 0)
-        ):
-            raise ValueError("Invalid vertical transform")
+        vertical = vertical_diagnostics(h, int(d.N), d.theta_s, d.theta_b, d.hc_m)
         return {
             "local_validation": "pass",
             "format": d.data_model,
             "rho_shape": [ny, nx],
             "n_cell": [nx - 2, ny - 2, int(d.N)],
             "rx0": r,
-            "minimum_layer_thickness_m": float(np.min(np.diff(zw, axis=0))),
+            "minimum_layer_thickness_m": vertical["minimum_layer_thickness_m"],
             "reader_validation": "not_run",
         }
 

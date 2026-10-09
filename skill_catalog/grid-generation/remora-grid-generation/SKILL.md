@@ -11,6 +11,8 @@ Own the numerical grid, not the scientific polygon. For a complete scientific re
 
 Use Python 3.11+ with prebuilt packages in [requirements.txt](requirements.txt): `python -m pip install --only-binary=:all: -r requirements.txt`. No C/C++ grid generator, source build, Gmsh, or remote grid-generation dependency is required. Install `remora-region-bpoly` beside this skill. See [interfaces](references/interfaces.md) for requests and [numerics](references/numerics.md) for conventions and limitations.
 
+Vertical diagnostics use bounded row blocks and section plots compute only their selected slices. Size the horizontal grid to available memory; do not reduce scientifically chosen vertical layers solely to bypass diagnostic memory use.
+
 Emma's remora-region-setup is a production-structure/output reference, not imported runtime code. Pinned REMORA source determines reader conventions; [reader verification](references/reader_check.md) describes that separate check.
 
 ## Two returning stages
