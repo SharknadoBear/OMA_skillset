@@ -28,7 +28,7 @@ by capability family rather than by the older broad project-stage folders.
 - `memory-control/`: project-memory workflow skills, currently
   `brain-dumping` and `brain-refreshing`.
 - `workspace-bridging/`: skills that bridge local workspaces to Kestrel,
-  Expanse, Constance, and configured cloud VM execution environments, including
+  NERSC Perlmutter, Expanse, Constance, and configured cloud VM execution environments, including
   Codex and Copilot-facing variants where staged.
 - `visual-analysis/`: active structured-grid POM, staggered-grid ROMS, and
   sparse curvilinear EFDC map and movie post-processing, FVCOM tidal
