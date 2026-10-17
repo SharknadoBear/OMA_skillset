@@ -15,6 +15,8 @@ Use this skill for local orchestration artifacts and evidence. It never opens SS
 python scripts/fvcom_run_control.py init --request request.json --project PROJECT
 ```
 
+For new `barotropic_tide` projects, initialization creates `agents/00_lead/`, `agents/01_grid/`, `agents/02_tpxo/`, and `agents/03_configuration_build/`, and records the mapping under `agent_layout` in the project manifest. Follow `$fvcom-simulation`'s `references/barotropic_agent_layout.md` for role ownership and handoffs. The scientific product paths remain unchanged. Benchmark-only projects do not acquire this layout; existing project manifests and evidence are preserved on reinitialization.
+
 2. Derive the baseline controls from the exact metric 2DM and its ordered OBC chains:
 
 ```powershell
@@ -34,8 +36,10 @@ python scripts/fvcom_run_control.py record --project PROJECT --kind preprocessin
 At the preparation barrier, validate exactly three role manifests through their common typed envelope (role-specific schema names are allowed):
 
 ```powershell
-python scripts/fvcom_run_control.py join --manifest gridding/worker_manifest.json --manifest forcing/shared_source/worker_manifest.json --manifest run/build/worker_manifest.json --output preparation_join.json
+python scripts/fvcom_run_control.py join --manifest PROJECT/agents/01_grid/role_manifest.json --manifest PROJECT/agents/02_tpxo/role_manifest.json --manifest PROJECT/agents/03_configuration_build/role_manifest.json --output PROJECT/agents/00_lead/preparation_join.json
 ```
+
+Use those paths for new barotropic projects. Existing projects may pass their recorded legacy manifest paths; the join command still validates the same common envelope. The status report discovers both fixed role handoffs and legacy worker manifests.
 
 3. Create the finite, deduplicated stability strategy:
 
@@ -87,6 +91,7 @@ Stop for `user_stopped` or after every planned attempt has terminal evidence and
 ## Validation
 
 ```powershell
+python scripts/selftest_project_layout.py
 python scripts/selftest_fvcom_run_control.py
 python scripts/selftest_audit_fvcom_production.py
 python scripts/selftest_fvcom_time_anchor.py

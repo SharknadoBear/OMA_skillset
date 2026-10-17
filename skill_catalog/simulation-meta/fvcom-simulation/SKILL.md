@@ -9,6 +9,8 @@ Interpret the science request and route the complete workflow. This skill is an 
 
 Read [simulation request contract](references/simulation_request_v1.md) before initializing a project and [state and manifest contract](references/state_contract.md) before resuming one.
 
+For `barotropic_tide`, read the [fixed agent workspace contract](references/barotropic_agent_layout.md) before initialization or delegation. The caller supplies the project root; this skill owns the structure beneath `agents/`. Experiment matrix names belong outside the project, not in this contract.
+
 ## Modes
 
 - `barotropic_tide`: prepare, stabilize, benchmark, run, and validate a tide-only FVCOM case.
@@ -19,7 +21,7 @@ Default new projects to `Workspace/fvcom-simulation/<case_id>` and their Kestrel
 ## Initialize
 
 1. Parse the prompt as `simulation_request_v1`. Preserve explicit dates, benchmark policy, and settings. For the April 2025 tide experiment use 2025-04-01 through 2025-05-01 UTC for analysis, seven spin-up days beginning 2025-03-25, 20 C, 30 PSU, ten uniform sigma levels (nine layers), all TPXO constituents, and the requested NOAA station mapping policy. An explicit `observations.water_level_mapping_policy` overrides the legacy inside-only station policy for water levels only.
-2. Invoke `$fvcom-run-control` to initialize the project, provenance ledger, `project_status.json`, `commands.jsonl`, and `report.html`.
+2. Invoke `$fvcom-run-control` to initialize the project, provenance ledger, `project_status.json`, `commands.jsonl`, and `report.html`. For a new barotropic project it also creates the four fixed role folders and records their relative paths in `project_manifest.json`.
 3. Ask the human only for secure Password+OTP entry after `$kestrel-hpc` displays its credential window. Never receive a password or OTP in chat or write it to an artifact.
 4. Preserve accepted inputs. Hash and freeze an accepted mesh package before creating project-owned copies or derivatives.
 
@@ -32,6 +34,8 @@ Prepare three independent roles and require each to return a typed role manifest
 3. **Configuration/build worker** invokes `$fvcom-namelist-configuration` for a provisional configuration and `$fvcom-build`, which in turn uses `$kestrel-hpc` for the remote source audit and build.
 
 The simulation lead remains the sole coordinator. Do not create hidden workers or let roles overwrite one another's artifact roots. A campaign parent owns shared skill edits and installs; workers report defects and use the recorded installed version.
+
+For barotropic projects, pass each role its assigned `agents/` workspace and canonical product ownership from the fixed workspace contract. Collect the three `role_manifest.json` handoffs there, including when the lead performs a role directly. The lead controls publication into shared runtime inputs; the role folders do not replace the scientific product layout.
 
 ## Join and Preparation Gate
 

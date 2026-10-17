@@ -44,6 +44,17 @@ Default new projects to `Workspace/fvcom-simulation/<case_id>`. Explicit and his
 
 ## Internal project layout
 
+For new `barotropic_tide` projects, the [fixed agent workspace contract](barotropic_agent_layout.md) adds the following role roots; `benchmark` projects do not require them:
+
+```text
+<project>/agents/00_lead/
+<project>/agents/01_grid/
+<project>/agents/02_tpxo/
+<project>/agents/03_configuration_build/
+```
+
+The scientific product layout remains:
+
 ```text
 <project>/
   gridding/accepted_t6v6/

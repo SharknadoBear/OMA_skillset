@@ -14,6 +14,12 @@ from typing import Any
 
 
 G = 9.81
+BAROTROPIC_AGENT_ROOTS = {
+    "lead": "agents/00_lead",
+    "grid": "agents/01_grid",
+    "tpxo": "agents/02_tpxo",
+    "configuration_build": "agents/03_configuration_build",
+}
 ALLOWED_STATES = {
     "initialized", "awaiting_authentication", "parallel_preparation",
     "preparation_join", "input_assembly", "stability_smoke",
@@ -77,12 +83,14 @@ def validate_request(req: dict[str, Any]) -> None:
         raise ValueError("unsupported current policy")
 
 
-def project_layout(root: Path) -> list[Path]:
+def project_layout(root: Path, mode: str = "barotropic_tide") -> list[Path]:
     paths = [
         "gridding/accepted_t6v6", "gridding/fresh_reproduction",
         "forcing/shared_source", "forcing/accepted_t6v6", "forcing/fresh_reproduction",
         "run/build", "analysis/observations",
     ]
+    if mode == "barotropic_tide":
+        paths += list(BAROTROPIC_AGENT_ROOTS.values())
     for case in ("accepted_t6v6", "fresh_reproduction"):
         paths += [
             f"input/{case}/base", f"input/{case}/attempts", f"input/{case}/final",
@@ -95,12 +103,12 @@ def project_layout(root: Path) -> list[Path]:
 def init_project(request_path: Path, project: Path) -> dict[str, Any]:
     req = load_data(request_path)
     validate_request(req)
-    project.mkdir(parents=True, exist_ok=True)
-    for p in project_layout(project):
-        p.mkdir(parents=True, exist_ok=True)
     request_copy = project / "request.json"
     if request_copy.exists() and json.loads(request_copy.read_text(encoding="utf-8")) != req:
         raise FileExistsError("project already contains a different request.json")
+    project.mkdir(parents=True, exist_ok=True)
+    for p in project_layout(project, req["mode"]):
+        p.mkdir(parents=True, exist_ok=True)
     write_json(request_copy, req)
     manifest = {
         "schema": "simulation_project_manifest_v1",
@@ -113,8 +121,16 @@ def init_project(request_path: Path, project: Path) -> dict[str, Any]:
         "grid_order": ["accepted_t6v6", "fresh_reproduction"],
         "immutable_attempts": True,
     }
-    if not (project / "project_manifest.json").exists():
-        write_json(project / "project_manifest.json", manifest)
+    if req["mode"] == "barotropic_tide":
+        manifest["agent_layout"] = {
+            "schema": "fvcom_barotropic_agent_layout_v1",
+            "role_roots": dict(BAROTROPIC_AGENT_ROOTS),
+        }
+    manifest_path = project / "project_manifest.json"
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    else:
+        write_json(manifest_path, manifest)
     status = {
         "schema": "simulation_project_status_v1",
         "case_id": req["case_id"],
@@ -778,7 +794,8 @@ def render_report(project: Path) -> Path:
         for p, s, j, d in benchmark_rows
     ) or "<tr><td colspan='4'>No benchmark attempts.</td></tr>"
     worker_rows = []
-    for p in sorted(set(project.glob("gridding/**/worker_manifest.json")) |
+    for p in sorted(set(project.glob("agents/*/role_manifest.json")) |
+                    set(project.glob("gridding/**/worker_manifest.json")) |
                     set(project.glob("forcing/**/worker_manifest.json")) |
                     set(project.glob("run/build/**/worker_manifest.json"))):
         try:

@@ -22,6 +22,8 @@ mandatory:
 
 `ready` requires all role outputs, not merely a started task. `waiting_user` is limited to secure authentication, registered-data authorization, or an explicit user stop. `blocked` identifies an external or scope boundary. `failed` identifies invalid generated evidence.
 
+For new barotropic projects, store each preparation handoff as `role_manifest.json` under its fixed role root from the [barotropic workspace contract](barotropic_agent_layout.md). The manifest's `artifact_root` is that project-relative role path. `project_manifest.json` records `agent_layout.schema=fvcom_barotropic_agent_layout_v1` with the `lead`, `grid`, `tpxo`, and `configuration_build` entries in `agent_layout.role_roots`. Existing projects without this field retain their recorded legacy paths; initialization does not rewrite an existing project manifest to adopt the new layout.
+
 ## Resume rules
 
 - Verify all hashes before reusing a completed stage.
