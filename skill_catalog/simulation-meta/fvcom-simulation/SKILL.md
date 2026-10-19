@@ -1,6 +1,6 @@
 ---
 name: fvcom-simulation
-description: Orchestrate reproducible FVCOM simulations from a science request through build, preparation, Kestrel execution, stability, benchmarking, and validation. Use for complete barotropic-tide studies or FVCOM performance benchmarks; delegate all scripts and remote actions to the named specialist skills.
+description: Orchestrate reproducible FVCOM simulations from a science request through build, preparation, Kestrel execution, stability, benchmarking, and validation. Use for complete barotropic-tide studies, the paper_barotropic experiment profile, or FVCOM performance benchmarks; delegate all scripts and remote actions to the named specialist skills.
 ---
 
 # FVCOM Simulation
@@ -11,7 +11,19 @@ Read [simulation request contract](references/simulation_request_v1.md) before i
 
 For `barotropic_tide`, read the [fixed agent workspace contract](references/barotropic_agent_layout.md) before initialization or delegation. The caller supplies the project root; this skill owns the structure beneath `agents/`. Experiment matrix names belong outside the project, not in this contract.
 
-## Modes
+## paper_barotropic profile
+
+For an explicit `paper_barotropic` request, use `mode: barotropic_tide` with
+`profile: paper_barotropic` and read [the short paper workflow](references/paper_barotropic.md).
+Use the **Three Initial Preparation Roles** and **Join and Preparation Gate** below
+for common scientific preparation. The profile replaces all default dates,
+grid order, subsequent stability/benchmark/production sequencing and retry policy.
+Do not run the ordinary Initialize, Numerical Controls and Stability, or Benchmark,
+Production, and Validation recipes for this profile. Its sole run stages are
+24-hour smoke and 17-day cold-start production, each with three total attempts.
+Keep native evidence only; Bear controls campaign timing and stopping.
+
+## Modes (ordinary workflow)
 
 - `barotropic_tide`: prepare, stabilize, benchmark, run, and validate a tide-only FVCOM case.
 - `benchmark`: use a validated restart and scientifically identical 24-hour segments to compare Kestrel layouts. Do not interpret a benchmark as a validated simulation.

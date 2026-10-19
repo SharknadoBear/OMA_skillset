@@ -44,10 +44,19 @@ def write_frame(frame: pd.DataFrame, path: Path) -> None:
 
 
 def prepare(condensation_manifest: Path, observation_root: Path, output_dir: Path,
-            manifest_path: Path, station_inventory_path: Path | None = None) -> dict[str, Any]:
+            manifest_path: Path, station_inventory_path: Path | None = None, *,
+            analysis_period: tuple[dt.datetime, dt.datetime] | None = None) -> dict[str, Any]:
     condensation = json.loads(condensation_manifest.read_text(encoding="utf-8-sig"))
     if condensation.get("status") != "ready":
         raise ValueError("condensation manifest is not ready")
+    if analysis_period is not None:
+        analysis_start, analysis_end = [pd.Timestamp(value) for value in analysis_period]
+        if analysis_start.tzinfo is None or analysis_end.tzinfo is None or analysis_start >= analysis_end:
+            raise ValueError("analysis period must have ordered timezone-aware endpoints")
+    def reference_period(frame):
+        if analysis_period is None:
+            return frame
+        return frame.loc[(frame["time"] >= analysis_start) & (frame["time"] < analysis_end)].copy()
     output_dir.mkdir(parents=True, exist_ok=True)
     products: list[dict[str, Any]] = []
     warnings: list[str] = []
@@ -59,7 +68,7 @@ def prepare(condensation_manifest: Path, observation_root: Path, output_dir: Pat
         if role == "water_level":
             observation_path = observation_root / "water_level" / f"{station_id}_noaa_waterlevel.csv"
             model = read_time_csv(model_path, ["model"])
-            observation = read_time_csv(observation_path, ["observed", "predicted"])
+            observation = reference_period(read_time_csv(observation_path, ["observed", "predicted"]))
             combined = model.merge(observation[["time", "observed", "predicted"]], on="time", how="inner")
             # Preserve the two reference supports independently. Missing diagnostic
             # observations must not erase valid astronomical prediction samples.
@@ -73,7 +82,7 @@ def prepare(condensation_manifest: Path, observation_root: Path, output_dir: Pat
         elif role == "current":
             observation_path = observation_root / "currents" / station_id / "depth_mean.csv"
             model = read_time_csv(model_path, ["model_u", "model_v"]).dropna(subset=["model_u", "model_v"])
-            observation = read_time_csv(observation_path, ["east_m_s", "north_m_s"]).dropna(subset=["east_m_s", "north_m_s"])
+            observation = reference_period(read_time_csv(observation_path, ["east_m_s", "north_m_s"]).dropna(subset=["east_m_s", "north_m_s"]))
             model_ns = model["time"].astype("int64").to_numpy()
             gaps = np.diff(model_ns) / 1.0e9
             if len(gaps) and float(np.max(gaps)) > 720.0:
@@ -112,6 +121,7 @@ def prepare(condensation_manifest: Path, observation_root: Path, output_dir: Pat
         "schema": "fvcom_noaa_validation_tables_v1", "status": "ready", "generated_at": utcnow(),
         "condensation_manifest": str(condensation_manifest), "condensation_manifest_sha256": sha256(condensation_manifest),
         "observation_root": str(observation_root), "products": products, "warnings": warnings,
+        "analysis_period": {"start": analysis_start.isoformat(), "end": analysis_end.isoformat(), "end_exclusive": True} if analysis_period is not None else None,
         "station_inventory": str(station_inventory_path) if station_inventory_path else None,
         "station_inventory_sha256": sha256(station_inventory_path) if station_inventory_path else None,
         "blocking_reasons": [], "resume_token": f"validation_tables:{sha256(condensation_manifest)}",

@@ -7,6 +7,22 @@ description: Initialize immutable FVCOM simulation projects, derive conservative
 
 Use this skill for local orchestration artifacts and evidence. It never opens SSH or submits a job; invoke `$kestrel-hpc` for transfer, submission, monitoring, cancellation, and retrieval.
 
+
+## paper_barotropic
+
+Use [the parent profile](../fvcom-simulation/references/paper_barotropic.md) for
+paper requests. `init` resolves its settings and initializes only the fresh grid.
+Derive aligned controls normally, then use `attempt --paper-stage smoke|production
+--index 0|1|2 --controls controls.json --base-namelist stage.nml` plus the usual
+input, project and resource arguments. Do not supply `--plan`, `--revision` or
+the three-stage bundle. Each stage has three total submitted attempts, not three
+retries. Do not resubmit an existing attempt. Use debug/shared for smoke;
+production is two exclusive nodes/208 ranks with 104 ranks per node and core
+binding. `--partition auto` omits the Slurm partition directive. Record each
+job identity and terminal evidence in native trial artifacts. Corrections must
+preserve the scientific request and cumulative counts. Production audit counts
+default to the actual namelist duration/cadence (4,081/137 for this profile).
+
 ## Workflow
 
 1. Initialize the fixed project from a `simulation_request_v1` JSON document:

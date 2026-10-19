@@ -88,3 +88,14 @@ Every compatibility change additionally has a pre-change copy, a `.diff`, and a 
   "resume_token": "build:<case_id>:<checkpoint>"
 }
 ```
+
+## paper_barotropic override
+
+For `profile: paper_barotropic`, replace the pinned environment above with the
+discovered native RH9 environment (document any RH8 fallback). Require
+`kestrel.project_dir` and a source copy beneath it; record `kestrel.build_environment`
+with `os`, `compiler`, `compiler_options`, `modules` and any `fallback_reason`.
+Retain actual `os-release.txt`, module and build-command evidence, and bind the
+identical environment object in `freeze.json`. All scientific feature, linking,
+input-reading and executable-lineage checks still apply. These checks must not
+advance model time outside the profile's counted smoke/production attempts.

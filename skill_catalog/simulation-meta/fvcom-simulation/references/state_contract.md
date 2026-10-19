@@ -31,3 +31,14 @@ For new barotropic projects, store each preparation handoff as `role_manifest.js
 - Only one stability job may be active.
 - The executable hash is frozen before the first submitted attempt and must be identical across the accepted/fresh pair.
 - Accepted and fresh grid artifacts have independent roots and forcing products even when deterministic generation yields identical bytes.
+
+## paper_barotropic exception
+
+The fresh-only paper profile has independent smoke and production attempt IDs
+`attempt_smoke_0000..0002` and `attempt_production_0000..0002`. Counts persist
+across resumes and corrections. There is no accepted/fresh pair, exhaustive
+stability strategy or benchmark. `attempt_limit_reached` means a stage failed
+all three total attempts; it is a failure, not validation completion. An earlier
+explicit inability may use `scope_exhausted` with its evidence without exhausting
+the ordinary strategy. Bear owns timing and acceptance; these native manifests
+are evidence records, not an autonomous campaign controller.

@@ -9,8 +9,12 @@ import json
 import re
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Tuple
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fvcom-run-control" / "scripts"))
+from fvcom_profiles import PAPER_PROFILE, resolve_request
 
 
 SCHEMA = "fvcom_build_worker_manifest_v1"
@@ -107,8 +111,27 @@ def validate_request(request: Dict[str, Any]) -> None:
     if not isinstance(kestrel, dict):
         raise ContractError("kestrel object is required")
     source = kestrel.get("source_dir")
-    if not isinstance(source, str) or not source.startswith("/home/yhuang168/"):
+    if request.get("profile") == PAPER_PROFILE:
+        project = kestrel.get("project_dir", "")
+        if not isinstance(source, str) or not isinstance(project, str) or not project.startswith(("/scratch/", "/kfs3/scratch/")) or ".." in PurePosixPath(project).parts or ".." in PurePosixPath(source).parts or not source.startswith(project.rstrip("/") + "/"):
+            raise ContractError("paper source_dir must be inside the explicit kestrel.project_dir scratch root")
+    elif not isinstance(source, str) or not source.startswith("/home/yhuang168/"):
         raise ContractError("kestrel.source_dir must be an explicit path below /home/yhuang168")
+
+
+def build_environment(request: Dict[str, Any]) -> Dict[str, Any]:
+    if request.get("profile") != PAPER_PROFILE:
+        return {"compiler": "mpiifort", "compiler_options": ["-O3", "-fpp", "-qopenmp-stubs"], "modules": MODULES}
+    env = request["kestrel"].get("build_environment", {})
+    if env.get("os") not in {"rh9", "rh8"} or not env.get("compiler") or not env.get("modules") or not env.get("compiler_options"):
+        raise ContractError("paper build requires discovered os, compiler, compiler_options and modules in kestrel.build_environment")
+    if env["os"] == "rh8" and not str(env.get("fallback_reason", "")).strip():
+        raise ContractError("RH8 fallback requires a documented reason")
+    if not isinstance(env["modules"], list) or not all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9._+/-]+", x) for x in env["modules"]):
+        raise ContractError("build modules must be explicit safe module names")
+    if not isinstance(env["compiler_options"], list) or not all(isinstance(x, str) and x for x in env["compiler_options"]):
+        raise ContractError("compiler_options must be a nonempty string list")
+    return dict(env)
 
 
 def active_defines(text: str) -> List[str]:
@@ -165,7 +188,9 @@ def audit_make_inc(path: Path, expected_topdir: str) -> Dict[str, Any]:
 
 
 def build_plan(request: Dict[str, Any], local_root: Path, remote_root: str) -> Dict[str, Any]:
+    request = resolve_request(request)
     validate_request(request)
+    environment = build_environment(request)
     source = request["kestrel"]["source_dir"].rstrip("/")
     case_id = request["case_id"]
     return {
@@ -176,9 +201,7 @@ def build_plan(request: Dict[str, Any], local_root: Path, remote_root: str) -> D
         "local_artifact_root": str(local_root.resolve()),
         "remote_artifact_root": remote_root.rstrip("/"),
         "fvcom_version_required": "4.3.1",
-        "compiler": "mpiifort",
-        "compiler_options": ["-O3", "-fpp", "-qopenmp-stubs"],
-        "modules": MODULES,
+        **environment,
         "required_defines": sorted(REQUIRED_DEFINES),
         "forbidden_defines": sorted(FORBIDDEN_EXACT),
         "authoritative_blank_namelist_command": (
@@ -210,7 +233,9 @@ def parse_checksum_file(path: Path) -> Tuple[str, str]:
 
 
 def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Dict[str, Any]:
+    request = resolve_request(request)
     validate_request(request)
+    environment = build_environment(request)
     missing = [name for name in MANDATORY_EVIDENCE if not (evidence / name).is_file()]
     blocking: List[str] = []
     warnings: List[str] = []
@@ -218,12 +243,26 @@ def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Di
     provenance: Dict[str, Any] = {
         "source_dir": request["kestrel"]["source_dir"],
         "fvcom_version": "4.3.1",
-        "modules": MODULES,
+        **environment,
         "evidence_dir": str(evidence.resolve()),
         "finalized_utc": utc_now(),
     }
     if missing:
         blocking.append("missing mandatory build evidence: " + ", ".join(missing))
+    if request.get("profile") == PAPER_PROFILE:
+        for filename in ("os-release.txt", "modules.txt", "build_commands.txt"):
+            path = evidence / filename
+            if not path.is_file():
+                blocking.append(f"missing native build evidence: {filename}")
+                continue
+            hashes[filename] = sha256(path)
+            content = path.read_text(encoding="utf-8-sig", errors="replace")
+            if filename == "os-release.txt" and not re.search(r'^VERSION_ID=[\"\']?' + environment["os"][-1] + r'(?:[.\"\']|$)', content, re.M):
+                blocking.append("observed OS does not match the selected build environment")
+            if filename == "modules.txt" and any(module not in content for module in environment["modules"]):
+                blocking.append("observed modules do not match the selected build environment")
+            if filename == "build_commands.txt" and environment["compiler"] not in content:
+                blocking.append("build transcript does not identify the selected compiler")
     audit_path = evidence / "make_inc_audit.json"
     if audit_path.is_file():
         audit = load_json(audit_path)
@@ -245,6 +284,8 @@ def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Di
             blocking.append("frozen and observed executable hashes differ")
         if freeze.get("source_edits_after_freeze_allowed") is not False:
             blocking.append("freeze record does not forbid post-freeze source edits")
+        if request.get("profile") == PAPER_PROFILE and freeze.get("build_environment") != environment:
+            blocking.append("freeze record does not bind the selected native build environment")
         hashes["freeze_sha256"] = sha256(freeze_path)
     smoke_path = evidence / "smoke.log"
     if smoke_path.is_file():
@@ -320,7 +361,7 @@ def cli(argv: Iterable[str] | None = None) -> int:
         result = finalize(load_json(args.request), args.evidence, args.artifact_root)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result["status"] == "ready" else 3
-    except (OSError, json.JSONDecodeError, ContractError) as exc:
+    except (OSError, ValueError, TypeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 

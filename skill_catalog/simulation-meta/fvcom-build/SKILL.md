@@ -7,6 +7,20 @@ description: Audit, configure, compile, smoke-test, and freeze a reproducible FV
 
 Produce an evidence-backed executable lineage, not merely a successful `make` exit.
 
+
+## paper_barotropic native build
+
+For this profile, replace the legacy module pins below with the actual native
+environment discovered through Kestrel HPC. Prefer RH9; RH8 needs a documented
+reason. Set `kestrel.project_dir`, use a trial-owned source copy beneath it, and
+record `kestrel.build_environment` (`os`, `compiler`, `compiler_options`, `modules`,
+and RH8 `fallback_reason`). Capture `os-release.txt`, actual loaded modules and
+compiler/build transcripts, and bind that same environment in `freeze.json`.
+The planner/finalizer require this evidence. Match the runtime compute environment
+to the build; do not silently reuse an RH8 binary on RH9. Blank-namelist and
+input-reader checks must not advance model time; any integration is a counted
+smoke attempt. The build skill never adds an uncounted stability or speed test.
+
 ## Inputs and outputs
 
 Accept a `simulation_request_v1` object and a build artifact root. For the Galveston workflow the source is `/home/yhuang168/FVCOM_source_agent_test`; the immutable evidence root belongs under the case's `run/build/` tree locally and its Kestrel mirror under `/scratch/yhuang168/FVCOM_Simulation/<case_id>/run/build/`.

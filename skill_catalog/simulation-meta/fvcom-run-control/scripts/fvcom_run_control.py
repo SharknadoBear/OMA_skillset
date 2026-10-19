@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 
 
+from fvcom_profiles import PAPER_PROFILE, resolve_request
+
+
 G = 9.81
 BAROTROPIC_AGENT_ROOTS = {
     "lead": "agents/00_lead",
@@ -25,7 +28,7 @@ ALLOWED_STATES = {
     "preparation_join", "input_assembly", "stability_smoke",
     "stability_canary", "stability_spinup", "benchmarking", "production",
     "validation", "validation_complete", "waiting_user", "user_stopped",
-    "scope_exhausted",
+    "scope_exhausted", "attempt_limit_reached",
 }
 
 
@@ -69,8 +72,10 @@ def validate_request(req: dict[str, Any]) -> None:
         raise ValueError("mode must be barotropic_tide or benchmark")
     if not str(req.get("case_id", "")).strip():
         raise ValueError("case_id is required")
-    if req.get("grid_policy") != "accepted_then_fresh":
-        raise ValueError("this workflow requires grid_policy=accepted_then_fresh")
+    if req.get("grid_policy") not in {"accepted_then_fresh", "fresh_only"}:
+        raise ValueError("grid_policy must be accepted_then_fresh or fresh_only")
+    if req.get("grid_policy") == "fresh_only" and req.get("accepted_grid"):
+        raise ValueError("fresh_only cannot consume an accepted grid")
     physics = req.get("physics", {})
     if physics.get("formulation") != "three_dimensional_barotropic":
         raise ValueError("physics.formulation must be three_dimensional_barotropic")
@@ -83,16 +88,24 @@ def validate_request(req: dict[str, Any]) -> None:
         raise ValueError("unsupported current policy")
 
 
-def project_layout(root: Path, mode: str = "barotropic_tide") -> list[Path]:
+def grid_order(policy: str = "accepted_then_fresh") -> list[str]:
+    if policy == "fresh_only":
+        return ["fresh_reproduction"]
+    if policy == "accepted_then_fresh":
+        return ["accepted_t6v6", "fresh_reproduction"]
+    raise ValueError("unsupported grid policy")
+
+
+def project_layout(root: Path, mode: str = "barotropic_tide", policy: str = "accepted_then_fresh") -> list[Path]:
     paths = [
-        "gridding/accepted_t6v6", "gridding/fresh_reproduction",
-        "forcing/shared_source", "forcing/accepted_t6v6", "forcing/fresh_reproduction",
+        "forcing/shared_source",
         "run/build", "analysis/observations",
     ]
     if mode == "barotropic_tide":
         paths += list(BAROTROPIC_AGENT_ROOTS.values())
-    for case in ("accepted_t6v6", "fresh_reproduction"):
+    for case in grid_order(policy):
         paths += [
+            f"gridding/{case}", f"forcing/{case}",
             f"input/{case}/base", f"input/{case}/attempts", f"input/{case}/final",
             f"run/{case}/attempts", f"run/{case}/benchmark",
             f"output/{case}/station", f"output/{case}/condensed", f"analysis/{case}",
@@ -101,13 +114,13 @@ def project_layout(root: Path, mode: str = "barotropic_tide") -> list[Path]:
 
 
 def init_project(request_path: Path, project: Path) -> dict[str, Any]:
-    req = load_data(request_path)
+    req = resolve_request(load_data(request_path))
     validate_request(req)
     request_copy = project / "request.json"
     if request_copy.exists() and json.loads(request_copy.read_text(encoding="utf-8")) != req:
         raise FileExistsError("project already contains a different request.json")
     project.mkdir(parents=True, exist_ok=True)
-    for p in project_layout(project, req["mode"]):
+    for p in project_layout(project, req["mode"], req["grid_policy"]):
         p.mkdir(parents=True, exist_ok=True)
     write_json(request_copy, req)
     manifest = {
@@ -117,9 +130,10 @@ def init_project(request_path: Path, project: Path) -> dict[str, Any]:
         "request": "request.json",
         "request_sha256": sha256(request_copy),
         "local_root": str(project.resolve()),
-        "kestrel_root": f"/scratch/yhuang168/FVCOM_Simulation/{req['case_id']}",
-        "grid_order": ["accepted_t6v6", "fresh_reproduction"],
+        "kestrel_root": req.get("kestrel", {}).get("project_dir") or f"/scratch/yhuang168/FVCOM_Simulation/{req['case_id']}",
+        "grid_order": grid_order(req["grid_policy"]),
         "immutable_attempts": True,
+        **({"profile": req["profile"]} if req.get("profile") else {}),
     }
     if req["mode"] == "barotropic_tide":
         manifest["agent_layout"] = {
@@ -516,13 +530,14 @@ def attempt_sbatch(args: argparse.Namespace, aid: str, stage: str | None) -> str
         raise ValueError("unsupported CPU binding")
     bind_option = f" --cpu-bind={cpu_bind}" if cpu_bind else ""
     exclusive_directive = "#SBATCH --exclusive\n" if getattr(args, "exclusive", False) else ""
+    partition_directive = "" if args.partition == "auto" else f"#SBATCH --partition={args.partition}\n"
+    per_node = "#SBATCH --ntasks-per-node=104\n" if getattr(args, "paper_stage", None) == "production" else ""
     return f"""#!/bin/bash
 #SBATCH --job-name={args.grid_case}_{aid}{suffix}
 #SBATCH --account={args.account}
-#SBATCH --partition={args.partition}
-#SBATCH --nodes={int(args.nodes)}
+{partition_directive}#SBATCH --nodes={int(args.nodes)}
 #SBATCH --ntasks={int(args.ranks)}
-{exclusive_directive}#SBATCH --time={args.walltime}
+{per_node}{exclusive_directive}#SBATCH --time={args.walltime}
 #SBATCH --output=stdout.log
 #SBATCH --error=stderr.log
 set -euo pipefail
@@ -534,9 +549,47 @@ srun{bind_option} --ntasks={int(args.ranks)} {args.remote_executable} --casename
 
 def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
     project = Path(args.project)
-    plan_path = Path(args.plan)
-    plan = json.loads(plan_path.read_text(encoding="utf-8"))
-    attempt = plan["attempts"][args.index]
+    request_path = project / "request.json"
+    request = resolve_request(load_data(request_path)) if request_path.exists() else {}
+    paper_stage = getattr(args, "paper_stage", None)
+    if request.get("profile") == PAPER_PROFILE:
+        if paper_stage not in {"smoke", "production"} or not 0 <= args.index < 3:
+            raise ValueError("paper_barotropic requires --paper-stage smoke|production and index 0, 1 or 2 (three total attempts per stage)")
+        if args.grid_case != "fresh_reproduction" or getattr(args, "stage_namelist", None):
+            raise ValueError("paper_barotropic uses fresh-only single-stage attempts")
+        if args.plan or not getattr(args, "controls", None):
+            raise ValueError("paper_barotropic requires --controls, not the exhaustive --plan")
+        if getattr(args, "revision", 0):
+            raise ValueError("paper_barotropic uses one immutable package per attempt; correct preflight before materializing")
+        if paper_stage == "smoke" and not (args.nodes == 1 and 1 <= args.ranks <= 104):
+            raise ValueError("paper smoke requires one CPU node and 1..104 ranks")
+        if paper_stage == "production" and (args.nodes, args.ranks) != (2, 208):
+            raise ValueError("paper production requires two nodes and 208 ranks")
+        if paper_stage == "smoke" and args.partition not in {"debug", "shared"}:
+            raise ValueError("paper smoke must use debug or shared")
+        if paper_stage == "production" and args.partition in {"debug", "shared", "sharedl"}:
+            raise ValueError("paper production requires an eligible exclusive CPU partition")
+        if paper_stage == "production":
+            args.exclusive = True
+            args.cpu_bind = "cores"
+        plan_path = Path(args.controls)
+        controls = load_data(plan_path)
+        step, split = float(controls["extstep_seconds"]), int(controls["isplit"])
+        if isinstance(controls["isplit"], bool) or float(controls["isplit"]) != split or not math.isclose(step * 10, round(step * 10), abs_tol=1e-7):
+            raise ValueError("controls require integer ISPLIT and an external step on the 0.1-second grid")
+        if not math.isfinite(step) or step <= 0 or split < 1 or not math.isclose(360 / (step * split), round(360 / (step * split)), abs_tol=1e-7):
+            raise ValueError("paper controls must be positive and align to six-minute cadence")
+        attempt = {"index": args.index, "attempt_id": f"attempt_{paper_stage}_{args.index:04d}",
+                   "extstep_seconds": step, "isplit": split,
+                   "sponge_radius_multiplier": 1.0, "sponge_coefficient_multiplier": 1.0}
+    else:
+        if paper_stage or getattr(args, "controls", None):
+            raise ValueError("--paper-stage/--controls require a paper_barotropic project")
+        if not args.plan:
+            raise ValueError("ordinary attempts require --plan")
+        plan_path = Path(args.plan)
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        attempt = plan["attempts"][args.index]
     strategy_attempt_id = attempt["attempt_id"]
     revision = int(getattr(args, "revision", 0))
     if revision < 0:
@@ -551,6 +604,12 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
     if len(sponge_sources) != 1:
         raise ValueError(f"base input must contain exactly one *_spg.dat; found {len(sponge_sources)}")
     nml_sources = attempt_namelist_sources(args)
+    if paper_stage:
+        from audit_fvcom_production import parse_namelist
+        nml = parse_namelist(nml_sources[None])
+        expected_end = "2025-03-30 00:00:00" if paper_stage == "smoke" else "2025-04-15 00:00:00"
+        if nml.get("START_DATE") != "2025-03-29 00:00:00" or nml.get("END_DATE") != expected_end or nml.get("STARTUP_TYPE", "").lower() != "coldstart":
+            raise ValueError("paper attempt must use the profile's cold-start stage dates")
     staged = None not in nml_sources
     attempt_input_reference = (
         f"../../../../../input/{args.grid_case}/attempts/{aid}" if staged
@@ -609,6 +668,8 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
                              "exclusive": bool(getattr(args, "exclusive", False))},
         "attempt_sponge_sha256": sha256(attempt_spg),
         "plan_sha256": sha256(plan_path), "status": "prepared",
+        **({"profile": PAPER_PROFILE, "paper_stage": paper_stage, "stage_attempt": args.index + 1,
+            "stage_attempt_limit": 3, "controls_sha256": sha256(plan_path)} if paper_stage else {}),
     }
     if staged:
         manifest["stages"] = {stage: stage_manifests[stage] for stage in ("smoke", "canary", "spinup")}
@@ -851,7 +912,9 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--controls", required=True); q.add_argument("--output", required=True)
     q = sub.add_parser("attempt")
     q.add_argument("--project", required=True); q.add_argument("--grid-case", required=True, choices=["accepted_t6v6", "fresh_reproduction"])
-    q.add_argument("--plan", required=True); q.add_argument("--index", type=int, required=True)
+    q.add_argument("--plan"); q.add_argument("--index", type=int, required=True)
+    q.add_argument("--controls", help="Diagnosed controls for one paper_barotropic attempt")
+    q.add_argument("--paper-stage", choices=["smoke", "production"])
     q.add_argument("--base-input", required=True); q.add_argument("--base-namelist")
     q.add_argument("--stage-namelist", action="append", default=[])
     q.add_argument("--revision", type=int, default=0)

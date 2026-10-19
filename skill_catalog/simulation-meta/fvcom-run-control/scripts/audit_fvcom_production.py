@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -191,8 +192,8 @@ def main() -> int:
                         help="Actual frozen startup restart; otherwise resolve INPUT_DIR/STARTUP_FILE")
     parser.add_argument("--station-mapping", required=True)
     parser.add_argument("--lineage", required=True)
-    parser.add_argument("--expected-station-records", type=int, default=7201)
-    parser.add_argument("--expected-full-grid-records", type=int, default=241)
+    parser.add_argument("--expected-station-records", type=int, help="Optional expected count; otherwise derive from the namelist period and cadence")
+    parser.add_argument("--expected-full-grid-records", type=int, help="Optional expected count; otherwise derive from the namelist period and cadence")
     parser.add_argument("--station-interval-seconds", type=float, default=360)
     parser.add_argument("--full-grid-interval-seconds", type=float, default=10800)
     parser.add_argument("--output", required=True)
@@ -208,6 +209,13 @@ def main() -> int:
     start, end = parse_utc(values["START_DATE"]), parse_utc(values["END_DATE"])
     extstep, isplit = float(values["EXTSTEP_SECONDS"]), int(values["ISPLIT"])
     internal_step = extstep * isplit
+    for attribute, cadence in (("expected_station_records", args.station_interval_seconds),
+                               ("expected_full_grid_records", args.full_grid_interval_seconds)):
+        intervals = (end - start).total_seconds() / cadence if cadence > 0 else -1
+        if intervals <= 0 or not math.isclose(intervals, round(intervals), abs_tol=1e-7):
+            raise ValueError("production duration must be a positive multiple of output cadence")
+        if getattr(args, attribute) is None:
+            setattr(args, attribute, int(round(intervals)) + 1)
     stdout, stderr = stdout_path.read_text(encoding="utf-8", errors="replace"), stderr_path.read_text(encoding="utf-8", errors="replace")
     problems = []
     if args.exit_code != 0:

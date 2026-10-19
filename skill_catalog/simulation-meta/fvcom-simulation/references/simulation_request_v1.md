@@ -3,9 +3,10 @@
 ```yaml
 schema: simulation_request_v1
 mode: barotropic_tide | benchmark
+profile: paper_barotropic # optional; omit for the ordinary workflow
 case_id: string
 project_dir: optional absolute or workspace-relative path
-grid_policy: accepted_then_fresh
+grid_policy: accepted_then_fresh | fresh_only
 period:
   analysis_start: optional UTC timestamp
   analysis_end: optional UTC timestamp
@@ -80,3 +81,16 @@ The scientific product layout remains:
 ```
 
 Project and worker manifests contain relative artifact paths when inside the project, UTC timestamps, SHA-256 for immutable inputs/outputs, code and source lineage, warnings, blocking reasons, and resume tokens. They never contain credentials.
+
+## Paper profile
+
+`profile: paper_barotropic` selects the [paper workflow](paper_barotropic.md).
+Run Control resolves the fixed dates, fresh-only grid, physics, stage limits and
+production layout into `request.json` before initialization. Explicit conflicts
+fail validation; omission of the profile preserves ordinary defaults. No version
+suffix is part of the profile name. Record the installed skill commit separately.
+Supply `kestrel.project_dir` for the assigned remote root and `source_dir` for its
+project-owned source copy. After native environment discovery, record
+`kestrel.build_environment` with `os`, `compiler`, `compiler_options`, `modules`
+and an RH8 `fallback_reason` when applicable. Complete this preparation before
+freezing the request. Authentication/discovery does not launch a model run.
