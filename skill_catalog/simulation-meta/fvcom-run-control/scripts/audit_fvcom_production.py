@@ -140,8 +140,11 @@ TURBULENCE_FIELDS = ["viscofm", "viscofh", "km", "kh", "kq", "q2", "q2l", "l"]
 # SETUP_RSTFILE always adds RESTART_EXTRAS_FILE_OBJECT and DENSITY_FILE_OBJECT,
 # irrespective of optional station/full-grid flags or inactive tracers.
 RESTART_EXTRA_FIELDS = ["et", "rho1", "rmean1", "tmean1", "smean1", "cor", "cc_sponge"]
+# FVCOM 4.3.1 WET_DRY_FILE_OBJECT and the matching restart reader use these
+# five masks. inundation_cells is an optional extension, checked if present
+# through PHYSICAL_FIELDS; it is not part of the native restart contract.
 WET_RESTART_FIELDS = ["wet_nodes", "wet_cells", "wet_nodes_prev_int",
-                      "wet_cells_prev_int", "wet_cells_prev_ext", "inundation_cells"]
+                      "wet_cells_prev_int", "wet_cells_prev_ext"]
 
 
 def required_fields(values: dict[str, str], kind: str) -> list[str]:
@@ -178,7 +181,7 @@ def restart_field_dimensions(values: dict[str, str]) -> dict[str, tuple[str, ...
         ("time",): ["iint"],
         ("time", "node"): ["zeta", "et", "wet_nodes", "wet_nodes_prev_int"],
         ("time", "nele"): ["ua", "va", "tauc", "wet_cells", "wet_cells_prev_int",
-                            "wet_cells_prev_ext", "inundation_cells"],
+                            "wet_cells_prev_ext"],
         ("time", "siglay", "nele"): ["u", "v", "ww", "viscofm"],
         ("time", "siglay", "node"): ["temp", "salinity", "viscofh", "rho1"],
         ("time", "siglev", "node"): ["omega", "km", "kh", "kq", "q2", "q2l", "l"],
@@ -194,7 +197,8 @@ def restart_state_audit(paths: list[Path], values: dict[str, str]) -> list[dict[
     """Require conditional restart fields, native dimensions, and finite state.
 
     This gate complements exact clocks and grid/input-identity audits; it does
-    not replace them. Inundation state is not a binary wet-mask predicate.
+    not replace them. Optional inundation_cells is checked for finite unmasked
+    values when present, without imposing a binary wet-mask predicate.
     """
     dimensions = restart_field_dimensions(values)
     return nc_audit(paths, list(dimensions), expected_dimensions=dimensions)
