@@ -24,11 +24,15 @@ EXCLUDED_NAMES = {
     "__pycache__",
     "commands",
     "results",
+    "inflight",
+    "progress",
     "bridge_sessions",
 }
 EXCLUDED_FILES = {
     "bridge_identity.json",
     "bridge_status.txt",
+    "bridge_status.json",
+    "bridge.lock",
 }
 
 
