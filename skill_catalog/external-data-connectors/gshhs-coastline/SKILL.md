@@ -28,7 +28,7 @@ Read `references/gshhg_sources.md` before changing source URLs, resolution polic
 python scripts/estimate_data_request.py --request request.json --run-dir runs/case --output runs/case/download_estimate.json
 ```
 
-3. Prefer local cache. The skill searches:
+3. An explicit `--cache-dir` restricts discovery and acquisition to that directory; a missing explicit cache is downloaded there and never falls back outside it. When no cache is supplied, the legacy discovery order is:
 - the requested `--cache-dir`;
 - `Workspace/Preprocessing/fvcom-gshhs-coastline/cache/gshhg`;
 - legacy cache `Workspace/Preprocessing/fvcom-cusp-coastline/cache/gshhg`.

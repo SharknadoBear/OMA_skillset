@@ -667,7 +667,10 @@ def finalize(
         raise ValueError("unsupported open-exterior contract")
     assessed_hash = sha256_file(contract_path)
     role_pass = True
-    if schema == "fvcom_open_exterior_contract_v2":
+    role_assignment_enabled = contract.get("residual_boundary_policy", {}).get("role_assignment_enabled", True)
+    if schema == "fvcom_open_exterior_contract_v2" and not role_assignment_enabled and residual_roles:
+        raise ValueError("Residual role assignment is not applicable to this noncoastal contract")
+    if schema == "fvcom_open_exterior_contract_v2" and role_assignment_enabled:
         if decision == "pass":
             _verify_component_maps(contract)
         role_pass = _apply_residual_roles(

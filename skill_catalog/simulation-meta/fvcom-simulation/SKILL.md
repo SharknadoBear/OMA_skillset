@@ -35,7 +35,7 @@ Default new projects to `Workspace/fvcom-simulation/<case_id>` and their Kestrel
 1. Parse the prompt as `simulation_request_v1`. Preserve explicit dates, benchmark policy, and settings. For the April 2025 tide experiment use 2025-04-01 through 2025-05-01 UTC for analysis, seven spin-up days beginning 2025-03-25, 20 C, 30 PSU, ten uniform sigma levels (nine layers), all TPXO constituents, and the requested NOAA station mapping policy. An explicit `observations.water_level_mapping_policy` overrides the legacy inside-only station policy for water levels only.
 2. Invoke `$fvcom-run-control` to initialize the project, provenance ledger, `project_status.json`, `commands.jsonl`, and `report.html`. For a new barotropic project it also creates the four fixed role folders and records their relative paths in `project_manifest.json`.
 3. Ask the human only for secure Password+OTP entry after `$kestrel-hpc` displays its credential window. Never receive a password or OTP in chat or write it to an artifact.
-4. Preserve accepted inputs. Hash and freeze an accepted mesh package before creating project-owned copies or derivatives.
+4. Honor the request's grid policy. With `fresh_only`, generate a new grid and do not inspect or import accepted mesh packages. Otherwise preserve, hash and freeze accepted inputs before creating project-owned copies or derivatives.
 
 ## Three Initial Preparation Roles
 
@@ -53,7 +53,7 @@ For barotropic projects, pass each role its assigned `agents/` workspace and can
 
 Wait for all three manifests. Advance only when each is `ready`, hashes are present, resume tokens are unique, the executable is frozen, the grid delivery is benchmark-ready, and its `fvcom_tge_boundary_junction_gate.passed` value is true. After the build and grid workers join, invoke `$fvcom-grid-generation`'s `audit_fvcom_tge_topology.py` against the delivered 2DM and the exact frozen-tree `tge.F`; require both the reproduced cell-sum decision and source-pattern/SHA binding to pass. This second, source-bound join gate is mandatory even when an earlier algorithm-only grid audit passed. A registered-data or authentication requirement is `waiting_user`, not a scientific failure.
 
-For each grid case in `accepted_t6v6`, then `fresh_reproduction` order:
+For each grid case in the initialized manifest's `grid_order` (`fresh_reproduction` only for `fresh_only`; otherwise `accepted_t6v6`, then `fresh_reproduction`):
 
 1. Invoke `$fvcom-preconfiguration` with the complete grid-delivery contract and the passing source-bound TGE junction audit. Require metric `_grd.dat`, positive-down depth, per-node geodetic latitude in `_cor.dat`, exact plural-OBC identity/order, ten uniform sigma levels (nine layers), and a hash-bound manifest. Its independent TGE/source check must agree cell-for-cell with the Grid gate.
 2. Return the exact OBC nodes to the TPXO worker. Invoke `$fvcom-tpxo-tides` to create the monotonic six-minute UTC elevation forcing for the complete run window. Require all discovered constituents; Galveston expects 22 and a different count blocks until explained.
@@ -73,6 +73,8 @@ Before freezing controls, align the internal step to all requested stage/output/
 
 Run, one job at a time through `$kestrel-hpc`: input smoke, three-day canary including the full ramp, and seven-day spin-up. An attempt is stable only when `srun` succeeds, the debug log reaches `TADA!`, the requested final timestamp exists, and required NetCDF/restart files are readable.
 
+Use `$kestrel-hpc`'s bounded read-only reconciliation when a terminal job has disappeared from the active queue and an ID query reports `Invalid job id specified`. This is within the authorized audit and needs no separate approval. Preserve the consumed check and original evidence, allow only the claimed reconciliation, and keep holds for active, ambiguous, conflicting or otherwise failed queries. Do not create a replacement schedule or relax the scientific gates. Adopt any authorization/evidence contract revision explicitly, preserving frozen stage code and cumulative repair limits.
+
 On failure, let `$fvcom-run-control` create immutable attempts using only:
 
 1. external-step multipliers 0.75, 0.50, 0.25;
@@ -88,6 +90,8 @@ Update root `report.html` after every attempt. Never tune validation metrics, ch
 After a stable spin-up, invoke `$fvcom-benchmark` and `$kestrel-hpc` for sequential, identical 24-hour restart segments at ranks `1,2,4,8,13,26,52,104,156,208,312,416` on 104-core CPU nodes. Extend by 104 ranks while performance improves until two successive layouts are slower. Repeat the Pareto neighborhood three times. Report fastest, least-node-hour, and Pareto-knee layouts; use the knee for the 30-day run unless the request chooses another objective.
 
 An explicit request overrides that exploratory default. For a focused campaign, record ranks, repeats, maximum rank, extension policy, and production objective in the request and benchmark plan; pass that plan to analysis. Without a serial benchmark, use the lowest successfully measured rank as the speedup/efficiency reference. Do not infer a serial time. Treat high-rank compatibility probes separately from performance records: independently test each requested rank, record actual compute-environment `MPI_TAG_UB`, and promote only successful probes to full 24-hour benchmarks. One failed probe must not hold other requested probes or valid production layouts. Communication failures do not authorize changes to a frozen model source or MPI environment.
+
+If the explicit benchmark policy prohibits additional probes, that restriction also overrides the compatibility-probe default. Execute only the requested 24-hour layouts and replicate count; record any compatibility failure from those runs without adding a separate probe or extending the rank list.
 
 Before monthly completion invoke `$fvcom-run-control`'s production audit with the frozen startup restart and input file map. Require exact startup-anchored IINT coverage, independent full-grid/restart clocks, required finite unmasked 3-D restart state, expected cadence/count, and rule version `startup_anchor_exact_clock_3d_v1`. Then invoke `$fvcom-tidal-validation`'s regional runner on retrieved station outputs and exact case manifests. Compare model elevation primarily with NOAA GMT/MSL astronomical predictions; retain available total observations as non-scoring diagnostics. Use each reference's exact common timestamps and disclose its mean offset, without implying a datum conversion. For prediction-only stations, preserve explicit requested-period observation-absence evidence in the eligible inventory and follow the owning validation gate; missing diagnostic observations do not erase valid predictions or permit fabricated data. Compare `ua/va` only with vertically weighted downward-looking all-bin profiles. Force all constituents but interpret only one-month-resolvable harmonics.
 

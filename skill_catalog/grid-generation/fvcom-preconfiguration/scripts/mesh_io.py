@@ -188,11 +188,15 @@ def estimate_sponge(
     default_coeff: float = 0.0025,
     radius_scale: float = 3.0,
     xy_by_node: dict[int, tuple[float, float]] | None = None,
+    cyclic: bool = False,
 ) -> dict[str, float | int]:
     nodestring = mesh.nodestrings.get(nodestring_id)
     if nodestring is None:
         raise ValueError(f"Nodestring {nodestring_id} not found. Available: {sorted(mesh.nodestrings)}")
-    lengths = edge_lengths_for_nodes(mesh, nodestring.nodes, xy_by_node=xy_by_node)
+    nodes = list(nodestring.nodes)
+    pairs = _boundary_node_pairs(nodes, cyclic=cyclic)
+    lengths = edge_lengths_for_nodes(mesh, nodes + nodes[:1] if cyclic else nodes, xy_by_node=xy_by_node)
+    assert len(lengths) == len(pairs)
     if not lengths:
         raise ValueError(f"Nodestring {nodestring_id} needs at least two nodes for sponge estimation")
     if not math.isfinite(radius_scale) or radius_scale <= 0:
@@ -209,6 +213,7 @@ def estimate_sponge(
         "sponge_radius_m": radius,
         "sponge_radius_scale": radius_scale,
         "sponge_coefficient": float(default_coeff),
+        **({"cyclic": True} if cyclic else {}),
     }
 
 
@@ -318,35 +323,47 @@ def _utm_definition(crs: str) -> tuple[int, bool] | None:
 
 
 def projected_xy_values(
-    mesh: Mesh2DM, source_crs: str, target_crs: str
+    mesh: Mesh2DM, source_crs: str, target_crs: str,
+    provenance: dict[str, object] | None = None,
 ) -> dict[int, tuple[float, float]]:
     source_key = source_crs.strip().upper().replace(" ", "")
     target_key = target_crs.strip().upper().replace(" ", "")
+    report: dict[str, object] = {"source_crs": source_crs, "target_crs": target_crs}
     if source_key == target_key:
         values = {node.id: (node.x, node.y) for node in mesh.sorted_nodes}
+        report["backend"] = "identity"
     else:
-        target_utm = _utm_definition(target_crs)
-        if source_key in {"EPSG:4326", "EPSG:4269"} and target_utm:
+        try:
+            import pyproj  # type: ignore
+        except ImportError as exc:
+            target_utm = _utm_definition(target_crs)
+            if source_key not in {"EPSG:4326", "EPSG:4269"} or target_utm is None:
+                raise ValueError(
+                    f"Transform {source_crs!r} to {target_crs!r} requires pyproj"
+                ) from exc
             zone, northern = target_utm
             values = {
                 node.id: _utm_xy(node.x, node.y, zone, northern)
                 for node in mesh.sorted_nodes
             }
+            report.update({
+                "backend": "legacy_wgs84_utm_series",
+                "fallback_reason": "pyproj_unavailable",
+                "accuracy_certification": "requires_independent_delivery_audit",
+            })
         else:
-            try:
-                from pyproj import Transformer  # type: ignore
-            except ImportError as exc:
-                raise ValueError(
-                    f"Transform {source_crs!r} to {target_crs!r} requires pyproj"
-                ) from exc
-            transformer = Transformer.from_crs(source_crs, target_crs, always_xy=True)
+            transformer = pyproj.Transformer.from_crs(source_crs, target_crs, always_xy=True)
             values = {
                 node.id: tuple(map(float, transformer.transform(node.x, node.y)))
                 for node in mesh.sorted_nodes
             }
+            report.update({"backend": "pyproj", "pyproj_version": pyproj.__version__,
+                           "always_xy": True})
     for node_id, (x, y) in values.items():
         if not math.isfinite(x) or not math.isfinite(y):
             raise ValueError(f"Nonfinite projected coordinate for node {node_id}")
+    if provenance is not None:
+        provenance.update(report)
     return values
 
 
@@ -424,6 +441,20 @@ def ordered_nodes_sha256(node_ids: Iterable[int]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _boundary_node_pairs(node_ids: list[int], cyclic: bool = False) -> list[tuple[int, int]]:
+    """Return each declared edge once without changing source node order."""
+    if type(cyclic) is not bool:
+        raise ValueError("Open-boundary cyclic must be a boolean")
+    if len(node_ids) < (3 if cyclic else 2):
+        raise ValueError("Open boundary needs at least three nodes when cyclic, otherwise two")
+    if cyclic and len(set(node_ids)) != len(node_ids):
+        raise ValueError("Cyclic open boundary must contain unique nodes without repeated closure")
+    pairs = list(zip(node_ids[:-1], node_ids[1:]))
+    if cyclic:
+        pairs.append((node_ids[-1], node_ids[0]))
+    return pairs
+
+
 def audit_open_boundary_topology(
     mesh: Mesh2DM,
     open_boundaries: Iterable[dict[str, object]],
@@ -448,7 +479,7 @@ def audit_open_boundary_topology(
         node_ids = [int(value) for value in boundary["node_ids"]]  # type: ignore[index]
         if len(node_ids) < 2:
             raise ValueError(f"Open boundary {obc_id} must contain at least two nodes")
-        for left, right in zip(node_ids[:-1], node_ids[1:]):
+        for left, right in _boundary_node_pairs(node_ids, cyclic=boundary.get("cyclic", False)):
             edge = tuple(sorted((left, right)))
             prior = open_edge_owner.get(edge)
             if prior is not None:
@@ -645,6 +676,7 @@ def write_fvcom_dat(
                 "obc_type_code": obc_type_code(str(supplied.get("obc_type", obc_type))),
                 "flat_start_index_1based": len(all_open_nodes) - len(actual_nodes) + 1,
                 "flat_end_index_1based": len(all_open_nodes),
+                **({"cyclic": supplied["cyclic"]} if "cyclic" in supplied else {}),
             }
         )
 
@@ -675,10 +707,11 @@ def write_fvcom_dat(
             raise ValueError(f"Nodestring {river_id} cannot be both an OBC and a river exclusion")
 
     depths = mesh.depths(mode=depth_mode, constant_depth=constant_depth)
+    coordinate_transform: dict[str, object] = {"backend": "mesh_native_unspecified_metric"}
     if source_crs == "mesh_native_unspecified_metric":
         metric_xy = {node.id: (node.x, node.y) for node in mesh.sorted_nodes}
     else:
-        metric_xy = projected_xy_values(mesh, source_crs, target_crs)
+        metric_xy = projected_xy_values(mesh, source_crs, target_crs, provenance=coordinate_transform)
     cor = coriolis_values(
         mesh, coriolis_mode, latitude_deg=latitude_deg, source_crs=source_crs
     )
@@ -720,6 +753,7 @@ def write_fvcom_dat(
             default_coeff=sponge_coeff,
             radius_scale=sponge_radius_scale,
             xy_by_node=metric_xy,
+            cyclic=boundary.get("cyclic", False),
         )
         if sponge_mode.lower() == "estimate":
             radius = float(estimate["sponge_radius_m"])
@@ -843,6 +877,7 @@ def write_fvcom_dat(
         "latitude_deg": latitude_deg,
         "mesh_coordinate_crs": source_crs,
         "output_grid_crs": target_crs,
+        "coordinate_transform": coordinate_transform,
         "horizontal_units": "m",
         "coriolis_latitude_min_deg": min(cor.values()),
         "coriolis_latitude_max_deg": max(cor.values()),

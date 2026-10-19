@@ -21,7 +21,12 @@ END = dt.datetime(2024, 6, 4, tzinfo=dt.timezone.utc)
 MJD_EPOCH = dt.datetime(1858, 11, 17, tzinfo=dt.timezone.utc)
 STARTUP_IINT = 1500
 RESTART_FIELDS = ("zeta", "ua", "va", "u", "v", "tauc", "ww", "omega", "temp", "salinity",
-                  "viscofm", "viscofh", "km", "kh", "kq", "q2", "q2l", "l")
+                  "viscofm", "viscofh", "km", "kh", "kq", "q2", "q2l", "l",
+                  "et", "rho1", "rmean1", "tmean1", "smean1", "cor", "cc_sponge",
+                  "obc_nodes", "obc_type", "wet_nodes", "wet_cells", "wet_nodes_prev_int",
+                  "wet_cells_prev_int", "wet_cells_prev_ext", "inundation_cells")
+INTEGER_RESTART_FIELDS = {"obc_nodes", "obc_type", "wet_nodes", "wet_cells", "wet_nodes_prev_int",
+                          "wet_cells_prev_int", "wet_cells_prev_ext", "inundation_cells"}
 
 
 def sha256(path: Path) -> str:
@@ -54,22 +59,28 @@ def clock(ds: nc.Dataset, times: list[dt.datetime]) -> None:
 
 def state_file(path: Path, steps, times: list[dt.datetime], *, complete: bool) -> None:
     with nc.Dataset(path, "w") as ds:
-        for name, size in (("time", len(times)), ("node", 3), ("nele", 3), ("siglay", 9), ("siglev", 10)):
+        for name, size in (("time", len(times)), ("node", 3), ("nele", 3), ("siglay", 9), ("siglev", 10), ("nobc", 1)):
             ds.createDimension(name, size)
         ds.createVariable("iint", "i4", ("time",))[:] = steps
         clock(ds, times)
         for name in RESTART_FIELDS if complete else ("zeta", "ua", "va"):
-            if name == "zeta":
+            if name in {"obc_nodes", "obc_type"}:
+                dimensions = ("nobc",)
+            elif name in {"cor", "cc_sponge"}:
+                dimensions = ("nele",)
+            elif name in {"rmean1", "tmean1", "smean1"}:
+                dimensions = ("siglay", "node")
+            elif name in {"zeta", "et", "wet_nodes", "wet_nodes_prev_int"}:
                 dimensions = ("time", "node")
-            elif name in {"ua", "va", "tauc"}:
+            elif name in {"ua", "va", "tauc", "wet_cells", "wet_cells_prev_int", "wet_cells_prev_ext", "inundation_cells"}:
                 dimensions = ("time", "nele")
-            elif name in {"u", "v", "ww"}:
+            elif name in {"u", "v", "ww", "viscofm"}:
                 dimensions = ("time", "siglay", "nele")
-            elif name in {"temp", "salinity", "viscofm", "viscofh"}:
+            elif name in {"temp", "salinity", "viscofh", "rho1"}:
                 dimensions = ("time", "siglay", "node")
             else:
                 dimensions = ("time", "siglev", "node")
-            ds.createVariable(name, "f4", dimensions, fill_value=-9999)[:] = (
+            ds.createVariable(name, "i4" if name in INTEGER_RESTART_FIELDS else "f4", dimensions, fill_value=-9999)[:] = (
                 20 if name == "temp" else 30 if name == "salinity" else 1)
 
 
@@ -117,6 +128,7 @@ def fixture(project: Path, mixed: bool, runner, audit_script: Path, skill_dir: P
     nml.write_text("START_DATE='2024-06-01 00:00:00',\nEND_DATE='2024-06-04 00:00:00',\n"
                    "EXTSTEP_SECONDS=1.2,\nISPLIT=4,\nSTARTUP_TYPE='hotstart',\n"
                    "STARTUP_FILE='startup.nc',\n"
+                   "OBC_ON=.true.,\nWETTING_DRYING_ON=.true.,\n"
                    f"INPUT_DIR='{inputs.as_posix()}',\nOBC_ELEVATION_FILE='region_tide.nc',\n"
                    "NC_VELOCITY=.false.,\nNC_VERTICAL_VEL=.false.,\nNC_SALT_TEMP=.false.,\n"
                    "NC_TURBULENCE=.false.,\nOUT_VELOCITY_3D=.false.,\nOUT_SALT_TEMP=.false.,\n",

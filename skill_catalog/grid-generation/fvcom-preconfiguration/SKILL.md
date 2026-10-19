@@ -14,6 +14,11 @@ namelist finalization, or model execution.
   counts, projected CRS/units, and every OBC node-order hash before writing.
 - Keep `_dep.dat` and `_grd.dat` depths positive down. For 2DM meshes with
   negative bed elevations, use the default `--depth-mode auto`.
+- Use the installed `pyproj` engine with `always_xy=True` for coordinate
+  transforms and record its version in the DAT manifest. Identical CRSs retain
+  the serialized coordinates. When `pyproj` is unavailable, the legacy UTM
+  series fallback is disclosed and still requires the independent delivery
+  coordinate audit; transform errors never activate a fallback.
 - Treat `_cor.dat` values as latitude degrees for geophysical meter grids;
   FVCOM converts them to physical Coriolis internally. Contract mode derives
   every latitude from the declared CRS. EPSG:326xx/327xx works without an
@@ -22,6 +27,10 @@ namelist finalization, or model execution.
 - Preserve each OBC chain independently in the manifest and flatten chains
   into `_obc.dat` only in contract order. Never sort, reverse, concatenate
   away chain identity, or allow nodes to overlap between OBCs.
+- Preserve an explicitly declared boolean `cyclic` in each OBC manifest row.
+  A cyclic chain has at least three unique nodes, omits a repeated first node,
+  and includes its last-to-first edge exactly once in exterior topology and
+  median-edge sponge audits. An absent `cyclic` retains legacy open-chain behavior.
 - Audit boundary-cell topology before writing DAT files using FVCOM 4.3.1's
   exact `TGE.F` node-flag sequence: mark exterior nodes `ISONB=1`, overwrite
   OBC nodes with `ISONB=2`, accept an open cell when its three-node sum equals

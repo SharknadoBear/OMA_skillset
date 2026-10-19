@@ -41,6 +41,8 @@ benchmark: # optional explicit override of the exploratory default
 
 Dates must be UTC and analysis end is exclusive. Defaults for an unspecified Galveston test are analysis `[2025-04-01T00:00:00Z, 2025-05-01T00:00:00Z)`, seven spin-up days, a forcing start of `2025-03-25T00:00:00Z`, and six-minute forcing/station cadence.
 
+`fresh_only` starts from a new grid and initializes only `fresh_reproduction` scientific branches. It never imports accepted inputs. `accepted_then_fresh` retains the legacy two-case order. The manifest's `grid_order` is authoritative for stage iteration. `forcing/shared_source` means source shared by roles within this project, not between independent projects.
+
 Default new projects to `Workspace/fvcom-simulation/<case_id>`. Explicit and historical roots remain valid. `physics.sigma_layers` is a legacy alias for the number of sigma levels; when both aliases are provided they must agree. Do not change the physical vertical grid during a terminology migration.
 
 ## Internal project layout

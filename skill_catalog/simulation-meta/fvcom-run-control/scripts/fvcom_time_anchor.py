@@ -131,14 +131,21 @@ def anchored_times(steps: np.ndarray, anchor: dict[str, Any], internal_step: flo
     return [start + dt.timedelta(microseconds=(int(step) - origin) * int(round(micros))) for step in steps]
 
 
-def check_file_clock(ds: Any, expected: list[dt.datetime], *, require_exact: bool = False) -> dict[str, Any]:
+def check_file_clock(ds: Any, expected: list[dt.datetime], *, require_exact: bool = False,
+                     require_native_time: bool = False) -> dict[str, Any]:
     present = any(name in ds.variables for name in ("Times", "Itime", "Itime2"))
+    if require_native_time and "time" not in ds.variables:
+        raise ValueError("native FVCOM station clock is missing time")
+    if not require_exact and not present and "time" not in ds.variables:
+        raise ValueError("NetCDF has no native clock; IINT alone is insufficient")
     if require_exact or present:
         if exact_clock(ds) != expected:
             raise ValueError("exact NetCDF clock disagrees with startup-anchored iint")
     diagnostic = {"exact_clock_verified": bool(require_exact or present)}
     if "time" in ds.variables:
         var = ds["time"]
+        if require_native_time and var.dimensions != ("time",):
+            raise ValueError("native FVCOM station time must have dimension (time,)")
         raw = finite_array(var)
         if raw.shape != (len(expected),):
             raise ValueError("floating time has the wrong shape")
@@ -153,7 +160,17 @@ def check_file_clock(ds: Any, expected: list[dt.datetime], *, require_exact: boo
         if np.any(error > tolerance):
             raise ValueError("floating NetCDF time disagrees with anchored UTC beyond its precision")
         diagnostic["maximum_float_time_error_seconds"] = float(np.max(error) * 86400)
+        diagnostic["native_time_verified"] = True
     return diagnostic
+
+
+def check_station_clock(ds: Any, expected: list[dt.datetime]) -> dict[str, Any]:
+    """Check the native station time against externally anchored IINT dates.
+
+    Frozen station output always writes time. Exact clocks, when present, must
+    also agree; float32 MJD retains its unavoidable half-ULP tolerance.
+    """
+    return check_file_clock(ds, expected, require_native_time=True)
 
 
 def audit_restart(path: Path, anchor: dict[str, Any], internal_step: float, end: dt.datetime) -> dict[str, Any]:

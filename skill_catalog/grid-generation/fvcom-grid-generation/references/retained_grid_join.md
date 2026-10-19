@@ -42,6 +42,24 @@ ID and the terminal nodestring, ordered nodes and cyclicity agree. Cyclic chains
 cannot be trimmed. Noncyclic trims are restricted to endpoint(s), must reproduce
 the original sum-five TGE failure, and must pass the complete corrected audit.
 
+An explicitly selected `--endpoint-fan-max-steps N` correction may additionally
+return a multi-node contiguous endpoint trim. The terminal contract must bind
+`source_delivery.endpoint_fan_max_steps` and the complete hash-bound
+`delivery_artifacts.endpoint_fan_trace`. The trace names the source mesh and
+TGE hashes, planner hash, all original chains and cyclicity, the uniquely
+anchored original fatal components, every current-endpoint demotion, and each
+before/after source-audit and ordered-chain digest. The join recomputes the
+planner from the original mesh and exact source, compares the entire trace,
+and requires exact terminal geometry and plural order. Missing, stale, edited,
+reordered, enlarged-bound, unanchored or incomplete traces fail closed; presence
+of a trace alone never waives the ordinary quality/boundary/DAT/forcing gates.
+
+New certificates archive both `auditor.py` and `fvcom_tge_endpoint_fan.py` and
+bind both hashes. Verification requires the executing planner to match the
+archived planner before scientific replay. Run with the matching frozen Grid
+package on `PYTHONPATH`; the archived helper remains beside the auditor. Earlier
+certificates retain their earlier exact auditor versions and are not rewritten.
+
 Run `selftest_retained_grid_join.py`, `selftest_forcing_join.py` and
 `selftest_grid_project.py` after changes. Also retain the actual failing legacy
 join, a passing real retained-grid replay, and independent mutations of its

@@ -90,6 +90,21 @@ discloses missing generation intermediates. It never certifies a fresh grid or
 claims the complete standardized project passed. Other geometry/connectivity
 repairs require their owning audited delivery route, not this compatibility path.
 
+When a source-TGE failure is a connected noncyclic endpoint fan that the default
+single-pass endpoint rule cannot resolve, the explicit
+`repair_fvcom_tge_endpoints.py --endpoint-fan-max-steps N` option permits at most
+`N` sequential demotions (`1 <= N <= 4`, total across all chains). The omitted
+option retains the legacy rule. Every original fatal component must consist
+only of same-chain sum-five cells and have one initial endpoint anchor. Every
+demotion is a unique current endpoint and strictly decreases source-TGE fatal
+cells; unrelated, cyclic, ambiguous, detached, or exhausted cases are rejected.
+No geometry, depth, triangle, non-NS bytes, or untouched OBC order may change.
+Sequential products appear atomically in the result's `delivery/` only after
+serialized/source and final input-hash checks pass; rejected staged bytes are
+diagnostic evidence only. Require a geographic review of the prescribed-to-solid
+boundary-role delta. The corrected contract binds the selected bound and full
+step trace, which the retained join independently replays before admission.
+
 Every mesh-quality evaluation embeds the algorithm-bound TGE junction gate.
 Publication may remain benchmark-only without local FVCOM source, but
 submission eligibility requires `publish --tge-source /path/to/TGE.F`. The
@@ -100,9 +115,13 @@ source audit blocking for `validate --require-submission-ready`.
 When forcing is generated after terminal-grid publication, use
 `manage_fvcom_grid_project.py join-forcing` to bind the terminal grid contract,
 ordered geographic OBC points, actual elevation NetCDF, and forcing-owner
-manifest in a new immutable certificate revision. This resolves only missing
+manifest in a new immutable certificate revision. This resolves missing
 or incompatible forcing preconditions after actual node, coordinate, hash,
-time-encoding, finite-data and nodal-provenance checks pass. Preserve original
+time-encoding, finite-data and nodal-provenance checks pass. For cyclic OBCs,
+the v2 certificate additionally certifies the mesh-plus-sidecar package after
+checking explicit cyclicity, exact identities/order and every topological
+boundary edge including closure; standalone SMS remains non-self-describing.
+Preserve original
 quality, conditioning, source-order remapping, maps and source-bound TGE
 evidence; do not republish changed companions to mark forcing ready. See
 `references/grid_project_contract.md` for the command and revision contract.

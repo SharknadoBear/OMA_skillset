@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import copy
+import hashlib
 import tempfile
 from argparse import Namespace
 from pathlib import Path
@@ -31,6 +33,62 @@ def main() -> int:
         assert controls["extstep_seconds"] > 0
         assert controls["isplit"] >= 1
         assert len(controls["sponge"]) == 2
+        cyclic_mesh = root / "cyclic.2dm"
+        cyclic_mesh.write_text(
+            "MESH2D\nE3T 1 1 2 3 1\nE3T 2 1 3 4 1\n"
+            "ND 1 0 0 5\nND 2 100 0 5\nND 3 100 200 5\nND 4 0 300 5\n"
+            "NS 1 2 3 -4\n", encoding="utf-8")
+        contract_path = root / "grid_contract.json"
+        ids = [1, 2, 3, 4]
+        contract = {"schema_version": "fvcom_grid_delivery_contract_v1",
+                    "mesh": {"sha256": hashlib.sha256(cyclic_mesh.read_bytes()).hexdigest()},
+                    "open_boundaries": [{"nodestring_id": 1, "node_ids": ids, "cyclic": True,
+                        "node_order_sha256": hashlib.sha256(b"[1,2,3,4]").hexdigest()}]}
+        contract_path.write_text(json.dumps(contract), encoding="utf-8")
+        before = derive_controls(cyclic_mesh)
+        after = derive_controls(cyclic_mesh, grid_contract=contract_path)
+        expected_median = (200 + 20000 ** 0.5) / 2
+        assert abs(after["sponge"][0]["radius_m"] - 3 * expected_median) < 1e-10
+        assert after["sponge"][0]["edge_count"] == 4
+        assert after["sponge"][0]["cyclic"] is True
+        assert after["sponge"][0]["radius_m"] != before["sponge"][0]["radius_m"]
+        assert after["extstep_seconds"] == before["extstep_seconds"]
+        assert after["isplit"] == before["isplit"]
+        contract["open_boundaries"][0]["cyclic"] = False
+        contract_path.write_text(json.dumps(contract), encoding="utf-8")
+        noncyclic = derive_controls(cyclic_mesh, grid_contract=contract_path)
+        assert noncyclic["sponge"][0]["edge_count"] == 3
+        assert noncyclic["sponge"][0]["radius_m"] == before["sponge"][0]["radius_m"]
+        for defect in ("mesh_hash", "order_hash", "order", "repeated", "identity", "duplicate", "cyclic_type", "cyclicity"):
+            bad = copy.deepcopy(contract)
+            boundary = bad["open_boundaries"][0]
+            if defect == "mesh_hash": bad["mesh"]["sha256"] = "0" * 64
+            elif defect == "order_hash": boundary["node_order_sha256"] = "0" * 64
+            elif defect == "order": boundary["node_ids"] = list(reversed(ids))
+            elif defect == "repeated": boundary["node_ids"] = ids + [ids[0]]
+            elif defect == "identity": boundary["nodestring_id"] = 2
+            elif defect == "duplicate": bad["open_boundaries"].append(copy.deepcopy(boundary))
+            elif defect == "cyclicity": boundary["cyclicity"] = "cyclic"
+            else: boundary["cyclic"] = "true"
+            contract_path.write_text(json.dumps(bad), encoding="utf-8")
+            try:
+                derive_controls(cyclic_mesh, grid_contract=contract_path)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"cyclic contract guard accepted {defect}")
+        # A last-to-first chord crossing the interior is not a valid cyclic boundary.
+        cyclic_mesh.write_text(cyclic_mesh.read_text().replace("NS 1 2 3 -4", "NS 1 2 -3"), encoding="utf-8")
+        contract["mesh"]["sha256"] = hashlib.sha256(cyclic_mesh.read_bytes()).hexdigest()
+        contract["open_boundaries"][0].update(node_ids=[1, 2, 3], cyclic=True,
+            node_order_sha256=hashlib.sha256(b"[1,2,3]").hexdigest())
+        contract_path.write_text(json.dumps(contract), encoding="utf-8")
+        try:
+            derive_controls(cyclic_mesh, grid_contract=contract_path)
+        except ValueError as exc:
+            assert "boundary edge" in str(exc)
+        else:
+            raise AssertionError("accepted interior closing chord")
         plan = stability_plan(controls)
         assert plan["attempts"][0]["extstep_multiplier"] == 1.0
         keys = {(a["extstep_multiplier"], a["isplit"], a["sponge_radius_multiplier"], a["sponge_coefficient_multiplier"]) for a in plan["attempts"]}

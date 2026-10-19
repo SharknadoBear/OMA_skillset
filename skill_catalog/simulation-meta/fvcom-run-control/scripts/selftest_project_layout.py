@@ -67,6 +67,21 @@ class ProjectLayoutTests(unittest.TestCase):
         self.assertFalse((self.project / "agents").exists())
         self.assertTrue((self.project / "run/accepted_t6v6/benchmark").is_dir())
 
+    def test_fresh_only_has_no_accepted_branch(self) -> None:
+        write_json(self.request, dict(self.value, grid_policy="fresh_only"))
+        manifest = init_project(self.request, self.project)
+        self.assertEqual(manifest["grid_order"], ["fresh_reproduction"])
+        for parent in ("gridding", "forcing", "input", "run", "output", "analysis"):
+            self.assertFalse((self.project/parent/"accepted_t6v6").exists())
+        self.assertTrue((self.project/"input/fresh_reproduction/base").is_dir())
+        self.assertTrue((self.project/"agents/02_tpxo").is_dir())
+
+    def test_fresh_only_rejects_accepted_input(self) -> None:
+        write_json(self.request, dict(self.value, grid_policy="fresh_only", accepted_grid="old.2dm"))
+        with self.assertRaises(ValueError):
+            init_project(self.request, self.project)
+        self.assertFalse(self.project.exists())
+
     def test_reinitialize_preserves_manifest_state_and_role_evidence(self) -> None:
         initial = init_project(self.request, self.project)
         state = self.project / "project_status.json"

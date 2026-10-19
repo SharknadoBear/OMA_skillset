@@ -74,5 +74,12 @@ or readiness labels.
 These are W12 packaging results, not a new RegionBPoly decision gate.
 
 An accepted pass includes `accepted_s1_geometry_freeze` with the canonical
-RegionBPoly hash, immutable candidate/review hashes, offshore-side index, and
+RegionBPoly hash, retained candidate hash, offshore-side index, and
 `downstream_geometry_repair_permitted: false`. S2 consumes that exact geometry.
+The coastal route additionally binds its scientific review. The native island/lake
+route uses `acceptance_route: noncoastal_resolved_delivery`, binds the final map,
+and keeps scientific-review fields null; a geometry freeze is not a claim that
+an agent inspected or accepted the science. Retain the agent's map review separately.
+Its `region_bpoly_geometry_candidate.json` is a required canonical member outside
+`intermediate/`, so execute-mode cleanup preserves the freeze evidence. Revised
+geometry or map evidence requires a new run directory.

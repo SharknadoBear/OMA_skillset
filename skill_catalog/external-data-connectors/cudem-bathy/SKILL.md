@@ -49,10 +49,12 @@ python scripts/check_download_health.py --request request.json --run-dir runs/ca
 - Do Python plotting and health reports locally. If Kestrel is used, use it for remote download/storage staging, then download compact evidence or products back for local checks.
 - Keep legacy model-specific functions and file conventions available as deprecated compatibility aliases where they already exist, but prefer generic names in new docs, manifests, tests, and examples.
 - Do not store credentials, personal tokens, passwords, OTPs, or unsupported source-access claims in scripts, logs, metadata, or examples.
+- Source coverage plots read `source_id.legend`, falling back to dataset `source_legend`. Preserve these declarations when passing datasets to the plotter: numeric source IDs differ between legacy and current products. Undeclared IDs receive neutral labels rather than guessed source names.
 
 ## Validation
 
 - Validate the skill with `quick_validate.py`.
 - Compile all Python scripts after edits.
+- Run `scripts/selftest_source_id_plot.py` for current/legacy source labels, sparse categories, and rendered color/legend agreement.
 - Test `estimate_data_request.py` with local, Kestrel, and unknown-estimate cases.
 - Test `check_download_health.py` on a tiny cached or synthetic artifact and confirm JSON plus at least one plot for plottable data.

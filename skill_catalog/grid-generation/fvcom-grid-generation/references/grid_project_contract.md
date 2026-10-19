@@ -124,8 +124,17 @@ open-exterior source and, for a reviewed Adaptive-v2 gate,
 `--boundary-resolution-source`. The owning boundary validator reopens that
 evidence and its dependencies and must reproduce the published decision.
 
-Only `open_boundary_forcing_missing` and
-`open_boundary_forcing_incompatible` may be resolved by this certificate.
+The v1 certificate resolves `open_boundary_forcing_missing` and
+`open_boundary_forcing_incompatible`. When the original findings also contain
+`cyclic_obc_not_self_describing_in_sms_2dm`, the manager emits a v2 certificate
+that certifies the complete mesh-plus-sidecar package. Contract/remap/sidecar
+identities, node order and explicit boolean cyclicity must agree; each cyclic
+chain must contain at least three distinct nodes with no repeated seam, and
+every ordered segment including last-to-first closure must be an actual
+one-triangle boundary edge. Actual terminal-order forcing must still pass all
+checks. This resolves that package submission precondition without claiming
+standalone SMS encodes cyclicity. Existing v1 certificates retain their exact
+readback rules and cannot resolve the cyclic finding.
 Original quality findings and every frozen grid companion remain unchanged;
 the source-order remap is not reinterpreted as compatible. The effective
 submission decision is derived from the original findings plus the certified

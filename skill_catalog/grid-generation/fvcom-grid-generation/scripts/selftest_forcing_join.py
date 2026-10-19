@@ -18,6 +18,7 @@ def read(p):return json.loads(Path(p).read_text())
 def write(p,v):Path(p).write_text(json.dumps(v),encoding='utf-8')
 
 class ForcingJoinTests(unittest.TestCase):
+    cyclic=False
     @classmethod
     def setUpClass(cls):
         cls.storage=tempfile.TemporaryDirectory();cls.base=Path(cls.storage.name)/'base'
@@ -25,7 +26,8 @@ class ForcingJoinTests(unittest.TestCase):
         angles=np.arange(6)*np.pi/3
         xy=np.vstack([np.column_stack([-75+.1*np.cos(angles),39+.1*np.sin(angles)]),[-75,39]])
         triangles=np.asarray([[i+1,(i+1)%6+1,7] for i in range(6)])
-        chains=[[1,2],[4,5]];nsids=[11,22];ids=[1,2,4,5]
+        chains=[[1,2,3,4,5,6]] if cls.cyclic else [[1,2],[4,5]]
+        nsids=[11] if cls.cyclic else [11,22];ids=[i for chain in chains for i in chain]
         def mesh(path):
             path.parent.mkdir(parents=True,exist_ok=True)
             return write_2dm(path,xy,np.full(7,5.),triangles,np.empty(0,dtype=int),open_boundary_chains=chains,open_boundary_ids=nsids)
@@ -33,19 +35,21 @@ class ForcingJoinTests(unittest.TestCase):
         promote(p,'06_raw_mesh',raw,'raw_mesh.2dm',generator_manifest=gmsh6_candidate(raw))
         conditioned=mesh(p/'07_conditioning/_work/mesh.2dm')
         promote(p,'07_conditioning',conditioned,'conditioned_mesh.2dm')
-        cls.companion_sources=companions(p,findings=['open_boundary_forcing_incompatible'])
+        findings=['open_boundary_forcing_incompatible']
+        if cls.cyclic:findings.append('cyclic_obc_not_self_describing_in_sms_2dm')
+        cls.companion_sources=companions(p,findings=findings)
         quality=read(cls.companion_sources['mesh_quality'])
-        quality['fvcom_tge_boundary_junction_gate']=audit_tge_boundary_junctions(7,triangles-1,[[0,1],[3,4]])
+        quality['fvcom_tge_boundary_junction_gate']=audit_tge_boundary_junctions(7,triangles-1,[[n-1 for n in chain] for chain in chains])
         write(cls.companion_sources['mesh_quality'],quality)
-        write(cls.companion_sources['obc_remap_manifest'],{'chains':[{'nodestring_id':ns,'delivered_node_ids_1based':chain,'delivered_node_count':len(chain),'cyclic':False} for ns,chain in zip(nsids,chains)],
-            'cyclicity_contract':{'chains':[{'nodestring_id':ns,'node_count':len(chain),'cyclic':False,'declared_open_boundary_id':str(ns)} for ns,chain in zip(nsids,chains)]}})
+        write(cls.companion_sources['obc_remap_manifest'],{'chains':[{'nodestring_id':ns,'delivered_node_ids_1based':chain,'delivered_node_count':len(chain),'cyclic':cls.cyclic} for ns,chain in zip(nsids,chains)],
+            'cyclicity_contract':{'chains':[{'nodestring_id':ns,'node_count':len(chain),'cyclic':cls.cyclic,'declared_open_boundary_id':str(ns)} for ns,chain in zip(nsids,chains)]}})
         publish(p,mesh=p/'07_conditioning/conditioned_mesh.2dm',companions=cls.companion_sources,
             fvcom_ready=True,submission_eligible=False,obc_status='pass',forcing_status='missing',
             failures=[],open_exterior_source=contract_fixture(p/'evidence'),
             tge_source=tge_source_fixture(p/'source'),basemap_provider='offline')
         write(p/'final/grid_delivery_contract.json',{'schema_version':'fvcom_grid_delivery_contract_v1',
             'mesh':{'sha256':digest(p/'final/fvcom_grid.2dm'),'coordinate_crs':'EPSG:4326','node_count':7,'triangle_count':6},
-            'open_boundaries':[{'node_ids':chain,'nodestring_id':ns,'obc_id':str(ns),'cyclic':False,
+            'open_boundaries':[{'node_ids':chain,'nodestring_id':ns,'obc_id':str(ns),'cyclic':cls.cyclic,
                 'node_order_sha256':hashlib.sha256(json.dumps(chain,separators=(',',':')).encode()).hexdigest()} for ns,chain in zip(nsids,chains)]})
         f=p/'forcing';f.mkdir();points=f/'obc_points.csv'
         point_lines=''.join(f'{i},{xy[i-1,0]:.12f},{xy[i-1,1]:.12f}\n' for i in ids)
@@ -57,18 +61,18 @@ class ForcingJoinTests(unittest.TestCase):
         provenance={'reconstruction_rule_version':'utide_exact_time_nodal_v1','utide_ngflags':[False]*4,
             'utide_version':'0.3.1','interval_minutes':6,'time_coverage_start':dates[0].isoformat(),'time_coverage_end':dates[-1].isoformat()}
         with nc.Dataset(f/'elevation.nc','w') as ds:
-            for name,size in [('time',3),('nobc',4),('DateStrLen',26)]:ds.createDimension(name,size)
+            for name,size in [('time',3),('nobc',len(ids)),('DateStrLen',26)]:ds.createDimension(name,size)
             ds.createVariable('obc_nodes','i4',('nobc',))[:]=ids
             time=ds.createVariable('time','f8',('time',));time[:]=times;time.units='days since 1858-11-17 00:00:00';time.time_zone='UTC'
             ds.createVariable('Itime','i4',('time',))[:]=np.floor(times)
             ds.createVariable('Itime2','i4',('time',))[:]=[0,360000,720000]
             ds.createVariable('Times','S1',('time','DateStrLen'))[:]=np.asarray([d.strftime('%Y/%m/%d %H:%M:%S.%f') for d in dates],dtype='S26').view('S1').reshape(3,26)
-            eta=ds.createVariable('elevation','f4',('time','nobc'),fill_value=-9999);eta[:]=np.arange(12).reshape(3,4)*.1;eta.units='meters'
+            eta=ds.createVariable('elevation','f4',('time','nobc'),fill_value=-9999);eta[:]=np.arange(3*len(ids)).reshape(3,len(ids))*.1;eta.units='meters'
             ds.setncatts({**hashes,'reconstruction_rule_version':'utide_exact_time_nodal_v1','utide_ngflags_json':json.dumps([False]*4),'utide_version':'0.3.1'})
         hashes['forcing_sha256']=digest(f/'elevation.nc')
         write(f/'forcing_manifest.json',{'status':'ready','blocking_reasons':[],'health':{'status':'pass','problems':[]},
             'interpolation':{'unresolved_count':0},'hashes':hashes,'provenance':provenance,
-            'constituents':['M2'],'constituent_count':1,'time_count':3,'obc_node_count':4})
+            'constituents':['M2'],'constituent_count':1,'time_count':3,'obc_node_count':len(ids)})
 
     @classmethod
     def tearDownClass(cls):cls.storage.cleanup()
@@ -88,6 +92,7 @@ class ForcingJoinTests(unittest.TestCase):
         before={str(p.relative_to(self.p)):digest(p) for p in (self.p/'final').iterdir() if p.name!='fvcom_grid_status.json'}
         self.assertFalse(validate(self.p,require_submission_ready=True)['passed'])
         result=self.join();self.assertTrue(result['passed'],result)
+        self.assertEqual(read(self.p/'08_audit/forcing_joins/v001/certificate.json')['schema_version'],'fvcom_terminal_forcing_certificate_v1')
         self.assertEqual(before,{name:digest(self.p/name) for name in before})
         self.assertEqual(result['status']['submission_failure_taxonomy'],[])
         self.assertEqual(read(self.p/'final/mesh_quality.json')['all_quality_findings'],['open_boundary_forcing_incompatible'])

@@ -12,7 +12,7 @@ from typing import Any
 import netCDF4 as nc4
 import numpy as np
 
-from fvcom_time_anchor import (resolve_anchor, anchored_times, read_iint, check_file_clock, audit_restart)
+from fvcom_time_anchor import (resolve_anchor, anchored_times, read_iint, check_file_clock, check_station_clock, audit_restart)
 
 
 FAILURE = re.compile(r"blow\s*up|fatal|segmentation|mpi_abort|forrtl:|floating invalid|nan detected", re.I)
@@ -71,6 +71,7 @@ def finite_variable(variable: Any, chunk: int = 8) -> bool:
 def time_audit(paths: list[Path], start: dt.datetime, end: dt.datetime, internal_step: float,
                expected_count: int, interval_seconds: float | None = None, *,
                anchor: dict[str, Any], require_exact_clock: bool = False,
+               require_station_clock: bool = False,
                duplicate_variables: tuple[str, ...] = ("zeta", "ua", "va")) -> dict[str, Any]:
     if not np.isfinite(internal_step) or internal_step <= 0 or expected_count < 2:
         raise ValueError("monthly output requires a positive internal step and at least two records")
@@ -86,6 +87,8 @@ def time_audit(paths: list[Path], start: dt.datetime, end: dt.datetime, internal
         with nc4.Dataset(path) as ds:
             values = read_iint(ds)
             check_file_clock(ds, anchored_times(values, anchor, internal_step), require_exact=require_exact_clock)
+            if require_station_clock:
+                check_station_clock(ds, anchored_times(values, anchor, internal_step))
             for index, step in enumerate(values):
                 if int(step) in rows:
                     prior_path, prior_index = rows[int(step)]
@@ -114,6 +117,7 @@ def time_audit(paths: list[Path], start: dt.datetime, end: dt.datetime, internal
     return {
         "startup_anchored": True,
         "exact_clock_verified": require_exact_clock,
+        "native_station_clock_verified": require_station_clock,
         "iint_at_start": anchor["iint_at_start"],
         "record_count": int(len(values)),
         "iint_first": int(values[0]),
@@ -129,8 +133,15 @@ def time_audit(paths: list[Path], start: dt.datetime, end: dt.datetime, internal
 # Actual frozen mod_ncdio.F names: vertical velocity is ww, not w.
 PHYSICAL_FIELDS = {"zeta", "ua", "va", "u", "v", "tauc", "ww", "omega", "temp", "salinity",
                    "viscofm", "viscofh", "km", "kh", "kq", "q2", "q2l", "l", "et",
-                   "rho1", "rmean1", "tmean1", "smean1"}
+                   "rho1", "rmean1", "tmean1", "smean1", "cor", "cc_sponge",
+                   "obc_nodes", "obc_type", "wet_nodes", "wet_cells",
+                   "wet_nodes_prev_int", "wet_cells_prev_int", "wet_cells_prev_ext", "inundation_cells"}
 TURBULENCE_FIELDS = ["viscofm", "viscofh", "km", "kh", "kq", "q2", "q2l", "l"]
+# SETUP_RSTFILE always adds RESTART_EXTRAS_FILE_OBJECT and DENSITY_FILE_OBJECT,
+# irrespective of optional station/full-grid flags or inactive tracers.
+RESTART_EXTRA_FIELDS = ["et", "rho1", "rmean1", "tmean1", "smean1", "cor", "cc_sponge"]
+WET_RESTART_FIELDS = ["wet_nodes", "wet_cells", "wet_nodes_prev_int",
+                      "wet_cells_prev_int", "wet_cells_prev_ext", "inundation_cells"]
 
 
 def required_fields(values: dict[str, str], kind: str) -> list[str]:
@@ -141,7 +152,11 @@ def required_fields(values: dict[str, str], kind: str) -> list[str]:
             raise ValueError(f"explicit logical {name} is required for the field audit")
         return value in {"t", ".true."}
     if kind == "restart":
-        result += ["u", "v", "tauc", "ww", "omega", "temp", "salinity"] + TURBULENCE_FIELDS
+        result += ["u", "v", "tauc", "ww", "omega", "temp", "salinity"] + TURBULENCE_FIELDS + RESTART_EXTRA_FIELDS
+        if enabled("OBC_ON"):
+            result += ["obc_nodes", "obc_type"]
+        if enabled("WETTING_DRYING_ON"):
+            result += WET_RESTART_FIELDS
     elif kind == "full":
         for flag, fields in (("NC_VELOCITY", ["u", "v", "tauc"]), ("NC_VERTICAL_VEL", ["ww", "omega"]),
                              ("NC_SALT_TEMP", ["temp", "salinity"]), ("NC_TURBULENCE", TURBULENCE_FIELDS)):
@@ -157,13 +172,47 @@ def required_fields(values: dict[str, str], kind: str) -> list[str]:
     return result
 
 
-def nc_audit(paths: list[Path], required: list[str]) -> list[dict[str, Any]]:
+def restart_field_dimensions(values: dict[str, str]) -> dict[str, tuple[str, ...]]:
+    """Native FVCOM 4.3.1 non-GOTM restart state, in NetCDF/Python order."""
+    groups = {
+        ("time",): ["iint"],
+        ("time", "node"): ["zeta", "et", "wet_nodes", "wet_nodes_prev_int"],
+        ("time", "nele"): ["ua", "va", "tauc", "wet_cells", "wet_cells_prev_int",
+                            "wet_cells_prev_ext", "inundation_cells"],
+        ("time", "siglay", "nele"): ["u", "v", "ww", "viscofm"],
+        ("time", "siglay", "node"): ["temp", "salinity", "viscofh", "rho1"],
+        ("time", "siglev", "node"): ["omega", "km", "kh", "kq", "q2", "q2l", "l"],
+        ("siglay", "node"): ["rmean1", "tmean1", "smean1"],
+        ("nele",): ["cor", "cc_sponge"],
+        ("nobc",): ["obc_nodes", "obc_type"],
+    }
+    dimensions = {name: dims for dims, fields in groups.items() for name in fields}
+    return {name: dimensions[name] for name in required_fields(values, "restart")}
+
+
+def restart_state_audit(paths: list[Path], values: dict[str, str]) -> list[dict[str, Any]]:
+    """Require conditional restart fields, native dimensions, and finite state.
+
+    This gate complements exact clocks and grid/input-identity audits; it does
+    not replace them. Inundation state is not a binary wet-mask predicate.
+    """
+    dimensions = restart_field_dimensions(values)
+    return nc_audit(paths, list(dimensions), expected_dimensions=dimensions)
+
+
+def nc_audit(paths: list[Path], required: list[str], *,
+             expected_dimensions: dict[str, tuple[str, ...]] | None = None) -> list[dict[str, Any]]:
     rows = []
     for path in paths:
         with nc4.Dataset(path) as ds:
             missing = [item for item in required if item not in ds.variables]
             if missing:
                 raise ValueError(f"{path} is missing variables {missing}")
+            if expected_dimensions is not None:
+                for name, dimensions in expected_dimensions.items():
+                    if ds[name].dimensions != dimensions or any(size <= 0 for size in ds[name].shape):
+                        raise ValueError(f"{path} has wrong or empty native dimensions for {name}: "
+                                         f"{ds[name].dimensions}, expected {dimensions}")
             checked = sorted(set(required) | (PHYSICAL_FIELDS & set(ds.variables)))
             nonfinite = [item for item in checked if not finite_variable(ds[item])]
             if nonfinite:
@@ -175,6 +224,9 @@ def nc_audit(paths: list[Path], required: list[str]) -> list[dict[str, Any]]:
                 "required_variables": required,
                 "checked_variables": checked,
                 "required_variables_finite_and_unmasked": True,
+                **({"required_native_dimensions_verified": True,
+                    "expected_dimensions": {name: list(dims) for name, dims in expected_dimensions.items()}}
+                   if expected_dimensions is not None else {}),
             })
     return rows
 
@@ -245,7 +297,7 @@ def main() -> int:
         if found != expected_names:
             raise ValueError(f"station IDs/order differ in {path}: {found} != {expected_names}")
     full_nc = nc_audit(full_paths, full_required)
-    restart_nc = nc_audit([restart_path], required_fields(values, "restart"))[0]
+    restart_nc = restart_state_audit([restart_path], values)[0]
 
     restart_time = audit_restart(restart_path, anchor, internal_step, end)
 
@@ -268,7 +320,8 @@ def main() -> int:
         "run_namelist_sha256": sha256(namelist_path),
         "logs": {"stdout_sha256": sha256(stdout_path), "stderr_sha256": sha256(stderr_path), "exit_code": args.exit_code, "tada": True},
         "station_time": time_audit(station_paths, start, end, internal_step, args.expected_station_records, args.station_interval_seconds,
-                                   anchor=anchor, duplicate_variables=tuple(x for x in station_required if x != "iint")),
+                                   anchor=anchor, require_station_clock=True,
+                                   duplicate_variables=tuple(x for x in station_required if x != "iint")),
         "full_grid_time": time_audit(full_paths, start, end, internal_step, args.expected_full_grid_records, args.full_grid_interval_seconds, anchor=anchor,
                                      require_exact_clock=True, duplicate_variables=tuple(x for x in full_required if x != "iint")),
         "station_netcdf": station_nc,
