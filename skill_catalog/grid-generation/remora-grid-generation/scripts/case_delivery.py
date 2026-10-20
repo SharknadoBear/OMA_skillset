@@ -25,7 +25,9 @@ def finalize(case_root, delivery, release_revision):
     source=resolve(delivery.parent,doc["grid"]["path"])
     validation=read_json(resolve(delivery.parent,doc["validation"]["path"]))
     checked=readback(source)
-    if validation["smoothing"].get("method")!="area_weighted_log_pair_projection_v1":
+    if validation["smoothing"].get("method") not in (
+            "area_weighted_log_pair_projection_v1",
+            "area_weighted_log_rx0_rx1_pair_projection_v2"):
         raise ValueError("Final delivery requires log-depth smoothing evidence")
     fit_path=resolve(delivery.parent,doc["fit"]["path"])
     fit=read_json(fit_path)
@@ -37,7 +39,9 @@ def finalize(case_root, delivery, release_revision):
               ("Initial and final masks and corrected cells",[("grid",named["mask_changes"])]),
               ("Bathymetry before and after smoothing",[("grid",named["bathymetry_comparison"])]),
               ("Absolute and relative depth changes",[("grid",named["smoothing_changes"])]),
-              ("Vertical sections and required-feature closeups",[("grid",named["vertical_sections"])]+[("grid",v) for k,v in named.items() if k.startswith("feature_")])]
+              ("Vertical sections and required-feature closeups",[("grid",named["vertical_sections"])]+
+               ([("grid",named["vertical_quality"])] if "vertical_quality" in named else [])+
+               [("grid",v) for k,v in named.items() if k.startswith("feature_")])]
     target=root/"final"
     if target.exists():
         raise ValueError("Final delivery already exists; preserve it and use a new case revision")
@@ -82,7 +86,8 @@ def finalize(case_root, delivery, release_revision):
 <h1>{esc(title)} — REMORA grid review</h1><p>{esc(purpose)}</p>
 <p><a href="remora_grid.nc">Final NetCDF</a> · <a href="case_delivery.json">Case manifest</a> · <a href="validation.json">Numerical diagnostics</a></p>
 <p>Human review: pending. Agent review: {esc(agent_review['decision'])}. Local validation: pass. Executable reader: {esc(reader)}. Simulation validation: not run.</p>
-<p>Grid: {esc(checked['n_cell'])}; spacing {fit['parameters']['spacing_m']:g} m. Smoothing: log depth; rx0 {checked['rx0']:.8f}. Physical-interior volume change: {smoothing['physical_volume_relative_change']*100:.3f}%.</p>
+<p>Physical grid: {esc(checked['n_cell'])}; rho shape (eta,xi): {esc(checked['rho_shape'])}. Spacing and geometry: {esc(validation.get('geometry', {'nominal_spacing_m':fit['parameters']['spacing_m']}))}. Smoothing: log depth; rx0 {checked['rx0']:.8f}; rx1 {checked['haney_rx1_diagnostic']:.5f}. Physical-interior volume change: {smoothing['physical_volume_relative_change']*100:.3f}%.</p>
+<p>Scientific regime and design rationale: {esc(fit.get('science',{}))} {esc(fit.get('design',{}))}</p>
 <p>Agent assessment: {esc(agent_review['rationale'])}</p><ul>{warnings}</ul>
 {''.join(body)}<h2>Feature-section diagnostics</h2><p>Grid-axis transects through protected wet features; these are not automatically channel-normal sections.</p><pre>{esc(__import__('json').dumps(validation.get('feature_sections',[]),indent=2))}</pre></body></html>'''
     (target/"review.html").write_text(page,encoding="utf-8")

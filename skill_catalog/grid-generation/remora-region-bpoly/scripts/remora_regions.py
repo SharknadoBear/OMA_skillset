@@ -17,6 +17,12 @@ import numpy as np
 import geopandas as gpd
 from shapely.geometry import Point, Polygon, box, mapping
 
+MODELING_PURPOSES = {"barotropic_tide", "baroclinic"}
+FEATURE_PRIORITIES = {"essential", "optional", "future_refinement"}
+FEATURE_DISPOSITIONS = {"included", "simplified", "excluded", "deferred"}
+FEATURE_TYPES = {"water", "land", "coverage"}
+BOUNDARY_INTENTS = {"open", "land", "mixed", "undetermined"}
+
 
 def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8-sig"))
@@ -72,15 +78,113 @@ def polygon(vertices):
 
 
 def feature_shape(f):
+    if ("point_lonlat" in f) == ("bbox_wsen" in f):
+        raise ValueError("A feature needs exactly one point_lonlat or bbox_wsen")
     if "point_lonlat" in f:
         a = np.asarray(f["point_lonlat"], float)
-        if a.shape != (2,) or not np.isfinite(a).all():
+        if (
+            a.shape != (2,)
+            or not np.isfinite(a).all()
+            or abs(a[0]) > 180
+            or abs(a[1]) >= 80
+        ):
             raise ValueError("Invalid feature point")
         return Point(a)
     a = np.asarray(f["bbox_wsen"], float)
-    if a.shape != (4,) or not np.isfinite(a).all() or a[0] >= a[2] or a[1] >= a[3]:
+    if (
+        a.shape != (4,)
+        or not np.isfinite(a).all()
+        or a[0] >= a[2]
+        or a[1] >= a[3]
+        or np.any(np.abs(a[[0, 2]]) > 180)
+        or np.any(np.abs(a[[1, 3]]) >= 80)
+        or a[2] - a[0] >= 180
+    ):
         raise ValueError("Invalid feature bbox")
     return box(*a)
+
+
+def region_features(region):
+    """New feature declarations and the compatible legacy feature list."""
+    result = []
+    for key in ("required_features", "features"):
+        features = region.get(key, [])
+        if not isinstance(features, list):
+            raise ValueError(f"{key} must be a list")
+        result.extend(features)
+    return result
+
+
+def validate_science(document):
+    purpose = document.get("modeling_purpose")
+    if purpose is not None and (not isinstance(purpose, str) or purpose not in MODELING_PURPOSES):
+        raise ValueError("modeling_purpose must be barotropic_tide or baroclinic")
+    if "science_rationale" in document and (
+        not isinstance(document["science_rationale"], str)
+        or not document["science_rationale"].strip()
+    ):
+        raise ValueError("science_rationale must be nonempty when supplied")
+
+
+def validate_features(region, p):
+    names = set()
+    for f in region_features(region):
+        name = f.get("name")
+        if not isinstance(name, str) or not name.strip() or name in names:
+            raise ValueError("Feature names must be nonempty and unique per region")
+        names.add(name)
+        priority = f.get("priority", "essential")
+        if not isinstance(priority, str) or priority not in FEATURE_PRIORITIES:
+            raise ValueError(f"Invalid feature priority: {name}")
+        default_disposition = "deferred" if priority == "future_refinement" else "included"
+        disposition = f.get("disposition", default_disposition)
+        if not isinstance(disposition, str) or disposition not in FEATURE_DISPOSITIONS:
+            raise ValueError(f"Invalid feature disposition: {name}")
+        if priority == "essential" and disposition != "included":
+            raise ValueError(f"Essential feature must be included: {name}")
+        if priority == "optional" and disposition == "deferred":
+            raise ValueError(f"Use future_refinement priority for a deferred feature: {name}")
+        if priority == "future_refinement" and disposition != "deferred":
+            raise ValueError(f"Future refinement feature must be deferred: {name}")
+        if disposition != "included" and not str(f.get("rationale", "")).strip():
+            raise ValueError(f"Feature disposition requires physical rationale: {name}")
+        evidence = f.get("evidence", [])
+        if not isinstance(evidence, list) or any(
+            not isinstance(e, dict)
+            or not isinstance(e.get("source"), str)
+            or not e["source"].strip()
+            or not isinstance(e.get("finding"), str)
+            or not e["finding"].strip()
+            for e in evidence
+        ):
+            raise ValueError(f"Feature evidence needs source and finding records: {name}")
+        if disposition in {"simplified", "excluded"} and not evidence:
+            raise ValueError(f"Feature simplification or exclusion requires evidence: {name}")
+        shape = feature_shape(f)
+        feature_type = f.get("feature_type", "water" if isinstance(shape, Point) else "coverage")
+        if not isinstance(feature_type, str) or feature_type not in FEATURE_TYPES:
+            raise ValueError(f"Invalid feature_type: {name}")
+        if disposition in {"included", "simplified"} and not p.covers(shape):
+            raise ValueError(f"Included feature {name} outside {region['id']}")
+        radius = f.get("review_radius_km", 8)
+        if isinstance(radius, bool) or not isinstance(radius, (float, int)) or not np.isfinite(radius) or radius <= 0:
+            raise ValueError(f"Feature review_radius_km must be finite and positive: {name}")
+
+
+def validate_boundary_intents(region):
+    intents = region.get("boundary_intents", [])
+    if not isinstance(intents, list):
+        raise ValueError("boundary_intents must be a list")
+    sides = set()
+    for boundary in intents:
+        side = boundary.get("side_index")
+        if isinstance(side, bool) or not isinstance(side, int) or side not in range(4) or side in sides:
+            raise ValueError("Boundary side_index must be unique and in 0..3")
+        sides.add(side)
+        if boundary.get("intent") not in BOUNDARY_INTENTS:
+            raise ValueError("Invalid geographic boundary intent")
+        if not str(boundary.get("rationale", "")).strip():
+            raise ValueError("Boundary intent requires physical rationale")
 
 
 def validate_regions(regions):
@@ -92,9 +196,13 @@ def validate_regions(regions):
         if not str(r.get("purpose", "")).strip():
             raise ValueError(f"Missing purpose: {rid}")
         p = polygon(r["vertices_lonlat"])
-        for f in r.get("required_features", []):
-            if not p.covers(feature_shape(f)):
-                raise ValueError(f"Required feature {f['name']} outside {rid}")
+        validate_features(r, p)
+        validate_boundary_intents(r)
+        role, parent = r.get("role"), r.get("parent_id")
+        if role == "outer_domain" and parent is not None:
+            raise ValueError(f"Outer domain cannot have a parent: {rid}")
+        if role in {"nesting_interest", "refinement_interest"} and parent is None:
+            raise ValueError(f"{role} requires a parent: {rid}")
         by_id[rid] = (r, p)
     if not by_id:
         raise ValueError("Empty region plan")
@@ -154,12 +262,16 @@ def map_regions(plan, land, output):
                     [w - 0.04, s - 0.04, e + 0.04, n + 0.04],
                 )
             )
-        for i, f in enumerate(r.get("required_features", [])):
+        for i, f in enumerate(region_features(r)):
             w, s, e, n = feature_shape(f).bounds
             dy = max(float(f.get("review_radius_km", 8)) / 111.32, 0.01)
             dx = dy / np.cos(np.deg2rad((s + n) / 2))
             views.append(
-                (f"feature_{r['id']}_{i}", f["name"], [w - dx, s - dy, e + dx, n + dy])
+                (
+                    f"feature_{r['id']}_{i}",
+                    f"{f['name']} ({f.get('priority', 'essential')})",
+                    [w - dx, s - dy, e + dx, n + dy],
+                )
             )
     paths = []
     for name, title, bounds in views:
@@ -175,12 +287,27 @@ def map_regions(plan, land, output):
                 label=f"{r['id']} ({r.get('role','region')})",
             )
             ax.scatter(x[:-1], y[:-1], color=f"C{idx%10}", s=20)
-            for f in r.get("required_features", []):
+            for boundary in r.get("boundary_intents", []):
+                i = boundary["side_index"]
+                ax.annotate(
+                    f"side {i}: {boundary['intent']}",
+                    ((x[i] + x[i + 1]) / 2, (y[i] + y[i + 1]) / 2),
+                    fontsize=8,
+                    color=f"C{idx%10}",
+                    bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
+                )
+            for f in region_features(r):
                 c = feature_shape(f).centroid
-                ax.plot(c.x, c.y, "k+", ms=7)
+                priority = f.get("priority", "essential")
+                color, marker = {
+                    "essential": ("#111111", "+"),
+                    "optional": ("#bd6c00", "x"),
+                    "future_refinement": ("#6a51a3", "o"),
+                }[priority]
+                ax.plot(c.x, c.y, marker=marker, color=color, ms=7, fillstyle="none")
                 if bounds[0] <= c.x <= bounds[2] and bounds[1] <= c.y <= bounds[3]:
                     ax.annotate(
-                        f["name"],
+                        f"{f['name']} [{priority}]",
                         (c.x, c.y),
                         xytext=(4, 4),
                         textcoords="offset points",
@@ -202,6 +329,7 @@ def build(request_path, output):
     out = Path(output).resolve()
     if (out / "region_delivery.json").exists():
         raise ValueError("Use a new directory for a changed plan")
+    validate_science(req)
     validate_regions(req["regions"])
     coast = req["coastline"]
     cp = resolve(request_path.parent, coast["path"])
@@ -216,6 +344,9 @@ def build(request_path, output):
         "regions": req["regions"],
         "geographic_sources": req.get("geographic_sources", []),
     }
+    for key in ("modeling_purpose", "science_rationale"):
+        if key in req:
+            plan[key] = req[key]
     out.mkdir(parents=True, exist_ok=True)
     write_json(out / "region_plan.json", plan)
     write_json(
@@ -269,6 +400,9 @@ def validate_delivery(path, require_reviewed=False):
         if sha(resolve(base, rec["path"])) != rec["sha256"]:
             raise ValueError("Changed evidence: " + rec["path"])
     plan = read_json(resolve(base, d["plan"]["path"]))
+    if plan.get("schema") != "remora_region_plan_v1":
+        raise ValueError("Unsupported region plan schema")
+    validate_science(plan)
     validate_regions(plan["regions"])
     if require_reviewed:
         r = read_json(resolve(base, d["review"]))

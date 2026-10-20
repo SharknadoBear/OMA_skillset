@@ -155,8 +155,8 @@ The REMORA gridding workflow has two independently invocable skills under
 
 | Skill | Responsibility | Validation |
 | --- | --- | --- |
-| `remora-region-bpoly` | Four-sided scientific regions, required features, optional parent/child interests, maps and recorded visual review | Polygon/hierarchy and artifact-integrity tests in `scripts/selftest.py` |
-| `remora-grid-generation` | Rotated orthogonal footprint, staggered coordinates/metrics, source bathymetry, mask correction, log-depth smoothing, bounded-memory vertical diagnostics, CDF5 NetCDF and standardized case delivery | Numerical/error-path tests, full-array versus blocked vertical equivalence, combined two-skill CLI test and a separate executable reader checker |
+| `remora-region-bpoly` | Science-driven four-sided regions, essential/optional features, boundary intent, future refinement interests and visual review | Hierarchy, feature policy and artifact-integrity tests |
+| `remora-grid-generation` | Orthogonal conformal footprints, graded spacing, source repair, protected masks, log-depth rx0/rx1 conditioning, bounded vertical diagnostics and CDF5 delivery | Local analytical tests, scientific contracts, combined workflows and Delaware regression passed; GPU reader validation pending for this upgrade |
 
 Grid generation uses Python with prebuilt dependencies and requires no local
 C/C++ compiler. A complete request invokes the polygon stage and returns for

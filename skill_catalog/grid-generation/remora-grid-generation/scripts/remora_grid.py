@@ -35,7 +35,6 @@ from remora_regions import (
 )
 from grid_math import (
     fit_domain,
-    coordinates,
     sample_netcdf,
     connected_mask,
     roughness,
@@ -45,6 +44,7 @@ from grid_math import (
     staggered_masks,
     GEOD,
 )
+from curvilinear import coordinates, fit_curvilinear, geometry_report
 
 
 def parameters(req):
@@ -62,6 +62,37 @@ def parameters(req):
     p.update(req.get("parameters", {}))
     if not np.isfinite(p["hmin_m"]) or p["hmin_m"] <= 0:
         raise ValueError("hmin must be positive")
+    if req.get("science") or req.get("geometry"):
+        science = req.get("science", {})
+        if science.get("regime") not in ("barotropic_tide", "baroclinic"):
+            raise ValueError("New geometry requires explicit science.regime")
+        if not science.get("rationale", "").strip():
+            raise ValueError("Scientific regime rationale required")
+        for key in ("coverage_rationale", "resolution_rationale", "cell_budget_rationale"):
+            if not req.get("design", {}).get(key, "").strip():
+                raise ValueError("Explicit design."+key+" required")
+        intents=req["design"].get("boundary_intents", {})
+        if set(intents) != {"xlo","xhi","ylo","yhi"}:
+            raise ValueError("Record design.boundary_intents for all four logical sides")
+        for side,value in intents.items():
+            if (not isinstance(value,dict) or value.get("intent") not in
+                    ("open","land","mixed","undetermined")
+                    or not value.get("rationale","").strip()):
+                raise ValueError("Invalid boundary intent for "+side)
+        if "N" not in req.get("parameters", {}) or not p.get("vertical_rationale", "").strip():
+            raise ValueError("Choose N explicitly with vertical_rationale")
+        if science["regime"] == "barotropic_tide" and not 8 <= p["N"] <= 20:
+            raise ValueError("Barotropic-tide policy requires 8–20 justified layers")
+        if isinstance(p["N"], bool) or int(p["N"]) != p["N"]:
+            raise ValueError("N must be an integer")
+        p["N"] = int(p["N"])
+        p.setdefault("rx1_max", 9.0)
+        p.setdefault("rx1_preferred", 7.0)
+        p.setdefault("rx1_target", p["rx1_preferred"])
+        if not (0 < p["rx1_target"] <= p["rx1_max"]
+                and 0 < p["rx1_preferred"] <= p["rx1_max"]):
+            raise ValueError("Invalid rx1 target/preferred/maximum")
+        p["scientific_regime"] = science["regime"]
     return p
 
 
@@ -74,6 +105,9 @@ def load_request(path):
         )
     region_path = resolve(path.parent, req["region_delivery"])
     rd, rp = validate_region(region_path, True)
+    if (rp.get("modeling_purpose") and req.get("science", {}).get("regime")
+            and rp["modeling_purpose"] != req["science"]["regime"]):
+        raise ValueError("Region purpose and grid scientific regime disagree")
     roots = [r for r in rp["regions"] if r.get("parent_id") is None]
     if "region_id" not in req and len(roots) != 1:
         raise ValueError("Select region_id for multi-root plans")
@@ -123,13 +157,10 @@ def fit(path, out):
     req, p, rpath, rd, rp, region = load_request(path)
     if (out / "grid_fit.json").exists():
         raise ValueError("Use a new fit directory for changed geometry")
-    geom = fit_domain(
-        region["vertices_lonlat"],
-        p["spacing_m"],
-        p["padding_m"],
-        p.get("rotation_deg"),
-        p["max_cells"],
-    )
+    args = (region["vertices_lonlat"], p["spacing_m"], p["padding_m"],
+            p.get("rotation_deg"), p["max_cells"])
+    geom = (fit_curvilinear(*args, req["geometry"]) if req.get("geometry")
+            else fit_domain(*args))
     a = coordinates(geom)
     coast = resolve(rpath.parent, rd["source"]["path"])
     bounds = [
@@ -163,7 +194,9 @@ def fit(path, out):
     ax.plot(f[:, 0], f[:, 1], "r-", lw=2, label="Physical grid footprint")
     ax.legend(loc="upper left", fontsize=8)
     ax.set_title(
-        f"Fitted grid: {geom['nx']} x {geom['ny']} cells, {p['spacing_m']:g} m\nGeographic regions remain separate from the numerical footprint"
+        f"Fitted grid: {geom['nx']} x {geom['ny']} cells\n"
+        f"xi spacing {1/a['pm'].max():.0f}–{1/a['pm'].min():.0f} m; "
+        f"eta spacing {1/a['pn'].max():.0f}–{1/a['pn'].min():.0f} m"
     )
     out.mkdir(parents=True, exist_ok=True)
     fig.savefig(out / "grid_fit.png", dpi=150)
@@ -172,6 +205,9 @@ def fit(path, out):
         "schema": "remora_grid_fit_v1",
         "geometry": geom,
         "parameters": p,
+        "science": req.get("science", {}),
+        "design": req.get("design", {}),
+        "geometry_validation": geometry_report(a, geom),
         "request": file_record(path, out),
         "region_delivery": file_record(rpath, out),
         "region_review": file_record(resolve(rpath.parent, rd["review"]), out),
@@ -226,15 +262,46 @@ def anchor_indices(a, mask, features, spacing):
     result = []
     records = []
     for f in features:
+        if f.get("priority", "essential") != "essential":
+            raise ValueError("protected_wet_features must contain essential features only")
         x, y = f["point_lonlat"]
         _, k = tree.query([x * scale, y])
         j, i = int(jj[k]), int(ii[k])
         _, _, distance = GEOD.inv(x, y, float(lon[j, i]), float(lat[j, i]))
-        if distance > f.get("max_snap_m", spacing * 1.5):
+        local_spacing = max(1/a["pm"][j,i], 1/a["pn"][j,i])
+        if distance > f.get("max_snap_m", local_spacing * 1.5):
             raise ValueError("Required wet feature unsupported: " + f["name"])
         result.append((j, i))
         records.append({"name": f["name"], "j": j, "i": i, "snap_distance_m": distance})
     return result, records
+
+
+def require_scientific_features(req, region):
+    """Bind essential water geography to mask protection for new requests."""
+    if not req.get("science"):
+        return
+    protected=req.get("protected_wet_features",[])
+    lookup={f["name"]:f for f in protected}
+    if len(lookup)!=len(protected):
+        raise ValueError("Duplicate protected wet feature names")
+    features=region.get("features",[])+region.get("required_features",[])
+    for feature in features:
+        kind=feature.get("feature_type","water" if "point_lonlat" in feature else "coverage")
+        if feature.get("priority","essential") != "essential" or kind!="water":
+            continue
+        anchor=lookup.get(feature["name"])
+        if anchor is None:
+            raise ValueError("Essential water feature needs a named protected anchor: "+feature["name"])
+        point=np.asarray(anchor.get("point_lonlat"),dtype=float)
+        if point.shape!=(2,) or not np.isfinite(point).all():
+            raise ValueError("Protected feature needs finite lon/lat")
+        if "point_lonlat" in feature:
+            if not np.allclose(point,feature["point_lonlat"],rtol=0,atol=1e-8):
+                raise ValueError("Protected anchor moved from declared water feature: "+feature["name"])
+        else:
+            west,south,east,north=feature["bbox_wsen"]
+            if not (west<=point[0]<=east and south<=point[1]<=north):
+                raise ValueError("Protected anchor outside its essential water feature")
 
 
 def export_grid(path, a, h, mask, p, fitdoc, raw):
@@ -260,13 +327,18 @@ def export_grid(path, a, h, mask, p, fitdoc, raw):
         ds.grid_schema = "remora_grid_v1"
         ds.projection_wkt = fitdoc["geometry"]["crs_wkt"]
         ds.coordinate_note = "x/y are logical projected-grid metres; lon/lat describe geographic location"
+        ds.geometry_kind = fitdoc["geometry"].get("geometry_kind", "rotated_uniform")
+        ds.geometry_definition = json.dumps(fitdoc["geometry"], separators=(",", ":"))
+        ds.science = json.dumps(fitdoc.get("science", {}), separators=(",", ":"))
+        ds.design_rationale = json.dumps(fitdoc.get("design", {}), separators=(",", ":"))
         ds.numerical_levels = 1
-        ds.smoothing_method = "area_weighted_log_pair_projection_v1"
+        ds.smoothing_method = ("area_weighted_log_rx0_rx1_pair_projection_v2"
+                               if "rx1_max" in p else "area_weighted_log_pair_projection_v1")
         ds.smoothing_space = "natural_log_depth"
         ds.smoothing_volume_policy = "report_only_no_rescaling"
         ds.source_policy = "Real source data; no missing wet bathymetry substitution"
         for key, val in p.items():
-            if isinstance(val, (int, float)):
+            if isinstance(val, (int, float, str)):
                 ds.setncattr(key, val)
         for tag in ["rho", "u", "v", "psi"]:
             for prefix in ["lon", "lat", "x", "y"]:
@@ -278,6 +350,12 @@ def export_grid(path, a, h, mask, p, fitdoc, raw):
                     if prefix == "lon"
                     else "degrees_north" if prefix == "lat" else "m"
                 )
+            for prefix in ("projected_x", "projected_y"):
+                name = f"{prefix}_{tag}"
+                if name in a:
+                    v = ds.createVariable(name, "f8", (f"eta_{tag}", f"xi_{tag}"))
+                    v[:] = a[name]
+                    v.units = "m"
         for name, data in {
             **{k: a[k] for k in ["pm", "pn", "angle", "f"]},
             "h": h,
@@ -310,8 +388,8 @@ def export_grid(path, a, h, mask, p, fitdoc, raw):
             ("Vtransform", 2),
             ("Vstretching", 4),
             ("spherical", 1),
-            ("xl", fitdoc["geometry"]["nx"] * p["spacing_m"]),
-            ("el", fitdoc["geometry"]["ny"] * p["spacing_m"]),
+            ("xl", fitdoc["geometry"].get("logical_extent_m", [fitdoc["geometry"]["nx"] * p["spacing_m"], fitdoc["geometry"]["ny"] * p["spacing_m"]])[0]),
+            ("el", fitdoc["geometry"].get("logical_extent_m", [fitdoc["geometry"]["nx"] * p["spacing_m"], fitdoc["geometry"]["ny"] * p["spacing_m"]])[1]),
         ]:
             ds.createVariable(name, "f8", ())[...] = value
 
@@ -327,6 +405,7 @@ def build(fit_path, out):
         raise ValueError("Use a new build directory for a changed grid")
     request_path = resolve(fit_path.parent, f["request"]["path"])
     req, p, rpath, rd, rp, region = load_request(request_path)
+    require_scientific_features(req,region)
     a = coordinates(f["geometry"])
     landpath = resolve(rpath.parent, rd["source"]["path"])
     land = land_frame(landpath)
@@ -350,15 +429,56 @@ def build(fit_path, out):
     initial = shore_water & (elev < 0)
     if not initial.any():
         raise ValueError("No wet cells after coastline/bathymetry classification")
+    candidate = initial.copy()
+    explicit_edits = []
+    declared_features={feature["name"]:feature
+                       for feature in region.get("features",[])+region.get("required_features",[])}
+    for edit in req.get("mask_adjustments", []):
+        if (edit.get("action") != "close_optional" or not edit.get("rationale", "").strip()
+                or not edit.get("evidence")):
+            raise ValueError("Mask adjustment must close optional water with rationale and evidence")
+        feature=declared_features.get(edit.get("feature_name"))
+        if not feature or feature.get("priority","essential") != "optional":
+            raise ValueError("Explicit closure must identify a declared optional region feature")
+        if any(not isinstance(e,dict) or not e.get("source") or not e.get("finding")
+               for e in edit["evidence"]):
+            raise ValueError("Closure evidence needs source and finding")
+        shape = polygon(edit["vertices_lonlat"])
+        affected = shapely.intersects_xy(shape, a["lon_rho"], a["lat_rho"]) & candidate
+        candidate[affected] = False
+        explicit_edits.append(dict(edit, changed_cells=int(affected.sum())))
+    # Snap in the original source mask, so a closure cannot move an essential
+    # anchor into a different surviving basin and falsely claim preservation.
     anchors, anchor_report = anchor_indices(
         a, initial, req.get("protected_wet_features", []), p["spacing_m"]
     )
-    mask, corrections = connected_mask(initial, anchors)
+    mask, corrections = connected_mask(candidate, anchors)
+    if req.get("science"):
+        for feature in declared_features.values():
+            if feature.get("priority","essential")!="essential" or feature.get("feature_type")!="land":
+                continue
+            if "point_lonlat" in feature:
+                x,y=feature["point_lonlat"]
+                if not shapely.intersects_xy(land.geometry.union_all(),x,y):
+                    raise ValueError("Essential land feature lacks shoreline support: "+feature["name"])
+                distance=(a["lon_rho"]-x)**2*np.cos(np.deg2rad(y))**2+(a["lat_rho"]-y)**2
+                j,i=np.unravel_index(distance.argmin(),mask.shape)
+                if mask[j,i]:
+                    raise ValueError("Essential island/land point is not represented by the mask: "+feature["name"])
+    corrections["explicit_optional_closures"] = explicit_edits
+    corrections["removed_cells"] = int((initial & ~mask).sum())
     raw = np.where(mask, np.maximum(-elev, p["hmin_m"]), p["hmin_m"])
     if not np.isfinite(raw).all():
         raise ValueError("Nonfinite classified depth")
     area = 1 / (a["pm"] * a["pn"])
-    h, smoothing = smooth_depth(raw, mask, area, p["rx0_max"])
+    if "rx1_max" in p:
+        from conditioning import smooth_depth_vertical
+        h, smoothing = smooth_depth_vertical(
+            raw, mask, area, p["rx0_max"], p["rx1_target"], p["N"],
+            p["theta_s"], p["theta_b"], p["hc_m"], hmin=p["hmin_m"],
+            max_iter=p.get("smoothing_max_iter", 4000))
+    else:
+        h, smoothing = smooth_depth(raw, mask, area, p["rx0_max"])
     vertical = vertical_diagnostics(
         h, p["N"], p["theta_s"], p["theta_b"], p["hc_m"], mask=mask)
     out.mkdir(parents=True, exist_ok=True)
@@ -399,6 +519,13 @@ def build(fit_path, out):
     smoothing["physical_volume_relative_change"] = float(
         np.sum((h - raw)[core] * area[core]) / np.sum(raw[core] * area[core])
     )
+    source_depth = np.where(mask, -elev, p["hmin_m"])
+    floor_added_volume = float(np.sum((raw-source_depth)[core]*area[core]))
+    floor_report = {
+        "wet_cells_clipped": int((mask & (source_depth<p["hmin_m"])).sum()),
+        "physical_volume_added_m3": floor_added_volume,
+        "physical_volume_relative_change": floor_added_volume/float(np.sum(source_depth[core]*area[core])),
+        "interpretation": "depth-floor changes before log smoothing; hraw already includes this floor"}
     report.update(
         smoothing=smoothing,
         feature_sections=section_report,
@@ -410,6 +537,17 @@ def build(fit_path, out):
         orthogonality_error_max_deg=float(a["orthogonality_error_deg"].max()),
         source_vertical_datum=bathy.get("vertical_datum", "unspecified"),
         warnings=list(bathy.get("warnings", [])),
+        geometry=geometry_report(a, f["geometry"]),
+        design=req.get("design", {}),
+        science=req.get("science", {}),
+        depth_floor=floor_report,
+        computational_size={
+            "physical_dimensions": [f["geometry"]["nx"], f["geometry"]["ny"]],
+            "rho_dimensions": [h.shape[1], h.shape[0]],
+            "physical_horizontal_cells": f["geometry"]["nx"]*f["geometry"]["ny"],
+            "allocated_3d_cells_without_halo": f["geometry"]["nx"]*f["geometry"]["ny"]*p["N"],
+            "wet_3d_cells_without_halo": int(mask[1:-1,1:-1].sum())*p["N"],
+            "interpretation": "counts only; no measured runtime or speedup"},
     )
     report["edge_wet_cells"] = {
         k: int(v.sum())
@@ -425,16 +563,22 @@ def build(fit_path, out):
         k: ("water_boundary_requires_forcing" if n else "land")
         for k, n in report["edge_wet_cells"].items()
     }
+    if req.get("science"):
+        for side, intent in req["design"]["boundary_intents"].items():
+            if intent["intent"] == "land" and report["edge_wet_cells"][side]:
+                report["warnings"].append(
+                    f"{side} was intended as land but has wet boundary cells; revise or explain boundary intent.")
     if corrections["removed_cells"]:
         report["warnings"].append(
             f"Closed {corrections['removed_cells']} disconnected water cells; inspect lagoon and tributary consequences before scientific use."
         )
     write_json(out / "validation.json", report)
     nx, ny = f["geometry"]["nx"], f["geometry"]["ny"]
+    lx, ly = f["geometry"].get("logical_extent_m", [nx*p["spacing_m"],ny*p["spacing_m"]])
     snippet = f"""# Grid-only snippet; merge with a complete REMORA simulation configuration.
 remora.n_cell = {nx} {ny} {p['N']}
 remora.prob_lo = 0 0 {-float(h.max()):.8g}
-remora.prob_hi = {nx*p['spacing_m']:.8g} {ny*p['spacing_m']:.8g} 0
+remora.prob_hi = {lx:.8g} {ly:.8g} 0
 remora.use_curvilinear_grid = true
 remora.nc_grid_file_0 = remora_grid.nc
 remora.ic_type = netcdf
@@ -515,9 +659,23 @@ def readback(path):
             if not np.array_equal(d[name][:], expected):
                 raise ValueError("Inconsistent mask " + name)
         r = roughness(h, m.astype(bool))
-        if r > d.rx0_max + 2e-8:
+        if r > d.rx0_max + (0 if hasattr(d,"rx1_max") else 2e-8):
             raise ValueError("Excessive bathymetric roughness")
-        vertical = vertical_diagnostics(h, int(d.N), d.theta_s, d.theta_b, d.hc_m)
+        vertical = vertical_diagnostics(h, int(d.N), d.theta_s, d.theta_b, d.hc_m,
+                                        mask=m.astype(bool))
+        if hasattr(d, "rx1_max") and vertical["haney_rx1_diagnostic"] >= d.rx1_max:
+            raise ValueError("Excessive vertical-coordinate rx1")
+        geometry = {}
+        if getattr(d, "geometry_kind", "") == "conformal_graded":
+            definition = json.loads(d.geometry_definition)
+            expected_geometry = coordinates(definition)
+            for name in ["pm","pn","angle","f"] + [
+                    f"{prefix}_{tag}" for tag in ("rho","u","v","psi")
+                    for prefix in ("lon","lat","x","y","projected_x","projected_y")]:
+                np.testing.assert_allclose(d[name][:],expected_geometry[name],
+                                           rtol=1e-12,atol=1e-10,
+                                           err_msg="Grid geometry readback mismatch: "+name)
+            geometry = geometry_report(expected_geometry,definition)
         return {
             "local_validation": "pass",
             "format": d.data_model,
@@ -525,6 +683,10 @@ def readback(path):
             "n_cell": [nx - 2, ny - 2, int(d.N)],
             "rx0": r,
             "minimum_layer_thickness_m": vertical["minimum_layer_thickness_m"],
+            "haney_rx1_diagnostic": vertical["haney_rx1_diagnostic"],
+            "rx1_preferred_met": bool(vertical["haney_rx1_diagnostic"] <
+                                      getattr(d,"rx1_preferred",7.0)),
+            "geometry": geometry,
             "reader_validation": "not_run",
         }
 

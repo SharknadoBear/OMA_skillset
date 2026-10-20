@@ -3,6 +3,9 @@
 Use the absolute case root supplied by the caller. The caller or agent writes
 `science_request.json` with `location`, `modeling_purpose`, and
 `required_focus_areas`; preserve the original scientific prompt when available.
+Use plain scientific prose in this file. Put the case agent's numerical choices,
+regime, feature priorities and design rationales in the separate region/grid
+requests. Do not replace a request with the parameter choices from a previous case.
 
 ```text
 CASE/
@@ -27,6 +30,14 @@ source files read-only; their provenance must remain explicit. Local generation
 can use the workspace's existing `.venv-remora` if its dependencies are healthy.
 All generated case files stay under CASE. Python GIS or source-provider caches
 are infrastructure, not alternative output packages.
+
+Before fetching data, inventory the supplied case sources and relevant workspace
+source/cache directories read-only. Inspect manifests for geographic coverage,
+resolution, sign, vertical datum, date/version and health, then compare those
+against the fitted footprint and rho halo. Reuse a healthy source with explicit
+provenance when suitable. A cached source's extent does not decide the scientific
+domain, and a prior case's accepted geometry or numerical solution is not a
+template answer for a fresh case.
 
 The numerical method is always natural-log depth smoothing. The script reports
 volume changes without global rescaling. `hraw` is the classified, depth-floor

@@ -6,7 +6,32 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from remora_regions import setup_map
-from grid_math import vertical_section
+from grid_math import vertical_section, depths
+
+
+def rx1_map(h, mask, p):
+    """Maximum incident wet-neighbor Haney value, using bounded row blocks."""
+    result = np.zeros_like(h, dtype=float)
+    for start in range(0,h.shape[0],32):
+        end=min(start+33,h.shape[0])
+        _,zw,_=depths(h[start:end],p["N"],p["theta_s"],p["theta_b"],p["hc_m"])
+        local_mask=mask[start:end]
+        for axis in (1,2):
+            lower=np.take(zw,range(zw.shape[axis]-1),axis=axis)
+            upper=np.take(zw,range(1,zw.shape[axis]),axis=axis)
+            values=np.max(np.abs(lower[1:]+lower[:-1]-upper[1:]-upper[:-1])/
+                          (np.diff(lower,axis=0)+np.diff(upper,axis=0)),axis=0)
+            ma=np.take(local_mask,range(local_mask.shape[axis-1]-1),axis=axis-1)
+            mb=np.take(local_mask,range(1,local_mask.shape[axis-1]),axis=axis-1)
+            values=np.where(ma&mb,values,0)
+            local=result[start:end]
+            if axis==1:
+                local[:-1]=np.maximum(local[:-1],values)
+                local[1:]=np.maximum(local[1:],values)
+            else:
+                local[:,:-1]=np.maximum(local[:,:-1],values)
+                local[:,1:]=np.maximum(local[:,1:],values)
+    return np.where(mask,result,np.nan)
 
 
 def diagnostic_maps(out, a, h, raw, mask, initial, land, features, vertical_parameters):
@@ -33,7 +58,12 @@ def diagnostic_maps(out, a, h, raw, mask, initial, land, features, vertical_para
         for ax, (data, caption, cmap, lower, upper, norm) in zip(axs[0], panels):
             setup_map(ax, land, bounds)
             kw = {"norm": norm} if norm else {"vmin": lower, "vmax": upper}
-            im = ax.pcolormesh(lo[sl], la[sl], data[sl], shading="nearest", cmap=cmap, zorder=2, **kw)
+            if "lon_rho_corners" in a:
+                edges=(slice(sl[0].start,sl[0].stop+1),slice(sl[1].start,sl[1].stop+1))
+                im=ax.pcolormesh(a["lon_rho_corners"][edges],a["lat_rho_corners"][edges],
+                                 data[sl],shading="flat",cmap=cmap,zorder=2,**kw)
+            else:
+                im = ax.pcolormesh(lo[sl], la[sl], data[sl], shading="nearest", cmap=cmap, zorder=2, **kw)
             local = land.cx[bounds[0]:bounds[2], bounds[1]:bounds[3]]
             if not local.empty:
                 local.boundary.plot(ax=ax, color="black", linewidth=.35, zorder=3)
@@ -59,7 +89,15 @@ def diagnostic_maps(out, a, h, raw, mask, initial, land, features, vertical_para
         (percent, "Relative depth change (%)", "RdBu_r", -maxpercent, maxpercent, None)])
     panel_file("geometry_quality", [
         (1/a["pm"], "Cell width in xi (m)", "viridis", None, None, None),
+        (1/a["pn"], "Cell width in eta (m)", "viridis", None, None, None),
         (a["orthogonality_error_deg"], "Orthogonality deviation (degrees)", "viridis", None, None, None)])
+    before_rx1=rx1_map(raw,mask,vertical_parameters)
+    after_rx1=rx1_map(h,mask,vertical_parameters)
+    vmax=max(1.,float(np.nanmax(before_rx1)),float(np.nanmax(after_rx1)))
+    panel_file("vertical_quality",[
+        (before_rx1,"Before smoothing: rx1 (dimensionless)","magma",0,vmax,None),
+        (after_rx1,"After smoothing: rx1 (dimensionless)","magma",0,vmax,None)],
+        title=f"Vertical stiffness — {vertical_parameters['N']} layers; matching scales")
     for k, f in enumerate(features):
         x, y = f["point_lonlat"]
         dy = f.get("review_radius_km", 12)/111.32
@@ -76,11 +114,11 @@ def diagnostic_maps(out, a, h, raw, mask, initial, land, features, vertical_para
     row = vertical_section(h, 0, j, p["N"], p["theta_s"], p["theta_b"], p["hc_m"])
     column = vertical_section(h, 1, i, p["N"], p["theta_s"], p["theta_b"], p["hc_m"])
     for ax, section, wet, x, title in [
-        (axs[0], row, mask[j], a["x_rho"][j]/1000, f"eta={j}"),
-        (axs[1], column, mask[:,i], a["y_rho"][:,i]/1000, f"xi={i}")]:
+        (axs[0], row, mask[j], np.cumsum(1/a["pm"][j])/1000, f"eta={j}"),
+        (axs[1], column, mask[:,i], np.cumsum(1/a["pn"][:,i])/1000, f"xi={i}")]:
         for k in range(0, len(section), max(1, (len(section)-1)//20)):
             ax.plot(x, np.where(wet, section[k], np.nan), color="#13688c", lw=.6)
-        ax.set(title="Vertical interfaces: "+title, xlabel="Logical distance (km)", ylabel="z (m)")
+        ax.set(title="Vertical interfaces: "+title, xlabel="Distance along grid section (km)", ylabel="z (m)")
         ax.grid(alpha=.2)
     path=out/"vertical_sections.png"
     fig.savefig(path,dpi=140); plt.close(fig); paths.append(path)

@@ -24,7 +24,7 @@ def run(script, *args, success=True):
     return p
 
 
-def main():
+def main(v2=False):
     grid = Path(__file__).with_name("remora_grid.py")
     region = REGION_SCRIPTS / "remora_regions.py"
     with tempfile.TemporaryDirectory() as td:
@@ -69,6 +69,22 @@ def main():
                 "positive": "up",
             },
         }
+        if v2:
+            reg["modeling_purpose"]="barotropic_tide"
+            reg["science_rationale"]="Synthetic constant-density geometry integration test"
+            write_json(root/"region_request.json",reg)
+            req["science"]={"regime":"barotropic_tide","rationale":reg["science_rationale"]}
+            req["design"]={
+                "coverage_rationale":"Synthetic fixture coverage",
+                "resolution_rationale":"Exercise curved and graded coordinates",
+                "cell_budget_rationale":"Small analytic integration fixture",
+                "boundary_intents":{side:{"intent":"undetermined","rationale":"Synthetic reader fixture"}
+                                    for side in ("xlo","xhi","ylo","yhi")}}
+            req["parameters"].update(vertical_rationale="Eight layers for constant-density fixture",
+                                     theta_s=2,theta_b=0,hc_m=10)
+            req["geometry"]={"kind":"conformal_graded","nx":32,"ny":32,
+                             "xi_control":[[0,0],[.5,.6],[1,1]],
+                             "eta_control":[[0,0],[1,1]],"c2":[0,.025],"c3":[0,0]}
         write_json(root / "request.json", req)
         case_root = root / "case"
         case = case_root / "attempts/attempt_001"
@@ -173,4 +189,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(v2="--v2" in sys.argv)
