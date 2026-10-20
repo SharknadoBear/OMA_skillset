@@ -30,11 +30,10 @@ def verify_host_key(key):
     return observed
 
 
-def connect_verified(identity):
-    user, host = validate_target(str(identity.get('remote_target', '')))
+def open_verified_transport(host):
+    """Verify a fresh transport without collecting or sending credentials."""
     sock = socket.create_connection((host, 22), timeout=30)
     transport = None
-    secret = None
     try:
         transport = paramiko.Transport(sock)
         transport.banner_timeout = 30
@@ -42,7 +41,21 @@ def connect_verified(identity):
         transport.get_security_options().key_types = ('rsa-sha2-512', 'rsa-sha2-256')
         transport.start_client(timeout=30)
         verify_host_key(transport.get_remote_server_key())
-        print('NERSC host fingerprint verified.', flush=True)
+        return transport
+    except BaseException:
+        if transport is not None:
+            transport.close()
+        else:
+            sock.close()
+        raise
+
+
+def connect_verified(identity):
+    user, host = validate_target(str(identity.get('remote_target', '')))
+    transport = None
+    secret = None
+    phase = 'host verification'
+    try:
         if identity.get('key_file'):
             key_path = Path(identity['key_file']).expanduser()
             certificate = Path(str(key_path)+'-cert.pub')
@@ -50,12 +63,26 @@ def connect_verified(identity):
                 raise ValueError('Refresh sshproxy: expected adjacent -cert.pub certificate')
             key = paramiko.PKey.from_path(key_path)
             key.load_certificate(str(certificate))
+            transport = open_verified_transport(host)
+            phase = 'certificate authentication'
             transport.auth_publickey(user, key)
         else:
             if not sys.stdin.isatty():
                 raise RuntimeError('Authenticate in the visible start_bridge_window.ps1 terminal only')
+            # Human entry can outlast the server's unauthenticated SSH grace
+            # period. Close the preflight, then verify a fresh connection after
+            # input; never submit credentials over the waiting connection.
+            preflight = open_verified_transport(host)
+            preflight.close()
+            print('NERSC host fingerprint verified. Ready for terminal input.', flush=True)
             print('Type your NERSC password followed immediately by the current OTP.', flush=True)
+            phase = 'terminal input'
             secret = getpass.getpass('Password+OTP: ')
+            phase = 'fresh host verification'
+            print('Connecting and verifying a fresh SSH session...', flush=True)
+            transport = open_verified_transport(host)
+            phase = 'password/OTP authentication'
+            print('Authenticating with NERSC (up to 60 seconds)...', flush=True)
             transport.auth_password(user, secret, fallback=True)
         if not transport.is_authenticated():
             raise paramiko.AuthenticationException('Authentication did not complete')
@@ -64,11 +91,16 @@ def connect_verified(identity):
         client._transport = transport
         print('Connected. Watching JSON command files.', flush=True)
         return client
-    except BaseException:
+    except BaseException as error:
         if transport is not None:
             transport.close()
+        # Do not print exception text: the authentication callback may include
+        # server-provided content. Phase and class safely explain a failed wait.
+        print(f'Connection failed during {phase} ({type(error).__name__}).', flush=True)
+        if isinstance(error, paramiko.AuthenticationException):
+            print('NERSC did not accept authentication. Check the account and current OTP before requesting reconnect.', flush=True)
         else:
-            sock.close()
+            print('No authenticated session remains. Inspect bridge status and request reconnect when ready.', flush=True)
         raise
     finally:
         secret = None

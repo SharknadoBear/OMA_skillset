@@ -2,6 +2,8 @@
 import argparse
 import hashlib
 import json
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 import tempfile
 import unittest
@@ -28,7 +30,7 @@ class SiteTests(unittest.TestCase):
     def test_mismatch_precedes_credentials_and_authentication(self):
         sock, t = self.setup_transport()
         t.get_remote_server_key.return_value.asbytes.return_value = b'wrong host'
-        with patch.object(site.socket,'create_connection',return_value=sock), patch.object(site.paramiko,'Transport',return_value=t), patch.object(site.getpass,'getpass') as prompt:
+        with patch.object(site.socket,'create_connection',return_value=sock), patch.object(site.paramiko,'Transport',return_value=t), patch.object(site.sys.stdin,'isatty',return_value=True), patch.object(site.getpass,'getpass') as prompt:
             with self.assertRaises(RuntimeError):
                 site.connect_verified({'remote_target':'example@perlmutter.nersc.gov'})
             prompt.assert_not_called()
@@ -40,7 +42,7 @@ class SiteTests(unittest.TestCase):
         events = []
         with patch.object(site.socket,'create_connection',return_value=sock), patch.object(site.paramiko,'Transport',return_value=t), patch.object(site,'verify_host_key',side_effect=lambda key:events.append('verified')), patch.object(site.sys.stdin,'isatty',return_value=True), patch.object(site.getpass,'getpass',side_effect=lambda text:events.append('prompt') or 'synthetic-test-only') as prompt:
             client = site.connect_verified({'remote_target':'example@perlmutter.nersc.gov'})
-        self.assertEqual(events, ['verified','prompt'])
+        self.assertEqual(events, ['verified','prompt','verified'])
         prompt.assert_called_once()
         t.auth_password.assert_called_once_with('example','synthetic-test-only',fallback=True)
         t.set_keepalive.assert_called_once_with(60)
@@ -53,16 +55,50 @@ class SiteTests(unittest.TestCase):
             with self.assertRaises(paramiko.AuthenticationException):
                 site.connect_verified({'remote_target':'example@perlmutter.nersc.gov'})
         prompt.assert_called_once()
-        t.close.assert_called_once()
+        self.assertEqual(t.close.call_count,2)
         t.auth_password.assert_called_once()
 
     def test_noninteractive_refused(self):
         sock,t = self.setup_transport()
-        with patch.object(site.socket,'create_connection',return_value=sock), patch.object(site.paramiko,'Transport',return_value=t), patch.object(site,'verify_host_key'), patch.object(site.sys.stdin,'isatty',return_value=False), patch.object(site.getpass,'getpass') as prompt:
+        with patch.object(site.socket,'create_connection',return_value=sock) as network, patch.object(site.paramiko,'Transport',return_value=t), patch.object(site,'verify_host_key'), patch.object(site.sys.stdin,'isatty',return_value=False), patch.object(site.getpass,'getpass') as prompt:
             with self.assertRaises(RuntimeError):
                 site.connect_verified({'remote_target':'example@perlmutter.nersc.gov'})
             prompt.assert_not_called()
-            t.close.assert_called_once()
+            network.assert_not_called()
+
+    def test_human_wait_cannot_expire_authentication_transport(self):
+        preflight=Mock()
+        fresh=Mock()
+        fresh.is_authenticated.return_value=True
+        def prompt(_):
+            preflight.close.assert_called_once()
+            preflight.is_active.return_value=False
+            # The human may wait indefinitely; there is no live SSH transport.
+            self.assertEqual(opening.call_count,1)
+            return 'synthetic-test-only'
+        with patch.object(site,'open_verified_transport',side_effect=[preflight,fresh]) as opening, patch.object(site.sys.stdin,'isatty',return_value=True), patch.object(site.getpass,'getpass',side_effect=prompt):
+            client=site.connect_verified({'remote_target':'example@perlmutter.nersc.gov'})
+        preflight.auth_password.assert_not_called()
+        fresh.auth_password.assert_called_once_with('example','synthetic-test-only',fallback=True)
+        self.assertIs(client.get_transport(),fresh)
+
+    def test_second_host_verification_failure_sends_no_credentials(self):
+        preflight=Mock()
+        with patch.object(site,'open_verified_transport',side_effect=[preflight,RuntimeError('synthetic pin mismatch')]), patch.object(site.sys.stdin,'isatty',return_value=True), patch.object(site.getpass,'getpass',return_value='synthetic-test-only'):
+            with self.assertRaises(RuntimeError):
+                site.connect_verified({'remote_target':'example@perlmutter.nersc.gov'})
+        preflight.auth_password.assert_not_called()
+
+    def test_authentication_error_is_visible_without_exception_text(self):
+        preflight,fresh=Mock(),Mock()
+        fresh.auth_password.side_effect=paramiko.SSHException('synthetic-sensitive-error-content')
+        log=io.StringIO()
+        with patch.object(site,'open_verified_transport',side_effect=[preflight,fresh]), patch.object(site.sys.stdin,'isatty',return_value=True), patch.object(site.getpass,'getpass',return_value='synthetic-test-only'),redirect_stdout(log):
+            with self.assertRaises(paramiko.SSHException):
+                site.connect_verified({'remote_target':'example@perlmutter.nersc.gov'})
+        self.assertIn('Connection failed during password/OTP authentication (SSHException)',log.getvalue())
+        self.assertNotIn('synthetic-sensitive-error-content',log.getvalue())
+        self.assertNotIn('synthetic-test-only',log.getvalue())
 
     def test_certificate_failure_has_no_password_fallback(self):
         sock,t = self.setup_transport()

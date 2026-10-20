@@ -220,7 +220,7 @@ and request reference for its exact scope and invocation.
   interface, independent command/transfer lanes, verified resumable transfers,
   bounded requests and durable receipts. NERSC endpoint verification, MFA and
   resource/storage guidance remain site-specific. Local output, failure-injection
-  and authentication tests cover 41 cases; live acceptance is recorded privately.
+  and authentication tests cover 44 cases; live acceptance is recorded privately.
 - `workspace-bridging/expanse-hpc` mirrors the named-session JSON bridge
   architecture for SDSC Expanse, supports password-or-agent authentication
   followed by TOTP, and documents Expanse-specific Slurm, Lmod, project,

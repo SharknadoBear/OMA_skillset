@@ -9,7 +9,7 @@ Use `user@perlmutter.nersc.gov` as the public example. Resolve the actual NERSC 
 
 Before asking for account details, inspect `%LOCALAPPDATA%/Codex/perlmutter-hpc/account.local.json` when present. Reuse user-confirmed details for the matching workspace, distinguishing a confirmed project from live-verified CPU/GPU charging-account access.
 
-The bridge verifies NERSC's published RSA host fingerprint before requesting authentication, with RSA SHA-2 signatures and no Kestrel MAC override. Enter password immediately followed by OTP only in its visible terminal. Never collect credentials through chat, files, arguments, environment variables, screenshots or logs. One attempt is made per connection request; investigate failures before explicit reconnect. See [NERSC authentication](references/nersc.md#authentication).
+The bridge verifies NERSC's published RSA host fingerprint before requesting authentication, with RSA SHA-2 signatures and no Kestrel MAC override. Enter password immediately followed by OTP only in its visible terminal. Never collect credentials through chat, files, arguments, environment variables, screenshots or logs. The credential-free host preflight closes before you type. After Enter, the bridge opens and verifies a fresh connection, then makes one authentication attempt; this prevents the server's pre-login timeout from expiring during human input. The terminal shows connection/authentication progress and a sanitized failure phase. Investigate failures before explicit reconnect. See [NERSC authentication](references/nersc.md#authentication).
 
 ## Local bridge workflow
 
