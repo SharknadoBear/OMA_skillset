@@ -8,6 +8,7 @@ import re
 import socket
 import sys
 import paramiko
+from site_network import connect_tcp
 
 HOST = 'perlmutter.nersc.gov'
 # Independently verified against https://docs.nersc.gov/connect/ on 2026-10-20.
@@ -32,13 +33,15 @@ def verify_host_key(key):
 
 def open_verified_transport(host):
     """Verify a fresh transport without collecting or sending credentials."""
-    sock = socket.create_connection((host, 22), timeout=30)
+    print('Resolving NERSC and opening TCP port 22 (20-second total limit)...', flush=True)
+    sock = connect_tcp(host)
     transport = None
     try:
         transport = paramiko.Transport(sock)
         transport.banner_timeout = 30
         transport.auth_timeout = 60
         transport.get_security_options().key_types = ('rsa-sha2-512', 'rsa-sha2-256')
+        print('Verifying SSH handshake and NERSC host key...', flush=True)
         transport.start_client(timeout=30)
         verify_host_key(transport.get_remote_server_key())
         return transport

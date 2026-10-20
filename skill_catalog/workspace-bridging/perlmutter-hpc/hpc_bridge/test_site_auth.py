@@ -30,7 +30,7 @@ class SiteTests(unittest.TestCase):
     def test_mismatch_precedes_credentials_and_authentication(self):
         sock, t = self.setup_transport()
         t.get_remote_server_key.return_value.asbytes.return_value = b'wrong host'
-        with patch.object(site.socket,'create_connection',return_value=sock), patch.object(site.paramiko,'Transport',return_value=t), patch.object(site.sys.stdin,'isatty',return_value=True), patch.object(site.getpass,'getpass') as prompt:
+        with patch.object(site,'connect_tcp',return_value=sock), patch.object(site.paramiko,'Transport',return_value=t), patch.object(site.sys.stdin,'isatty',return_value=True), patch.object(site.getpass,'getpass') as prompt:
             with self.assertRaises(RuntimeError):
                 site.connect_verified({'remote_target':'example@perlmutter.nersc.gov'})
             prompt.assert_not_called()
@@ -40,7 +40,7 @@ class SiteTests(unittest.TestCase):
     def test_verified_mfa_once_and_keepalive(self):
         sock, t = self.setup_transport()
         events = []
-        with patch.object(site.socket,'create_connection',return_value=sock), patch.object(site.paramiko,'Transport',return_value=t), patch.object(site,'verify_host_key',side_effect=lambda key:events.append('verified')), patch.object(site.sys.stdin,'isatty',return_value=True), patch.object(site.getpass,'getpass',side_effect=lambda text:events.append('prompt') or 'synthetic-test-only') as prompt:
+        with patch.object(site,'connect_tcp',return_value=sock), patch.object(site.paramiko,'Transport',return_value=t), patch.object(site,'verify_host_key',side_effect=lambda key:events.append('verified')), patch.object(site.sys.stdin,'isatty',return_value=True), patch.object(site.getpass,'getpass',side_effect=lambda text:events.append('prompt') or 'synthetic-test-only') as prompt:
             client = site.connect_verified({'remote_target':'example@perlmutter.nersc.gov'})
         self.assertEqual(events, ['verified','prompt','verified'])
         prompt.assert_called_once()
@@ -51,7 +51,7 @@ class SiteTests(unittest.TestCase):
     def test_auth_failure_closes_without_retry(self):
         sock,t = self.setup_transport()
         t.auth_password.side_effect = paramiko.AuthenticationException('synthetic rejection')
-        with patch.object(site.socket,'create_connection',return_value=sock), patch.object(site.paramiko,'Transport',return_value=t), patch.object(site,'verify_host_key'), patch.object(site.sys.stdin,'isatty',return_value=True), patch.object(site.getpass,'getpass',return_value='synthetic-test-only') as prompt:
+        with patch.object(site,'connect_tcp',return_value=sock), patch.object(site.paramiko,'Transport',return_value=t), patch.object(site,'verify_host_key'), patch.object(site.sys.stdin,'isatty',return_value=True), patch.object(site.getpass,'getpass',return_value='synthetic-test-only') as prompt:
             with self.assertRaises(paramiko.AuthenticationException):
                 site.connect_verified({'remote_target':'example@perlmutter.nersc.gov'})
         prompt.assert_called_once()
@@ -60,7 +60,7 @@ class SiteTests(unittest.TestCase):
 
     def test_noninteractive_refused(self):
         sock,t = self.setup_transport()
-        with patch.object(site.socket,'create_connection',return_value=sock) as network, patch.object(site.paramiko,'Transport',return_value=t), patch.object(site,'verify_host_key'), patch.object(site.sys.stdin,'isatty',return_value=False), patch.object(site.getpass,'getpass') as prompt:
+        with patch.object(site,'connect_tcp',return_value=sock) as network, patch.object(site.paramiko,'Transport',return_value=t), patch.object(site,'verify_host_key'), patch.object(site.sys.stdin,'isatty',return_value=False), patch.object(site.getpass,'getpass') as prompt:
             with self.assertRaises(RuntimeError):
                 site.connect_verified({'remote_target':'example@perlmutter.nersc.gov'})
             prompt.assert_not_called()
@@ -107,7 +107,7 @@ class SiteTests(unittest.TestCase):
             keypath.write_text('synthetic')
             Path(str(keypath)+'-cert.pub').write_text('synthetic certificate')
             t.auth_publickey.side_effect=paramiko.AuthenticationException('expired test certificate')
-            with patch.object(site.socket,'create_connection',return_value=sock), patch.object(site.paramiko,'Transport',return_value=t), patch.object(site,'verify_host_key'), patch.object(site.paramiko.PKey,'from_path',return_value=Mock()), patch.object(site.getpass,'getpass') as prompt:
+            with patch.object(site,'connect_tcp',return_value=sock), patch.object(site.paramiko,'Transport',return_value=t), patch.object(site,'verify_host_key'), patch.object(site.paramiko.PKey,'from_path',return_value=Mock()), patch.object(site.getpass,'getpass') as prompt:
                 with self.assertRaises(paramiko.AuthenticationException):
                     site.connect_verified({'remote_target':'example@perlmutter.nersc.gov','key_file':str(keypath)})
                 prompt.assert_not_called()
