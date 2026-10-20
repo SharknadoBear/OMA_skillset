@@ -1,0 +1,14 @@
+.venv/
+commands/
+results/
+inflight/
+progress/
+__pycache__/
+bridge_sessions/
+bridge_status.txt
+bridge_status.json
+bridge_identity.json
+bridge.lock
+*.py[cod]
+*.tmp
+*.log
