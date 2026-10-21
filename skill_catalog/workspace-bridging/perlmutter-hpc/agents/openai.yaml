@@ -1,0 +1,4 @@
+interface:
+  display_name: "Perlmutter HPC"
+  short_description: "Secure NERSC bridge, modules, storage and Slurm"
+  default_prompt: "Use $perlmutter-hpc to connect to NERSC and inspect the requested environment or run authorized work."

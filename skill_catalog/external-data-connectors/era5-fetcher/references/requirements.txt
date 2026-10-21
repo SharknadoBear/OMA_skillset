@@ -1,0 +1,8 @@
+cdsapi==0.7.7
+ecmwf-datastores-client==0.5.3
+numpy==2.4.6
+xarray==2026.7.0
+netCDF4==1.7.4
+requests==2.34.2
+PyYAML==6.0.3
+matplotlib==3.11.1

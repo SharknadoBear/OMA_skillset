@@ -70,3 +70,20 @@ skill_catalog/external-data-connectors/argo-fetcher/**/*.tmp
 
 .DS_Store
 Thumbs.db
+
+# Project runs and source payloads do not belong in acquisition skills.
+skill_catalog/external-data-connectors/era5-fetcher/runs/
+skill_catalog/external-data-connectors/era5-fetcher/**/*.nc
+skill_catalog/external-data-connectors/era5-fetcher/**/*.part
+skill_catalog/external-data-connectors/era5-fetcher/**/writer.lock
+skill_catalog/external-data-connectors/glorys-fetcher/runs/
+skill_catalog/external-data-connectors/glorys-fetcher/**/*.nc
+skill_catalog/external-data-connectors/glorys-fetcher/**/*.part
+skill_catalog/external-data-connectors/glorys-fetcher/**/writer.lock
+skill_catalog/external-data-connectors/noaa-ww3-fetcher/runs/
+skill_catalog/external-data-connectors/noaa-ww3-fetcher/**/*.nc
+skill_catalog/external-data-connectors/noaa-ww3-fetcher/**/*.part
+skill_catalog/external-data-connectors/noaa-ww3-fetcher/**/writer.lock
+skill_catalog/external-data-connectors/era5-fetcher/**/*.zip
+skill_catalog/external-data-connectors/noaa-ww3-fetcher/**/*.grb2
+skill_catalog/external-data-connectors/noaa-ww3-fetcher/**/*.tar.gz

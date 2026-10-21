@@ -1,0 +1,4 @@
+interface:
+  display_name: "NOAA WW3 Fetcher"
+  short_description: "Fetch historical NOAA wave grids and point spectra"
+  default_prompt: "Use $noaa-ww3-fetcher to inventory, fetch and validate a bounded historical NOAA multi_1 wave request."

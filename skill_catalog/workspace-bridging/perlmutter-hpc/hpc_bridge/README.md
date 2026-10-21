@@ -1,0 +1,17 @@
+# Perlmutter JSON Bridge
+
+This helper keeps one authenticated Paramiko SSH session open, with independent command and transfer lanes and a durable request ledger. The SSH target is supplied only when creating a local session; credentials are entered only in the visible bridge window and are never written to disk. See [reliability, recovery, and scheduled follow-ups](../references/bridge-reliability.md).
+
+Create a named session:
+
+```powershell
+python .\make_bridge_session.py `
+  --purpose "short purpose" `
+  --work-summary "brief work summary" `
+  --project-root "<local-project-root>" `
+  --remote-target "<username>@<hostname>"
+```
+
+Start the printed session directory with `start_bridge_window.ps1`. When launching from automation, use `Start-Process -WorkingDirectory <session-dir> -FilePath powershell.exe` rather than `wt.exe`; the latter can misparse the working directory and fail with `0x80070002`. The authenticated SSH transport sends a keepalive every 60 seconds. Use `send_perlmutter_command.py` for `identity`, `status`, `result`, `exec`, `upload`, `download`, `cancel`, `reconnect`, and `stop`. Its default caller wait is 30 seconds; preserve a pending request's ID instead of resubmitting it. `stop` stops the bridge, not Slurm jobs.
+
+Runtime `.venv`, `bridge_sessions`, `commands`, `results`, identity, status, account, path, and task information must remain local and uncommitted.

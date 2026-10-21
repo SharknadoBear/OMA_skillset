@@ -1,0 +1,81 @@
+{
+  "source": "latest installed kestrel-hpc/hpc_bridge",
+  "observed_date": "2026-10-20",
+  "exact_common_files": [
+    "bridge_runtime.py",
+    "bridge_transfer.py",
+    "start_bridge_window.ps1",
+    "requirements.txt",
+    "bridge_names.json",
+    "test_bridge_output_completion.py",
+    ".gitignore"
+  ],
+  "adaptations": "Perlmutter labels, endpoint validation, NERSC host pin and optional sshproxy authentication only",
+  "files": {
+    ".gitignore": {
+      "source_sha256": "dacb05764fcb1ff636c3e890372a018a7cdf54df92a8ba9e589c76dda634055a",
+      "target": ".gitignore",
+      "target_sha256": "dacb05764fcb1ff636c3e890372a018a7cdf54df92a8ba9e589c76dda634055a"
+    },
+    "bridge_names.json": {
+      "source_sha256": "1335b39d2343ef28c0b1a90096fe25e329fc37bac0ec6fae821dc2113e71a421",
+      "target": "bridge_names.json",
+      "target_sha256": "1335b39d2343ef28c0b1a90096fe25e329fc37bac0ec6fae821dc2113e71a421"
+    },
+    "bridge_runtime.py": {
+      "source_sha256": "58dac66ec4266b67cc83c4e6c1da35e12764ee2a961454df8a61da972f9718cd",
+      "target": "bridge_runtime.py",
+      "target_sha256": "58dac66ec4266b67cc83c4e6c1da35e12764ee2a961454df8a61da972f9718cd"
+    },
+    "bridge_server.py": {
+      "source_sha256": "89e24366dd313f2bb72f4f099f329ea40f12de746007c66e253871e6222c2beb",
+      "target": "bridge_server.py",
+      "target_sha256": "138660491d1f8f8450d235030b997a7acc3d32ebcb3ad574b12aac57c56bdd20"
+    },
+    "bridge_transfer.py": {
+      "source_sha256": "ecd92d8bc43609ffeba0c5e66256ca7e1a0d49807d7427a5ae6fe4c7edc5245c",
+      "target": "bridge_transfer.py",
+      "target_sha256": "ecd92d8bc43609ffeba0c5e66256ca7e1a0d49807d7427a5ae6fe4c7edc5245c"
+    },
+    "make_bridge_session.py": {
+      "source_sha256": "691e64dc59475f6b0f1118d50b8bb3814358815332eb234ddf0c153c94267d64",
+      "target": "make_bridge_session.py",
+      "target_sha256": "2a3c48441255d518920a4431b486c298e59fe9530d2ac7a557ca884213a85712"
+    },
+    "README.md": {
+      "source_sha256": "1fcc9e8a04cb0a57e168f7aea24cf0c8ac7c2845688439d9c1babba4b5ca3211",
+      "target": "README.md",
+      "target_sha256": "fe751af944c9d108205f6091f432658df64b67cbd67dc81085de53c96b930df6"
+    },
+    "requirements.txt": {
+      "source_sha256": "38bc589efaed9deceb6d908078f71d7d0f9edd7eccaf79882554f6e167c26501",
+      "target": "requirements.txt",
+      "target_sha256": "38bc589efaed9deceb6d908078f71d7d0f9edd7eccaf79882554f6e167c26501"
+    },
+    "run_bridge.cmd": {
+      "source_sha256": "ca04791748453ddaf9c61942b1aeabc06e40d9582e9313c195be08603a3f3620",
+      "target": "run_bridge.cmd",
+      "target_sha256": "84078677a4d12bd258b7da6036194a84ff5e04659394efa128da01548d550a15"
+    },
+    "send_kestrel_command.py": {
+      "source_sha256": "97cd041835b1d2501cfedc5061e31bc741319a50e5a8db21e40b0bf1a4623178",
+      "target": "send_perlmutter_command.py",
+      "target_sha256": "896665cb48da59f905122951d18713b658383fa7556f054f3fa5493789c67777"
+    },
+    "start_bridge_window.ps1": {
+      "source_sha256": "bf1ddaac9564f33fa609496e7349a44f658e53ec386a347d5f2d598f50650fc0",
+      "target": "start_bridge_window.ps1",
+      "target_sha256": "bf1ddaac9564f33fa609496e7349a44f658e53ec386a347d5f2d598f50650fc0"
+    },
+    "test_bridge_output_completion.py": {
+      "source_sha256": "58db330ad5bff3279c25f9cbef00773370d282826dd0db59469931b0872a7bc1",
+      "target": "test_bridge_output_completion.py",
+      "target_sha256": "58db330ad5bff3279c25f9cbef00773370d282826dd0db59469931b0872a7bc1"
+    },
+    "test_bridge_reliability.py": {
+      "source_sha256": "d3b821138254de1969e91b06b12676062b467f6bd171d65867372e00a52fc8b5",
+      "target": "test_bridge_reliability.py",
+      "target_sha256": "aee659e2c6a2b39167d6325ad28e04ac3dc1d61fbc927893e5f876ef884871ec"
+    }
+  }
+}

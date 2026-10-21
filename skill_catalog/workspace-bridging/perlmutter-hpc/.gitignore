@@ -1,0 +1,5 @@
+.venv/
+bridge_sessions/
+__pycache__/
+*.py[cod]
+account.local.json

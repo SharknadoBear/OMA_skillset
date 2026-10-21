@@ -1,0 +1,4 @@
+interface:
+  display_name: "GLORYS Fetcher"
+  short_description: "Download resumable regional GLORYS ocean fields"
+  default_prompt: "Use $glorys-fetcher to download and validate a bounded GLORYS ocean subset."
