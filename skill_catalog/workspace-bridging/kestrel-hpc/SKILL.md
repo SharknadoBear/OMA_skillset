@@ -1,6 +1,6 @@
 ---
 name: kestrel-hpc
-description: Use for authorized SSH/SFTP access, compilation, Slurm submission or monitoring, storage selection, environment inspection, and compact-result retrieval on NLR Kestrel. Use the public example target user@kestrel.nlr.gov while obtaining real account, allocation, path, and credential details privately at runtime. Never store passwords or OTPs.
+description: Use for authorized SSH/SFTP access, Globus upload/download and recovery, compilation, Slurm submission or monitoring, storage selection, and environment inspection on NLR Kestrel. Use the public example target user@kestrel.nlr.gov while obtaining real account, allocation, path, and credential details privately at runtime. Never store passwords or OTPs.
 ---
 
 # Kestrel HPC
@@ -25,6 +25,12 @@ rsync -av --progress -e "ssh -m hmac-sha2-256" <local-dir>/ user@kestrel.nlr.gov
 ```
 
 For WinSCP, create an SFTP site with host `kestrel.nlr.gov`, username `user`, and the interactive Password+Token flow. Transfer individual files by drag-and-drop or use directory synchronization only after reviewing its direction and deletion settings.
+
+## Globus transfer fallback
+
+Keep the SSH bridge for commands, builds, and Slurm. For large files, repeated SFTP/SCP timeouts, or an explicit Globus request, use the official CLI following [Globus transfers and recovery](references/globus-transfers.md). Reconcile the original transfer before switching tools; never let two writers target the same file.
+
+Globus needs its own CLI authorization, collection access, and an online Globus Connect Personal instance for workstation transfers. Check collection-relative paths instead of assuming SSH paths work. Retain the submission/task IDs, require `SUCCEEDED` with checksum verification, and schedule a same-chat follow-up before yielding an unfinished transfer. Globus can retry connection failures; it cannot guarantee bandwidth or eliminate filesystem latency.
 
 ## Local bridge workflow
 
@@ -221,3 +227,4 @@ Keep processed commands outside the watched queue, read JSON as `utf-8-sig`, pre
 - [Filesystems](https://natlabrockies.github.io/HPC/Documentation/Systems/Kestrel/Filesystems/)
 - [Programming environments](https://natlabrockies.github.io/HPC/Documentation/Systems/Kestrel/Environments/)
 - [WinSCP transfers](https://natlabrockies.github.io/HPC/Documentation/Managing_Data/Transferring_Files/winscp/)
+- [Globus transfers](https://natlabrockies.github.io/HPC/Documentation/Managing_Data/Transferring_Files/globus/)

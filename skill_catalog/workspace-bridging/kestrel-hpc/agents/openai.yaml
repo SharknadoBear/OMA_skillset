@@ -1,4 +1,4 @@
 interface:
   display_name: "Kestrel HPC"
-  short_description: "Private runtime bridge for Kestrel HPC"
-  default_prompt: "Use $kestrel-hpc with a privately supplied SSH target to run an authorized HPC workflow."
+  short_description: "Kestrel SSH workflows and Globus transfers"
+  default_prompt: "Use $kestrel-hpc for an authorized Kestrel workflow, with private runtime connection details and Globus fallback for large or interrupted transfers."
