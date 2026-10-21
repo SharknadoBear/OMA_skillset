@@ -5,6 +5,11 @@ description: Create and validate FVCOM 4.3.1 run namelists and cell-based statio
 
 # FVCOM Namelist Configuration
 
+For `paper_barotropic`, use the pinned FVCOM_MP source selected by the simulation
+profile. Its flume and grid-edge extensions are required by this configuration;
+upstream release-v4.3.1 is not a compatible substitute. Plastic physics remains
+disabled (`PLASTIC_MODEL=F`). Preserve the exact-executable template gate.
+
 Turn a scientific scenario into a version-compatible, auditable FVCOM runtime configuration.
 
 

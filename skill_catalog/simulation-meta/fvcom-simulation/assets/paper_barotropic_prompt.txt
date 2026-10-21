@@ -4,6 +4,7 @@ Experimental control
 - Trial: {TRIAL_ID}. Skill baseline: {SKILL_BASELINE}.
 - Chat name: {TRIAL_ID} test. Rename this chat to that exact name before starting.
 - Kestrel login: {KESTREL_LOGIN}.
+- FVCOM source: independently obtain https://github.com/SharknadoBear/FVCOM_MP at commit f8e4b50d4fd51409febcefc763cbc5dca11870e2. Compile within this trial using fvcom-build's compatibility patch, with plastic and sediment features disabled. Use only source/build files; do not reuse bundled binaries, cases, results or memories. Do not substitute upstream FVCOM.
 - Begin with empty local and remote project folders. If either contains existing project material, report it and wait for my decision.
 - Use the agreed skills and this trial's files as project context. Obtain required data independently through the skills. Keep project downloads, caches and results within the assigned roots. Do not read or reuse other trials, earlier experiments, project memories or other chats.
 - Workers and retries may share this trial's own files. Any workers must inherit this chat's model and reasoning effort. Do not edit shared skills during the trial; report defects.

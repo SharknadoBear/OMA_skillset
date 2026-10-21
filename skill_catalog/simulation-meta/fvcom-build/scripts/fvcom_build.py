@@ -42,7 +42,12 @@ FORBIDDEN_EXACT = {
     "DATA_ASSIMILATION",
     "ONLINE_NESTING",
 }
-FORBIDDEN_PARTS = ("SEDIMENT", "PARTICLE", "RIVER", "BIOGEN", "FABM", "ASSIM")
+FORBIDDEN_PARTS = ("SEDIMENT", "PARTICLE", "PLASTIC", "RIVER", "BIOGEN", "FABM", "ASSIM")
+PAPER_TEMPLATE_FIELDS = {
+    "NML_PHYSICS": ("FLUME_BOTTOM", "FLUME_DRAG_COEF"),
+    "NML_STATION_TIMESERIES": ("READ_GRID_EDGE_FROM_FILE", "GRID_EDGE_FILE_NAME"),
+    "NML_ADDITIONAL_MODELS": ("PLASTIC_MODEL",),
+}
 MODULES = [
     "gcc/12.1.0",
     "intel/2023.2.0",
@@ -201,6 +206,9 @@ def build_plan(request: Dict[str, Any], local_root: Path, remote_root: str) -> D
         "local_artifact_root": str(local_root.resolve()),
         "remote_artifact_root": remote_root.rstrip("/"),
         "fvcom_version_required": "4.3.1",
+        **({"source_repository": request["kestrel"]["source_repository"],
+            "source_commit": request["kestrel"]["source_commit"]}
+           if request.get("profile") == PAPER_PROFILE else {}),
         **environment,
         "required_defines": sorted(REQUIRED_DEFINES),
         "forbidden_defines": sorted(FORBIDDEN_EXACT),
@@ -250,6 +258,17 @@ def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Di
     if missing:
         blocking.append("missing mandatory build evidence: " + ", ".join(missing))
     if request.get("profile") == PAPER_PROFILE:
+        expected_source = {key: request["kestrel"][key]
+                           for key in ("source_repository", "source_commit")}
+        provenance.update(expected_source)
+        source_path = evidence / "source_revision.json"
+        if not source_path.is_file():
+            blocking.append("missing source_revision.json: record the observed Git origin and HEAD before build edits")
+        else:
+            observed_source = load_json(source_path)
+            hashes["source_revision_sha256"] = sha256(source_path)
+            if any(observed_source.get(key) != value for key, value in expected_source.items()):
+                blocking.append("observed source repository/commit does not match the paper source pin")
         for filename in ("os-release.txt", "modules.txt", "build_commands.txt"):
             path = evidence / filename
             if not path.is_file():
@@ -286,6 +305,10 @@ def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Di
             blocking.append("freeze record does not forbid post-freeze source edits")
         if request.get("profile") == PAPER_PROFILE and freeze.get("build_environment") != environment:
             blocking.append("freeze record does not bind the selected native build environment")
+        if request.get("profile") == PAPER_PROFILE and any(
+                freeze.get(key) != request["kestrel"][key]
+                for key in ("source_repository", "source_commit")):
+            blocking.append("freeze record does not bind the paper source repository/commit")
         hashes["freeze_sha256"] = sha256(freeze_path)
     smoke_path = evidence / "smoke.log"
     if smoke_path.is_file():
@@ -301,6 +324,13 @@ def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Di
     blank_path = evidence / "blank_namelist.nml"
     if blank_path.is_file() and "&NML_CASE" not in blank_path.read_text(encoding="utf-8-sig", errors="replace").upper():
         blocking.append("blank_namelist.nml is not an FVCOM namelist")
+    if blank_path.is_file() and request.get("profile") == PAPER_PROFILE:
+        blank = blank_path.read_text(encoding="utf-8-sig", errors="replace")
+        for group, keys in PAPER_TEMPLATE_FIELDS.items():
+            body = re.search(r"^\s*&" + group + r"\b(.*?)^\s*/", blank, re.I | re.M | re.S)
+            for key in keys:
+                if body is None or not re.search(r"\b" + key + r"\s*=", body[1], re.I):
+                    blocking.append(f"compiled paper template lacks {group}.{key}")
     artifact_root.mkdir(parents=True, exist_ok=True)
     lineage = {
         "schema": "fvcom_executable_lineage_v1",

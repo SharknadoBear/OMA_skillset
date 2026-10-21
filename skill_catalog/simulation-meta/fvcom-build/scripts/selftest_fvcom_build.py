@@ -35,10 +35,11 @@ def main() -> int:
         write(make_inc, f"TOPDIR = /home/yhuang168/FVCOM_source_agent_test\nDFLAGS = {flags}\n")
         audit = fb.audit_make_inc(make_inc, "/home/yhuang168/FVCOM_source_agent_test")
         assert audit["status"] == "pass", audit
-        write(make_inc, make_inc.read_text() + "DFLAGS += -DSPHERICAL -DSEDIMENT\n")
+        write(make_inc, make_inc.read_text() + "DFLAGS += -DSPHERICAL -DSEDIMENT -DPLASTIC -DOFFLINE_PLASTIC\n")
         bad = fb.audit_make_inc(make_inc, "/home/yhuang168/FVCOM_source_agent_test")
         assert bad["status"] == "fail"
         assert {"SPHERICAL", "SEDIMENT"}.issubset(set(bad["forbidden_active_defines"]))
+        assert {"PLASTIC", "OFFLINE_PLASTIC"}.issubset(set(bad["forbidden_active_defines"]))
         plan = fb.build_plan(REQUEST, root / "out", "/scratch/yhuang168/FVCOM_Simulation/galveston_tide_2025/run/build")
         assert plan["source_edits_after_freeze_allowed"] is False
         evidence = root / "evidence"

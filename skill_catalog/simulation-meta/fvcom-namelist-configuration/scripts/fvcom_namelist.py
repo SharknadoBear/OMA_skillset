@@ -44,6 +44,7 @@ FALSE_KEYS = {
     "DATA_ASSIMILATION",
     "BIOLOGICAL_MODEL",
     "SEDIMENT_MODEL",
+    "PLASTIC_MODEL",
     "ICING_MODEL",
     "ICE_MODEL",
     "HIGH_LATITUDE_WAVE",
@@ -439,6 +440,8 @@ def configuration_values(
             "OUT_INTERVAL": q("seconds=360.0"),
         },
     }
+    if request.get("profile") == PAPER_PROFILE:
+        values["NML_ADDITIONAL_MODELS"]["PLASTIC_MODEL"] = "F"
     timing = {
         "start_utc": start.isoformat().replace("+00:00", "Z"),
         "end_utc": end.isoformat().replace("+00:00", "Z"),

@@ -96,3 +96,10 @@ project-owned source copy. After native environment discovery, record
 `kestrel.build_environment` with `os`, `compiler`, `compiler_options`, `modules`
 and an RH8 `fallback_reason` when applicable. Complete this preparation before
 freezing the request. Authentication/discovery does not launch a model run.
+
+The paper resolver also fixes `kestrel.source_repository` to
+`https://github.com/SharknadoBear/FVCOM_MP.git` and `kestrel.source_commit` to
+`f8e4b50d4fd51409febcefc763cbc5dca11870e2`. These identify the independently acquired
+base source; record permitted build-portability diffs separately. Build finalization
+checks the observed revision and its freeze binding. Keep plastic/sediment features
+off; using the FVCOM_MP repository does not enable microplastic physics.

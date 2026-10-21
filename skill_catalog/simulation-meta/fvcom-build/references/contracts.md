@@ -99,3 +99,54 @@ Retain actual `os-release.txt`, module and build-command evidence, and bind the
 identical environment object in `freeze.json`. All scientific feature, linking,
 input-reading and executable-lineage checks still apply. These checks must not
 advance model time outside the profile's counted smoke/production attempts.
+
+## Paper source lineage
+
+The paper profile pins `https://github.com/SharknadoBear/FVCOM_MP.git` at
+`f8e4b50d4fd51409febcefc763cbc5dca11870e2`. This is a modified FVCOM source family,
+not interchangeable with upstream release-v4.3.1. Run Control resolves the pin
+into `kestrel.source_repository` and `kestrel.source_commit`.
+
+Use a fresh trial-owned checkout of source/build files (root Fortran/C sources,
+make/dependency files and required library source archives). A sparse checkout
+avoids the repository's bundled cases, results, memories and binaries. Do not
+read or reuse those artifacts. Compile cleanly for the selected native environment;
+the repository's supplied `make.inc` enables plastic and is not a tide-only preset.
+The numerical feature audit rejects plastic and sediment flags. The paper
+namelist explicitly sets `PLASTIC_MODEL=F` and `FLUME_BOTTOM=F`.
+
+Before build edits, record the observed `git remote get-url origin` (canonical
+HTTPS URL above) and `git rev-parse HEAD` as `source_repository` and `source_commit`
+in `source_revision.json`. Include these same two fields in `freeze.json`, alongside
+the executable hash and native build environment. Preserve diffs for permitted
+portability edits; the commit identifies the base, not an assertion of an unmodified
+working tree.
+
+At this pin, two plastic mass-diagnostic routines in `mod_plast.F` sit outside
+the `PLASTIC` preprocessor guard and prevent a plastic-off build. Before compilation,
+apply [fvcom_mp_no_plastic_guard.patch](../assets/fvcom_mp_no_plastic_guard.patch)
+to the trial-owned checkout with `git apply --check <patch>` followed by
+`git apply <patch>`. Do not enable plastic to work around the error. Preserve the
+original file, applied patch and reason alongside build evidence. This patch
+adds only the guard around those routines; it changes no numerical statements.
+For this base file, the SHA-256 after normalizing CRLF to LF is
+`4d8a53609fc3edab7c7849d8b99134aeb022f7a9083f586aadc7390158633cbe`
+before and `66a07e67f161305668fe537aadfc8e10d30a5d1be4028a7386e22bdec2ee9657`
+after. If neither matches, inspect the source discrepancy before proceeding;
+if the after-hash already matches, record it rather than applying twice.
+Retain the post-patch source inventory with the frozen executable. This is a
+build-copy compatibility patch, not a change to the upstream repository.
+
+The native RH9 probe also required renaming bundled METIS's private `__log2`
+symbol in `libs/metis/rename.h` to `__fvcom_metis_log2` to avoid a glibc symbol
+conflict. Apply this only when that bundled version still defines `__log2`,
+recording its before-copy, diff and reason. Resolve matching NetCDF C/Fortran
+libraries from the loaded modules; preserve their paths in link evidence.
+
+Before compilation, check `mod_main.F` for `NML_PHYSICS.FLUME_BOTTOM` and
+`FLUME_DRAG_COEF`, and `mod_station_timeseries.F` for
+`NML_STATION_TIMESERIES.READ_GRID_EDGE_FROM_FILE` and `GRID_EDGE_FILE_NAME`.
+Source declarations are an early compatibility check only. Finalization requires
+these fields and `NML_ADDITIONAL_MODELS.PLASTIC_MODEL` in the exact executable's
+generated blank template, then normal full rendering and input-reader validation.
+Do not synthesize missing keys or weaken the template-lineage gate.

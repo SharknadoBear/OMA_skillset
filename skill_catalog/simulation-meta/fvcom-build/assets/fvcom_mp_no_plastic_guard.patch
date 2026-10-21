@@ -1,0 +1,17 @@
+--- a/mod_plast.F
++++ b/mod_plast.F
+@@ -5565,6 +5565,7 @@
+ ! Only fires when PLAST_mass_check=T AND mod(PLAST_its, n_report)==0.
+ ! All CSV I/O is done by the master process (msr) after MPI_REDUCE.
+ !==========================================================================
++# if defined (PLASTIC)
+ Subroutine Write_Mass_Checkpoint(label, iplast_idx, c_a, c_d, m_a, m_d)
+ 
+   Use All_Vars, only : ART1, D, DZ
+@@ -5703,5 +5704,6 @@
+              6(',', ES20.10), ',', ES20.10)
+ 
+ End Subroutine Write_MC_1Field
++# endif
+ 
+ End Module Mod_Plast

@@ -31,6 +31,9 @@ def main():
     assert request["period"]["analysis_end"] == "2025-04-15T00:00:00Z"
     assert request["execution"]["max_smoke_attempts"] == request["execution"]["max_production_attempts"] == 3
     assert request["benchmark"]["enabled"] is False
+    source_pin = {key: request['kestrel'][key] for key in ('source_repository', 'source_commit')}
+    rejects(lambda: resolve_request(dict(raw, kestrel=dict(raw['kestrel'], source_repository='https://github.com/FVCOM-GitHub/FVCOM.git'))))
+    rejects(lambda: resolve_request(dict(raw, kestrel=dict(raw['kestrel'], source_commit='0'*40))))
     for patch in ({"profile": "paper_barotropic_v1"}, {"mode": "benchmark"},
                   {"grid_policy": "accepted_then_fresh"}, {"execution": {"max_smoke_attempts": 4}},
                   {"benchmark": {"enabled": True}}, {"period": {"spinup_days": 7}},
@@ -48,6 +51,10 @@ def main():
         assert fn.audit_stage_values(values, stage, "paper_barotropic") == []
         assert values["NML_STARTUP"]["STARTUP_FILE"] == "'none'"
         assert values["NML_RESTART"]["RST_ON"] == "T"
+        assert values['NML_ADDITIONAL_MODELS']['PLASTIC_MODEL'] == 'F'
+        plastic_on = copy.deepcopy(values)
+        plastic_on['NML_ADDITIONAL_MODELS']['PLASTIC_MODEL'] = 'T'
+        assert 'PLASTIC_MODEL must be false' in fn.audit_values(plastic_on)
         assert timing["ramp_internal_steps"] == 36000
         generated[stage] = "\n".join(f"{key} = {value}," for group in values.values() for key, value in group.items())
     for stage in ("canary", "spinup", "benchmark", "full"):
@@ -97,14 +104,27 @@ def main():
             (evidence/name).write_text('fixture')
         (evidence/'make_inc_audit.json').write_text(json.dumps({'status':'pass','sha256':'b'*64}))
         (evidence/'executable.sha256').write_text('a'*64+'  fvcom')
-        (evidence/'freeze.json').write_text(json.dumps({'executable_sha256':'a'*64, 'source_edits_after_freeze_allowed':False, 'build_environment':env}))
+        freeze = {'executable_sha256':'a'*64, 'source_edits_after_freeze_allowed':False, 'build_environment':env, **source_pin}
+        (evidence/'freeze.json').write_text(json.dumps(freeze))
+        (evidence/'source_revision.json').write_text(json.dumps(source_pin))
         (evidence/'smoke.log').write_text('FVCOM_INPUT_SMOKE_PASS')
-        (evidence/'blank_namelist.nml').write_text('&NML_CASE')
+        template = '&NML_CASE\n/\n' + ''.join('&'+group+'\n'+''.join(key+' = F,\n' for key in keys)+'/\n' for group, keys in fb.PAPER_TEMPLATE_FIELDS.items())
+        (evidence/'blank_namelist.nml').write_text(template)
         (evidence/'os-release.txt').write_text('VERSION_ID="9.6"\n')
         (evidence/'modules.txt').write_text('intel/native netcdf/native')
         (evidence/'build_commands.txt').write_text('mpiifx -O3')
         result = fb.finalize(native, evidence, root/'build')
         assert result['status'] == 'ready', result
+        (evidence/'source_revision.json').write_text(json.dumps(dict(source_pin, source_commit='0'*40)))
+        assert fb.finalize(native, evidence, root/'wrong-source')['status'] == 'blocked_compile'
+        (evidence/'source_revision.json').write_text(json.dumps(source_pin))
+        (evidence/'freeze.json').write_text(json.dumps(dict(freeze, source_commit='0'*40)))
+        assert fb.finalize(native, evidence, root/'wrong-freeze')['status'] == 'blocked_compile'
+        (evidence/'freeze.json').write_text(json.dumps(freeze))
+        (evidence/'blank_namelist.nml').write_text(template.replace('GRID_EDGE_FILE_NAME = F,\n', ''))
+        result = fb.finalize(native, evidence, root/'incompatible-template')
+        assert any('NML_STATION_TIMESERIES.GRID_EDGE_FILE_NAME' in x for x in result['blocking_reasons'])
+        (evidence/'blank_namelist.nml').write_text(template)
         (evidence/'os-release.txt').write_text('VERSION_ID="8.8"\n')
         assert fb.finalize(native, evidence, root/'bad')['status'] == 'blocked_compile'
     print('paper_barotropic profile selftest: PASS')

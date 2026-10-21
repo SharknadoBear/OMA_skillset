@@ -10,9 +10,23 @@ Produce an evidence-backed executable lineage, not merely a successful `make` ex
 
 ## paper_barotropic native build
 
+Use the profile's pinned **FVCOM_MP** repository and commit in
+`kestrel.source_repository` / `source_commit`; upstream release-v4.3.1 lacks
+the custom flume and grid-edge namelist fields used by this workflow.
+Obtain source/build files independently in the trial root; exclude bundled
+binaries, case directories, results and memories. Audit the source declarations
+before expensive preparation, then verify the exact executable's generated
+template. Keep plastic/sediment compile flags disabled and `PLASTIC_MODEL=F`.
+Before compiling this pin, apply the supplied plastic-off guard patch described
+in the source contract; it excludes two plastic diagnostics from a plastic-off build.
+Record observed Git origin/HEAD in `source_revision.json` and bind both in
+`freeze.json`; see [the source contract](references/contracts.md#paper-source-lineage).
+
 For this profile, replace the legacy module pins below with the actual native
 environment discovered through Kestrel HPC. Prefer RH9; RH8 needs a documented
-reason. Set `kestrel.project_dir`, use a trial-owned source copy beneath it, and
+reason. Submit RH9 jobs from an RH9 login node and let Kestrel assign its OS
+feature; do not force an `rh8`/`rh9` constraint. Verify the allocated node's OS.
+Set `kestrel.project_dir`, use a trial-owned source copy beneath it, and
 record `kestrel.build_environment` (`os`, `compiler`, `compiler_options`, `modules`,
 and RH8 `fallback_reason`). Capture `os-release.txt`, actual loaded modules and
 compiler/build transcripts, and bind that same environment in `freeze.json`.

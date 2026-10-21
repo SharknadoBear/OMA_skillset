@@ -8,6 +8,11 @@ in Run Control fills the following settings and rejects conflicting overrides.
 ## Fixed setup
 
 - Generate a fresh grid in empty local and remote trial roots (`fresh_only`).
+- Independently acquire `https://github.com/SharknadoBear/FVCOM_MP.git` at
+  `f8e4b50d4fd51409febcefc763cbc5dca11870e2`. Use only its source/build files;
+  exclude bundled binaries, cases, results and memories. Compile a trial-owned
+  hydrodynamic-only executable with plastic/sediment features disabled. Upstream
+  release-v4.3.1 does not supply this workflow's custom namelist fields.
 - Analysis: **2025-04-01 00:00 through 2025-04-15 00:00 UTC, end exclusive**.
 - Production: cold start **March 29 00:00**, end April 15 00:00; the first three
   days are physical spin-up within this run. Do not initialize from the smoke restart.

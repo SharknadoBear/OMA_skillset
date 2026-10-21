@@ -20,7 +20,9 @@ PAPER_SETTINGS = {
                   "max_smoke_attempts": 3, "max_production_attempts": 3,
                   "production_nodes": 2, "production_ranks": 208,
                   "production_ranks_per_node": 104},
-    "kestrel": {"os_preference": "rh9"},
+    "kestrel": {"os_preference": "rh9",
+                "source_repository": "https://github.com/SharknadoBear/FVCOM_MP.git",
+                "source_commit": "f8e4b50d4fd51409febcefc763cbc5dca11870e2"},
 }
 
 
