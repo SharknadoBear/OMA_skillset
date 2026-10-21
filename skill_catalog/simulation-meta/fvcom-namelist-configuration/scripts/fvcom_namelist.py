@@ -14,6 +14,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fvcom-run-control" / "scripts"))
+from fvcom_profiles import PAPER_PROFILE, resolve_request
+
+
 STAGES = {"smoke", "canary", "spinup", "benchmark", "production", "full"}
 REQUIRED_FILES = {
     "NML_GRID_COORDINATES": ["GRID_FILE", "SIGMA_LEVELS_FILE", "DEPTH_FILE", "CORIOLIS_FILE", "SPONGE_FILE"],
@@ -145,6 +149,7 @@ def nml_date(value: datetime) -> str:
 
 
 def validate_request(request: Mapping[str, Any]) -> Tuple[datetime, datetime, int, float, float, int]:
+    request = resolve_request(dict(request))
     if request.get("mode") not in {"barotropic_tide", "benchmark"}:
         raise ConfigError("mode must be barotropic_tide or benchmark")
     if not isinstance(request.get("case_id"), str) or not request["case_id"]:
@@ -185,6 +190,13 @@ def validate_numerics(numerics: Mapping[str, Any]) -> Tuple[float, int]:
 def stage_times(request: Mapping[str, Any], stage: str) -> Tuple[datetime, datetime, datetime, bool]:
     analysis_start, analysis_end, spinup_days, _, _, _ = validate_request(request)
     spinup_start = analysis_start - timedelta(days=spinup_days)
+    if request.get("profile") == PAPER_PROFILE:
+        if stage == "smoke":
+            end = spinup_start + timedelta(days=1)
+            return spinup_start, end, end, False
+        if stage == "production":
+            return spinup_start, analysis_end, analysis_end, False
+        raise ConfigError("paper_barotropic permits only smoke and production; no canary, separate spin-up, benchmark or full alias")
     if stage == "smoke":
         return spinup_start, spinup_start + timedelta(hours=1), analysis_start, False
     if stage == "canary":
@@ -233,7 +245,7 @@ def configuration_values(
     # when binary arithmetic puts an exact integer ratio just above it.
     ramp_steps = 0 if hotstart else int(round(172800 / internal_step))
     startup_file = bindings["restart_file"] if hotstart else "none"
-    restart_on = stage not in {"smoke", "canary"}
+    restart_on = stage not in {"smoke", "canary"} or request.get("profile") == PAPER_PROFILE
     restart_first = (restart_at if not hotstart else end) if restart_on else end
     values: Dict[str, Dict[str, str]] = {
         "NML_CASE": {
@@ -610,16 +622,25 @@ def audit_values(parsed: Mapping[str, Mapping[str, str]]) -> List[str]:
     return problems
 
 
-def audit_stage_values(parsed: Mapping[str, Mapping[str, str]], stage: str) -> List[str]:
+def audit_stage_values(parsed: Mapping[str, Mapping[str, str]], stage: str, profile: str | None = None) -> List[str]:
     problems: List[str] = []
+    if profile == PAPER_PROFILE:
+        if stage not in {"smoke", "production"}:
+            problems.append("paper_barotropic only permits smoke and production")
+        expected_end = "2025-03-30 00:00:00" if stage == "smoke" else "2025-04-15 00:00:00"
+        case = parsed.get("NML_CASE", {})
+        if scalar(case.get("START_DATE", "")) != "2025-03-29 00:00:00" or scalar(case.get("END_DATE", "")) != expected_end:
+            problems.append("paper_barotropic stage dates differ from the profile")
+        if scalar(parsed.get("NML_STARTUP", {}).get("STARTUP_TYPE", "")).lower() != "coldstart":
+            problems.append("paper_barotropic stages require coldstart")
     restart_on = logical(parsed.get("NML_RESTART", {}).get("RST_ON", ""))
-    expected = stage not in {"smoke", "canary"}
+    expected = stage not in {"smoke", "canary"} or profile == PAPER_PROFILE
     if restart_on is not expected:
         problems.append(f"RST_ON must be {'true' if expected else 'false'} for {stage}")
     grid_edge_read = logical(parsed.get("NML_STATION_TIMESERIES", {}).get("READ_GRID_EDGE_FROM_FILE", ""))
     if grid_edge_read is None:
         problems.append("READ_GRID_EDGE_FROM_FILE must be a logical value")
-    elif stage in {"benchmark", "production"} and not grid_edge_read:
+    elif profile != PAPER_PROFILE and stage in {"benchmark", "production"} and not grid_edge_read:
         problems.append(
             f"READ_GRID_EDGE_FROM_FILE must be true for hot-start {stage}"
         )
@@ -794,7 +815,7 @@ def cli(argv: Iterable[str] | None = None) -> int:
             checks = file_checks(parsed, args.input_root, timing["hotstart"])
             preconfig = args.preconfiguration_manifest
         hashes["namelist_sha256"] = sha256(namelist_path)
-        problems = audit_values(parsed) + audit_stage_values(parsed, args.stage)
+        problems = audit_values(parsed) + audit_stage_values(parsed, args.stage, request.get("profile"))
         result = manifest(
             request, args.stage, root, hashes, timing, numerics, checks, provisional,
             problems, preconfig, station_count,

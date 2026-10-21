@@ -7,6 +7,22 @@ description: Initialize immutable FVCOM simulation projects, derive conservative
 
 Use this skill for local orchestration artifacts and evidence. It never opens SSH or submits a job; invoke `$kestrel-hpc` for transfer, submission, monitoring, cancellation, and retrieval.
 
+
+## paper_barotropic
+
+Use [the parent profile](../fvcom-simulation/references/paper_barotropic.md) for
+paper requests. `init` resolves its settings and initializes only the fresh grid.
+Derive aligned controls normally, then use `attempt --paper-stage smoke|production
+--index 0|1|2 --controls controls.json --base-namelist stage.nml` plus the usual
+input, project and resource arguments. Do not supply `--plan`, `--revision` or
+the three-stage bundle. Each stage has three total submitted attempts, not three
+retries. Do not resubmit an existing attempt. Use debug/shared for smoke;
+production is two exclusive nodes/208 ranks with 104 ranks per node and core
+binding. `--partition auto` omits the Slurm partition directive. Record each
+job identity and terminal evidence in native trial artifacts. Corrections must
+preserve the scientific request and cumulative counts. Production audit counts
+default to the actual namelist duration/cadence (4,081/137 for this profile).
+
 ## Workflow
 
 1. Initialize the fixed project from a `simulation_request_v1` JSON document:
@@ -14,6 +30,8 @@ Use this skill for local orchestration artifacts and evidence. It never opens SS
 ```powershell
 python scripts/fvcom_run_control.py init --request request.json --project PROJECT
 ```
+
+For new `barotropic_tide` projects, initialization creates `agents/00_lead/`, `agents/01_grid/`, `agents/02_tpxo/`, and `agents/03_configuration_build/`, and records the mapping under `agent_layout` in the project manifest. Follow `$fvcom-simulation`'s `references/barotropic_agent_layout.md` for role ownership and handoffs. The scientific product paths remain unchanged. Benchmark-only projects do not acquire this layout; existing project manifests and evidence are preserved on reinitialization.
 
 2. Derive the baseline controls from the exact metric 2DM and its ordered OBC chains:
 
@@ -36,8 +54,10 @@ python scripts/fvcom_run_control.py record --project PROJECT --kind preprocessin
 At the preparation barrier, validate exactly three role manifests through their common typed envelope (role-specific schema names are allowed):
 
 ```powershell
-python scripts/fvcom_run_control.py join --manifest gridding/worker_manifest.json --manifest forcing/shared_source/worker_manifest.json --manifest run/build/worker_manifest.json --output preparation_join.json
+python scripts/fvcom_run_control.py join --manifest PROJECT/agents/01_grid/role_manifest.json --manifest PROJECT/agents/02_tpxo/role_manifest.json --manifest PROJECT/agents/03_configuration_build/role_manifest.json --output PROJECT/agents/00_lead/preparation_join.json
 ```
+
+Use those paths for new barotropic projects. Existing projects may pass their recorded legacy manifest paths; the join command still validates the same common envelope. The status report discovers both fixed role handoffs and legacy worker manifests.
 
 3. Create the finite, deduplicated stability strategy:
 
@@ -82,7 +102,9 @@ Require 7,201 station and 241 full-grid records for the April endpoint-inclusive
 
 Native station output must retain its `time(time)` variable even when exact character/integer clocks are absent. Use `check_station_clock(dataset, externally_anchored_dates)` for a separate station-clock certificate; IINT alone is insufficient. This checks finite, unmasked native time, days-since units, shape and agreement within floating-point precision, plus every exact clock present. It complements the independent startup/IINT, cadence, endpoint and input-identity gates.
 
-The audit checks flag-enabled full-grid/station variables, all present known physical state fields, and the frozen 3-D restart's velocity, vertical velocity (`ww`/`omega`), temperature/salinity and non-GOTM turbulence state. Restart state also requires `et`, `rho1`, `rmean1`, `tmean1`, `smean1`, `cor` and `cc_sponge` regardless of inactive tracers or optional output flags. Explicit `OBC_ON` enables required `obc_nodes`/`obc_type`; explicit `WETTING_DRYING_ON` enables the five current/previous wet masks plus `inundation_cells`. All required state must have native, nonempty dimensions and finite unmasked values, including static mean fields without a time dimension. `inundation_cells` is not constrained to binary mask values. Case-stage adapters can invoke `restart_state_audit(paths, parsed_namelist)` directly; it complements rather than replaces their clock, grid and input-identity checks. Optional station/full-grid fields may be absent when their flags are false. The final restart must end at the exact requested time and IINT. A passing report records rule version `startup_anchor_exact_clock_3d_v1` and the externally verified time anchor for tidal validation.
+The audit checks flag-enabled full-grid/station variables, all present known physical state fields, and the frozen 3-D restart's velocity, vertical velocity (`ww`/`omega`), temperature/salinity and non-GOTM turbulence state. Restart state also requires `et`, `rho1`, `rmean1`, `tmean1`, `smean1`, `cor` and `cc_sponge` regardless of inactive tracers or optional output flags. Explicit `OBC_ON` enables required `obc_nodes`/`obc_type`; explicit `WETTING_DRYING_ON` requires the five native FVCOM 4.3.1 masks: `wet_nodes`, `wet_cells`, `wet_nodes_prev_int`, `wet_cells_prev_int` and `wet_cells_prev_ext`. All required state must have native, nonempty dimensions and finite unmasked values, including static mean fields without a time dimension. The upstream 4.3.1 writer does not produce `inundation_cells`; its absence is valid. If present as an extension, check it for finite unmasked values without requiring binary values. Case-stage adapters can invoke `restart_state_audit(paths, parsed_namelist)` directly; it complements rather than replaces their clock, grid and input-identity checks. Optional station/full-grid fields may be absent when their flags are false. The final restart must end at the exact requested time and IINT. A passing report records rule version `startup_anchor_exact_clock_3d_v1` and the externally verified time anchor for tidal validation.
+
+The wet/dry field contract follows `WET_DRY_FILE_OBJECT` in [FVCOM 4.3.1 mod_ncdio.F](https://github.com/FVCOM-GitHub/FVCOM/blob/e2a265ca0c3f8a514a026906afec35c428c8d8a7/src/mod_ncdio.F) and its matching reader in `mod_startup.F`. Do not patch a model writer to supply an audit field absent from that source version.
 
 ## Terminal Rules
 
@@ -91,6 +113,7 @@ Stop for `user_stopped` or after every planned attempt has terminal evidence and
 ## Validation
 
 ```powershell
+python scripts/selftest_project_layout.py
 python scripts/selftest_fvcom_run_control.py
 python scripts/selftest_audit_fvcom_production.py
 python scripts/selftest_fvcom_time_anchor.py

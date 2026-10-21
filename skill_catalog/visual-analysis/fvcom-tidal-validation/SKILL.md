@@ -7,6 +7,17 @@ description: Condense FVCOM station output and validate tide-only elevation and 
 
 Run locally after `$kestrel-hpc` retrieves compact station output. Do not install analysis environments or plot on Kestrel.
 
+
+## paper_barotropic
+
+The regional runner accepts this explicit profile's March 29–April 15 cold-start
+production with a zero-IINT anchor, full 17-day output audit and final 3-D restart.
+It compares only [April 1, April 15), excluding spin-up and the end timestamp.
+Full model output remains available for interpolation at reference timestamps.
+Keep missing-data, station eligibility, lineage and physical assessment separate
+from workflow completion. Report the harmonic-resolution limits of 14 days;
+do not apply the ordinary one-month interpretability claim to this profile.
+
 ## Inputs and Scientific Rules
 
 - Require exact model case/executable/input hashes and station mappings.

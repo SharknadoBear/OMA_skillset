@@ -5,29 +5,20 @@ from __future__ import annotations
 
 import getpass
 import json
-import os
-import shutil
 import socket
 import time
-import traceback
 from datetime import datetime
 from pathlib import Path
 
 import paramiko
 
+from bridge_runtime import BridgeRuntime, MAX_OUTPUT, positive
+from bridge_transfer import transfer
+
 
 ROOT = Path(__file__).resolve().parent
 IDENTITY = ROOT / "bridge_identity.json"
-COMMANDS = ROOT / "commands"
-PROCESSED = COMMANDS / "processed"
-RESULTS = ROOT / "results"
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 3600.0
-
-
-def ensure_dirs() -> None:
-    COMMANDS.mkdir(parents=True, exist_ok=True)
-    PROCESSED.mkdir(parents=True, exist_ok=True)
-    RESULTS.mkdir(parents=True, exist_ok=True)
 
 
 def load_identity() -> dict:
@@ -74,53 +65,72 @@ def connect() -> paramiko.SSHClient:
 
     sock = socket.create_connection((host, 22), timeout=30)
     transport = paramiko.Transport(sock)
+    transport.banner_timeout = 30
+    transport.auth_timeout = 60
     opts = transport.get_security_options()
     if hasattr(opts, "digests") and "hmac-sha2-256" in opts.digests:
         opts.digests = ["hmac-sha2-256"] + [d for d in opts.digests if d != "hmac-sha2-256"]
-    transport.connect(username=user, password=password)
+    try:
+        transport.connect(username=user, password=password)
+    except BaseException:
+        transport.close()
+        raise
+    finally:
+        password = None
     transport.set_keepalive(60)
     client._transport = transport  # Paramiko exposes no public setter for this path.
     print("Connected. Watching JSON command files.")
     return client
 
 
-def read_command(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
-
-def write_result(command_id: str, result: dict) -> None:
-    result = {"id": command_id, **result}
-    tmp = RESULTS / f"{command_id}.json.tmp"
-    final = RESULTS / f"{command_id}.json"
-    tmp.write_text(json.dumps(result, indent=2), encoding="utf-8", newline="\n")
-    tmp.replace(final)
-
-
-def move_processed(path: Path) -> None:
-    dest = PROCESSED / path.name
-    if dest.exists():
-        dest.unlink()
-    shutil.move(str(path), str(dest))
-
-
-def exec_command(client: paramiko.SSHClient, command: str, timeout: float | None) -> dict:
+def exec_command(client: paramiko.SSHClient, command: str, timeout: float | None, operation=None) -> dict:
     effective_timeout = timeout if timeout is not None else DEFAULT_COMMAND_TIMEOUT_SECONDS
-    if effective_timeout <= 0:
-        raise ValueError("command timeout must be positive")
+    positive(effective_timeout, "command timeout")
 
-    stdin, stdout, stderr = client.exec_command(command, timeout=effective_timeout)
-    # Closing the write side makes accidental input-reading commands receive EOF
-    # instead of blocking this single-worker bridge indefinitely.
-    stdin.close()
-    channel = stdout.channel
+    if operation is not None:
+        # Bind before the exec acknowledgement so cancellation can close a server
+        # channel which stalls before command startup, too.
+        channel = client.get_transport().open_session(timeout=min(30, effective_timeout))
+        operation.bind(channel)
+        channel.settimeout(min(30, effective_timeout))
+        channel.exec_command(command)
+        channel.shutdown_write()
+    else:
+        stdin, stdout, stderr = client.exec_command(command, timeout=effective_timeout)
+        stdin.close()
+        channel = stdout.channel
     deadline = time.monotonic() + effective_timeout
     out_chunks: list[bytes] = []
     err_chunks: list[bytes] = []
+    counts = [0, 0]
+    truncated = False
     while True:
+        if operation is not None:
+            operation.check()
         while channel.recv_ready():
-            out_chunks.append(channel.recv(65536))
+            data = channel.recv(65536)
+            available = max(0, MAX_OUTPUT - counts[0])
+            if available:
+                out_chunks.append(data[:available])
+            counts[0] += len(data)
+            truncated |= len(data) > available
+            if operation is not None:
+                operation.check()
+            if time.monotonic() >= deadline:
+                channel.close()
+                raise TimeoutError("remote command output exceeded its deadline")
         while channel.recv_stderr_ready():
-            err_chunks.append(channel.recv_stderr(65536))
+            data = channel.recv_stderr(65536)
+            available = max(0, MAX_OUTPUT - counts[1])
+            if available:
+                err_chunks.append(data[:available])
+            counts[1] += len(data)
+            truncated |= len(data) > available
+            if operation is not None:
+                operation.check()
+            if time.monotonic() >= deadline:
+                channel.close()
+                raise TimeoutError("remote command output exceeded its deadline")
         if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
             # Exit status can arrive before the final stream data.  Only EOF
             # plus empty buffers establishes complete output capture.
@@ -134,83 +144,30 @@ def exec_command(client: paramiko.SSHClient, command: str, timeout: float | None
         time.sleep(0.05)
 
     exit_status = channel.recv_exit_status()
+    if exit_status < 0:
+        raise EOFError("Remote command ended without an exit status; effects are uncertain")
     out = b"".join(out_chunks).decode("utf-8", "replace")
     err = b"".join(err_chunks).decode("utf-8", "replace")
-    return {
+    result = {
         "status": "ok",
         "exit_status": exit_status,
         "stdout": out,
         "stderr": err,
     }
+    if truncated:
+        result.update(status="output_limit", capture_complete=False, stdout_bytes=counts[0], stderr_bytes=counts[1])
+    return result
 
 
-def upload_file(client: paramiko.SSHClient, local_path: str, remote_path: str) -> dict:
-    local = Path(local_path).expanduser().resolve()
-    if not local.is_file():
-        raise FileNotFoundError(f"Local file not found: {local}")
-    sftp = client.open_sftp()
-    try:
-        sftp.put(str(local), remote_path)
-    finally:
-        sftp.close()
-    return {"status": "ok", "exit_status": 0, "stdout": f"uploaded {local} -> {remote_path}\n", "stderr": ""}
-
-
-def download_file(client: paramiko.SSHClient, remote_path: str, local_path: str) -> dict:
-    local = Path(local_path).expanduser().resolve()
-    local.parent.mkdir(parents=True, exist_ok=True)
-    sftp = client.open_sftp()
-    try:
-        sftp.get(remote_path, str(local))
-    finally:
-        sftp.close()
-    return {"status": "ok", "exit_status": 0, "stdout": f"downloaded {remote_path} -> {local}\n", "stderr": ""}
-
-
-def handle_command(client: paramiko.SSHClient, payload: dict) -> tuple[dict, bool]:
-    action = payload.get("action")
-    timeout = payload.get("timeout")
-    if timeout is not None:
-        timeout = float(timeout)
-    if action == "exec":
-        return exec_command(client, payload["command"], timeout), False
-    if action == "upload":
-        return upload_file(client, payload["local_path"], payload["remote_path"]), False
-    if action == "download":
-        return download_file(client, payload["remote_path"], payload["local_path"]), False
-    if action == "stop":
-        return {"status": "ok", "exit_status": 0, "stdout": "stopping bridge\n", "stderr": ""}, True
-    raise ValueError(f"Unsupported action: {action}")
+def dispatch(client, payload, operation):
+    if payload["action"] == "exec":
+        operation.update(force=True, phase="remote_command")
+        return exec_command(client, payload["command"], payload.get("timeout"), operation)
+    return transfer(client, payload, operation, exec_command)
 
 
 def main() -> int:
-    ensure_dirs()
-    client = connect()
-    should_stop = False
-    try:
-        while not should_stop:
-            for path in sorted(COMMANDS.glob("*.json")):
-                try:
-                    payload = read_command(path)
-                    command_id = payload.get("id") or path.stem
-                    print(f"Processing {path.name}: {payload.get('action')}")
-                    result, should_stop = handle_command(client, payload)
-                except Exception as exc:
-                    command_id = path.stem
-                    result = {
-                        "status": "error",
-                        "exit_status": 1,
-                        "stdout": "",
-                        "stderr": f"{exc}\n{traceback.format_exc()}",
-                    }
-                write_result(command_id, result)
-                move_processed(path)
-                if should_stop:
-                    break
-            time.sleep(0.25)
-    finally:
-        client.close()
-    return 0
+    return BridgeRuntime(ROOT, dispatch, connect, load_identity()).run()
 
 
 if __name__ == "__main__":

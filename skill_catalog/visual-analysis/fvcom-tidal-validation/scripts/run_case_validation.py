@@ -21,6 +21,7 @@ for _run_control in (_script_path.parents[2] / "fvcom-run-control" / "scripts",
         break
 from audit_fvcom_production import parse_namelist, parse_utc, sha256
 from fvcom_time_anchor import resolve_anchor
+from fvcom_profiles import PAPER_PROFILE, resolve_request, paper_run_start
 
 
 def read(path: Path) -> dict[str, Any]:
@@ -49,7 +50,7 @@ def verify_prerequisites(args: argparse.Namespace) -> dict[str, Any]:
     if not attempt.is_relative_to(project / "run" / args.grid_case):
         raise ValueError("attempt must belong to project/run/<grid-case>")
     request_path = project / "request.json"
-    request = read(request_path)
+    request = resolve_request(read(request_path))
     attempt_manifest_path = attempt / "attempt_manifest.json"
     attempt_manifest = read(attempt_manifest_path)
     if attempt_manifest.get("grid_case") != args.grid_case:
@@ -85,10 +86,13 @@ def verify_prerequisites(args: argparse.Namespace) -> dict[str, Any]:
     nml = parse_namelist(namelist)
     start = parse_utc(request["period"]["analysis_start"])
     end = parse_utc(request["period"]["analysis_end"])
-    if parse_utc(nml["START_DATE"]) != start or parse_utc(nml["END_DATE"]) != end:
+    paper = request.get("profile") == PAPER_PROFILE
+    run_start = paper_run_start(request) if paper else start
+    if parse_utc(nml["START_DATE"]) != run_start or parse_utc(nml["END_DATE"]) != end:
         raise ValueError("this runner accepts the requested production interval only")
-    if nml.get("STARTUP_TYPE", "").lower() != "hotstart":
-        raise ValueError("production validation requires the frozen hotstart attempt")
+    expected_startup = "coldstart" if paper else "hotstart"
+    if nml.get("STARTUP_TYPE", "").lower() != expected_startup:
+        raise ValueError(f"production validation requires the frozen {expected_startup} attempt")
     binding_path = project / "run/build/executable_reuse_binding.json"
     binding = read(binding_path)
     executable_hash = digest(freeze.get("executable_sha256"))
@@ -164,10 +168,12 @@ def verify_prerequisites(args: argparse.Namespace) -> dict[str, Any]:
     if audit.get("audit_rules_version") != "startup_anchor_exact_clock_3d_v1":
         raise ValueError("production audit predates startup-anchored exact-clock and 3D-state checks")
     startup_name = nml.get("STARTUP_FILE", "")
-    if startup_name not in files:
+    if not paper and startup_name not in files:
         raise ValueError("startup restart is not a frozen flat input file")
-    anchor = resolve_anchor(nml, namelist, startup_restart=input_dir / startup_name,
-                            expected_sha256=files[startup_name], supplied=audit.get("time_anchor", {}))
+    anchor = resolve_anchor(nml, namelist,
+                            startup_restart=None if paper else input_dir / startup_name,
+                            expected_sha256=None if paper else files[startup_name],
+                            supplied=audit.get("time_anchor", {}))
     if not audit.get("restart_time", {}).get("exact_clock_verified") or not audit.get("restart_time", {}).get("startup_anchored"):
         raise ValueError("final restart lacks verified anchored clock evidence")
     if parse_utc(audit["restart_time"]["decoded_end_utc"]) != end:
@@ -178,10 +184,10 @@ def verify_prerequisites(args: argparse.Namespace) -> dict[str, Any]:
         info = audit[key]
         if not info.get("startup_anchored") or info.get("iint_at_start") != anchor["iint_at_start"] or info.get("iint_first") != anchor["iint_at_start"]:
             raise ValueError("production output is not anchored to the frozen startup restart")
-        count = int(round((end - start).total_seconds() / cadence)) + 1
+        count = int(round((end - run_start).total_seconds() / cadence)) + 1
         if info.get("record_count") != count or info.get("interval_seconds") != cadence:
             raise ValueError(f"production audit lacks the required exact {key} cadence/count")
-        if parse_utc(info["decoded_start_utc"]) != start or parse_utc(info["decoded_end_utc"]) != end:
+        if parse_utc(info["decoded_start_utc"]) != run_start or parse_utc(info["decoded_end_utc"]) != end:
             raise ValueError("production audit coverage differs from request")
     audit_nc = audit["station_netcdf"] + audit["full_grid_netcdf"] + [audit["restart_netcdf"]]
     if not all(row.get("required_variables_finite_and_unmasked") for row in audit_nc):
@@ -214,7 +220,7 @@ def verify_prerequisites(args: argparse.Namespace) -> dict[str, Any]:
                 inventory_path=inventory_path, observation_path=observation_path, observation=observation,
                 forcing_path=forcing_path, constituents=constituents, audit_path=audit_path,
                 station_paths=station_paths, station_keys=keys, start=start, end=end, time_anchor=anchor,
-                cell_sampling_audit=sampling)
+                cell_sampling_audit=sampling, paper=paper, run_start=run_start)
 
 
 def run_validation(args: argparse.Namespace) -> dict[str, Any]:
@@ -244,14 +250,18 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
                "station_mapping_sha256": sha256(context["mapping_path"]), "station_inventory_sha256": sha256(context["inventory_path"]),
                "forcing_manifest_sha256": sha256(context["forcing_path"]), "production_audit_sha256": sha256(context["audit_path"]),
                "constituents_forced": context["constituents"],
-               "period": [context["start"].isoformat(), context["end"].isoformat()]}
+               "period": [context["start"].isoformat(), context["end"].isoformat()],
+               "simulation_start": context["run_start"].isoformat(),
+               "analysis_end_exclusive": bool(context["paper"])}
     lineage_path = output / "validation_lineage.json"
     write(lineage_path, lineage)
     condensed_path = output / "condensation_manifest.json"
     condense(context["station_paths"], context["mapping_path"], context["namelist"], output / "condensed", condensed_path,
-             time_anchor=context["time_anchor"], startup_restart_path=Path(context["time_anchor"]["startup_restart_path"]))
+             time_anchor=context["time_anchor"],
+             startup_restart_path=Path(context["time_anchor"]["startup_restart_path"]) if context["time_anchor"].get("startup_restart_path") else None)
     tables_path = output / "validation_tables_manifest.json"
-    tables = prepare(condensed_path, context["observation_path"].parent, output / "tables", tables_path, context["inventory_path"])
+    tables = prepare(condensed_path, context["observation_path"].parent, output / "tables", tables_path, context["inventory_path"],
+                     analysis_period=(context["start"], context["end"]) if context["paper"] else None)
     products = {(row["station_id"], row["role"]): Path(row["path"]) for row in tables["products"]}
     comparison_keys = [key for key in context["station_keys"] if key[1] in {"water_level", "current"}]
     if set(products) != set(comparison_keys):

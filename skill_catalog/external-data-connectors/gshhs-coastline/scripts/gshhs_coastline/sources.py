@@ -44,8 +44,9 @@ def default_cache_dir() -> Path:
 def _candidate_dirs(cache_dir: str | Path | None = None) -> list[tuple[Path, str]]:
     rels = []
     if cache_dir:
-        requested = Path(cache_dir)
-        rels.extend([(requested / "GSHHS_shp", "requested_cache"), (requested, "requested_cache")])
+        # An explicit cache is a boundary, not a hint followed by global search.
+        requested = Path(cache_dir).expanduser().resolve()
+        return [(requested / "GSHHS_shp", "requested_cache"), (requested, "requested_cache")]
     rels.extend(
         [
             (default_cache_dir() / "GSHHS_shp", "default_cache"),

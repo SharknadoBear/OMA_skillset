@@ -14,6 +14,8 @@ description: Use for authorized SSH/SFTP access, compilation, Slurm submission o
 - Use `hmac-sha2-256` for direct SSH, SCP, and rsync when required by the endpoint.
 - Compile and submit from a login node matching the target CPU or GPU compute architecture. Do not run compute-intensive work on login nodes.
 
+During Kestrel's RHEL8-to-RHEL9 transition, choose the login and compute-node OS for each task: use the [RHEL9 CPU login `kl3.hpc.nlr.gov`](https://natlabrockies.github.io/HPC/RHEL9_upgrade/access/) (from a trusted Kestrel login if direct access is unavailable) for RH9 jobs while retaining RH8 access for established runs that still need the older stack. Before moving an existing workload between pools, verify its modules, dynamic libraries, MPI, and a reduced model run rather than changing its Slurm feature alone.
+
 Direct connection and transfer patterns:
 
 ```bash
@@ -58,9 +60,13 @@ Start-Process -WorkingDirectory "<session-dir>" -FilePath "powershell.exe" `
   -WindowStyle Normal
 ```
 
-The bridge enables a 60-second SSH transport keepalive after authentication. Leave a healthy, purpose-matched bridge open while its active workflow still needs Kestrel; stop and replace it only when it is stale, malfunctioning, or no longer in scope.
+The bridge keeps commands and transfers in separate lanes, reports local health every second, and uses a 60-second SSH keepalive. Reuse a healthy purpose-matched session. For transfer recovery, cancellation, or remote waits, read [bridge reliability and continuity](references/bridge-reliability.md).
 
-Pass an explicit `--timeout` suited to each remote command. The bridge closes remote stdin immediately, so commands must be noninteractive and accidental stdin readers terminate at EOF. Protect shell metacharacters across both the local PowerShell and remote POSIX-shell layers; for grep alternation, prefer repeated `-e` arguments over an unquoted `|`. If results stop advancing, inspect the oldest queued command before adding more work and replace a wedged bridge without touching independent Slurm jobs.
+Use an explicit `--timeout` for the operation; the caller returns a request ID after a short wait. A pending response is not failure: inspect `status <request-id>` and `result <request-id>` before retrying. Reconcile uncertain remote effects before any repeat submission. Transfers use verified partial files; `--resume` checks the prefix, and `--overwrite` explicitly permits replacing a different destination. Await an upload's successful receipt before running a command that consumes it.
+
+Commands must be noninteractive; remote stdin is closed. Protect shell metacharacters across PowerShell and the remote shell. After a lost connection, request `reconnect` and authenticate in the visible window; failed commands are not replayed. Cancelling a bridge request or stopping the bridge does not establish that a Slurm job has stopped.
+
+Before yielding an authorized workflow that is waiting on remote work, record its request/job identities and next check, and create or update a same-chat heartbeat through the app's automation interface. Follow the continuity procedure above: inspect original receipts, stay quiet on unchanged state, preserve human timing and stop authority, and pause the follow-up at completion or stop. If scheduling is unavailable, report that automatic continuation is not established. Do not create global hooks or a campaign controller.
 
 Verify identity before every operation:
 
@@ -72,7 +78,7 @@ Verify identity before every operation:
 .\.venv\Scripts\python.exe .\send_kestrel_command.py --bridge-name <name> stop
 ```
 
-Reuse a session only while its bridge name, purpose, project root, and remote target still match the active work. Keep `.venv/`, `bridge_sessions/`, `commands/`, `results/`, identity files, and status files local and uncommitted.
+Reuse a session only while its bridge name, purpose, project root, and remote target still match the active work. Keep environments, session folders, commands, inflight claims, results, progress, identity, and status files local and uncommitted. New helpers apply to newly created sessions; leave unrelated active sessions untouched.
 
 ## Nodes and resource selection
 

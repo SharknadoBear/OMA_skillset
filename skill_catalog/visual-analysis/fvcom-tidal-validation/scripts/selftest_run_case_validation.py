@@ -24,9 +24,9 @@ RESTART_FIELDS = ("zeta", "ua", "va", "u", "v", "tauc", "ww", "omega", "temp", "
                   "viscofm", "viscofh", "km", "kh", "kq", "q2", "q2l", "l",
                   "et", "rho1", "rmean1", "tmean1", "smean1", "cor", "cc_sponge",
                   "obc_nodes", "obc_type", "wet_nodes", "wet_cells", "wet_nodes_prev_int",
-                  "wet_cells_prev_int", "wet_cells_prev_ext", "inundation_cells")
+                  "wet_cells_prev_int", "wet_cells_prev_ext")
 INTEGER_RESTART_FIELDS = {"obc_nodes", "obc_type", "wet_nodes", "wet_cells", "wet_nodes_prev_int",
-                          "wet_cells_prev_int", "wet_cells_prev_ext", "inundation_cells"}
+                          "wet_cells_prev_int", "wet_cells_prev_ext"}
 
 
 def sha256(path: Path) -> str:
@@ -72,7 +72,7 @@ def state_file(path: Path, steps, times: list[dt.datetime], *, complete: bool) -
                 dimensions = ("siglay", "node")
             elif name in {"zeta", "et", "wet_nodes", "wet_nodes_prev_int"}:
                 dimensions = ("time", "node")
-            elif name in {"ua", "va", "tauc", "wet_cells", "wet_cells_prev_int", "wet_cells_prev_ext", "inundation_cells"}:
+            elif name in {"ua", "va", "tauc", "wet_cells", "wet_cells_prev_int", "wet_cells_prev_ext"}:
                 dimensions = ("time", "nele")
             elif name in {"u", "v", "ww", "viscofm"}:
                 dimensions = ("time", "siglay", "nele")

@@ -26,8 +26,11 @@ OUTPUT_FLAGS = ("NC_VELOCITY", "NC_VERTICAL_VEL", "NC_SALT_TEMP", "NC_TURBULENCE
 RESTART_FIELDS = ("zeta", "ua", "va", "u", "v", "tauc", "ww", "omega", "temp", "salinity",
                   "viscofm", "viscofh", "km", "kh", "kq", "q2", "q2l", "l",
                   "et", "rho1", "rmean1", "tmean1", "smean1", "cor", "cc_sponge")
+# FVCOM-GitHub/FVCOM release-v4.3.1, commit e2a265ca0c3f8a514a026906afec35c428c8d8a7:
+# src/mod_ncdio.F::WET_DRY_FILE_OBJECT writes only these five wet/dry fields;
+# src/mod_startup.F reads the same five. No native inundation_cells field exists.
 CONDITIONAL_RESTART_FIELDS = ("obc_nodes", "obc_type", "wet_nodes", "wet_cells", "wet_nodes_prev_int",
-                              "wet_cells_prev_int", "wet_cells_prev_ext", "inundation_cells")
+                              "wet_cells_prev_int", "wet_cells_prev_ext")
 INTEGER_RESTART_FIELDS = set(CONDITIONAL_RESTART_FIELDS)
 
 
@@ -63,7 +66,7 @@ def field(ds: nc4.Dataset, name: str) -> None:
         dimensions = ("time", "node")
     elif name in {"rmean1", "tmean1", "smean1"}:
         dimensions = ("siglay", "node")
-    elif name in {"ua", "va", "tauc", "wet_cells", "wet_cells_prev_int", "wet_cells_prev_ext", "inundation_cells"}:
+    elif name in {"ua", "va", "tauc", "wet_cells", "wet_cells_prev_int", "wet_cells_prev_ext"}:
         dimensions = ("time", "nele")
     elif name in {"u", "v", "ww", "viscofm"}:
         dimensions = ("time", "siglay", "nele")
@@ -72,7 +75,7 @@ def field(ds: nc4.Dataset, name: str) -> None:
     else:
         dimensions = ("time", "siglev", "node")
     ds.createVariable(name, "i4" if name in INTEGER_RESTART_FIELDS else "f4", dimensions, fill_value=-9999)[:] = (
-        20 if name == "temp" else 30 if name == "salinity" else 2 if name == "inundation_cells" else 1)
+        20 if name == "temp" else 30 if name == "salinity" else 1)
 
 
 def state_file(path: Path, steps: list[int], times: list[dt.datetime], *, complete: bool) -> None:
@@ -176,6 +179,24 @@ def main() -> int:
         outputs(0)
         result = succeeds("coldstart_exact_clocks_complete_restart")
         assert result["time_anchor"]["method"] == "coldstart_zero" and result["time_anchor"]["iint_at_start"] == 0
+        with nc4.Dataset(restart) as ds:
+            assert "inundation_cells" not in ds.variables
+        assert "inundation_cells" not in result["restart_netcdf"]["required_variables"]
+        assert set(CONDITIONAL_RESTART_FIELDS) <= set(result["restart_netcdf"]["required_variables"])
+        passed.append("native_431_wet_restart_without_inundation_cells")
+
+        # An extension field is optional, but known physical data must still be
+        # finite and unmasked when present. Its values need not be binary.
+        native_restart_bytes = restart.read_bytes()
+        with nc4.Dataset(restart, "a") as ds:
+            ds.createVariable("inundation_cells", "i4", ("time", "nele"), fill_value=-9999)[:] = 2
+        result = succeeds("optional_inundation_cells_nonbinary")
+        assert "inundation_cells" in result["restart_netcdf"]["checked_variables"]
+        assert "inundation_cells" not in result["restart_netcdf"]["required_variables"]
+        with nc4.Dataset(restart, "a") as ds:
+            ds["inundation_cells"][:] = -9999
+        fails("optional_inundation_cells_masked", "non-finite variables ['inundation_cells']")
+        restart.write_bytes(native_restart_bytes)
         with nc4.Dataset(station, "a") as ds:
             ds.renameVariable("time", "removed_time")
         fails("station_native_time_missing", "no native clock")

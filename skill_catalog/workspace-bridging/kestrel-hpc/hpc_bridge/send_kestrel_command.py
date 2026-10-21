@@ -6,9 +6,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+
+from bridge_runtime import atomic_json, positive, read_json, REQUEST_ID, MAX_REQUEST_BYTES
 
 
 ROOT = Path(__file__).resolve().parent
@@ -72,17 +76,17 @@ def write_command(payload: dict) -> Path:
     COMMANDS.mkdir(parents=True, exist_ok=True)
     RESULTS.mkdir(parents=True, exist_ok=True)
     command_id = uuid.uuid4().hex
-    payload = {"id": command_id, **payload}
+    payload = {**payload, "id": command_id}
+    if len(json.dumps(payload, indent=2).encode("utf-8")) > MAX_REQUEST_BYTES:
+        raise SystemExit("Request exceeds 64 KiB; upload a script and use a short command")
     final = COMMANDS / f"{command_id}.json"
-    tmp = COMMANDS / f"{command_id}.json.tmp"
-    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8", newline="\n")
-    tmp.replace(final)
+    atomic_json(final, payload)
     return RESULTS / f"{command_id}.json"
 
 
 def wait_result(result_path: Path, timeout: float) -> dict:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if result_path.exists():
             try:
                 return json.loads(result_path.read_text(encoding="utf-8-sig"))
@@ -101,15 +105,42 @@ def print_result(result: dict) -> int:
     return 1
 
 
-def parse_args() -> argparse.Namespace:
+def snapshot(request_id=None):
+    status_file = ROOT / "bridge_status.json"
+    health = read_json(status_file) if status_file.exists() else {"state": "not_started"}
+    if health.get("heartbeat_at"):
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(health["heartbeat_at"])).total_seconds()
+        health["heartbeat_age_seconds"] = round(age, 1)
+        health["heartbeat_stale"] = age > 10
+    if request_id is None:
+        return {"status": "ok", "bridge": health}
+    if not REQUEST_ID.fullmatch(request_id):
+        raise SystemExit("Invalid request ID")
+    for directory in ("results", "progress", "inflight", "commands"):
+        path = ROOT / directory / f"{request_id}.json"
+        if path.exists():
+            data = read_json(path)
+            if directory in {"inflight", "commands"}:
+                data = {"id": request_id, "action": data.get("action"),
+                        "state": "claimed" if directory == "inflight" else "queued"}
+            return {"status": "ok", "bridge": health, "request": data, "location": directory}
+    return {"status": "error", "bridge": health, "stderr": "Unknown request ID"}
+
+
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["identity", "exec", "upload", "download", "stop"])
+    parser.add_argument("action", choices=["identity", "status", "result", "exec", "upload", "download", "cancel", "reconnect", "stop"])
     parser.add_argument("args", nargs="*")
     parser.add_argument("--timeout", type=float, default=3600)
+    parser.add_argument("--wait", type=float, default=30, help="Caller wait only; expiry does not cancel or resubmit the request.")
+    parser.add_argument("--no-wait", action="store_true", help="Return the durable request ID immediately.")
+    parser.add_argument("--stall-timeout", type=float, default=120)
+    parser.add_argument("--resume", action="store_true", help="Verify an existing partial prefix before resuming a transfer.")
+    parser.add_argument("--overwrite", action="store_true", help="Allow atomic replacement of a different destination file.")
     parser.add_argument("--bridge-name", help="Expected Japanese bridge name for this session.")
     parser.add_argument("--purpose", help="Expected bridge purpose text.")
     parser.add_argument("--project-root", help="Expected local project root for this bridge.")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:
@@ -118,6 +149,22 @@ def main() -> int:
         return print_identity()
 
     validate_identity(args)
+
+    if args.action in {"status", "result"}:
+        if len(args.args) > 1 or args.action == "result" and len(args.args) != 1:
+            raise SystemExit("status takes an optional request ID; result requires one")
+        if args.action == "result":
+            request_id = args.args[0]
+            if not REQUEST_ID.fullmatch(request_id):
+                raise SystemExit("Invalid request ID")
+            path = RESULTS / f"{request_id}.json"
+            if path.exists():
+                return print_result(read_json(path))
+        return print_result(snapshot(args.args[0] if args.args else None))
+
+    positive(args.timeout, "timeout")
+    positive(args.wait, "wait")
+    positive(args.stall_timeout, "stall timeout")
 
     if args.action == "exec":
         if not args.args:
@@ -137,12 +184,33 @@ def main() -> int:
         if len(args.args) != 2:
             raise SystemExit("download requires remote_path local_path")
         payload = {"action": "download", "remote_path": args.args[0], "local_path": args.args[1]}
+    elif args.action == "cancel":
+        if len(args.args) != 1 or not REQUEST_ID.fullmatch(args.args[0]):
+            raise SystemExit("cancel requires the original request ID")
+        payload = {"action": "cancel", "request_id": args.args[0]}
     else:
-        payload = {"action": "stop"}
+        if args.args:
+            raise SystemExit(f"{args.action} takes no positional arguments")
+        payload = {"action": args.action}
+
+    payload.update(timeout=args.timeout, stall_timeout=args.stall_timeout,
+                   submitted_at=datetime.now(timezone.utc).isoformat(),
+                   expires_at=time.time() + args.timeout)
+    if args.action in {"upload", "download"}:
+        payload.update(resume=args.resume, overwrite=args.overwrite)
 
     result_path = write_command(payload)
-    # Leave a short grace interval for the bridge to serialize the timeout result.
-    result = wait_result(result_path, args.timeout + 30.0)
+    receipt = {"status": "submitted", "id": result_path.stem, "result_path": str(result_path),
+               "note": "Retain this ID. Inspect status/result before any retry; caller wait expiry is not remote failure."}
+    if args.no_wait:
+        print(json.dumps(receipt, indent=2))
+        return 0
+    print(json.dumps(receipt), file=sys.stderr, flush=True)
+    try:
+        result = wait_result(result_path, args.wait)
+    except TimeoutError:
+        print(json.dumps({**receipt, "status": "pending"}, indent=2))
+        return 2
     return print_result(result)
 
 

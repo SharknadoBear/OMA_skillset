@@ -1,0 +1,9 @@
+Please run a three-dimensional barotropic tide-only FVCOM simulation for {REGION}, starting from scratch. Use the fvcom-simulation skill with the paper_barotropic profile and the computing resources allocated on Kestrel. Compare the tidal results with available NOAA data and summarize the results and limitations. Save all project files and results in {TRIAL_ROOT} locally and {REMOTE_ROOT} on Kestrel.
+
+Experimental control
+- Trial: {TRIAL_ID}. Skill baseline: {SKILL_BASELINE}.
+- Begin with empty local and remote project folders. If either contains existing project material, report it and wait for my decision.
+- Use the agreed skills and this trial's files as project context. Obtain required data independently through the skills. Keep project downloads, caches and results within the assigned roots. Do not read or reuse other trials, earlier experiments, project memories or other chats.
+- Workers and retries may share this trial's own files. Any workers must inherit this chat's model and reasoning effort. Do not edit shared skills during the trial; report defects.
+- Follow paper_barotropic: at most three total smoke attempts and three total production attempts, including the initial run and two corrected reruns per stage. Report failure and stop if either limit is exhausted without success.
+- This is an automated test. Bear controls campaign launches, timing, pauses, and stopping. No additional guidance will be provided during testing. Request authentication directly through the kestrel-hpc skill when needed; Bear will authenticate. Do not affect unrelated work.

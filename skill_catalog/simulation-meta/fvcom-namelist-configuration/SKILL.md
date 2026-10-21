@@ -7,6 +7,15 @@ description: Create and validate FVCOM 4.3.1 run namelists and cell-based statio
 
 Turn a scientific scenario into a version-compatible, auditable FVCOM runtime configuration.
 
+
+## paper_barotropic
+
+An optional `profile: paper_barotropic` selects the parent skill's fixed setup.
+Only `--stage smoke` and `--stage production` are valid: cold starts on March 29
+for one day and seventeen days respectively. Both write a final restart; production
+does not consume the smoke restart. There is no separate canary, spin-up or
+benchmark namelist. Preserve the ordinary timing, scientific and file/hash audits.
+
 ## Contract
 
 Read [references/contracts.md](references/contracts.md) before generating a configuration. Use `scripts/fvcom_namelist.py` to make a provisional overlay, render a final namelist from the exact frozen executable's blank template, write cell-based station specifications, and validate physics plus file references.

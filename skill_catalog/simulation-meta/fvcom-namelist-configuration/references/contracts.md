@@ -133,3 +133,11 @@ FVCOM 4.3.1 input definitions are authoritative for field spelling. Important gr
 A final configuration requires readable grid, depth, Coriolis, sigma, sponge, OBC-node, elevation-forcing, and station files. Set `grid_edge_read_from_file=false` only for the first cold smoke that will generate the named adjacency artifact into its attempt workspace. After that stable smoke, freeze the generated file and set the binding to `true`; subsequent cold canary/spin-up stages and all hot-start benchmark/production stages then require and reuse it. Hot starts with the binding set to false are rejected. The preconfiguration manifest must report ten sigma levels (nine layers) and hashes consistent with the selected files.
 
 The configuration manifest records the namelist/station/template hashes, stage, timing, numerics, all file checks, warnings, blocking reasons, and a resume token.
+
+## paper_barotropic override
+
+`profile: paper_barotropic` resolves the fixed common settings from Run Control.
+Only smoke (March 29–30, 2025 UTC) and production (March 29–April 15 UTC) exist;
+both cold-start and emit a final restart. Analysis is April 1–15, end exclusive.
+There is no hotstart prerequisite or separate canary/spin-up/benchmark stage.
+All other timing, artifact-binding and tide-only checks remain in force.
