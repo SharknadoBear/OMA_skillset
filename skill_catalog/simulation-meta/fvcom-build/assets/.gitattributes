@@ -1,0 +1,2 @@
+# Preserve POSIX patch line endings and unified-diff blank context lines.
+*.patch text eol=lf whitespace=-blank-at-eol
