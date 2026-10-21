@@ -2,6 +2,7 @@ Please run a three-dimensional barotropic tide-only FVCOM simulation for {REGION
 
 Experimental control
 - Trial: {TRIAL_ID}. Skill baseline: {SKILL_BASELINE}.
+- Chat name: {TRIAL_ID} test. Rename this chat to that exact name before starting.
 - Kestrel login: {KESTREL_LOGIN}.
 - Begin with empty local and remote project folders. If either contains existing project material, report it and wait for my decision.
 - Use the agreed skills and this trial's files as project context. Obtain required data independently through the skills. Keep project downloads, caches and results within the assigned roots. Do not read or reuse other trials, earlier experiments, project memories or other chats.
