@@ -23,6 +23,28 @@ Production, and Validation recipes for this profile. Its sole run stages are
 24-hour smoke and 17-day cold-start production, each with three total attempts.
 Keep native evidence only; Bear controls campaign timing and stopping.
 
+## Continuity during remote waits (all profiles)
+
+Before ending a turn while awaiting a submission result, remote build or transfer,
+queued job, or running job, the simulation lead must follow `$kestrel-hpc`'s
+**Mandatory follow-up for a remote wait** in `references/bridge-reliability.md`.
+Workers return their wait identities to the lead; the lead owns one same-chat
+heartbeat for this trial and reuses it across stages.
+
+Keep a small trial-local wait record with original request/task/job receipts,
+exact owned paths, the permitted next action, deadline and expected next check.
+Create or update the heartbeat through the app interface before yielding; retain
+its receipt. On wakeup, reconcile the original operation before continuing this
+trial. A pending or uncertain submission never authorizes duplicate submission.
+Stay quiet while unchanged; report authentication needs or an observation gap.
+If scheduling fails or is unavailable, report that continuation is not established
+and give the next manual check instead of claiming a scheduled wakeup.
+
+Pause the heartbeat at completion, explicit inability, or a human pause/stop;
+resume only when authorized. Wakeups do not launch another trial or alter human
+timing, attempt counts or scientific gates. Do not create campaign controllers,
+global hooks or polling daemons. This rule also applies to `paper_barotropic`.
+
 ## Modes (ordinary workflow)
 
 - `barotropic_tide`: prepare, stabilize, benchmark, run, and validate a tide-only FVCOM case.

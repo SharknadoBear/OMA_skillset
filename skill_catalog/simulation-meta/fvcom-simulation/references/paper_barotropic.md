@@ -72,7 +72,10 @@ After a third unsuccessful attempt in either stage, set `attempt_limit_reached`,
 report what failed and stop. An earlier explicit inability is also a valid terminal
 report. Preserve artifacts. Bear controls campaign launches, concurrency, timing,
 pause/resume and stop decisions; report external waits without changing the human
-clock. Do not create campaign controllers, hooks, timers or scheduled supervision.
+clock. Apply the parent skill's **Continuity during remote waits** rule: one
+same-chat heartbeat follows this trial's authorized work and pauses at completion,
+explicit inability or a human pause/stop. Do not create campaign controllers,
+global hooks or polling daemons.
 On a human stop, stop only this trial's workers and jobs and report anything still
 active. Keep workflow completion and physical assessment separate; Bear judges
 acceptance. A stable run alone is not validation completion.

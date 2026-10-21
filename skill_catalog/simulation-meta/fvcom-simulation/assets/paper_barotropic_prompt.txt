@@ -2,8 +2,10 @@ Please run a three-dimensional barotropic tide-only FVCOM simulation for {REGION
 
 Experimental control
 - Trial: {TRIAL_ID}. Skill baseline: {SKILL_BASELINE}.
+- Kestrel login: {KESTREL_LOGIN}.
 - Begin with empty local and remote project folders. If either contains existing project material, report it and wait for my decision.
 - Use the agreed skills and this trial's files as project context. Obtain required data independently through the skills. Keep project downloads, caches and results within the assigned roots. Do not read or reuse other trials, earlier experiments, project memories or other chats.
 - Workers and retries may share this trial's own files. Any workers must inherit this chat's model and reasoning effort. Do not edit shared skills during the trial; report defects.
 - Follow paper_barotropic: at most three total smoke attempts and three total production attempts, including the initial run and two corrected reruns per stage. Report failure and stop if either limit is exhausted without success.
+- Before ending a turn for a submission, transfer, queue, or running-job wait, follow kestrel-hpc to record this trial's request/job/task IDs and schedule or update one same-chat wakeup. Continue only this trial's authorized workflow; stay quiet when unchanged and pause the wakeup on completion, inability to continue, or my pause/stop.
 - This is an automated test. Bear controls campaign launches, timing, pauses, and stopping. No additional guidance will be provided during testing. Request authentication directly through the kestrel-hpc skill when needed; Bear will authenticate. Do not affect unrelated work.
