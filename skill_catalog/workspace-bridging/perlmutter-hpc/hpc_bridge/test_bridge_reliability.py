@@ -91,6 +91,37 @@ class SFTP(paramiko.SFTPServerInterface):
             return paramiko.SFTPServer.convert_errno(exc.errno)
 
 
+class FixtureTransport(paramiko.Transport):
+    """Release fixture command workers only after their SSH success reply is sent.
+
+    Paramiko sends CHANNEL_SUCCESS after check_channel_exec_request returns.
+    A worker started inside that callback must not close the channel first.
+    This test-only hook also lets regressions hold the acknowledgement exactly,
+    without relying on a sleep to make the race less likely.
+    """
+    def __init__(self, sock):
+        super().__init__(sock)
+        self.exec_acks = {}
+        self.ack_pending = threading.Event()
+        self.allow_ack = threading.Event()
+        self.allow_ack.set()
+        self.sent_packets = []
+
+    def _send_user_message(self, message):
+        packet = message.asbytes()
+        ack = None
+        if packet[0] == paramiko.common.MSG_CHANNEL_SUCCESS:
+            ack = self.exec_acks.pop(int.from_bytes(packet[1:5], "big"), None)
+        if ack is not None:
+            self.ack_pending.set()
+            if not self.allow_ack.wait(5):
+                raise RuntimeError("Fixture exec acknowledgement was not released")
+        super()._send_user_message(message)
+        self.sent_packets.append(packet[0])
+        if ack is not None:
+            ack.set()
+
+
 class SSHServer(paramiko.ServerInterface):
     def __init__(self, fixture):
         self.fixture = fixture
@@ -103,9 +134,15 @@ class SSHServer(paramiko.ServerInterface):
 
     def check_channel_exec_request(self, channel, command):
         self.fixture.commands.append(command.decode())
+        self.fixture.channels.append(channel)
+        acknowledged = threading.Event()
+        channel.transport.exec_acks[channel.remote_chanid] = acknowledged
 
         def respond():
             try:
+                if not acknowledged.wait(5):
+                    return
+                self.fixture.response_started.set()
                 args = shlex.split(command.decode())
                 if args[:2] == ["sha256sum", "--"]:
                     data = self.fixture.path(args[2]).read_bytes()
@@ -143,6 +180,7 @@ class Fixture:
         self.corrupt_write = self.stall_reads = False
         self.read_started = threading.Event()
         self.exec_started = threading.Event()
+        self.response_started = threading.Event()
         self.release_read = threading.Event()
         self.release_exec = threading.Event()
         self.commands = []
@@ -153,7 +191,7 @@ class Fixture:
         self.sock.listen(1)
         self.client_transport = paramiko.Transport(socket.create_connection(self.sock.getsockname()))
         accepted, _ = self.sock.accept()
-        self.server_transport = paramiko.Transport(accepted)
+        self.server_transport = FixtureTransport(accepted)
         self.server_transport.add_server_key(paramiko.RSAKey.generate(2048))
         self.server_transport.set_subsystem_handler("sftp", paramiko.SFTPServer, SFTP)
         self.server_transport.start_server(event=threading.Event(), server=SSHServer(self))
@@ -169,6 +207,7 @@ class Fixture:
         return candidate
 
     def close(self):
+        self.server_transport.allow_ack.set()
         self.release_read.set()
         self.release_exec.set()
         self.client.close()
@@ -410,8 +449,73 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 sender.wait_result(result_path, .01)
         self.assertEqual(len(list((rt.root / "commands").glob("*.json"))), 1)
-        self.assertEqual(self.receipt(rt, result_path.stem)["status"], "ok")
+        receipt = self.receipt(rt, result_path.stem)
+        self.assertEqual(receipt["status"], "ok", receipt)
         self.assertEqual(self.fixture.commands.count("fixture status"), 1)
+
+    def test_exec_response_waits_for_acknowledgement(self):
+        transport = self.fixture.server_transport
+        transport.allow_ack.clear()
+        rt = self.new_runtime()
+        request = self.payload("exec", command="fixture status")
+        self.submit(rt, request)
+        rt.tick()
+        try:
+            self.assertTrue(transport.ack_pending.wait(2))
+            self.assertFalse(self.fixture.response_started.wait(.05))
+            self.assertFalse(self.fixture.channels[0].closed)
+        finally:
+            transport.allow_ack.set()
+        result = self.receipt(rt, request["id"])
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(result["stdout"], "scheduler reachable\n")
+        packets = transport.sent_packets
+        self.assertLess(packets.index(paramiko.common.MSG_CHANNEL_SUCCESS),
+                        packets.index(paramiko.common.MSG_CHANNEL_DATA))
+        self.assertLess(packets.index(paramiko.common.MSG_CHANNEL_SUCCESS),
+                        packets.index(paramiko.common.MSG_CHANNEL_CLOSE))
+
+    def test_fast_exec_closes_before_caller_resumes_without_losing_output(self):
+        original = paramiko.Channel.exec_command
+        closed_before_return = []
+
+        def delayed_return(channel, command):
+            original(channel, command)
+            end = time.monotonic() + 2
+            while not channel.closed and time.monotonic() < end:
+                time.sleep(.001)
+            closed_before_return.append(channel.closed)
+
+        rt = self.new_runtime()
+        request = self.payload("exec", command="fixture status")
+        self.submit(rt, request)
+        with patch.object(paramiko.Channel, "exec_command", delayed_return):
+            result = self.receipt(rt, request["id"])
+        self.assertEqual(closed_before_return, [True])
+        self.assertEqual(result["status"], "ok", result)
+        self.assertEqual(result["exit_status"], 0)
+        self.assertEqual(result["stdout"], "scheduler reachable\n")
+        self.assertEqual(self.fixture.commands.count("fixture status"), 1)
+
+    def test_close_before_exec_ack_is_uncertain_and_never_replays(self):
+        transport = self.fixture.server_transport
+        transport.allow_ack.clear()
+        rt = self.new_runtime()
+        request = self.payload("exec", command="fixture status")
+        self.submit(rt, request)
+        rt.tick()
+        try:
+            self.assertTrue(transport.ack_pending.wait(2))
+            self.fixture.channels[0].close()
+            result = self.receipt(rt, request["id"])
+            self.assertEqual(result["status"], "uncertain", result)
+            self.assertEqual(result["reason"], "SSHException")
+            self.assertIn("Channel closed", result["stderr"])
+            self.submit(rt, request)
+            rt.tick()
+            self.assertEqual(self.fixture.commands.count("fixture status"), 1)
+        finally:
+            transport.allow_ack.set()
 
     def test_session_lock_refuses_second_server(self):
         with runtime.SessionLock(self.root):

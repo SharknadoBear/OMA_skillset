@@ -1,6 +1,6 @@
 ---
 name: perlmutter-hpc
-description: Use for authorized SSH/SFTP access, file transfers, compilation, Slurm workflows and compact-result retrieval on NERSC Perlmutter through the same named-session bridge interface as Kestrel. Obtain NERSC account and allocation details privately; credentials stay in the visible terminal.
+description: Use for authorized SSH/SFTP access, Globus transfers and recovery, compilation, Slurm workflows and compact-result retrieval on NERSC Perlmutter through the same named-session bridge interface as Kestrel. Obtain NERSC account and allocation details privately; credentials stay in the visible terminal.
 ---
 
 # Perlmutter HPC
@@ -10,6 +10,12 @@ Use `user@perlmutter.nersc.gov` as the public example. Resolve the actual NERSC 
 Before asking for account details, inspect `%LOCALAPPDATA%/Codex/perlmutter-hpc/account.local.json` when present. Reuse user-confirmed details for the matching workspace, distinguishing a confirmed project from live-verified CPU/GPU charging-account access.
 
 The bridge verifies NERSC's published RSA host fingerprint before requesting authentication, with RSA SHA-2 signatures and no Kestrel MAC override. Enter password immediately followed by OTP only in its visible terminal. Never collect credentials through chat, files, arguments, environment variables, screenshots or logs. The credential-free host preflight closes before you type. After Enter, the bridge opens and verifies a fresh connection, then makes one authentication attempt; this prevents the server's pre-login timeout from expiring during human input. The terminal shows DNS/TCP, SSH verification and authentication progress plus a sanitized failure phase. DNS/TCP share a 20-second total deadline (DNS at most 5 seconds), with at most four resolved endpoint attempts in flight; the limit does not multiply by the number of DNS addresses. Investigate failures before explicit reconnect. See [NERSC authentication](references/nersc.md#authentication).
+
+## Globus transfer fallback
+
+Keep the SSH bridge for commands, builds, and Slurm. For large files, repeated SFTP/SCP timeouts, or an explicit Globus request, use the official CLI following [Globus transfers and recovery](references/globus-transfers.md). Reconcile the original transfer before switching tools; never let two writers target the same file.
+
+Use NERSC DTN as the primary NERSC collection and NERSC Perlmutter as the fallback when DTN is unavailable. Verify collection access and paths before submitting. Globus Connect Personal is needed only when the workstation is a transfer endpoint; a direct Kestrel-to-NERSC transfer does not pass through the workstation. Retain submission/task IDs, require terminal `SUCCEEDED` with checksum verification, and use the existing same-chat follow-up procedure for unfinished transfers.
 
 ## Local bridge workflow
 
@@ -79,6 +85,6 @@ Optional existing NERSC sshproxy credentials use `make_bridge_session.py --key-f
 
 The old `scripts/bridge.py --session` interface is retired. Create a new named session for this implementation; retain old sessions and their original request receipts as evidence. Do not replay interrupted old requests. The download order is now `remote-file local-file`, matching Kestrel. Automatic idle disconnection is replaced by the shared explicit `stop` lifecycle. Existing unrelated bridges are not patched or restarted.
 
-`hpc_bridge/bridge_runtime.py`, `bridge_transfer.py`, the setup launcher, naming pool and output-completion tests are copied unchanged from the latest installed Kestrel bridge. The sender differs only in its site name. The server's connection function delegates NERSC authentication to `site_auth.py`; session creation additionally validates the NERSC target and supports sshproxy. Preserve this separation when updating the common transport.
+`hpc_bridge/bridge_runtime.py`, `bridge_transfer.py`, the setup launcher, naming pool and output-completion tests match the canonical Kestrel bridge. The sender and loopback reliability suite differ only in site names and the sender import. The reliability fixture waits for SSH exec acknowledgement before responding and covers fast command closure plus uncertain pre-acknowledgement closure without replay. The server's connection function delegates NERSC authentication to `site_auth.py`; session creation additionally validates the NERSC target and supports sshproxy. Preserve this separation when updating the common transport.
 
 Run `test_bridge_output_completion.py`, `test_bridge_reliability.py`, `test_site_auth.py` and `test_site_network.py` in the Paramiko 5 environment, then the skill-creator validator. These local tests require no credentials. A separate authenticated check verifies live identity and bounded file transfers. Keep environments, private accounts, test reports and session records uncommitted.

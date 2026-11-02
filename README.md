@@ -218,9 +218,11 @@ and request reference for its exact scope and invocation.
   skill entrypoint and duplicated the TPXO builder utilities byte-for-byte.
 - `workspace-bridging/perlmutter-hpc` uses the latest Kestrel named-session
   interface, independent command/transfer lanes, verified resumable transfers,
-  bounded requests and durable receipts. NERSC endpoint verification, MFA and
-  resource/storage guidance remain site-specific. Local output, failure-injection
-  and authentication tests cover 50 cases; live acceptance is recorded privately.
+  bounded requests and durable receipts. Globus recovery and same-chat transfer
+  follow-ups use NERSC-specific collection and path guidance. NERSC endpoint
+  verification, MFA and resource/storage guidance remain site-specific. Local
+  output, failure-injection, authentication and network tests cover 53 cases;
+  live acceptance is recorded separately and privately.
 - `workspace-bridging/expanse-hpc` mirrors the named-session JSON bridge
   architecture for SDSC Expanse, supports password-or-agent authentication
   followed by TOTP, and documents Expanse-specific Slurm, Lmod, project,
