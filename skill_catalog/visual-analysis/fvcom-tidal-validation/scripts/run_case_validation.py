@@ -243,6 +243,7 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
     stack = [{"path": str(path), "sha256": sha256(path)} for path in context["station_paths"]]
     stack_digest = stack[0]["sha256"] if len(stack) == 1 else hashlib.sha256(json.dumps(stack, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     lineage = {"schema": "fvcom_case_validation_lineage_v1", "case_id": context["request"]["case_id"],
+               "mode": context["request"].get("mode"), "profile": context["request"].get("profile"),
                "grid_case": args.grid_case, "generated_at": datetime.now(timezone.utc).isoformat(),
                "executable_sha256": context["executable_hash"], "executable_binding_sha256": sha256(context["binding_path"]),
                "input_bundle_sha256": context["freeze"]["input_bundle_sha256"],

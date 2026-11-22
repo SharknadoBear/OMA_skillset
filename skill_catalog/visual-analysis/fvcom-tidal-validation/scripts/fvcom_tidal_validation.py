@@ -165,9 +165,12 @@ def load_lineage(path: Path) -> dict[str, Any]:
     return value
 
 
-def plot_water(df: pd.DataFrame, output: Path, title: str) -> None:
+def plot_water(df: pd.DataFrame, output: Path, title: str, river_study: bool = False) -> None:
     import matplotlib.pyplot as plt
-    references = [ref for ref in ('predicted', 'observed') if len(paired(df, ref)) >= 3]
+    labels = ({"observed": "NOAA observed total water level", "predicted": "NOAA astronomical prediction"}
+              if river_study else
+              {"predicted": "primary prediction comparison", "observed": "total observation diagnostic"})
+    references = [ref for ref in labels if len(paired(df, ref)) >= 3]
     fig, axes = plt.subplots(len(references), 1, figsize=(11, 4*len(references)), squeeze=False)
     for ax, ref in zip(axes[:, 0], references):
         support = paired(df, ref)
@@ -176,7 +179,7 @@ def plot_water(df: pd.DataFrame, output: Path, title: str) -> None:
             values = support[col] - support[col].mean()
             ax.plot(support['time'], values, label=label, lw=.8)
         ax.set_ylabel('mean-removed water level (m)')
-        ax.set_title(title + (' — primary prediction comparison' if ref == 'predicted' else ' — total observation diagnostic'))
+        ax.set_title(title + ' — ' + labels[ref])
         ax.legend()
     fig.autofmt_xdate(); fig.tight_layout()
     fig.savefig(output, dpi=150); plt.close(fig)
@@ -196,6 +199,7 @@ def validate(water_files: list[Path], current_files: list[Path], output_dir: Pat
              station_inventory_path: Path | None = None) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     lineage = load_lineage(lineage_path)
+    river_study = lineage.get("mode") == "barotropic-tide-river" or lineage.get("profile") == "columbia_river_pair"
     water_results, current_results = [], []
     for path in water_files:
         df = common_frame(path, ["model", "observed", "predicted"])
@@ -222,7 +226,8 @@ def validate(water_files: list[Path], current_files: list[Path], output_dir: Pat
                 "model": harmonic_fit(common["time"], common["model"].to_numpy(), ref_resolved),
                 "reference": harmonic_fit(common["time"], common[ref].to_numpy(), ref_resolved),
             }
-        image = output_dir / f"{path.stem}_water.png"; plot_water(df, image, path.stem)
+        image = output_dir / f"{path.stem}_water.png"
+        plot_water(df, image, path.stem, river_study)
         water_results.append({"station": path.stem, "station_id": station_id, "source": str(path), "source_sha256": file_sha256(path), "coverage_start": finite["time"].iloc[0].isoformat(), "coverage_end": finite["time"].iloc[-1].isoformat(), "datum_alignment": "independent mean removal on each model/reference common support; not a datum conversion", "reference_support": support, "model_minus_reference_mean_m": datum_offsets, "metrics": metrics, "resolved_constituents": resolved, "unresolved": unresolved, "harmonics": harmonics, "plot": image.name, "total_observation_scoring": False, "prediction_scoring": True})
     for path in current_files:
         df = common_frame(path, ["model_u", "model_v", "observed_u", "observed_v"])
@@ -303,14 +308,20 @@ def validate(water_files: list[Path], current_files: list[Path], output_dir: Pat
         "station_policy_evidence": station_policy_evidence,
         "water_level": water_results, "current": current_results,
     }
+    if river_study:
+        result["assessment_scope"] = (
+            "The informational thresholds assess agreement with astronomical predictions and available current "
+            "profiles. Assess the river response using observed total water levels, paired model offsets, "
+            "section export and storage change.")
     summary_path = output_dir / "validation_summary.json"
     summary_path.write_text(json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8")
-    sections = []
+    sections = [f"<p>{html.escape(result['assessment_scope'])}</p>"] if river_study else []
     for item in water_results:
         image_reference = Path(os.path.relpath(output_dir / item["plot"], report_path.parent)).as_posix()
         diagnostic = item['reference_support']['observed']['status']
         if diagnostic != 'available':
-            sections.append(f"<p>{html.escape(item['station'])}: total-water observation diagnostic {html.escape(diagnostic)}. No observation metrics were fabricated; astronomical predictions remain the primary comparison.</p>")
+            sections.append(f"<p>{html.escape(item['station'])} has total-water observation status "
+                            f"{html.escape(diagnostic)}. The astronomical prediction comparison is available.</p>")
         sections.append('<details><summary>Independent reference coverage and source evidence</summary><pre>' + html.escape(json.dumps(item['reference_support'], indent=2)) + '</pre></details>')
         sections.append(f"<h2>Water level: {html.escape(item['station'])}</h2><p>{html.escape(item['datum_alignment'])}</p><img src='{html.escape(image_reference)}' style='max-width:100%'><h3>Metrics and datum offsets</h3><pre>{html.escape(json.dumps({'offsets': item['model_minus_reference_mean_m'], 'metrics': item['metrics']}, indent=2))}</pre><details><summary>Resolvable harmonics and unresolved aliases</summary><pre>{html.escape(json.dumps({'resolved': item['resolved_constituents'], 'unresolved': item['unresolved'], 'harmonics': item['harmonics']}, indent=2))}</pre></details>")
     for item in current_results:

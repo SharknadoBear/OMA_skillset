@@ -67,6 +67,14 @@ class PredictionSupportTests(unittest.TestCase):
         self.assertIsNone(water['model_minus_reference_mean_m']['observed'])
         self.assertEqual(water['reference_support']['observed']['status'], 'unavailable_source_confirmed')
         self.assertIn('unavailable_source_confirmed', report.read_text())
+        lineage = json.loads(self.lineage.read_text())
+        lineage["mode"] = "barotropic-tide-river"
+        self.lineage.write_text(json.dumps(lineage))
+        river_report = self.root/'river/report.html'
+        river = validate([table], [], river_report.parent, river_report, ['M2'], self.lineage, self.inventory)
+        self.assertIn("observed total water levels", river["assessment_scope"])
+        self.assertNotIn("remain the primary comparison", river_report.read_text())
+        self.assertIsNone(river["water_level"][0]["metrics"]["observed"])
 
     def test_partial_observations_never_reduce_primary_samples(self):
         frame = self.frame.copy()
