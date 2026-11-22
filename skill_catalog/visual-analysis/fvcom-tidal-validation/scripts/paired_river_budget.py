@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import textwrap
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import netCDF4 as nc
 import numpy as np
 import pandas as pd
@@ -257,10 +259,16 @@ def compare(control, river, geometry_path, output):
     fig, axes = plt.subplots(2, 1, figsize=(10, 6), constrained_layout=True)
     axes[0].plot(times, data["applied_river_m3_s"], label="Applied river")
     axes[0].plot(times, rq-cq, label="Additional seaward transport", alpha=.75)
+    locator = mdates.AutoDateLocator(minticks=4, maxticks=7)
+    axes[0].xaxis.set_major_locator(locator)
+    axes[0].xaxis.set_major_formatter(mdates.DateFormatter("%b %d", tz=times.tz))
+    axes[0].set_xlabel("Date (UTC)")
     axes[0].set_ylabel("Discharge (m³/s)")
     axes[0].legend()
-    axes[1].bar(list(offsets), list(offsets.values()))
-    axes[1].set_ylabel("River − control level (m)")
+    station_names = {str(row["id"]): row.get("name") for row in read(river["inventory_path"])["stations"]}
+    labels = [textwrap.fill(station_names.get(sid) or sid, 17) for sid in offsets]
+    axes[1].bar(range(len(offsets)), list(offsets.values()), tick_label=labels)
+    axes[1].set_ylabel("River − control mean level (m)")
     axes[1].set_xlabel("NOAA station")
     fig.savefig(output/"paired_response.png", dpi=160)
     plt.close(fig)
