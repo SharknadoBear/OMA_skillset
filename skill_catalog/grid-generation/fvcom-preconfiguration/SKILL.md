@@ -99,6 +99,30 @@ The standalone `fvcom_sig.py` supports `UNIFORM`, `GEOMETRIC`, `TANH`,
 `GENERALIZED`, and `USER`. `USER` also requires FVCOM's
 `sigma_level_user.inp` in `INPUT_DIR`.
 
+## River intake and downstream volume budget
+
+For `barotropic-tide-river`, run the geometry builder after producing the metric
+grid and OBC. Use a reviewed, bank-to-bank upstream geometric boundary segment.
+Draw the downstream section across the whole wetted reach, extending both ends
+onto land. Supply WGS84 longitude/latitude pairs in `cutoff_line_lonlat` and
+`section_line_lonlat` (two endpoints each), `gauge_lonlat`, `horizontal_crs`
+(the runtime grid's projected metre CRS), `cutoff_tolerance_m`,
+`wet_depth_floor_m`, and `cutoff_description` in the request JSON. Select the
+cutoff matching tolerance from actual mesh/bank displacement. Select the depth
+floor from the low-water level and model wetting threshold.
+
+```powershell
+python scripts/prepare_river_geometry.py --grid case_grd.dat --obc case_obc.dat --request section_request.json --out-dir river_geometry
+```
+
+`river_mapping.json` records receiving node IDs, width times reference-depth
+weights, wet connections to the ocean, and gauge-to-cutoff distance. The distance
+is a straight-line geodesic. `river_budget_geometry.json` records the upstream
+triangle IDs, downstream cut edges, upstream-side sampling cells, and seaward
+unit normals in the model's projected frame. Each output binds the grid, OBC
+and geometry request by hash. Verify receiving-node wetness from the run and
+disclose any excluded shallow flow paths and the resulting discharge allocation.
+
 ## Validation
 
 From the skill folder:
