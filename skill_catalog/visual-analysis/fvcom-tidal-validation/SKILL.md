@@ -5,6 +5,8 @@ description: Condense FVCOM station output and validate tide-only elevation and 
 
 # FVCOM Tidal Validation
 
+Assess harmonic resolution against the fitted mean at zero frequency as well as the retained tidal constituents. In a 14-day record, the lunar monthly constituent spans about half a cycle. List it in the unresolved results. [NOAA Tidal Analysis and Prediction, section 3.3](https://tidesandcurrents.noaa.gov/publications/Tidal_Analysis_and_Predictions.pdf)
+
 Run locally after `$kestrel-hpc` retrieves compact station output. Do not install analysis environments or plot on Kestrel.
 
 

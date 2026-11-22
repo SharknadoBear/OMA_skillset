@@ -11,11 +11,18 @@ import numpy as np
 import pandas as pd
 
 from prepare_validation_tables import prepare
-from fvcom_tidal_validation import validate, scalar_metrics
+from fvcom_tidal_validation import validate, scalar_metrics, resolvability
 from water_level_support import water_support
 
 
 class PredictionSupportTests(unittest.TestCase):
+    def test_lunar_monthly_resolution_against_fitted_mean(self):
+        constituents = ["M2", "MM", "MF"]
+        resolved, unresolved = resolvability(constituents, 14*24-.1)
+        self.assertEqual(resolved, ["M2", "MF"])
+        self.assertEqual([(r["constituent"], r["nearest"]) for r in unresolved], [("MM", "mean")])
+        self.assertEqual(resolvability(constituents, 35*24)[0], constituents)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

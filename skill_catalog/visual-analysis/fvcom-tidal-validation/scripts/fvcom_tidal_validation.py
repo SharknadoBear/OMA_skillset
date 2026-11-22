@@ -80,21 +80,23 @@ def resolvability(names: list[str], duration_hours: float) -> tuple[list[str], l
     rayleigh = 1.0 / duration_hours
     known = [n.upper() for n in names if n.upper() in FREQUENCIES_CPH]
     resolved, unresolved = [], []
+    retained_frequencies = {"mean": 0.0}  # harmonic_fit includes an intercept.
     # Input order is the scientific priority order. Retain the first member of
     # each unresolved cluster and label later aliases rather than dropping both.
     for n in known:
-        nearest = min(
-            ((abs(FREQUENCIES_CPH[n] - FREQUENCIES_CPH[m]), m) for m in resolved),
-            default=(math.inf, None),
-        )
+        frequency = FREQUENCIES_CPH[n]
+        nearest = min((abs(frequency - value), name) for name, value in retained_frequencies.items())
         if nearest[0] < rayleigh:
             unresolved.append({
                 "constituent": n, "nearest": nearest[1],
                 "frequency_separation_cph": nearest[0], "rayleigh_cph": rayleigh,
-                "interpretation": "not independently resolvable; retained constituent is a cluster representative",
+                "interpretation": ("The analysis period spans less than one cycle relative to the fitted mean."
+                                   if nearest[1] == "mean" else
+                                   "The retained constituent represents this unresolved frequency cluster."),
             })
         else:
             resolved.append(n)
+            retained_frequencies[n] = frequency
     return resolved, unresolved
 
 
