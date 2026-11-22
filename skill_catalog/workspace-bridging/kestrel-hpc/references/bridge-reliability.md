@@ -25,6 +25,8 @@ python .\send_kestrel_command.py --bridge-name <name> reconnect
 
 `status` reads local health and progress without queueing another remote operation. Health is refreshed once a second while the bridge loop is alive; older than ten seconds is stale. A fresh local heartbeat does not prove that SSH, SFTP, Slurm, or the simulation is progressing. Inspect those states separately.
 
+A Windows reader may temporarily lock the health snapshot. The bridge keeps the authenticated connection and retries the atomic snapshot on its next heartbeat. If the timestamp stays stale, check the recorded process and the original request receipt before reopening the secure terminal.
+
 `cancel` requests closure of that operation's channels. Closing an exec channel does not prove that its remote process or submitted job stopped. `stop` shuts down this bridge and cancels its queued requests; it does **not** cancel Slurm jobs. For a human stop instruction, identify and cancel only the workflow's owned jobs, verify terminal state, then stop its bridge and pause its follow-up.
 
 Remote commands remain ordered within their lane; transfers remain ordered within theirs. They can overlap, so wait for an upload's successful receipt before submitting any command that consumes that file. A bridge restart marks unfinished claims uncertain. Inspect their original evidence and remote effects before proceeding.

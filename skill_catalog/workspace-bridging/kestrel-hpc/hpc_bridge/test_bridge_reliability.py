@@ -523,6 +523,18 @@ class BridgeTests(unittest.TestCase):
                 with runtime.SessionLock(self.root):
                     pass
 
+    def test_locked_heartbeat_keeps_session_alive_and_recovers(self):
+        rt = self.new_runtime()
+        health_path = rt.root / "bridge_status.json"
+        runtime.atomic_json(health_path, {"heartbeat_at": "old"})
+        with patch.object(runtime, "atomic_json", side_effect=PermissionError("locked")):
+            rt.tick()
+        self.assertEqual(runtime.read_json(health_path)["heartbeat_at"], "old")
+        self.assertTrue(rt.connected())
+        rt.last_health = 0
+        rt.tick()
+        self.assertEqual(runtime.read_json(health_path)["state"], "connected")
+
     def test_heartbeat_staleness_is_not_hidden(self):
         rt = self.new_runtime()
         runtime.atomic_json(rt.root / "bridge_status.json", {

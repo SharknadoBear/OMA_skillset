@@ -324,13 +324,19 @@ class BridgeRuntime:
             state = ("stopping" if self.stopping else "authenticating" if authenticating else
                      "receipt_write_failed" if self.receipt_failure else
                      "storage_limit" if not self.storage_ok else "connected" if self.connected() else "authentication_required")
-            atomic_json(self.root / "bridge_status.json", {
+            health = {
                 "state": state, "heartbeat_at": utc_now(), "pid": os.getpid(),
                 "bridge_name": self.identity.get("bridge_name"), "auth_error": self.auth_error,
                 "active": [op.state.copy() for op, _ in self.active.values()],
                 "queued_count": len(list((self.root / "commands").glob("*.json"))),
                 "ledger_limit_bytes": MAX_LEDGER_BYTES,
-            })
+            }
+            try:
+                atomic_json(self.root / "bridge_status.json", health)
+            except PermissionError:
+                # A reader can temporarily hold the last complete Windows snapshot.
+                # Its old timestamp already signals staleness. Retry on the next heartbeat.
+                pass
             self.last_health = time.monotonic()
 
     def run(self):
