@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fvcom_profiles import PAIR_PROFILE, RIVER_MODE, resolve_request
 from fvcom_run_control import create_attempt, init_project, sha256
+from freeze_attempt_inputs import freeze_attempt
 
 siblings = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(siblings / "fvcom-namelist-configuration/scripts"))
@@ -46,7 +47,11 @@ def main():
                 req["river"] = source
             project = root/name
             init_project(write(name+".json",req), project)
+            binding = project/"run/build/executable_reuse_binding.json"
+            binding.parent.mkdir(parents=True, exist_ok=True)
+            binding.write_text(json.dumps({"status":"frozen","executable_sha256":"1"*64}))
             inputs = project/"input/fresh_reproduction/base"
+            (inputs/"station_mapping.json").write_text(json.dumps({"status":"ready","stations":[]}))
             bindings = dict(BINDINGS)
             for src,k in ((fixture.mesh,"grid_file"),(fixture.dep,"depth_file"),(fixture.obc,"obc_file")):
                 shutil.copyfile(src,inputs/bindings[k])
@@ -68,6 +73,18 @@ def main():
                 assert attempt["profile"] == PAIR_PROFILE and attempt["stage"] == stage
                 assert attempt["skill_commit"] == "0"*40
                 assert attempt["stage_attempt_limit"] == 3
+                run = project/attempt["run_dir"]
+                frozen = freeze_attempt(project, run)
+                assert frozen == freeze_attempt(project, run)
+                assert frozen["files"]["station_mapping.json"] == sha256(inputs/"station_mapping.json")
+                staged_mapping = project/attempt["input_dir"]/"station_mapping.json"
+                staged_mapping.write_text("{}")
+                try:
+                    freeze_attempt(project, run)
+                except ValueError as e:
+                    assert "existing freeze" in str(e)
+                else:
+                    raise AssertionError("changed input was silently refrozen")
             if mode == RIVER_MODE:
                 with (inputs/"river.nc").open("ab") as f:
                     f.write(b"changed after configuration")

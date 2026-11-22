@@ -5,6 +5,8 @@ description: Initialize immutable FVCOM simulation projects, derive conservative
 
 # FVCOM Run Control
 
+For `columbia_river_pair`, create each member with `init` and use the [matched-pair workflow](../fvcom-simulation/references/barotropic_tide_river.md). For each prepared single-stage attempt, run `python scripts/freeze_attempt_inputs.py --project PROJECT --attempt run/fresh_reproduction/attempts/ATTEMPT` before transfer. It binds the actual run namelist, station mapping, executable and flat file inventory in `input_freeze.json`. Repeating the command verifies the existing freeze.
+
 Use this skill for local orchestration artifacts and evidence. It never opens SSH or submits a job; invoke `$kestrel-hpc` for transfer, submission, monitoring, cancellation, and retrieval.
 
 
