@@ -1,6 +1,6 @@
 ---
 name: fvcom-namelist-configuration
-description: Create and validate FVCOM 4.3.1 run namelists and cell-based station files from simulation_request_v1 contracts. Use for tide-only provisional/final configuration; do not use it to generate forcing, grids, Slurm scripts, or execute FVCOM.
+description: Create and validate FVCOM 4.3.1 run namelists and cell-based station files from simulation_request_v1 contracts. Use for tide-only and barotropic tide-plus-river provisional/final configuration; do not use it to generate forcing, grids, Slurm scripts, or execute FVCOM.
 ---
 
 # FVCOM Namelist Configuration
@@ -20,6 +20,10 @@ Only `--stage smoke` and `--stage production` are valid: cold starts on March 29
 for one day and seventeen days respectively. Both write a final restart; production
 does not consume the smoke restart. There is no separate canary, spin-up or
 benchmark namelist. Preserve the ordinary timing, scientific and file/hash audits.
+
+## Barotropic river discharge
+
+`mode: barotropic-tide-river` requires `bindings.river_manifest` for final rendering. The configurator binds the variable node discharge and its companion to the exact mesh, ocean OBC, gauge product, and simulation window. The provisional overlay can omit the grid-dependent river block until the river manifest is ready. The optional `columbia_river_pair` profile sets identical one-day smoke and 17-day cold production windows for river and tide-only members. See the binding and standalone validation commands in the contract.
 
 ## Contract
 

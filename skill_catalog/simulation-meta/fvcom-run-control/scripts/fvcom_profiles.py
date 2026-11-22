@@ -6,6 +6,27 @@ from datetime import datetime, timedelta
 from typing import Any
 
 PAPER_PROFILE = "paper_barotropic"
+PAIR_PROFILE = "columbia_river_pair"
+RIVER_MODE = "barotropic-tide-river"
+
+
+def is_cold_pair_stage(request: dict[str, Any]) -> bool:
+    """Both short experiments cold-start smoke and production independently."""
+    return request.get("profile") in {PAPER_PROFILE, PAIR_PROFILE}
+
+
+def validate_river_source(request: dict[str, Any]) -> None:
+    source = request.get("river")
+    if request.get("mode") == RIVER_MODE:
+        if not isinstance(source, dict) or not all(
+            isinstance(source.get(key), str) and source[key].strip()
+            for key in ("provider", "station_id", "parameter_code")
+        ):
+            raise ValueError("river mode requires river.provider, station_id and parameter_code")
+    elif source is not None:
+        raise ValueError("river source requires mode barotropic-tide-river")
+
+
 PAPER_SETTINGS = {
     "mode": "barotropic_tide",
     "grid_policy": "fresh_only",
@@ -30,9 +51,10 @@ def resolve_request(request: dict[str, Any]) -> dict[str, Any]:
     """Fill profile defaults and reject contradictory settings, without mutating input."""
     result = deepcopy(request)
     profile = result.get("profile")
+    validate_river_source(result)
     if profile is None:
         return result
-    if profile != PAPER_PROFILE:
+    if profile not in {PAPER_PROFILE, PAIR_PROFILE}:
         raise ValueError(f"unsupported simulation profile: {profile}")
 
     def merge(target, settings, prefix=""):
@@ -47,12 +69,19 @@ def resolve_request(request: dict[str, Any]) -> dict[str, Any]:
             elif key in target and (target[key] != value or
                     (isinstance(value, (int, float)) and not isinstance(value, bool)
                      and isinstance(target[key], bool))):
-                raise ValueError(f"{PAPER_PROFILE} fixes {label}={value!r}")
+                raise ValueError(f"{profile} fixes {label}={value!r}")
             else:
                 target[key] = deepcopy(value)
-    merge(result, PAPER_SETTINGS)
+    settings = PAPER_SETTINGS
+    if profile == PAIR_PROFILE:
+        if result.get("mode") not in {"barotropic_tide", RIVER_MODE}:
+            raise ValueError("paired study requires an explicit tide-only or river mode")
+        settings = {key: value for key, value in PAPER_SETTINGS.items() if key != "mode"}
+        if result["mode"] == RIVER_MODE:
+            settings["river"] = {"provider": "usgs", "station_id": "14246900", "parameter_code": "72137"}
+    merge(result, settings)
     if result.get("accepted_grid"):
-        raise ValueError("paper_barotropic cannot reuse an accepted grid")
+        raise ValueError(f"{profile} requires a fresh grid")
     if result["physics"].get("sigma_layers", 10) != 10:
         raise ValueError("legacy sigma_layers counts ten interfaces, not nine physical layers")
     return result

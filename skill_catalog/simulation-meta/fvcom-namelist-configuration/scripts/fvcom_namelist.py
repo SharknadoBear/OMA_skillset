@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fvcom-run-control" / "scripts"))
-from fvcom_profiles import PAPER_PROFILE, resolve_request
+from fvcom_profiles import RIVER_MODE, is_cold_pair_stage, resolve_request
 
 
 STAGES = {"smoke", "canary", "spinup", "benchmark", "production", "full"}
@@ -149,10 +149,79 @@ def nml_date(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def load_river_manifest(path: Path, start: datetime, end: datetime) -> Dict[str, Any]:
+    river = load_json(path)
+    if river.get("schema") != "fvcom_river_forcing_v1" or river.get("status") != "ready":
+        raise ConfigError("river_manifest must be a ready fvcom_river_forcing_v1 product")
+    if type(river.get("river_number")) is not int or river["river_number"] < 1:
+        raise ConfigError("river_number must be a positive count of source entries")
+    if (parse_utc(river["start_utc"], "river start") > start
+            or parse_utc(river["end_utc"], "river end") < end):
+        raise ConfigError("river forcing does not cover the entire stage")
+    for key in ("namelist", "netcdf"):
+        item = river["files"][key]
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}", item["path"]):
+            raise ConfigError(f"river {key} must use a flat FVCOM filename of up to 80 characters")
+        source = path.parent / item["path"]
+        if not source.is_file() or sha256(source) != item["sha256"]:
+            raise ConfigError(f"river {key} provenance hash mismatch")
+    return river
+
+
+def river_settings(river: Mapping[str, Any]) -> Dict[str, str]:
+    return {
+        "RIVER_NUMBER": str(river["river_number"]),
+        "RIVER_KIND": q("variable"),
+        "RIVER_TS_SETTING": q("calculated"),
+        "RIVER_INFLOW_LOCATION": q("node"),
+        "RIVER_INFO_FILE": q(Path(river["files"]["namelist"]["path"]).name),
+    }
+
+
+def verify_staged_river(river: Mapping[str, Any], request: Mapping[str, Any],
+                        parsed: Mapping[str, Mapping[str, str]], input_root: Path) -> Dict[str, str]:
+    for key in ("provider", "station_id", "parameter_code"):
+        if river["source"].get(key) != request["river"][key]:
+            raise ConfigError(f"river source {key} differs from the request")
+    files = {
+        "river_namelist": (Path(river["files"]["namelist"]["path"]).name, river["files"]["namelist"]["sha256"]),
+        "river_netcdf": (Path(river["files"]["netcdf"]["path"]).name, river["files"]["netcdf"]["sha256"]),
+        "river_bound_grid": (scalar(parsed["NML_GRID_COORDINATES"]["GRID_FILE"]), river["mesh_sha256"]),
+        "river_bound_depth": (scalar(parsed["NML_GRID_COORDINATES"]["DEPTH_FILE"]), river["depth_sha256"]),
+        "river_bound_obc": (scalar(parsed["NML_OPEN_BOUNDARY_CONTROL"]["OBC_NODE_LIST_FILE"]), river["obc_sha256"]),
+    }
+    for name, (filename, digest) in files.items():
+        path = input_root / filename
+        if not path.is_file() or sha256(path) != digest:
+            raise ConfigError(f"staged {name} differs from river_manifest: {filename}")
+    companion = (input_root / files["river_namelist"][0]).read_text(encoding="utf-8-sig")
+    blocks = re.findall(r"^\s*&NML_RIVER\b.*?^\s*/\s*$", companion, re.M | re.I | re.S)
+    nodes = river["nodes"]
+    if len(blocks) != river["river_number"] or len(nodes) != len(blocks):
+        raise ConfigError("staged river companion entry count differs from river_number")
+    weights = [node["weight"] for node in nodes]
+    if (not all(isinstance(w, (int, float)) and not isinstance(w, bool)
+                and math.isfinite(w) and w > 0 for w in weights)
+            or not math.isclose(math.fsum(weights), 1.0, abs_tol=1e-9, rel_tol=0)):
+        raise ConfigError("river node weights must be finite, positive and normalized")
+    if len(set(n["node_id"] for n in nodes)) != len(nodes) or len(set(n["name"] for n in nodes)) != len(nodes):
+        raise ConfigError("river node IDs and entry names must each be unique")
+    for block, node in zip(blocks, nodes):
+        entry = parse_values(block)["NML_RIVER"]
+        if (type(node["node_id"]) is not int or node["node_id"] < 1
+                or scalar(entry.get("RIVER_GRID_LOCATION", "")) != str(node["node_id"])
+                or scalar(entry.get("RIVER_NAME", "")) != node["name"]):
+            raise ConfigError("river companion does not match the ordered source names and node IDs")
+        if (scalar(entry.get("RIVER_FILE", "")) != files["river_netcdf"][0]
+                or scalar(entry.get("RIVER_VERTICAL_DISTRIBUTION", "")) != "uniform"):
+            raise ConfigError("staged river entry requires the bound NetCDF and named uniform distribution")
+    return {name + "_sha256": digest for name, (_, digest) in files.items()}
+
+
 def validate_request(request: Mapping[str, Any]) -> Tuple[datetime, datetime, int, float, float, int]:
     request = resolve_request(dict(request))
-    if request.get("mode") not in {"barotropic_tide", "benchmark"}:
-        raise ConfigError("mode must be barotropic_tide or benchmark")
+    if request.get("mode") not in {"barotropic_tide", RIVER_MODE, "benchmark"}:
+        raise ConfigError("unsupported simulation mode")
     if not isinstance(request.get("case_id"), str) or not request["case_id"]:
         raise ConfigError("case_id is required")
     period = request.get("period")
@@ -191,13 +260,13 @@ def validate_numerics(numerics: Mapping[str, Any]) -> Tuple[float, int]:
 def stage_times(request: Mapping[str, Any], stage: str) -> Tuple[datetime, datetime, datetime, bool]:
     analysis_start, analysis_end, spinup_days, _, _, _ = validate_request(request)
     spinup_start = analysis_start - timedelta(days=spinup_days)
-    if request.get("profile") == PAPER_PROFILE:
+    if is_cold_pair_stage(request):
         if stage == "smoke":
             end = spinup_start + timedelta(days=1)
             return spinup_start, end, end, False
         if stage == "production":
             return spinup_start, analysis_end, analysis_end, False
-        raise ConfigError("paper_barotropic permits only smoke and production; no canary, separate spin-up, benchmark or full alias")
+        raise ConfigError("this cold-start profile permits only smoke and production; no canary, separate spin-up, benchmark or full alias")
     if stage == "smoke":
         return spinup_start, spinup_start + timedelta(hours=1), analysis_start, False
     if stage == "canary":
@@ -226,7 +295,8 @@ def bindings_required(bindings: Mapping[str, Any]) -> None:
 
 
 def configuration_values(
-    request: Mapping[str, Any], bindings: Mapping[str, Any], numerics: Mapping[str, Any], stage: str
+    request: Mapping[str, Any], bindings: Mapping[str, Any], numerics: Mapping[str, Any], stage: str,
+    *, provisional: bool = False, river: Mapping[str, Any] | None = None,
 ) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Any]]:
     bindings_required(bindings)
     analysis_start, _, _, temperature, salinity, _ = validate_request(request)
@@ -246,11 +316,12 @@ def configuration_values(
     # when binary arithmetic puts an exact integer ratio just above it.
     ramp_steps = 0 if hotstart else int(round(172800 / internal_step))
     startup_file = bindings["restart_file"] if hotstart else "none"
-    restart_on = stage not in {"smoke", "canary"} or request.get("profile") == PAPER_PROFILE
+    restart_on = stage not in {"smoke", "canary"} or is_cold_pair_stage(request)
     restart_first = (restart_at if not hotstart else end) if restart_on else end
+    case_kind = "tide-plus-river" if request.get("mode") == RIVER_MODE else "tide-only"
     values: Dict[str, Dict[str, str]] = {
         "NML_CASE": {
-            "CASE_TITLE": q(f"{request['case_id']} {stage} tide-only"),
+            "CASE_TITLE": q(f"{request['case_id']} {stage} {case_kind}"),
             "TIMEZONE": q("UTC"),
             "DATE_FORMAT": q("YMD"),
             "DATE_REFERENCE": q("default"),
@@ -440,7 +511,19 @@ def configuration_values(
             "OUT_INTERVAL": q("seconds=360.0"),
         },
     }
-    if request.get("profile") == PAPER_PROFILE:
+    if request.get("mode") == RIVER_MODE:
+        if bindings.get("river_manifest"):
+            if river is None:
+                river = load_river_manifest(Path(bindings["river_manifest"]), start, end)
+            values["NML_RIVER_TYPE"] = river_settings(river)
+        elif provisional:
+            # A grid-dependent river count is unknown until the inflow section is joined.
+            del values["NML_RIVER_TYPE"]
+        else:
+            raise ConfigError("river mode requires bindings.river_manifest")
+    elif bindings.get("river_manifest"):
+        raise ConfigError("river_manifest binding requires river mode")
+    if is_cold_pair_stage(request):
         values["NML_ADDITIONAL_MODELS"]["PLASTIC_MODEL"] = "F"
     timing = {
         "start_utc": start.isoformat().replace("+00:00", "Z"),
@@ -592,7 +675,8 @@ def audit_duration_values(parsed: Mapping[str, Mapping[str, str]]) -> List[str]:
     return problems
 
 
-def audit_values(parsed: Mapping[str, Mapping[str, str]]) -> List[str]:
+def audit_values(parsed: Mapping[str, Mapping[str, str]], mode: str = "barotropic_tide",
+                 river: Mapping[str, Any] | None = None, provisional: bool = False) -> List[str]:
     problems: List[str] = audit_duration_values(parsed)
     flat = {key: value for group in parsed.values() for key, value in group.items()}
     for key in sorted(TRUE_KEYS):
@@ -613,7 +697,15 @@ def audit_values(parsed: Mapping[str, Mapping[str, str]]) -> List[str]:
         problems.append("NC_SUBDOMAIN_FILES must be the case-sensitive FVCOM full-domain sentinel")
     if scalar(flat.get("GRID_FILE_UNITS", "")).lower() != "meters":
         problems.append("GRID_FILE_UNITS must be meters")
-    if scalar(flat.get("RIVER_NUMBER", "")) != "0":
+    if mode == RIVER_MODE:
+        if river is not None:
+            group = parsed.get("NML_RIVER_TYPE", {})
+            for key, expected in river_settings(river).items():
+                if scalar(group.get(key, "")) != scalar(expected):
+                    problems.append(f"{key} disagrees with the bound river forcing")
+        elif not provisional or "NML_RIVER_TYPE" in parsed:
+            problems.append("river mode requires the bound forcing manifest")
+    elif scalar(flat.get("RIVER_NUMBER", "")) != "0":
         problems.append("RIVER_NUMBER must be zero")
     if scalar(flat.get("STARTUP_TS_TYPE", "")).lower() == "constant":
         t_values = [float(x) for x in flat.get("STARTUP_T_VALS", "").split(",")]
@@ -627,23 +719,23 @@ def audit_values(parsed: Mapping[str, Mapping[str, str]]) -> List[str]:
 
 def audit_stage_values(parsed: Mapping[str, Mapping[str, str]], stage: str, profile: str | None = None) -> List[str]:
     problems: List[str] = []
-    if profile == PAPER_PROFILE:
+    if is_cold_pair_stage({"profile": profile}):
         if stage not in {"smoke", "production"}:
-            problems.append("paper_barotropic only permits smoke and production")
+            problems.append("this cold-start profile only permits smoke and production")
         expected_end = "2025-03-30 00:00:00" if stage == "smoke" else "2025-04-15 00:00:00"
         case = parsed.get("NML_CASE", {})
         if scalar(case.get("START_DATE", "")) != "2025-03-29 00:00:00" or scalar(case.get("END_DATE", "")) != expected_end:
-            problems.append("paper_barotropic stage dates differ from the profile")
+            problems.append("stage dates differ from the cold-start profile")
         if scalar(parsed.get("NML_STARTUP", {}).get("STARTUP_TYPE", "")).lower() != "coldstart":
-            problems.append("paper_barotropic stages require coldstart")
+            problems.append("this profile requires coldstart")
     restart_on = logical(parsed.get("NML_RESTART", {}).get("RST_ON", ""))
-    expected = stage not in {"smoke", "canary"} or profile == PAPER_PROFILE
+    expected = stage not in {"smoke", "canary"} or is_cold_pair_stage({"profile": profile})
     if restart_on is not expected:
         problems.append(f"RST_ON must be {'true' if expected else 'false'} for {stage}")
     grid_edge_read = logical(parsed.get("NML_STATION_TIMESERIES", {}).get("READ_GRID_EDGE_FROM_FILE", ""))
     if grid_edge_read is None:
         problems.append("READ_GRID_EDGE_FROM_FILE must be a logical value")
-    elif profile != PAPER_PROFILE and stage in {"benchmark", "production"} and not grid_edge_read:
+    elif not is_cold_pair_stage({"profile": profile}) and stage in {"benchmark", "production"} and not grid_edge_read:
         problems.append(
             f"READ_GRID_EDGE_FROM_FILE must be true for hot-start {stage}"
         )
@@ -785,11 +877,26 @@ def cli(argv: Iterable[str] | None = None) -> int:
             item.add_argument("--preconfiguration-manifest", type=Path, required=True)
     validate = sub.add_parser("validate")
     validate.add_argument("--namelist", type=Path, required=True)
+    validate.add_argument("--request", type=Path)
+    validate.add_argument("--river-manifest", type=Path)
+    validate.add_argument("--input-root", type=Path)
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
         if args.command == "validate":
             parsed = parse_values(args.namelist.read_text(encoding="utf-8-sig"))
-            problems = audit_values(parsed)
+            request = resolve_request(load_json(args.request)) if args.request else {}
+            river = None
+            if request.get("mode") == RIVER_MODE:
+                if not args.river_manifest or not args.input_root:
+                    raise ConfigError("river validation requires --river-manifest and --input-root")
+                case = parsed["NML_CASE"]
+                river = load_river_manifest(args.river_manifest,
+                                            parse_utc(scalar(case["START_DATE"]), "model start"),
+                                            parse_utc(scalar(case["END_DATE"]), "model end"))
+                verify_staged_river(river, request, parsed, args.input_root)
+            elif args.river_manifest:
+                raise ConfigError("--river-manifest requires a river-mode request")
+            problems = audit_values(parsed, request.get("mode", "barotropic_tide"), river)
             print(json.dumps({"status": "pass" if not problems else "fail", "problems": problems}, indent=2))
             return 0 if not problems else 2
         request = load_json(args.request)
@@ -797,11 +904,22 @@ def cli(argv: Iterable[str] | None = None) -> int:
         numerics = load_json(args.numerics)
         root: Path = args.artifact_root
         root.mkdir(parents=True, exist_ok=True)
-        values, timing = configuration_values(request, bindings, numerics, args.stage)
-        station_path = root / bindings["station_file"]
         provisional = args.command == "provisional"
+        river = None
+        hashes = {}
+        if bindings.get("river_manifest"):
+            river_path = args.bindings.parent / bindings["river_manifest"]
+            bindings["river_manifest"] = str(river_path)
+            start, end, _, _ = stage_times(request, args.stage)
+            river = load_river_manifest(river_path, start, end)
+            hashes["river_manifest_sha256"] = sha256(river_path)
+        values, timing = configuration_values(request, bindings, numerics, args.stage,
+                                              provisional=provisional, river=river)
+        if river and not provisional:
+            hashes.update(verify_staged_river(river, request, values, args.input_root))
+        station_path = root / bindings["station_file"]
         station_count = write_station_file(station_path, load_json(args.stations), provisional=provisional)
-        hashes = {"station_file_sha256": sha256(station_path)}
+        hashes["station_file_sha256"] = sha256(station_path)
         if provisional:
             namelist_path = root / f"{request['case_id']}_{args.stage}_provisional_overlay.nml"
             write_overlay(namelist_path, values)
@@ -818,7 +936,8 @@ def cli(argv: Iterable[str] | None = None) -> int:
             checks = file_checks(parsed, args.input_root, timing["hotstart"])
             preconfig = args.preconfiguration_manifest
         hashes["namelist_sha256"] = sha256(namelist_path)
-        problems = audit_values(parsed) + audit_stage_values(parsed, args.stage, request.get("profile"))
+        problems = audit_values(parsed, request["mode"], river, provisional)
+        problems.extend(audit_stage_values(parsed, args.stage, request.get("profile")))
         result = manifest(
             request, args.stage, root, hashes, timing, numerics, checks, provisional,
             problems, preconfig, station_count,

@@ -5,7 +5,7 @@
 `simulation_request_v1` supplies the science and period:
 
 ```yaml
-mode: barotropic_tide | benchmark
+mode: barotropic_tide | barotropic-tide-river | benchmark
 case_id: string
 period:
   analysis_start: UTC timestamp
@@ -146,3 +146,14 @@ Only smoke (March 29–30, 2025 UTC) and production (March 29–April 15 UTC) ex
 both cold-start and emit a final restart. Analysis is April 1–15, end exclusive.
 There is no hotstart prerequisite or separate canary/spin-up/benchmark stage.
 All other timing, artifact-binding and tide-only checks remain in force.
+
+
+## River binding and audit
+
+For river mode the bindings JSON carries `river_manifest`, resolved relative to that JSON or as an absolute local path. The ready `fvcom_river_forcing_v1` manifest supplies the positive entry count, full forcing interval, requested gauge identity, SHA-256 of the metric grid and ocean OBC files, and the original names and hashes of the river companion and NetCDF. Stage both files under their basenames in the runtime input root. Final rendering checks the actual staged bytes, source provenance, named uniform distribution, companion entry count and NetCDF reference. Preserve the river manifest and all four runtime bindings in the case freeze.
+
+On this build the runtime uses `RIVER_KIND='variable'`, `RIVER_TS_SETTING='calculated'` and `RIVER_INFLOW_LOCATION='node'`. The general tide-only audit retains its zero-source requirement. To audit a rendered river configuration, supply the same source and input root.
+
+```powershell
+python scripts/fvcom_namelist.py validate --namelist case_run.nml --request request.json --river-manifest forcing/river_manifest.json --input-root input
+```

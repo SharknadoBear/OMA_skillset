@@ -20,6 +20,16 @@ do not apply the ordinary one-month interpretability claim to this profile.
 
 ## Inputs and Scientific Rules
 
+For the `columbia_river_pair` profile, run the regional pipeline for each member,
+then invoke `scripts/paired_river_budget.py --control-project ... --control-attempt ...
+--river-project ... --river-attempt ... --geometry ... --output ...`. Both member
+projects must contain their audited production outputs, frozen input file maps and
+the same observed/predicted station records. The section geometry supplies the
+runtime mesh SHA-256, 1-based upstream element IDs and the complete mesh-edge cut,
+with each section face mapped to its upstream diagnostic station. Use a new output
+directory. Report the signed budget residual, absolute river-induced level change
+and limitations of the sampled transport with the two NOAA validation reports.
+
 - Require exact model case/executable/input hashes and station mappings.
 - Support the request's explicit water-level proxy policy. Preserve original gauge and model-cell coordinates, geometric distance, depth, cell/node IDs, three-node weights and geometry-review hash through condensation, tables and reports. Outside status alone is neither a run nor closure blocker. Label cell-centroid proxies accurately; never tune their selection against agreement scores. Current spatial/profile/period gates remain unchanged.
 - Mixed mappings may retain `model_diagnostic` rows with `validation_eligible=false`. Audit every row against full NetCDF station order, retain their CSVs in `diagnostic_products`, and join NOAA tables only from water-level/current comparison `products`. Unknown roles or diagnostics claimed as NOAA comparisons remain invalid.

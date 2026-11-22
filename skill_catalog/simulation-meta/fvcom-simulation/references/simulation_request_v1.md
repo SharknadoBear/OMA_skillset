@@ -2,8 +2,8 @@
 
 ```yaml
 schema: simulation_request_v1
-mode: barotropic_tide | benchmark
-profile: paper_barotropic # optional; omit for the ordinary workflow
+mode: barotropic_tide | barotropic-tide-river | benchmark
+profile: paper_barotropic | columbia_river_pair # optional
 case_id: string
 project_dir: optional absolute or workspace-relative path
 grid_policy: accepted_then_fresh | fresh_only
@@ -16,6 +16,10 @@ physics:
   temperature_c: optional number
   salinity_psu: optional number
   sigma_levels: 10 # ten interfaces, nine layers; legacy sigma_layers also counts levels
+river: # required only for barotropic-tide-river
+  provider: usgs
+  station_id: "14246900"
+  parameter_code: "72137"
 tpxo:
   constituents: all_available
 observations:
@@ -83,6 +87,18 @@ The scientific product layout remains:
 ```
 
 Project and worker manifests contain relative artifact paths when inside the project, UTC timestamps, SHA-256 for immutable inputs/outputs, code and source lineage, warnings, blocking reasons, and resume tokens. They never contain credentials.
+
+## Paired Columbia profile
+
+The separate `columbia_river_pair` profile requires an explicit mode, either
+`barotropic_tide` for the control or `barotropic-tide-river` for the treatment.
+The two requests share one freshly generated grid and frozen executable. Use the
+[river workflow](barotropic_tide_river.md) for forcing handoffs and pair validation.
+Place `kestrel.project_dir` for each member directly beneath the common
+`kestrel.pair_root`. Put the shared `kestrel.source_dir` under that pair root.
+Set the verified native compiler, options and modules in `kestrel.build_environment`.
+If the login or compute shell needs a site initialization file to expose those modules,
+record its absolute path as `kestrel.build_environment.module_init`.
 
 ## Paper profile
 

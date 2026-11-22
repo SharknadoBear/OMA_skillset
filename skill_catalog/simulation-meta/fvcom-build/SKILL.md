@@ -22,18 +22,30 @@ in the source contract; it excludes two plastic diagnostics from a plastic-off b
 Record observed Git origin/HEAD in `source_revision.json` and bind both in
 `freeze.json`; see [the source contract](references/contracts.md#paper-source-lineage).
 
-For this profile, replace the legacy module pins below with the actual native
+For the paper and Columbia paired profiles, replace the legacy module pins below with the actual native
 environment discovered through Kestrel HPC. Prefer RH9; RH8 needs a documented
 reason. Submit RH9 jobs from an RH9 login node and let Kestrel assign its OS
 feature; do not force an `rh8`/`rh9` constraint. Verify the allocated node's OS.
-Set `kestrel.project_dir`, use a trial-owned source copy beneath it, and
-record `kestrel.build_environment` (`os`, `compiler`, `compiler_options`, `modules`,
+Verify the scheduler accepts submissions from the selected native login host.
+If a migration policy rejects that host, retain the rejection, reconcile the
+original submission receipt, and retry from an eligible native login only after
+confirming the rejected request created no job.
+Set `kestrel.project_dir` and use a trial-owned source copy. When a login shell
+exposes only Cray modules, verify the site CPU-stack profile at
+`/nopt/nlr/apps/kestrel-cpu/init/profile`. Source it after `module purge` and
+load the selected native modules. In scripts using nounset, bracket this sequence
+with `set +u` and `set -u`. Use the same initialization in the compute job.
+Record `kestrel.build_environment` (`os`, `compiler`, `compiler_options`, `modules`,
 and RH8 `fallback_reason`). Capture `os-release.txt`, actual loaded modules and
 compiler/build transcripts, and bind that same environment in `freeze.json`.
 The planner/finalizer require this evidence. Match the runtime compute environment
 to the build; do not silently reuse an RH8 binary on RH9. Blank-namelist and
 input-reader checks must not advance model time; any integration is a counted
 smoke attempt. The build skill never adds an uncounted stability or speed test.
+
+## Paired tide and river executable
+
+`columbia_river_pair` uses one project-owned source tree and one frozen binary for both members. Set `kestrel.pair_root` to their shared scratch parent, `project_dir` to the member directory and `source_dir` to the shared source directory beneath the pair root. Apply the same native build and pin checks as the paper profile. The default source already implements variable node discharge at runtime. Keep `RIVER_FLOAT` off so the native reader accepts the named `uniform` distribution. Confirm the compiled blank contains all five `NML_RIVER_TYPE` settings.
 
 ## Inputs and outputs
 

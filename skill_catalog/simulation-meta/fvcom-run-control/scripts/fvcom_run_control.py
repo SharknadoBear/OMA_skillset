@@ -9,11 +9,12 @@ import json
 import math
 import re
 import shutil
-from pathlib import Path
+import sys
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
-from fvcom_profiles import PAPER_PROFILE, resolve_request
+from fvcom_profiles import PAIR_PROFILE, PAPER_PROFILE, RIVER_MODE, is_cold_pair_stage, resolve_request
 
 
 G = 9.81
@@ -68,8 +69,8 @@ def write_json(path: Path, value: Any) -> None:
 def validate_request(req: dict[str, Any]) -> None:
     if req.get("schema") != "simulation_request_v1":
         raise ValueError("schema must be simulation_request_v1")
-    if req.get("mode") not in {"barotropic_tide", "benchmark"}:
-        raise ValueError("mode must be barotropic_tide or benchmark")
+    if req.get("mode") not in {"barotropic_tide", RIVER_MODE, "benchmark"}:
+        raise ValueError("unsupported FVCOM simulation mode")
     if not str(req.get("case_id", "")).strip():
         raise ValueError("case_id is required")
     if req.get("grid_policy") not in {"accepted_then_fresh", "fresh_only"}:
@@ -101,7 +102,7 @@ def project_layout(root: Path, mode: str = "barotropic_tide", policy: str = "acc
         "forcing/shared_source",
         "run/build", "analysis/observations",
     ]
-    if mode == "barotropic_tide":
+    if mode in {"barotropic_tide", RIVER_MODE}:
         paths += list(BAROTROPIC_AGENT_ROOTS.values())
     for case in grid_order(policy):
         paths += [
@@ -135,7 +136,7 @@ def init_project(request_path: Path, project: Path) -> dict[str, Any]:
         "immutable_attempts": True,
         **({"profile": req["profile"]} if req.get("profile") else {}),
     }
-    if req["mode"] == "barotropic_tide":
+    if req["mode"] in {"barotropic_tide", RIVER_MODE}:
         manifest["agent_layout"] = {
             "schema": "fvcom_barotropic_agent_layout_v1",
             "role_roots": dict(BAROTROPIC_AGENT_ROOTS),
@@ -570,7 +571,15 @@ def attempt_sbatch(args: argparse.Namespace, aid: str, stage: str | None) -> str
             raise ValueError(f"unsafe module name: {name}")
     module_setup = ""
     if modules:
-        module_setup = "module purge\n" + "\n".join(f"module load {name}" for name in modules) + "\n"
+        profile = getattr(args, "module_init", None)
+        module_setup = "module purge\n"
+        if profile:
+            if not re.fullmatch(r"/[A-Za-z0-9_./+-]+", profile) or ".." in PurePosixPath(profile).parts:
+                raise ValueError("module initialization requires an absolute site profile path")
+            module_setup += f"set +u\nsource '{profile}'\n"
+        module_setup += "\n".join(f"module load {name}" for name in modules) + "\n"
+        if profile:
+            module_setup += "set -u\n"
     cpu_bind = getattr(args, "cpu_bind", None)
     if cpu_bind not in (None, "cores", "none"):
         raise ValueError("unsupported CPU binding")
@@ -579,7 +588,7 @@ def attempt_sbatch(args: argparse.Namespace, aid: str, stage: str | None) -> str
     partition_directive = "" if args.partition == "auto" else f"#SBATCH --partition={args.partition}\n"
     per_node = "#SBATCH --ntasks-per-node=104\n" if getattr(args, "paper_stage", None) == "production" else ""
     return f"""#!/bin/bash
-#SBATCH --job-name={args.grid_case}_{aid}{suffix}
+#SBATCH --job-name={getattr(args, 'job_prefix', args.grid_case)}_{aid}{suffix}
 #SBATCH --account={args.account}
 {partition_directive}#SBATCH --nodes={int(args.nodes)}
 #SBATCH --ntasks={int(args.ranks)}
@@ -593,28 +602,71 @@ srun{bind_option} --ntasks={int(args.ranks)} {args.remote_executable} --casename
 """
 
 
+def verify_river_stage(request: dict, namelist: Path, input_root: Path) -> None:
+    """Bind the actual runtime inventory to the requested physics before each use."""
+    if request.get("mode") != RIVER_MODE and request.get("profile") != PAIR_PROFILE:
+        return
+    from audit_fvcom_production import parse_namelist, parse_utc
+    actual = parse_namelist(namelist)
+    path = input_root / "river_manifest.json"
+    if request["mode"] != RIVER_MODE:
+        if int(actual["RIVER_NUMBER"]) != 0 or path.exists():
+            raise ValueError("paired tide-only control contains a river forcing")
+        return
+    scripts = Path(__file__).resolve().parents[2] / "fvcom-namelist-configuration" / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
+    from fvcom_namelist import load_river_manifest, parse_values, river_settings, scalar, verify_staged_river
+    river = load_river_manifest(path, parse_utc(actual["START_DATE"]), parse_utc(actual["END_DATE"]))
+    if any(actual.get(key) != scalar(value) for key, value in river_settings(river).items()):
+        raise ValueError("runtime river settings disagree with frozen river forcing")
+    verify_staged_river(river, request, parse_values(namelist.read_text(encoding="utf-8")), input_root)
+
+
 def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
     project = Path(args.project)
     request_path = project / "request.json"
     request = resolve_request(load_data(request_path)) if request_path.exists() else {}
+    installation = {}
+    if request.get("profile") == PAIR_PROFILE:
+        args.job_prefix = "columbia_river" if request["mode"] == RIVER_MODE else "columbia_control"
+        environment = request.get("kestrel", {}).get("build_environment", {})
+        args.module_init = environment.get("module_init")
+        if environment.get("modules"):
+            if args.module and args.module != environment["modules"]:
+                raise ValueError("paired runtime module stack must match the frozen build")
+            args.module = environment["modules"]
+        receipt_path = getattr(args, "skill_installation", None)
+        if not receipt_path:
+            raise ValueError("paired attempts require --skill-installation with verified local package hashes")
+        receipt = load_data(Path(receipt_path))
+        commit = receipt.get("commit", "")
+        if not re.fullmatch(r"[0-9a-f]{40}", commit) or not receipt.get("files"):
+            raise ValueError("installation receipt must identify the tested commit and files")
+        skill_root = Path(receipt["installed_root"]).resolve()
+        for name, expected in receipt["files"].items():
+            file = (skill_root / name).resolve()
+            if not file.is_relative_to(skill_root) or sha256(file) != expected:
+                raise ValueError(f"installed skill changed before attempt: {name}")
+        installation = {"skill_commit": commit, "installed_skill_receipt_sha256": sha256(Path(receipt_path))}
     paper_stage = getattr(args, "paper_stage", None)
-    if request.get("profile") == PAPER_PROFILE:
+    if is_cold_pair_stage(request):
         if paper_stage not in {"smoke", "production"} or not 0 <= args.index < 3:
-            raise ValueError("paper_barotropic requires --paper-stage smoke|production and index 0, 1 or 2 (three total attempts per stage)")
+            raise ValueError("cold-start profile requires --stage smoke|production and index 0, 1 or 2 (three total attempts per stage)")
         if args.grid_case != "fresh_reproduction" or getattr(args, "stage_namelist", None):
-            raise ValueError("paper_barotropic uses fresh-only single-stage attempts")
+            raise ValueError("cold-start profile uses fresh-only single-stage attempts")
         if args.plan or not getattr(args, "controls", None):
-            raise ValueError("paper_barotropic requires --controls, not the exhaustive --plan")
+            raise ValueError("cold-start profile requires --controls, not the exhaustive --plan")
         if getattr(args, "revision", 0):
-            raise ValueError("paper_barotropic uses one immutable package per attempt; correct preflight before materializing")
+            raise ValueError("cold-start profile uses one immutable package per attempt; correct preflight before materializing")
         if paper_stage == "smoke" and not (args.nodes == 1 and 1 <= args.ranks <= 104):
-            raise ValueError("paper smoke requires one CPU node and 1..104 ranks")
+            raise ValueError("cold-start smoke requires one CPU node and 1..104 ranks")
         if paper_stage == "production" and (args.nodes, args.ranks) != (2, 208):
-            raise ValueError("paper production requires two nodes and 208 ranks")
+            raise ValueError("cold-start production requires two nodes and 208 ranks")
         if paper_stage == "smoke" and args.partition not in {"debug", "shared"}:
-            raise ValueError("paper smoke must use debug or shared")
+            raise ValueError("cold-start smoke must use debug or shared")
         if paper_stage == "production" and args.partition in {"debug", "shared", "sharedl"}:
-            raise ValueError("paper production requires an eligible exclusive CPU partition")
+            raise ValueError("cold-start production requires an eligible exclusive CPU partition")
         if paper_stage == "production":
             args.exclusive = True
             args.cpu_bind = "cores"
@@ -624,13 +676,13 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
         if isinstance(controls["isplit"], bool) or float(controls["isplit"]) != split or not math.isclose(step * 10, round(step * 10), abs_tol=1e-7):
             raise ValueError("controls require integer ISPLIT and an external step on the 0.1-second grid")
         if not math.isfinite(step) or step <= 0 or split < 1 or not math.isclose(360 / (step * split), round(360 / (step * split)), abs_tol=1e-7):
-            raise ValueError("paper controls must be positive and align to six-minute cadence")
+            raise ValueError("cold-start controls must be positive and align to six-minute cadence")
         attempt = {"index": args.index, "attempt_id": f"attempt_{paper_stage}_{args.index:04d}",
                    "extstep_seconds": step, "isplit": split,
                    "sponge_radius_multiplier": 1.0, "sponge_coefficient_multiplier": 1.0}
     else:
         if paper_stage or getattr(args, "controls", None):
-            raise ValueError("--paper-stage/--controls require a paper_barotropic project")
+            raise ValueError("--paper-stage/--controls require a cold-start profile project")
         if not args.plan:
             raise ValueError("ordinary attempts require --plan")
         plan_path = Path(args.plan)
@@ -650,12 +702,14 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
     if len(sponge_sources) != 1:
         raise ValueError(f"base input must contain exactly one *_spg.dat; found {len(sponge_sources)}")
     nml_sources = attempt_namelist_sources(args)
+    for path in nml_sources.values():
+        verify_river_stage(request, path, base_input)
     if paper_stage:
         from audit_fvcom_production import parse_namelist
         nml = parse_namelist(nml_sources[None])
         expected_end = "2025-03-30 00:00:00" if paper_stage == "smoke" else "2025-04-15 00:00:00"
         if nml.get("START_DATE") != "2025-03-29 00:00:00" or nml.get("END_DATE") != expected_end or nml.get("STARTUP_TYPE", "").lower() != "coldstart":
-            raise ValueError("paper attempt must use the profile's cold-start stage dates")
+            raise ValueError("cold-start attempt must use the profile's cold-start stage dates")
     staged = None not in nml_sources
     attempt_input_reference = (
         f"../../../../../input/{args.grid_case}/attempts/{aid}" if staged
@@ -714,7 +768,8 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
                              "exclusive": bool(getattr(args, "exclusive", False))},
         "attempt_sponge_sha256": sha256(attempt_spg),
         "plan_sha256": sha256(plan_path), "status": "prepared",
-        **({"profile": PAPER_PROFILE, "paper_stage": paper_stage, "stage_attempt": args.index + 1,
+        **installation,
+        **({"profile": request["profile"], ("paper_stage" if request["profile"] == PAPER_PROFILE else "stage"): paper_stage, "stage_attempt": args.index + 1,
             "stage_attempt_limit": 3, "controls_sha256": sha256(plan_path)} if paper_stage else {}),
     }
     if staged:
@@ -961,7 +1016,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--project", required=True); q.add_argument("--grid-case", required=True, choices=["accepted_t6v6", "fresh_reproduction"])
     q.add_argument("--plan"); q.add_argument("--index", type=int, required=True)
     q.add_argument("--controls", help="Diagnosed controls for one paper_barotropic attempt")
-    q.add_argument("--paper-stage", choices=["smoke", "production"])
+    q.add_argument("--stage", "--paper-stage", dest="paper_stage", choices=["smoke", "production"])
+    q.add_argument("--skill-installation", help="Paired run installation receipt with commit, installed_root and file SHA-256 map")
     q.add_argument("--base-input", required=True); q.add_argument("--base-namelist")
     q.add_argument("--stage-namelist", action="append", default=[])
     q.add_argument("--revision", type=int, default=0)

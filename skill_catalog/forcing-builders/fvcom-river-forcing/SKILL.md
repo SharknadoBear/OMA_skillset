@@ -1,11 +1,41 @@
 ---
 name: fvcom-river-forcing
-description: Generate FVCOM river forcing toolbox products. Use when Codex needs self-contained helper scripts for USGS/NWIS discharge preparation, analytical Delaware P0-P7 river scenarios, FVCOM river NetCDF/NML writing, sediment/floc tracer arrays, or microplastic river tracer coupling.
+description: Build and verify observed, node-distributed barotropic FVCOM river forcing, analytical Delaware P0-P7 river scenarios, FVCOM river NetCDF/NML, and optional sediment or microplastic inputs.
 ---
 
 # FVCOM River Forcing
 
-Use this skill as an initial FVCOM river-forcing toolbox. It packages existing Delaware-oriented helpers and copied dependencies for completeness; do not treat generated products as scientifically accepted until project-specific river nodes, gauges, timing, and tracer settings are reviewed.
+Use the observed-discharge workflow for `barotropic-tide-river`. The Delaware
+helpers below also support analytical and tracer studies.
+
+## Observed barotropic inflow
+
+1. Obtain a complete, regular `usgs_continuous_discharge_v1` source through
+   `usgs-rivers`. Document the gauge and its hydrologic relationship to the
+   upstream cutoff. Supply nonnegative, tidally filtered volume inflow for the
+   Columbia estuary.
+2. Use the final mesh and ocean OBC from preconfiguration. The grid specialist
+   supplies a reviewed cutoff mapping with `mesh_sha256` (metric `_grd.dat`),
+   `obc_sha256` (`_obc.dat`), `cutoff_description`, `gauge_to_cutoff_km`,
+   `wet_depth_floor_m` and ordered `nodes` containing `node_id` and physical
+   tributary `width_m` along the cutoff. The builder derives each node's share
+   from width times local runtime depth. The leading dimensions of the grid
+   and depths must match. River nodes belong on the ocean-connected, wet solid
+   boundary. Check realized wetness again during model execution.
+3. Invoke the builder using the simulation interval. Source padding accommodates
+   interpolation. The model applies the cold-start ramp.
+
+```bash
+python scripts/build_barotropic_river.py --source-manifest gauge/source_manifest.json --mapping river_cutoff.json --grd case_grd.dat --dep case_dep.dat --obc case_obc.dat --start 2025-03-29T00:00:00Z --end 2025-04-15T00:00:00Z --interval-seconds 360 --output-dir forcing/river_001
+```
+
+Pass `river_manifest.json` to namelist configuration as `bindings.river_manifest`.
+The `fvcom_river_forcing_v1` manifest binds each runtime file, source, mesh,
+ocean boundary, mapping and depths. It records per-node weights, peak discharge
+rounding error and independent comparisons of written and source water volumes.
+The node-based variable inflow uses the native character `'uniform'` vertical
+distribution. The reader requires `river_temp` and `river_salt`, populated
+with 20 °C and 30 PSU for the uniform, inactive scalars in this scenario.
 
 ## Core Rules
 
@@ -41,6 +71,7 @@ For packaging checks only:
 
 ```powershell
 python -m compileall scripts
+python scripts/selftest_barotropic_river.py
 python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .
 ```
 

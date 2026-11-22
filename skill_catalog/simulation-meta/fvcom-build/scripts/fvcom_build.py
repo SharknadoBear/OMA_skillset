@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fvcom-run-control" / "scripts"))
-from fvcom_profiles import PAPER_PROFILE, resolve_request
+from fvcom_profiles import PAIR_PROFILE, RIVER_MODE, is_cold_pair_stage, resolve_request
 
 
 SCHEMA = "fvcom_build_worker_manifest_v1"
@@ -104,8 +104,8 @@ def write_json(path: Path, value: Dict[str, Any]) -> None:
 
 
 def validate_request(request: Dict[str, Any]) -> None:
-    if request.get("mode") not in {"barotropic_tide", "benchmark"}:
-        raise ContractError("mode must be barotropic_tide or benchmark")
+    if request.get("mode") not in {"barotropic_tide", RIVER_MODE, "benchmark"}:
+        raise ContractError("unsupported build mode")
     case_id = request.get("case_id")
     if not isinstance(case_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", case_id):
         raise ContractError("case_id must be a filesystem-safe non-empty string")
@@ -116,20 +116,26 @@ def validate_request(request: Dict[str, Any]) -> None:
     if not isinstance(kestrel, dict):
         raise ContractError("kestrel object is required")
     source = kestrel.get("source_dir")
-    if request.get("profile") == PAPER_PROFILE:
+    if is_cold_pair_stage(request):
         project = kestrel.get("project_dir", "")
-        if not isinstance(source, str) or not isinstance(project, str) or not project.startswith(("/scratch/", "/kfs3/scratch/")) or ".." in PurePosixPath(project).parts or ".." in PurePosixPath(source).parts or not source.startswith(project.rstrip("/") + "/"):
-            raise ContractError("paper source_dir must be inside the explicit kestrel.project_dir scratch root")
+        build_root = kestrel.get("pair_root") if request.get("profile") == PAIR_PROFILE else project
+        if (not isinstance(build_root, str) or not build_root.startswith(("/scratch/", "/kfs3/scratch/"))
+                or not isinstance(project, str) or not isinstance(source, str)
+                or any(".." in PurePosixPath(path).parts for path in (build_root, project, source))
+                or PurePosixPath(build_root) not in PurePosixPath(source).parents):
+            raise ContractError("profile source_dir must be inside the explicit project or pair scratch root")
+        if request.get("profile") == PAIR_PROFILE and PurePosixPath(project).parent != PurePosixPath(build_root):
+            raise ContractError("each paired project_dir must be a child of kestrel.pair_root")
     elif not isinstance(source, str) or not source.startswith("/home/yhuang168/"):
         raise ContractError("kestrel.source_dir must be an explicit path below /home/yhuang168")
 
 
 def build_environment(request: Dict[str, Any]) -> Dict[str, Any]:
-    if request.get("profile") != PAPER_PROFILE:
+    if not is_cold_pair_stage(request):
         return {"compiler": "mpiifort", "compiler_options": ["-O3", "-fpp", "-qopenmp-stubs"], "modules": MODULES}
     env = request["kestrel"].get("build_environment", {})
     if env.get("os") not in {"rh9", "rh8"} or not env.get("compiler") or not env.get("modules") or not env.get("compiler_options"):
-        raise ContractError("paper build requires discovered os, compiler, compiler_options and modules in kestrel.build_environment")
+        raise ContractError("profile build requires discovered os, compiler, compiler_options and modules in kestrel.build_environment")
     if env["os"] == "rh8" and not str(env.get("fallback_reason", "")).strip():
         raise ContractError("RH8 fallback requires a documented reason")
     if not isinstance(env["modules"], list) or not all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9._+/-]+", x) for x in env["modules"]):
@@ -208,7 +214,7 @@ def build_plan(request: Dict[str, Any], local_root: Path, remote_root: str) -> D
         "fvcom_version_required": "4.3.1",
         **({"source_repository": request["kestrel"]["source_repository"],
             "source_commit": request["kestrel"]["source_commit"]}
-           if request.get("profile") == PAPER_PROFILE else {}),
+           if is_cold_pair_stage(request) else {}),
         **environment,
         "required_defines": sorted(REQUIRED_DEFINES),
         "forbidden_defines": sorted(FORBIDDEN_EXACT),
@@ -257,7 +263,7 @@ def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Di
     }
     if missing:
         blocking.append("missing mandatory build evidence: " + ", ".join(missing))
-    if request.get("profile") == PAPER_PROFILE:
+    if is_cold_pair_stage(request):
         expected_source = {key: request["kestrel"][key]
                            for key in ("source_repository", "source_commit")}
         provenance.update(expected_source)
@@ -268,7 +274,7 @@ def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Di
             observed_source = load_json(source_path)
             hashes["source_revision_sha256"] = sha256(source_path)
             if any(observed_source.get(key) != value for key, value in expected_source.items()):
-                blocking.append("observed source repository/commit does not match the paper source pin")
+                blocking.append("observed source repository/commit does not match the requested source pin")
         for filename in ("os-release.txt", "modules.txt", "build_commands.txt"):
             path = evidence / filename
             if not path.is_file():
@@ -303,12 +309,12 @@ def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Di
             blocking.append("frozen and observed executable hashes differ")
         if freeze.get("source_edits_after_freeze_allowed") is not False:
             blocking.append("freeze record does not forbid post-freeze source edits")
-        if request.get("profile") == PAPER_PROFILE and freeze.get("build_environment") != environment:
+        if is_cold_pair_stage(request) and freeze.get("build_environment") != environment:
             blocking.append("freeze record does not bind the selected native build environment")
-        if request.get("profile") == PAPER_PROFILE and any(
+        if is_cold_pair_stage(request) and any(
                 freeze.get(key) != request["kestrel"][key]
                 for key in ("source_repository", "source_commit")):
-            blocking.append("freeze record does not bind the paper source repository/commit")
+            blocking.append("freeze record does not bind the requested source repository/commit")
         hashes["freeze_sha256"] = sha256(freeze_path)
     smoke_path = evidence / "smoke.log"
     if smoke_path.is_file():
@@ -324,9 +330,14 @@ def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Di
     blank_path = evidence / "blank_namelist.nml"
     if blank_path.is_file() and "&NML_CASE" not in blank_path.read_text(encoding="utf-8-sig", errors="replace").upper():
         blocking.append("blank_namelist.nml is not an FVCOM namelist")
-    if blank_path.is_file() and request.get("profile") == PAPER_PROFILE:
+    if blank_path.is_file() and is_cold_pair_stage(request):
         blank = blank_path.read_text(encoding="utf-8-sig", errors="replace")
-        for group, keys in PAPER_TEMPLATE_FIELDS.items():
+        template_fields = dict(PAPER_TEMPLATE_FIELDS)
+        if request.get("profile") == PAIR_PROFILE:
+            template_fields["NML_RIVER_TYPE"] = (
+                "RIVER_NUMBER", "RIVER_TS_SETTING", "RIVER_INFLOW_LOCATION", "RIVER_KIND", "RIVER_INFO_FILE",
+            )
+        for group, keys in template_fields.items():
             body = re.search(r"^\s*&" + group + r"\b(.*?)^\s*/", blank, re.I | re.M | re.S)
             for key in keys:
                 if body is None or not re.search(r"\b" + key + r"\s*=", body[1], re.I):

@@ -40,6 +40,26 @@ def main() -> int:
         assert bad["status"] == "fail"
         assert {"SPHERICAL", "SEDIMENT"}.issubset(set(bad["forbidden_active_defines"]))
         assert {"PLASTIC", "OFFLINE_PLASTIC"}.issubset(set(bad["forbidden_active_defines"]))
+        write(make_inc, f"TOPDIR = /scratch/pair/source\nDFLAGS = {flags} -DRIVER_FLOAT\n")
+        assert "RIVER_FLOAT" in fb.audit_make_inc(make_inc, "/scratch/pair/source")["forbidden_active_defines"]
+        pair = {"case_id": "river", "profile": fb.PAIR_PROFILE, "mode": fb.RIVER_MODE,
+                "river": {"provider": "usgs", "station_id": "14246900", "parameter_code": "72137"},
+                "kestrel": {"pair_root": "/scratch/pair", "project_dir": "/scratch/pair/river",
+                            "source_dir": "/scratch/pair/source",
+                            "build_environment": {"os": "rh9", "compiler": "mpiifx",
+                               "compiler_options": ["-O3"], "modules": ["oneapi/2025.3.1"]}}}
+        pair_plan = fb.build_plan(pair, root / "shared", "/scratch/pair/run/build")
+        assert pair_plan["source_commit"] == "f8e4b50d4fd51409febcefc763cbc5dca11870e2"
+        for key, invalid in (("project_dir", "/scratch/pair_other/river"),
+                             ("source_dir", "/scratch/pair/../other/source"),
+                             ("pair_root", "/scratch/other")):
+            invalid_request = dict(pair, kestrel=dict(pair["kestrel"], **{key: invalid}))
+            try:
+                fb.build_plan(invalid_request, root / "shared", "/scratch/pair/run/build")
+            except fb.ContractError:
+                pass
+            else:
+                raise AssertionError(f"invalid shared build path accepted: {key}")
         plan = fb.build_plan(REQUEST, root / "out", "/scratch/yhuang168/FVCOM_Simulation/galveston_tide_2025/run/build")
         assert plan["source_edits_after_freeze_allowed"] is False
         evidence = root / "evidence"

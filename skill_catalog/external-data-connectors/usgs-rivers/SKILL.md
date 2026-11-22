@@ -47,9 +47,24 @@ python scripts/check_download_health.py --request request.json --run-dir runs/ca
 - Keep legacy model-specific functions and file conventions available as deprecated compatibility aliases where they already exist, but prefer generic names in new docs, manifests, tests, and examples.
 - Do not store credentials, personal tokens, passwords, OTPs, or unsupported source-access claims in scripts, logs, metadata, or examples.
 
+## Continuous discharge
+
+For a bounded continuous discharge record, use `scripts/fetch_continuous_discharge.py`.
+For the Columbia main stem, USGS 14246900 parameter 72137 is the tidally
+filtered series. Preserve both the original units and USGS approval flags.
+Supply inclusive UTC endpoints aligned to the native sample interval and a new
+output directory. The connector checks the site, parameter, series ID, units,
+cadence and coverage, then publishes the original response, an SI time series,
+and their hashes in `source_manifest.json`.
+
+```bash
+python scripts/fetch_continuous_discharge.py --site USGS-14246900 --parameter 72137 --start 2025-03-28T00:00:00Z --end 2025-04-16T00:00:00Z --interval-minutes 60 --output-dir runs/columbia/gauge
+```
+
 ## Validation
 
 - Validate the skill with `quick_validate.py`.
+- Exercise continuous-series identity, cadence, and units with `python scripts/selftest_continuous_discharge.py`.
 - Compile all Python scripts after edits.
 - Test `estimate_data_request.py` with local, Kestrel, and unknown-estimate cases.
 - Test `check_download_health.py` on a tiny cached or synthetic artifact and confirm JSON plus at least one plot for plottable data.

@@ -1,0 +1,21 @@
+# Barotropic tide and river discharge
+
+Retain the tide workflow's three preparation roles. Grid owns the river cutoff and the diagnostic section. TPXO also calls the USGS and river specialists, using separate product directories for the river and ocean. Configuration/build owns the hydrodynamic executable and namelist. The lead freezes both forcing products against the same terminal mesh and controls publication of the runtime files.
+
+## Prepare
+
+1. Identify the upstream main-stem cross-section, receiving nodes, and downstream validation transect before viewing model scores. Require wet connectivity to the sea, adequate low-water depth and a cross-section that can carry the imposed flow. Save the gauge-to-cutoff distance and omitted tributary or reach-storage contributions. Bind node IDs, positive width and depth weights, and section geometry to terminal mesh hashes. Keep the river nodes out of the ocean OBC and sponge.
+2. Stage the source series with its USGS site, parameter, units, original observations, qualifiers, native cadence and coverage. Use tidally filtered main-stem discharge at Port Westward for the Columbia pair. Apply UTC interpolation to the unramped hydrograph. Verify positive sign, distributed flux and integrated volume with the river specialist. FVCOM applies the cold-start ramp internally.
+3. Require the river specialist's ready `fvcom_river_forcing_v1` manifest. Bind it through `bindings.river_manifest`, stage it as `river_manifest.json` alongside the named NetCDF and information namelist, and freeze all three files. Require uniform vertical distribution over nine layers with constant tracer properties and inactive temperature and salinity. Freeze the executable, ocean forcing, source-bound TGE audit, station geometry and controls using the existing joins.
+
+## Run the Columbia pair
+
+Create sibling control and river projects under a new pair root. Set `profile: columbia_river_pair` on both. Use the exact river and tide-only mode names from the request contract. Generate one fresh grid for the pair, including river and diagnostic geometry, and publish identical immutable shared inputs in both members. Prepare identical diagnostic stations along the transect. Register the selected source and installed code revision for each attempt.
+
+Use Run Control `attempt --stage smoke|production --controls ... --index 0|1|2 --skill-installation ...` in each member. The installation receipt holds the full Git `commit`, the absolute `installed_root`, and `files` mapping each installed relative path to its SHA-256. Run 24-hour cold smoke tests from March 29, 2025 on one shared/debug CPU node. Confirm reader behavior and a detectable seaward response before either production job. Cold-start both 17-day production jobs from March 29 through April 15 UTC on two exclusive nodes at 208 ranks. Run one simulation job at a time. Preserve the three cumulative submitted attempts per member per stage. Reconcile the original Slurm receipt before retrying. A shared input change invalidates both dependent results.
+
+## Validate
+
+Require successful process termination, TADA, independently decoded clocks, finite output and a complete 3-D restart. At six-minute station and three-hour full-grid output intervals, production includes 4,081 and 137 records respectively. Run the regional validation runner with each member's actual input freeze. Compare NOAA levels on common timestamps over April 1–14 UTC, with observed total levels, astronomical predictions and eligible depth-mean currents identified separately. Disclose the 14-day harmonic resolution. Preserve the absolute paired model level change before any common-period demeaning.
+
+Use the tidal validation specialist's paired river budget with the preselected mesh-edge section. Report the integrated ramped input, section export, storage change and residual in cubic metres and as a fraction of input. Document discretization of area, water depth, flux and time. Confirm that shared inputs match before interpreting any paired result. Distinguish completed execution, completed validation, and the physical assessment.

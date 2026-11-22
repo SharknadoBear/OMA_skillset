@@ -34,7 +34,7 @@ Forbidden definition families include `SPHERICAL`, `TWO_D_MODEL`, `SEMI_IMPLICIT
 ## `simulation_request_v1` fields used here
 
 ```yaml
-mode: barotropic_tide | benchmark
+mode: barotropic_tide | barotropic-tide-river | benchmark
 case_id: string
 project_dir: optional path
 physics:
@@ -44,6 +44,8 @@ kestrel:
   account: hindcastra
   partition: auto
 ```
+
+The paired profile uses sibling member project directories under `kestrel.pair_root` and a shared source directory inside that root. Its executable exposes `RIVER_NUMBER`, `RIVER_KIND`, `RIVER_TS_SETTING`, `RIVER_INFLOW_LOCATION` and `RIVER_INFO_FILE` in its generated blank. Its make flags match the tide-only control, including disabled `RIVER_FLOAT`.
 
 Additional schema-valid fields are retained in provenance but do not broaden build authority.
 

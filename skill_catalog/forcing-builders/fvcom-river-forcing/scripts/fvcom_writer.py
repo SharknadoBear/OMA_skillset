@@ -331,7 +331,8 @@ def write_river_nc(out_path: str | Path,
                    extra_tracers: dict | None = None,
                    info1: str = "Delaware River Estuary",
                    info2: str = "Microplastic",
-                   casename: str = "waterPACT") -> None:
+                   casename: str = "waterPACT",
+                   precise_clock: bool = False) -> None:
     """
     Write FVCOM river forcing NetCDF (NETCDF3_CLASSIC).
 
@@ -427,6 +428,13 @@ def write_river_nc(out_path: str | Path,
         for j, ch in enumerate(s[:26]):
             time_str_arr[i, j] = ch.encode("ascii")
 
+    if precise_clock:
+        total_ms = np.rint(time_mjd * 86400000).astype(np.int64)
+        mjd_floor, mjd_ms = np.divmod(total_ms, 86400000)
+        timestamps = MJD_EPOCH + total_ms.astype("timedelta64[ms]")
+        strings = np.datetime_as_string(timestamps, unit="us").astype("S26")
+        time_str_arr = strings.view("S1").reshape(ntime, 26)
+
     with nc4.Dataset(out_path, "w", format="NETCDF3_CLASSIC") as nc:
         # Global attributes
         nc.type    = "FVCOM RIVER FORCING FILE"
@@ -450,12 +458,12 @@ def write_river_nc(out_path: str | Path,
         v[:] = name_arr
 
         # time (float MJD)
-        v           = nc.createVariable("time", "f4", ("time",))
+        v           = nc.createVariable("time", "f8" if precise_clock else "f4", ("time",))
         v.long_name = "time"
         v.units     = "days since 1858-11-17 00:00:00"
         v.format    = "modified julian day (MJD)"
         v.time_zone = "UTC"
-        v[:]        = time_mjd.astype(np.float32)
+        v[:]        = time_mjd
 
         # Itime (integer days)
         v           = nc.createVariable("Itime", "i4", ("time",))
@@ -539,7 +547,8 @@ def write_river_nml(out_path: str | Path,
                     river_nodes: list[int],
                     nc_file: str,
                     n_sigma: int = 20,
-                    uniform: bool = True) -> None:
+                    uniform: bool = True,
+                    named_distribution: bool = False) -> None:
     """
     Write the FVCOM river namelist (``.nml``) companion file.
 
@@ -569,7 +578,7 @@ def write_river_nml(out_path: str | Path,
 
     if uniform:
         frac = 1.0 / n_sigma
-        vdist = f"{n_sigma}*{frac:.11f}"
+        vdist = "'uniform'" if named_distribution else f"{n_sigma}*{frac:.11f}"
     else:
         raise NotImplementedError(
             "Non-uniform vertical distribution not yet supported; "
