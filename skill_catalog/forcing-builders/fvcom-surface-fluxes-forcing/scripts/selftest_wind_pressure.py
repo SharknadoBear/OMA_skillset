@@ -1,16 +1,21 @@
 """Offline tests of the hourly forcing physics, grid frame, and paired file contract."""
 
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import netCDF4 as nc
 import numpy as np
 from pyproj import CRS
+from scipy.interpolate import RegularGridInterpolator
 
 from acquire_wind_pressure import validate_clock
 from prepare_wind_pressure import (
+    checked_fields,
+    coordinates,
     hour_axis,
     model_basis,
     obc_ids,
@@ -26,6 +31,54 @@ from surface_fluxes_validation import _wind_diagnostics_to_earth
 
 
 class WindPressureTests(unittest.TestCase):
+    def test_cfs_samples_each_native_grid(self):
+        lat, lon = np.array([44, 46, 48]), np.array([234, 235, 236])
+        yp, xp = np.array([49, 43]), np.array([233, 237])
+        mesh = SimpleNamespace(
+            lonc=np.array([-124.75]),
+            latc=np.array([45.75]),
+            lon=np.array([-124.5, -125.5]),
+            lat=np.array([45.5, 46.5]),
+        )
+        with tempfile.TemporaryDirectory() as d, nc.Dataset(Path(d) / "native.nc", "w") as ds:
+            ds.model, ds.source_provider = "cfsv2", "ncei"
+            ds.createDimension("time", 1)
+            for name, axis in (
+                ("latitude", lat),
+                ("longitude", lon),
+                ("mslp_latitude", yp),
+                ("mslp_longitude", xp),
+            ):
+                ds.createDimension(name, axis.size)
+                ds.createVariable(name, "f8", (name,))[:] = axis
+            for name in ("eastward_wind", "northward_wind"):
+                var = ds.createVariable(name, "f4", ("time", "latitude", "longitude"))
+                var.units = "m/s"
+                var.source_grib_metadata = json.dumps(
+                    dict(
+                        type_of_level="heightAboveGround",
+                        level=10,
+                        uv_relative_to_grid=0,
+                        grid_type="regular_gg",
+                    )
+                )
+                var[0] = lat[:, None] + lon[None, :] - 270
+            p = ds.createVariable(
+                "air_pressure_at_mean_sea_level", "f4", ("time", "mslp_latitude", "mslp_longitude")
+            )
+            p.units = "Pa"
+            p.source_grib_metadata = json.dumps(dict(short_name="msl", type_of_level="meanSea"))
+            p[0] = 100000 + 4 * yp[:, None] - 2 * xp[None, :]
+            u, _, pressure = checked_fields(ds, "cfsv2", [0])
+            axes, elements, pressure_axes, nodes = coordinates(ds, "cfsv2", mesh)
+            np.testing.assert_allclose(
+                RegularGridInterpolator(axes, u[0])(elements), mesh.latc + mesh.lonc + 360 - 270
+            )
+            np.testing.assert_allclose(
+                RegularGridInterpolator(pressure_axes, pressure[0])(nodes),
+                100000 + 4 * mesh.lat - 2 * (mesh.lon + 360),
+            )
+
     def test_duplicate_and_missing_hours(self):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)

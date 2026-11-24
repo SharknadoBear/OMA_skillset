@@ -749,7 +749,8 @@ def _snapshot_messages(unit: Mapping[str, Any], target: datetime, specs: Sequenc
     selected: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any], Path]] = {}
     target_text = time_text(target)
     month_start = datetime(target.year, target.month, 1, tzinfo=timezone.utc)
-    if target > month_start:
+    # The first analysis cycle is cheaper to scan directly than to binary-search the month.
+    if (target - month_start).total_seconds() > 6 * 3600:
         low, high, best = 0, int(unit["bytes"]) - 16, 0
         for _ in range(24):
             if high - low < 1024 * 1024:
@@ -801,7 +802,25 @@ def _snapshot_messages(unit: Mapping[str, Any], target: datetime, specs: Sequenc
     return selected
 
 
-def _write_canonical(path: Path, times: Sequence[datetime], latitude: np.ndarray, longitude: np.ndarray, fields: Mapping[str, np.ndarray], metadata: Mapping[str, Mapping[str, Any]], attrs: Mapping[str, Any]) -> None:
+MSLP_FIELD = "air_pressure_at_mean_sea_level"
+MSLP_AXES = ("mslp_latitude", "mslp_longitude")
+
+
+def _same_lattice(first, second):
+    return all(a.shape == b.shape and np.allclose(a, b, rtol=0, atol=1e-7)
+               for a, b in zip(first, second))
+
+
+def _native_field_grids(grids):
+    main = next((grid for name, grid in grids.items() if name != MSLP_FIELD), next(iter(grids.values())))
+    for name, grid in grids.items():
+        if name != MSLP_FIELD and not _same_lattice(main, grid):
+            raise CfsAtmosphericError(f"Requested field {name} does not share the primary native grid")
+    pressure = grids.get(MSLP_FIELD)
+    return main, pressure if pressure is not None and not _same_lattice(main, pressure) else None
+
+
+def _write_canonical(path: Path, times: Sequence[datetime], latitude: np.ndarray, longitude: np.ndarray, fields: Mapping[str, np.ndarray], metadata: Mapping[str, Mapping[str, Any]], attrs: Mapping[str, Any], *, mslp_grid=None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".part")
     with nc4.Dataset(temporary, "w", format="NETCDF4") as dataset:
@@ -813,8 +832,15 @@ def _write_canonical(path: Path, times: Sequence[datetime], latitude: np.ndarray
         tv[:] = np.asarray([int(value.timestamp()) for value in times], dtype=np.int64)
         yv = dataset.createVariable("latitude", "f8", ("latitude",)); yv.units = "degrees_north"; yv[:] = latitude
         xv = dataset.createVariable("longitude", "f8", ("longitude",)); xv.units = "degrees_east"; xv[:] = longitude
+        if mslp_grid is not None:
+            for axis, values, standard, units in zip(MSLP_AXES, mslp_grid, ("latitude", "longitude"), ("degrees_north", "degrees_east")):
+                dataset.createDimension(axis, len(values))
+                coordinate = dataset.createVariable(axis, "f8", (axis,))
+                coordinate.standard_name, coordinate.units = standard, units
+                coordinate[:] = values
         for name, values in fields.items():
-            variable = dataset.createVariable(name, "f4", ("time", "latitude", "longitude"), zlib=True, complevel=2, fill_value=np.float32(9.96921e36))
+            spatial = MSLP_AXES if name == MSLP_FIELD and mslp_grid is not None else ("latitude", "longitude")
+            variable = dataset.createVariable(name, "f4", ("time", *spatial), zlib=True, complevel=2, fill_value=np.float32(9.96921e36))
             variable[:] = np.asarray(values, dtype=np.float32)
             detail = dict(metadata[name])
             variable.units = str(detail.pop("canonical_units"))
@@ -837,8 +863,7 @@ def fetch_ncei_snapshot(model: str, plan: Mapping[str, Any], run_dir: Path, dest
     units = {row["product"]: row for row in plan["source_units"] if row["month"] == target.strftime("%Y%m")}
     fields: dict[str, np.ndarray] = {}
     metadata: dict[str, dict[str, Any]] = {}
-    canonical_lat: np.ndarray | None = None
-    canonical_lon: np.ndarray | None = None
+    grids = {}
     for product in request["products"]:
         status.update(message=f"Reading ranged GRIB snapshot for {product}", active_chunk=product)
         selected = _snapshot_messages(units[product], target, PRODUCTS[product]["fields"], request, raw_dir)
@@ -846,16 +871,13 @@ def fetch_ncei_snapshot(model: str, plan: Mapping[str, Any], run_dir: Path, dest
             yi = _bbox_indices(lat, request["bbox"][1], request["bbox"][3], int(request["halo_cells"]))
             xi = _bbox_indices(lon, request["bbox"][0], request["bbox"][2], int(request["halo_cells"]))
             local_lat, local_lon = lat[yi], lon[xi]
-            if canonical_lat is None:
-                canonical_lat, canonical_lon = local_lat, local_lon
-            elif not (np.allclose(canonical_lat, local_lat) and np.allclose(canonical_lon, local_lon)):
-                raise CfsAtmosphericError("Requested NCEI products do not share one native grid")
+            grids[name] = (local_lat, local_lon)
             converted, conversion = _convert(values[np.ix_(yi, xi)], meta, name)
             fields[name] = converted[None, :, :]
             spec = next(field for field in PRODUCTS[product]["fields"] if field["name"] == name)
             metadata[name] = {**meta, "canonical_units": spec["units"], "conversion": conversion, "source_file": Path(str(units[product]["url"])).name, "raw_message": raw_path.name, "raw_sha256": sha256_file(raw_path)}
-    assert canonical_lat is not None and canonical_lon is not None
-    _write_canonical(destination, [target], canonical_lat, canonical_lon, fields, metadata, {"connector": MODEL_CONFIG[model]["connector"], "model": model, "source_provider": "ncei", "request_hash": plan["request_hash"], "provider_lock": "whole_request", "request_bbox_0_360": request["bbox"]})
+    grid, mslp_grid = _native_field_grids(grids)
+    _write_canonical(destination, [target], *grid, fields, metadata, {"connector": MODEL_CONFIG[model]["connector"], "model": model, "source_provider": "ncei", "request_hash": plan["request_hash"], "provider_lock": "whole_request", "request_bbox_0_360": request["bbox"]}, mslp_grid=mslp_grid)
 
 
 def _download_unit(unit: Mapping[str, Any], raw_dir: Path, request: Mapping[str, Any], status: DownloadStatus) -> Path:
@@ -942,24 +964,21 @@ def fetch_ncei_full(model: str, plan: Mapping[str, Any], run_dir: Path, destinat
         times.append(datetime.fromtimestamp(times[-1].timestamp() + 3600, tz=timezone.utc))
     fields: dict[str, np.ndarray] = {}
     metadata: dict[str, dict[str, Any]] = {}
-    canonical_lat: np.ndarray | None = None
-    canonical_lon: np.ndarray | None = None
+    grids = {}
     for product in request["products"]:
         for spec in PRODUCTS[product]["fields"]:
             missing = [time_text(value) for value in times if value not in records[spec["name"]]]
             if missing:
                 raise CfsAtmosphericError(f"Missing exact hourly {spec['name']} records: {', '.join(missing[:8])}")
             chosen = [records[spec["name"]][value] for value in times]
-            for record in chosen:
-                local_lat, local_lon = record[3], record[4]
-                if canonical_lat is None:
-                    canonical_lat, canonical_lon = local_lat, local_lon
-                elif not (np.allclose(canonical_lat, local_lat) and np.allclose(canonical_lon, local_lon)):
-                    raise CfsAtmosphericError("Requested NCEI products do not share one dominant native grid")
+            grid = chosen[0][3:5]
+            if any(not _same_lattice(grid, record[3:5]) for record in chosen[1:]):
+                raise CfsAtmosphericError(f"Native grid of {spec['name']} changed during the request")
+            grids[spec["name"]] = grid
             fields[spec["name"]] = np.stack([record[1] for record in chosen])
             metadata[spec["name"]] = chosen[0][2]
-    assert canonical_lat is not None and canonical_lon is not None
-    _write_canonical(destination, times, canonical_lat, canonical_lon, fields, metadata, {"connector": MODEL_CONFIG[model]["connector"], "model": model, "source_provider": "ncei", "request_hash": plan["request_hash"], "provider_lock": "whole_request", "request_bbox_0_360": request["bbox"]})
+    grid, mslp_grid = _native_field_grids(grids)
+    _write_canonical(destination, times, *grid, fields, metadata, {"connector": MODEL_CONFIG[model]["connector"], "model": model, "source_provider": "ncei", "request_hash": plan["request_hash"], "provider_lock": "whole_request", "request_bbox_0_360": request["bbox"]}, mslp_grid=mslp_grid)
     if cleanup_raw:
         for path in downloaded.values():
             path.unlink(missing_ok=True)
@@ -1059,7 +1078,7 @@ def health(path: str | Path, request: Mapping[str, Any] | None = None) -> dict[s
                 checks["schema"] = str(getattr(dataset, "schema_version", "")) == SCHEMA_FIELDS
                 dimensions = {name: len(dimension) for name, dimension in dataset.dimensions.items()}
                 provider = str(getattr(dataset, "source_provider", "unknown"))
-                variables = [name for name in dataset.variables if name not in {"time", "latitude", "longitude"}]
+                variables = [name for name in dataset.variables if name not in dataset.dimensions]
                 checks["coordinate_dimensions"] = all(dimensions.get(name, 0) > 0 for name in ("time", "latitude", "longitude"))
                 checks["finite_fields"] = all(np.all(np.isfinite(np.ma.filled(dataset[name][:], np.nan))) for name in variables)
                 if request:

@@ -177,6 +177,11 @@ def source_time(ds):
     )
 
 
+def geographic_points(lon, lat, longitude_axis):
+    centre = longitude_axis.mean()
+    return np.column_stack((lat, (lon - centre + 180.0) % 360.0 - 180.0 + centre))
+
+
 def coordinates(ds, provider, mesh):
     if provider == "hrrr":
         require(
@@ -194,17 +199,30 @@ def coordinates(ds, provider, mesh):
         x, y = array(ds["longitude"]), array(ds["latitude"])
 
         def points(lon, lat):
-            return np.column_stack((lat, (lon - x.mean() + 180.0) % 360.0 - 180.0 + x.mean()))
+            return geographic_points(lon, lat, x)
 
     require(len(x) > 1 and len(y) > 1, "Insufficient native interpolation support")
-    return (y, x), points(mesh.lonc, mesh.latc), points(mesh.lon, mesh.lat)
+    pressure_axes = (y, x)
+    if provider in ("cfsv2", "cfsr") and ds[NAMES[provider][2]].dimensions[1:] == (
+        "mslp_latitude",
+        "mslp_longitude",
+    ):
+        pressure_axes = tuple(array(ds[dim]) for dim in ds[NAMES[provider][2]].dimensions[1:])
+        require(all(len(axis) > 1 for axis in pressure_axes), "Insufficient native pressure support")
+        nodes = geographic_points(mesh.lon, mesh.lat, pressure_axes[1])
+    else:
+        nodes = points(mesh.lon, mesh.lat)
+    return (y, x), points(mesh.lonc, mesh.latc), pressure_axes, nodes
 
 
 def checked_fields(ds, provider, times):
     u, v, p = (ds[n] for n in NAMES[provider])
     spatial = ("y", "x") if provider == "hrrr" else ("latitude", "longitude")
+    pressure_dimensions = {("time", *spatial)}
+    if provider in ("cfsv2", "cfsr"):
+        pressure_dimensions.add(("time", "mslp_latitude", "mslp_longitude"))
     require(
-        all(var.dimensions == ("time", *spatial) for var in (u, v, p)),
+        u.dimensions == v.dimensions == ("time", *spatial) and p.dimensions in pressure_dimensions,
         "Unexpected provider field dimensions",
     )
     require(
@@ -366,7 +384,9 @@ def prepare(source_index, grd, obc, model_crs, mod_bulk, start, end, case_name, 
     output = Path(output).resolve()
     require(not output.exists(), "Choose a fresh bundle directory")
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=".atmosphere-", dir=output.parent) as temp, ExitStack() as mappings:
+    with tempfile.TemporaryDirectory(
+        prefix=".atmosphere-", dir=output.parent
+    ) as temp, ExitStack() as mappings:
         work = Path(temp)
         fields = {}
         for field in FIELDS:
@@ -403,7 +423,7 @@ def prepare(source_index, grd, obc, model_crs, mod_bulk, start, end, case_name, 
                     and not seen[pos].any(),
                     "Gap, duplicate or out-of-window source hours",
                 )
-                axes, elements, nodes = coordinates(ds, provider, mesh)
+                axes, elements, pressure_axes, nodes = coordinates(ds, provider, mesh)
                 u, v, p = checked_fields(ds, provider, t)
                 for k, i in enumerate(pos):
                     ue = RegularGridInterpolator(axes, u[k], bounds_error=True)(elements)
@@ -413,7 +433,9 @@ def prepare(source_index, grd, obc, model_crs, mod_bulk, start, end, case_name, 
                     tx, ty = psimple_drag(ue * c - vn * s, ue * s + vn * c)
                     fields[FIELDS[0]][i] = tx
                     fields[FIELDS[1]][i] = ty
-                    fields[FIELDS[2]][i] = RegularGridInterpolator(axes, p[k], bounds_error=True)(nodes)
+                    fields[FIELDS[2]][i] = RegularGridInterpolator(
+                        pressure_axes, p[k], bounds_error=True
+                    )(nodes)
                 seen[pos] = True
         require(seen.all(), "Selected provider does not cover every requested hour")
         package = work / "bundle"

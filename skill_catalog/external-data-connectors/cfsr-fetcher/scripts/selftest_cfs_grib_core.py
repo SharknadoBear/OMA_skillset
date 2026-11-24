@@ -6,12 +6,14 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from io import BytesIO
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
+import netCDF4 as nc
 
 from cfs_grib_core import (
     CfsAtmosphericError,
@@ -19,6 +21,7 @@ from cfs_grib_core import (
     PRODUCTS,
     _convert,
     _match_field,
+    _native_field_grids,
     _download_unit,
     _plan_gate,
     _write_canonical,
@@ -95,6 +98,57 @@ class SharedCoreTests(unittest.TestCase):
         actual, _ = _convert(np.array([1013.25]), meta, spec["name"])
         np.testing.assert_allclose(actual, [101325.0])
         self.assertFalse(hycom_eligibility("cfsv2", ["wind_10m", "mean_sea_level_pressure"])["eligible"])
+
+    def test_pressure_and_wind_preserve_their_native_grids(self) -> None:
+        wind = (np.array([46.0, 47.0, 48.0]), np.array([234.0, 235.0, 236.0]))
+        pressure = (np.array([45.0, 49.0]), np.array([233.0, 237.0]))
+        grids = dict(air_pressure_at_mean_sea_level=pressure, eastward_wind=wind, northward_wind=wind)
+        main, secondary = _native_field_grids(grids)
+        self.assertIs(main, wind)
+        self.assertIs(secondary, pressure)
+        self.assertIsNone(_native_field_grids({"air_pressure_at_mean_sea_level": pressure})[1])
+        with self.assertRaisesRegex(CfsAtmosphericError, "primary native grid"):
+            _native_field_grids(dict(grids, northward_wind=pressure))
+        values = {name: (lat[:, None] + lon[None, :])[None] for name, (lat, lon) in grids.items()}
+        metadata = {name: {"canonical_units": "Pa" if name.startswith("air_pressure") else "m/s"}
+                    for name in grids}
+        output = self.root / "native-grids.nc"
+        _write_canonical(output, [datetime(2008, 1, 1, tzinfo=timezone.utc)], *main, values,
+                         metadata, {"source_provider": "ncei"}, mslp_grid=secondary)
+        self.assertCountEqual(health(output)["variables"], grids)
+        self.assertTrue(health(output)["passed"])
+        with nc.Dataset(output) as dataset:
+            self.assertEqual(dataset["air_pressure_at_mean_sea_level"].dimensions,
+                             ("time", "mslp_latitude", "mslp_longitude"))
+            np.testing.assert_array_equal(dataset["mslp_longitude"][:], pressure[1])
+            for name in grids:
+                np.testing.assert_array_equal(dataset[name][:], values[name])
+
+    def test_ncei_object_store_when_default_tds_unavailable(self) -> None:
+        model = "cfsr"
+        date = "2008-01-01T00:00:00Z"
+        request = normalize_request({"start":date,"end":date,"products":["wind_10m","mean_sea_level_pressure"],
+                                     "bbox":[234.0,44.0,238.0,48.0]}, model)
+        header = b"GRIB" + bytes(3) + bytes([2]) + (120).to_bytes(8, "big")
+        def reply(*_, **__):
+            response = MagicMock()
+            response.__enter__.return_value = response
+            response.status_code = 206
+            response.headers = {"Content-Range":"bytes 0-15/120"}
+            response.raw = BytesIO(header)
+            return response
+        with patch("cfs_grib_core._tds_inventory", side_effect=CfsAtmosphericError("HTTP 503")), \
+                patch("cfs_grib_core._request", side_effect=reply):
+            inv = ncei_inventory(model, request)
+            self.assertEqual(inv["transport"], "ncei_https_object_store")
+            self.assertEqual(inv["coverage"]["scope"], "requested_months")
+            self.assertEqual(inv["total_bytes"], 240)
+            self.assertIn("/prmsl.gdas.", inv["source_units"][1]["url"])
+            with self.assertRaisesRegex(CfsAtmosphericError, "503"):
+                ncei_inventory(model, dict(request, catalog_root="https://example.org/catalog.xml"))
+            header = b"<html>error page"
+            with self.assertRaisesRegex(CfsAtmosphericError, "Invalid GRIB2"):
+                ncei_inventory(model, request)
 
     def test_catalog_full_resolution_selection(self) -> None:
         server = ThreadingHTTPServer(("127.0.0.1", 0), CatalogHandler)

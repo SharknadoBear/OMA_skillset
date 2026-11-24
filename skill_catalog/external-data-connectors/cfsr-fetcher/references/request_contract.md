@@ -42,6 +42,8 @@ Provider selection is atomic for one era segment. HYCOM is eligible only if ever
 
 Canonical fields use `time`, `latitude`, and `longitude`, plus provider-neutral names such as `eastward_wind`, `northward_wind`, `absolute_air_pressure`, `air_temperature_2m`, `specific_humidity_2m`, and `precipitation_rate`. Output variables retain source GRIB units, level, product-definition template, interval/step, forecast lead, filename, conversion, and checksum metadata.
 
+When the archive publishes PRMSL on a distinct native grid, its dimensions are `time, mslp_latitude, mslp_longitude`. The coordinate variables retain the original pressure locations in degrees. Read each field's own dimensions to interpolate wind and pressure independently.
+
 ## Gates, resume, and monitoring
 
 If NOAA’s default THREDDS catalog is unavailable, verify every requested original monthly GRIB2 object through NCEI’s official HTTPS object store. The recorded coverage then describes requested months only. Explicit catalog or file-template overrides remain authoritative.
