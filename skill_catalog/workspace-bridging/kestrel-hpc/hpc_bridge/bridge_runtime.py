@@ -258,10 +258,16 @@ class BridgeRuntime:
             if not thread.is_alive():
                 del self.active[lane]
         if time.monotonic() - self.last_storage > 10:
-            size = sum(p.stat().st_size for name in ("commands", "inflight", "results", "progress")
-                       for p in (self.root / name).rglob("*") if p.is_file())
-            self.storage_ok = size < MAX_LEDGER_BYTES
-            self.last_storage = time.monotonic()
+            try:
+                size = sum(p.stat().st_size for name in ("commands", "inflight", "results", "progress")
+                           for p in (self.root / name).rglob("*") if p.is_file())
+            except (FileNotFoundError, PermissionError):
+                # A writer can publish/rename an entry during the directory walk.
+                # Hold new work until a complete inventory is available.
+                self.storage_ok = False
+            else:
+                self.storage_ok = size < MAX_LEDGER_BYTES
+                self.last_storage = time.monotonic()
         paths = sorted((self.root / "commands").glob("*.json"), key=lambda p: (p.stat().st_mtime_ns, p.name))
         # Control requests bypass both occupied lanes and the storage gate.
         pending = []
@@ -314,7 +320,11 @@ class BridgeRuntime:
                 continue
             if lane in self.active or not self.connected() or not self.storage_ok or self.receipt_failure:
                 continue
-            path.replace(self.root / "inflight" / path.name)
+            try:
+                path.replace(self.root / "inflight" / path.name)
+            except (FileNotFoundError, PermissionError):
+                # No claim succeeded. Leave the original request for the next tick.
+                continue
             op = Operation(self.root, payload)
             thread = threading.Thread(target=self.execute, args=(op,), daemon=True)
             self.active[lane] = (op, thread)

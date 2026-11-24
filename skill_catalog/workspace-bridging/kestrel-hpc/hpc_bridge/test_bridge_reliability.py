@@ -535,6 +535,27 @@ class BridgeTests(unittest.TestCase):
         rt.tick()
         self.assertEqual(runtime.read_json(health_path)["state"], "connected")
 
+    def test_locked_command_claim_preserves_session_and_original_request(self):
+        rt = self.new_runtime()
+        request = self.payload(action="exec", command="fixture status")
+        self.submit(rt, request)
+        queued = rt.root / "commands" / (request["id"] + ".json")
+        replace = Path.replace
+
+        def locked(path, destination):
+            if path == queued:
+                raise PermissionError("temporary Windows sharing violation")
+            return replace(path, destination)
+
+        with patch.object(Path, "replace", locked):
+            rt.tick()
+            self.assertTrue(rt.connected())
+            self.assertTrue(queued.is_file())
+            self.assertFalse(rt.active)
+        result = self.receipt(rt, request["id"])
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(self.fixture.commands.count("fixture status"), 1)
+
     def test_heartbeat_staleness_is_not_hidden(self):
         rt = self.new_runtime()
         runtime.atomic_json(rt.root / "bridge_status.json", {
