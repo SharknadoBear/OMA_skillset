@@ -15,7 +15,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fvcom-run-control" / "scripts"))
-from fvcom_profiles import RIVER_MODE, is_cold_pair_stage, resolve_request
+from fvcom_profiles import RIVER_MODE, WIND_MODE, WIND_PROFILE, is_cold_pair_stage, resolve_request
 
 
 STAGES = {"smoke", "canary", "spinup", "benchmark", "production", "full"}
@@ -220,7 +220,7 @@ def verify_staged_river(river: Mapping[str, Any], request: Mapping[str, Any],
 
 def validate_request(request: Mapping[str, Any]) -> Tuple[datetime, datetime, int, float, float, int]:
     request = resolve_request(dict(request))
-    if request.get("mode") not in {"barotropic_tide", RIVER_MODE, "benchmark"}:
+    if request.get("mode") not in {"barotropic_tide", RIVER_MODE, WIND_MODE, "benchmark"}:
         raise ConfigError("unsupported simulation mode")
     if not isinstance(request.get("case_id"), str) or not request["case_id"]:
         raise ConfigError("case_id is required")
@@ -294,6 +294,59 @@ def bindings_required(bindings: Mapping[str, Any]) -> None:
         raise ConfigError("grid_edge_read_from_file binding must be true or false")
 
 
+def wind_controls(mode: str, surface_file: str = "columbia_surface.nc") -> Dict[str, str]:
+    if mode == WIND_MODE:
+        return {"WIND_ON": "T", "WIND_KIND": q("variable"), "WIND_TYPE": q("stress"),
+                "WIND_FILE": q(surface_file), "AIRPRESSURE_ON": "T",
+                "AIRPRESSURE_KIND": q("variable"), "AIRPRESSURE_FILE": q(surface_file)}
+    return {"WIND_ON": "F", "WIND_FILE": q("none"), "AIRPRESSURE_ON": "T",
+            "AIRPRESSURE_KIND": q("constant"), "AIRPRESSURE_VALUE": "101325.0",
+            "AIRPRESSURE_FILE": q("none")}
+
+
+def verify_wind_stage(request: Mapping[str, Any], namelist: Path, input_root: Path) -> Optional[Path]:
+    """Bind the frozen surface and boundary data to the exact native settings."""
+    mode = request["mode"]
+    if mode != WIND_MODE and request.get("profile") != WIND_PROFILE:
+        return None
+    parsed = parse_values(namelist.read_text(encoding="utf-8-sig"))
+    problems = audit_values(parsed, mode, profile=request.get("profile"))
+    if problems:
+        raise ConfigError(", ".join(problems))
+    manifest = input_root / "atmosphere_manifest.json"
+    if mode != WIND_MODE:
+        if manifest.exists():
+            raise ConfigError("constant-pressure control contains a treatment atmosphere manifest")
+        return None
+    skills = Path(__file__).resolve().parents[2]
+    forcing_skills = skills.parent / "forcing-builders" if skills.name == "simulation-meta" else skills
+    for skill in ("fvcom-surface-fluxes-forcing", "fvcom-boundary-waterlevel-forcing"):
+        sys.path.insert(0, str(forcing_skills / skill / "scripts"))
+    from prepare_wind_pressure import verify_bundle
+    from wind_boundary import verify_wind_boundary
+
+    grid = scalar(parsed["NML_GRID_COORDINATES"]["GRID_FILE"])
+    obc = scalar(parsed["NML_OPEN_BOUNDARY_CONTROL"]["OBC_NODE_LIST_FILE"])
+    if any(Path(name).name != name or name in {"", ".", ".."} for name in (grid, obc)):
+        raise ConfigError("wind geometry bindings must be flat filenames")
+    coverage = {}
+    if request.get("profile") == WIND_PROFILE:
+        start, end, _, _ = stage_times(request, "production")
+        coverage = {"start": start.isoformat(), "end": end.isoformat()}
+    data = verify_bundle(manifest, input_root / grid, input_root / obc, **coverage)
+    file_info = data["files"]["surface"]
+    source_file = scalar(parsed["NML_SURFACE_FORCING"]["AIRPRESSURE_FILE"])
+    if source_file != file_info["path"]:
+        raise ConfigError("native surface file does not match the atmosphere manifest")
+    start = parse_utc(data["start_utc"], "surface start")
+    end = parse_utc(data["end_utc"], "surface end")
+    case = parsed["NML_CASE"]
+    if (start > parse_utc(scalar(case["START_DATE"]), "stage start")
+            or end < parse_utc(scalar(case["END_DATE"]), "stage end")):
+        raise ConfigError("hourly atmosphere does not span the whole model stage")
+    return verify_wind_boundary(input_root, parsed)
+
+
 def configuration_values(
     request: Mapping[str, Any], bindings: Mapping[str, Any], numerics: Mapping[str, Any], stage: str,
     *, provisional: bool = False, river: Mapping[str, Any] | None = None,
@@ -319,6 +372,8 @@ def configuration_values(
     restart_on = stage not in {"smoke", "canary"} or is_cold_pair_stage(request)
     restart_first = (restart_at if not hotstart else end) if restart_on else end
     case_kind = "tide-plus-river" if request.get("mode") == RIVER_MODE else "tide-only"
+    if request.get("mode") == WIND_MODE:
+        case_kind = "tide-plus-wind-and-pressure"
     values: Dict[str, Dict[str, str]] = {
         "NML_CASE": {
             "CASE_TITLE": q(f"{request['case_id']} {stage} {case_kind}"),
@@ -511,6 +566,11 @@ def configuration_values(
             "OUT_INTERVAL": q("seconds=360.0"),
         },
     }
+    if request.get("mode") == WIND_MODE or request.get("profile") == WIND_PROFILE:
+        surface_name = bindings.get("surface_file", "columbia_surface.nc")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.nc", surface_name):
+            raise ConfigError("surface_file must be a flat NetCDF filename")
+        values["NML_SURFACE_FORCING"].update(wind_controls(request["mode"], surface_name))
     if request.get("mode") == RIVER_MODE:
         if bindings.get("river_manifest"):
             if river is None:
@@ -676,13 +736,34 @@ def audit_duration_values(parsed: Mapping[str, Mapping[str, str]]) -> List[str]:
 
 
 def audit_values(parsed: Mapping[str, Mapping[str, str]], mode: str = "barotropic_tide",
-                 river: Mapping[str, Any] | None = None, provisional: bool = False) -> List[str]:
+                 river: Mapping[str, Any] | None = None, provisional: bool = False,
+                 profile: str | None = None) -> List[str]:
     problems: List[str] = audit_duration_values(parsed)
     flat = {key: value for group in parsed.values() for key, value in group.items()}
     for key in sorted(TRUE_KEYS):
         if logical(flat.get(key, "")) is not True:
             problems.append(f"{key} must be true")
-    for key in sorted(FALSE_KEYS):
+    disabled = FALSE_KEYS
+    if mode == WIND_MODE or profile == WIND_PROFILE:
+        disabled = FALSE_KEYS - {"WIND_ON", "AIRPRESSURE_ON"}
+        group = parsed.get("NML_SURFACE_FORCING", {})
+        surface_name = scalar(group.get("WIND_FILE", ""))
+        if mode == WIND_MODE and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.nc", surface_name):
+            problems.append("wind and pressure require a flat native NetCDF filename")
+        for key, expected in wind_controls(mode, surface_name).items():
+            actual = group.get(key, "")
+            if key.endswith("_ON"):
+                matches = logical(actual) is logical(expected)
+            elif key == "AIRPRESSURE_VALUE":
+                try:
+                    matches = float(scalar(actual).replace("D", "E").replace("d", "e")) == float(expected)
+                except ValueError:
+                    matches = False
+            else:
+                matches = scalar(actual) == scalar(expected)
+            if not matches:
+                problems.append(f"{key} disagrees with the wind scenario")
+    for key in sorted(disabled):
         if key in flat and logical(flat[key]) is not False:
             problems.append(f"{key} must be false")
     if scalar(flat.get("LOCATION_TYPE", "")).lower() != "cell":
@@ -722,9 +803,11 @@ def audit_stage_values(parsed: Mapping[str, Mapping[str, str]], stage: str, prof
     if is_cold_pair_stage({"profile": profile}):
         if stage not in {"smoke", "production"}:
             problems.append("this cold-start profile only permits smoke and production")
-        expected_end = "2025-03-30 00:00:00" if stage == "smoke" else "2025-04-15 00:00:00"
+        start = "2025-03-18" if profile == WIND_PROFILE else "2025-03-29"
+        smoke_end = "2025-03-19" if profile == WIND_PROFILE else "2025-03-30"
+        expected_end = (smoke_end if stage == "smoke" else "2025-04-15") + " 00:00:00"
         case = parsed.get("NML_CASE", {})
-        if scalar(case.get("START_DATE", "")) != "2025-03-29 00:00:00" or scalar(case.get("END_DATE", "")) != expected_end:
+        if scalar(case.get("START_DATE", "")) != start + " 00:00:00" or scalar(case.get("END_DATE", "")) != expected_end:
             problems.append("stage dates differ from the cold-start profile")
         if scalar(parsed.get("NML_STARTUP", {}).get("STARTUP_TYPE", "")).lower() != "coldstart":
             problems.append("this profile requires coldstart")
@@ -896,7 +979,12 @@ def cli(argv: Iterable[str] | None = None) -> int:
                 verify_staged_river(river, request, parsed, args.input_root)
             elif args.river_manifest:
                 raise ConfigError("--river-manifest requires a river-mode request")
-            problems = audit_values(parsed, request.get("mode", "barotropic_tide"), river)
+            problems = audit_values(parsed, request.get("mode", "barotropic_tide"), river,
+                                    profile=request.get("profile"))
+            if request.get("mode") == WIND_MODE or request.get("profile") == WIND_PROFILE:
+                if not args.input_root:
+                    raise ConfigError("wind scenario validation requires --input-root")
+                verify_wind_stage(request, args.namelist, args.input_root)
             print(json.dumps({"status": "pass" if not problems else "fail", "problems": problems}, indent=2))
             return 0 if not problems else 2
         request = load_json(args.request)
@@ -936,7 +1024,12 @@ def cli(argv: Iterable[str] | None = None) -> int:
             checks = file_checks(parsed, args.input_root, timing["hotstart"])
             preconfig = args.preconfiguration_manifest
         hashes["namelist_sha256"] = sha256(namelist_path)
-        problems = audit_values(parsed, request["mode"], river, provisional)
+        problems = audit_values(parsed, request["mode"], river, provisional, request.get("profile"))
+        if not provisional and (request.get("mode") == WIND_MODE or request.get("profile") == WIND_PROFILE):
+            verify_wind_stage(request, namelist_path, args.input_root)
+            if request["mode"] == WIND_MODE:
+                for name in ("atmosphere_manifest.json", "wind_boundary_manifest.json"):
+                    hashes[name] = sha256(args.input_root / name)
         problems.extend(audit_stage_values(parsed, args.stage, request.get("profile")))
         result = manifest(
             request, args.stage, root, hashes, timing, numerics, checks, provisional,

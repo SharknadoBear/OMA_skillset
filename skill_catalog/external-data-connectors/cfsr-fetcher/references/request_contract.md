@@ -36,13 +36,15 @@ Times are inclusive exact UTC hours. The bbox is `[west,south,east,north]` in 0-
 
 ## Providers and products
 
-NCEI uses full-resolution monthly files and rejects `.l.` products. Each selected GRIB message must match its parameter, native level, and requested valid time. Duplicate valid times retain the shortest forecast lead.
+NCEI uses full-resolution monthly files and rejects `.l.` products. Request `mean_sea_level_pressure` for `prmsl.gdas` at mean sea level, decoded from GRIB msl/prmsl and published as `air_pressure_at_mean_sea_level` in Pa. The separate `surface_pressure` product uses `pressfc.gdas`. Only the NCEI route supports the MSLP and wind bundle. Each selected GRIB message must match its parameter, native level, and requested valid time. Duplicate valid times retain the shortest forecast lead.
 
 Provider selection is atomic for one era segment. HYCOM is eligible only if every requested product has an exact mapping; unsupported temperature/humidity or composite mappings fail closed instead of being fabricated. Provider attempts and the final lock are recorded.
 
 Canonical fields use `time`, `latitude`, and `longitude`, plus provider-neutral names such as `eastward_wind`, `northward_wind`, `absolute_air_pressure`, `air_temperature_2m`, `specific_humidity_2m`, and `precipitation_rate`. Output variables retain source GRIB units, level, product-definition template, interval/step, forecast lead, filename, conversion, and checksum metadata.
 
 ## Gates, resume, and monitoring
+
+If NOAA’s default THREDDS catalog is unavailable, verify every requested original monthly GRIB2 object through NCEI’s official HTTPS object store. The recorded coverage then describes requested months only. Explicit catalog or file-template overrides remain authoritative.
 
 - `estimate` hashes the normalized request and immutable plan, probes a bounded HTTP range, and requires `free_bytes > 4 * raw_transfer_bytes`.
 - `snapshot` downloads only complete ranged GRIB messages for one valid hour. Production `fetch` resumes full monthly files through `.part` files.

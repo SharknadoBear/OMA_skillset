@@ -42,6 +42,13 @@ def main() -> int:
         assert {"PLASTIC", "OFFLINE_PLASTIC"}.issubset(set(bad["forbidden_active_defines"]))
         write(make_inc, f"TOPDIR = /scratch/pair/source\nDFLAGS = {flags} -DRIVER_FLOAT\n")
         assert "RIVER_FLOAT" in fb.audit_make_inc(make_inc, "/scratch/pair/source")["forbidden_active_defines"]
+        write(make_inc, f"TOPDIR = /scratch/pair/source\nDFLAGS = {flags}\n")
+        assert fb.audit_make_inc(make_inc, "/scratch/pair/source", True)["missing_required_defines"] == ["AIR_PRESSURE"]
+        write(make_inc, make_inc.read_text() + "DFLAGS += -DAIR_PRESSURE\n")
+        assert fb.audit_make_inc(make_inc, "/scratch/pair/source", True)["status"] == "pass"
+        assert fb.audit_make_inc(make_inc, "/scratch/pair/source")["status"] == "fail"
+        write(make_inc, make_inc.read_text() + "DFLAGS += -DATMO_TIDE -DMEAN_FLOW\n")
+        assert set(fb.audit_make_inc(make_inc, "/scratch/pair/source", True)["forbidden_active_defines"]) == fb.WIND_INCOMPATIBLE_DEFINES
         pair = {"case_id": "river", "profile": fb.PAIR_PROFILE, "mode": fb.RIVER_MODE,
                 "river": {"provider": "usgs", "station_id": "14246900", "parameter_code": "72137"},
                 "kestrel": {"pair_root": "/scratch/pair", "project_dir": "/scratch/pair/river",
@@ -50,6 +57,12 @@ def main() -> int:
                                "compiler_options": ["-O3"], "modules": ["oneapi/2025.3.1"]}}}
         pair_plan = fb.build_plan(pair, root / "shared", "/scratch/pair/run/build")
         assert pair_plan["source_commit"] == "f8e4b50d4fd51409febcefc763cbc5dca11870e2"
+        for mode in ("barotropic_tide", fb.WIND_MODE):
+            wind_pair = {key: value for key, value in pair.items() if key != "river"}
+            wind_pair.update(profile=fb.WIND_PROFILE, mode=mode)
+            wind_plan = fb.build_plan(wind_pair, root / "shared", "/scratch/pair/run/build")
+            assert "AIR_PRESSURE" in wind_plan["required_defines"]
+            assert "AIR_PRESSURE" not in wind_plan["forbidden_defines"]
         for key, invalid in (("project_dir", "/scratch/pair_other/river"),
                              ("source_dir", "/scratch/pair/../other/source"),
                              ("pair_root", "/scratch/other")):

@@ -202,6 +202,7 @@ def validate(water_files: list[Path], current_files: list[Path], output_dir: Pat
     output_dir.mkdir(parents=True, exist_ok=True)
     lineage = load_lineage(lineage_path)
     river_study = lineage.get("mode") == "barotropic-tide-river" or lineage.get("profile") == "columbia_river_pair"
+    wind_study = lineage.get("mode") == "barotropic-tide-wind" or lineage.get("profile") == "columbia_wind_pair"
     water_results, current_results = [], []
     for path in water_files:
         df = common_frame(path, ["model", "observed", "predicted"])
@@ -229,7 +230,7 @@ def validate(water_files: list[Path], current_files: list[Path], output_dir: Pat
                 "reference": harmonic_fit(common["time"], common[ref].to_numpy(), ref_resolved),
             }
         image = output_dir / f"{path.stem}_water.png"
-        plot_water(df, image, path.stem, river_study)
+        plot_water(df, image, path.stem, river_study or wind_study)
         water_results.append({"station": path.stem, "station_id": station_id, "source": str(path), "source_sha256": file_sha256(path), "coverage_start": finite["time"].iloc[0].isoformat(), "coverage_end": finite["time"].iloc[-1].isoformat(), "datum_alignment": "independent mean removal on each model/reference common support; not a datum conversion", "reference_support": support, "model_minus_reference_mean_m": datum_offsets, "metrics": metrics, "resolved_constituents": resolved, "unresolved": unresolved, "harmonics": harmonics, "plot": image.name, "total_observation_scoring": False, "prediction_scoring": True})
     for path in current_files:
         df = common_frame(path, ["model_u", "model_v", "observed_u", "observed_v"])
@@ -315,9 +316,13 @@ def validate(water_files: list[Path], current_files: list[Path], output_dir: Pat
             "The informational thresholds assess agreement with astronomical predictions and available current "
             "profiles. Assess the river response using observed total water levels, paired model offsets, "
             "section export and storage change.")
+    if wind_study:
+        result["assessment_scope"] = (
+            "These thresholds describe astronomical-tide and current agreement. Use the paired wind "
+            "validation for observed total levels, non-tidal residuals, timing and signed response.")
     summary_path = output_dir / "validation_summary.json"
     summary_path.write_text(json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8")
-    sections = [f"<p>{html.escape(result['assessment_scope'])}</p>"] if river_study else []
+    sections = [f"<p>{html.escape(result['assessment_scope'])}</p>"] if river_study or wind_study else []
     for item in water_results:
         image_reference = Path(os.path.relpath(output_dir / item["plot"], report_path.parent)).as_posix()
         diagnostic = item['reference_support']['observed']['status']

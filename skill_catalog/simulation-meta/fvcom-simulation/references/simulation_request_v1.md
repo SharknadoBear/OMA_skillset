@@ -2,11 +2,11 @@
 
 ```yaml
 schema: simulation_request_v1
-mode: barotropic_tide | barotropic-tide-river | benchmark
-profile: paper_barotropic | columbia_river_pair # optional
+mode: barotropic_tide | barotropic-tide-river | barotropic-tide-wind | benchmark
+profile: paper_barotropic | columbia_river_pair | columbia_wind_pair # optional
 case_id: string
 project_dir: optional absolute or workspace-relative path
-grid_policy: accepted_then_fresh | fresh_only
+grid_policy: accepted_then_fresh | fresh_only | retained_only
 period:
   analysis_start: optional UTC timestamp
   analysis_end: optional UTC timestamp
@@ -119,3 +119,12 @@ The paper resolver also fixes `kestrel.source_repository` to
 base source; record permitted build-portability diffs separately. Build finalization
 checks the observed revision and its freeze binding. Keep plastic/sediment features
 off; using the FVCOM_MP repository does not enable microplastic physics.
+
+## Columbia wind pair
+
+Set `profile: columbia_wind_pair` on both requests. Use `barotropic_tide` on the
+control and `barotropic-tide-wind` on the treatment. The profile resolves
+`retained_only` to the single grid branch `retained_columbia`. Freeze the
+retained mesh with its earlier source-bound topology and ordered OBC evidence.
+The [wind workflow](barotropic_tide_wind.md) defines pressure handling,
+offshore reference, stage windows and the paired NOAA assessment.

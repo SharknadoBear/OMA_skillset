@@ -1,11 +1,11 @@
 ---
 name: fvcom-boundary-waterlevel-forcing
-description: Generate and scientifically validate FVCOM time-series open-boundary elevation forcing from an existing combined water-level record. Use when Codex needs to map NetCDF or tidy CSV water levels from boundary nodes, stations, or geographic grids onto FVCOM OBC nodes; encode exact FVCOM UTC time variables; inspect spectra; or create sample-node and complete-boundary Hovmöller QA plots.
+description: Generate and validate FVCOM time-series open-boundary elevation. Map supplied water levels onto OBC nodes, or assemble and certify barotropic-tide-wind forcing with TPXO, offshore GLORYS SSH anomaly and atmospheric pressure.
 ---
 
 # FVCOM Boundary Water-Level Forcing
 
-Use this skill only after the desired water-level series is scientifically combined and datum-corrected. Do not fetch TPXO/HYCOM/observations, reconstruct harmonics, or manufacture missing tidal, subtidal, or sea-level-rise components here.
+For an existing combined, datum-corrected water-level record, use the generic builder below. For a paired barotropic-tide-wind experiment, follow the dedicated [wind boundary procedure](references/wind_boundary.md). Source acquisition belongs to the provider skills.
 
 ## Core rules
 

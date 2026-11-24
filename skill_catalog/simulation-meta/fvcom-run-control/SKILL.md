@@ -7,6 +7,8 @@ description: Initialize immutable FVCOM simulation projects, derive conservative
 
 For `columbia_river_pair`, create each member with `init` and use the [matched-pair workflow](../fvcom-simulation/references/barotropic_tide_river.md). For each prepared single-stage attempt, run `python scripts/freeze_attempt_inputs.py --project PROJECT --attempt run/fresh_reproduction/attempts/ATTEMPT` before transfer. It binds the actual run namelist, station mapping, executable and flat file inventory in `input_freeze.json`. Repeating the command verifies the existing freeze.
 
+For `columbia_wind_pair`, initialize the tide control and wind treatment with the retained grid branch `retained_columbia`. The [wind workflow](../fvcom-simulation/references/barotropic_tide_wind.md) defines the 14-day spin-up, cold-start stages and forcing checks. Use the same attempt and freeze commands with that grid branch.
+
 Use this skill for local orchestration artifacts and evidence. It never opens SSH or submits a job; invoke `$kestrel-hpc` for transfer, submission, monitoring, cancellation, and retrieval.
 
 

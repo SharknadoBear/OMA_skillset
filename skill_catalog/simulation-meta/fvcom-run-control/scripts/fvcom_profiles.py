@@ -7,12 +7,14 @@ from typing import Any
 
 PAPER_PROFILE = "paper_barotropic"
 PAIR_PROFILE = "columbia_river_pair"
+WIND_PROFILE = "columbia_wind_pair"
+WIND_MODE = "barotropic-tide-wind"
 RIVER_MODE = "barotropic-tide-river"
 
 
 def is_cold_pair_stage(request: dict[str, Any]) -> bool:
-    """Both short experiments cold-start smoke and production independently."""
-    return request.get("profile") in {PAPER_PROFILE, PAIR_PROFILE}
+    """These profiles start smoke and production independently from rest."""
+    return request.get("profile") in {PAPER_PROFILE, PAIR_PROFILE, WIND_PROFILE}
 
 
 def validate_river_source(request: dict[str, Any]) -> None:
@@ -52,9 +54,11 @@ def resolve_request(request: dict[str, Any]) -> dict[str, Any]:
     result = deepcopy(request)
     profile = result.get("profile")
     validate_river_source(result)
+    if result.get("mode") == WIND_MODE:
+        result.setdefault("period", {}).setdefault("spinup_days", 14)
     if profile is None:
         return result
-    if profile not in {PAPER_PROFILE, PAIR_PROFILE}:
+    if profile not in {PAPER_PROFILE, PAIR_PROFILE, WIND_PROFILE}:
         raise ValueError(f"unsupported simulation profile: {profile}")
 
     def merge(target, settings, prefix=""):
@@ -79,8 +83,14 @@ def resolve_request(request: dict[str, Any]) -> dict[str, Any]:
         settings = {key: value for key, value in PAPER_SETTINGS.items() if key != "mode"}
         if result["mode"] == RIVER_MODE:
             settings["river"] = {"provider": "usgs", "station_id": "14246900", "parameter_code": "72137"}
+    if profile == WIND_PROFILE:
+        if result.get("mode") not in {"barotropic_tide", WIND_MODE}:
+            raise ValueError("wind pair requires tide-only control or barotropic-tide-wind treatment")
+        settings = {key: deepcopy(value) for key, value in PAPER_SETTINGS.items() if key != "mode"}
+        settings["grid_policy"] = "retained_only"
+        settings["period"]["spinup_days"] = 14
     merge(result, settings)
-    if result.get("accepted_grid"):
+    if result["grid_policy"] == "fresh_only" and result.get("accepted_grid"):
         raise ValueError(f"{profile} requires a fresh grid")
     if result["physics"].get("sigma_layers", 10) != 10:
         raise ValueError("legacy sigma_layers counts ten interfaces, not nine physical layers")

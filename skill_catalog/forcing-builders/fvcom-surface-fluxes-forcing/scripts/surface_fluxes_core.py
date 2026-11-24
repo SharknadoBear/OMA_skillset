@@ -725,7 +725,9 @@ def _write_one(
             variable.units = units
             variable.grid = "fvcom_grid" if data.layout == "fvcom" else "structured_grid"
             variable.source_role = role
-            variable[:] = (data.fields[role] * scale).astype(np.float32)
+            for first in range(0, len(data.times_ms), 12):
+                rows = slice(first, min(first+12, len(data.times_ms)))
+                variable[rows] = (data.fields[role][rows] * scale).astype(np.float32)
 
 
 def _validate_staged(path: Path, data: PreparedSurfaceData, packages: Sequence[str], wind_mode: str, heat_mode: str, coare_version: str) -> None:
@@ -739,9 +741,11 @@ def _validate_staged(path: Path, data: PreparedSurfaceData, packages: Sequence[s
         if not np.array_equal(MJD_EPOCH_MS + days * DAY_MS + millis, data.times_ms):
             raise ValueError(f"Staged file {path.name} lost exact UTC time")
         for _role, name, _units, _location, _scale in _package_variables(packages, data.layout, wind_mode, heat_mode, coare_version):
-            values = _masked_float(dataset.variables[name])
-            if not np.all(np.isfinite(values)):
-                raise ValueError(f"Staged file {path.name}:{name} contains missing values")
+            variable = dataset.variables[name]
+            for first in range(0, len(data.times_ms), 12):
+                raw = np.ma.asarray(variable[first:first+12])
+                if np.ma.getmaskarray(raw).any() or not np.isfinite(raw).all():
+                    raise ValueError(f"Staged file {path.name}:{name} contains missing values")
 
 
 def _namelist(package_files: Mapping[str, Path], packages: Sequence[str], wind_mode: str, heat_mode: str, coare_version: str) -> str:

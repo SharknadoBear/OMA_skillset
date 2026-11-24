@@ -1,6 +1,6 @@
 ---
 name: fvcom-simulation
-description: Orchestrate reproducible FVCOM tide-only, barotropic-tide-river, and benchmark studies from source preparation through Kestrel execution and scientific validation.
+description: Orchestrate reproducible FVCOM tide-only, tide with wind or river discharge, and benchmark studies from source preparation through Kestrel execution and scientific validation.
 ---
 
 # FVCOM Simulation
@@ -49,6 +49,7 @@ global hooks or polling daemons. This rule also applies to `paper_barotropic`.
 
 - `barotropic_tide`: prepare, stabilize, benchmark, run, and validate a tide-only FVCOM case.
 - `barotropic-tide-river`: add observed volume discharge to the three-dimensional barotropic tide workflow. Follow [river preparation and validation](references/barotropic_tide_river.md) for the source, mesh, configuration, and experiment-specific gates. The optional `columbia_river_pair` profile selects a matched control and treatment with a short cold-start schedule.
+- `barotropic-tide-wind`: drive a three-dimensional barotropic case with tides, surface wind stress, absolute atmospheric pressure, offshore sea-level anomalies and open-boundary inverse-barometer response. Follow the [wind workflow](references/barotropic_tide_wind.md), including the matched Columbia profile.
 - `benchmark`: use a validated restart and scientifically identical 24-hour segments to compare Kestrel layouts. Do not interpret a benchmark as a validated simulation.
 
 Default new projects to `Workspace/fvcom-simulation/<case_id>` and their Kestrel mirror to `/scratch/yhuang168/FVCOM_Simulation/<case_id>`. Preserve explicit project roots and existing archives. Use the internal project layout in the request contract. Attempts are immutable; resume a complete stage or create the next numbered attempt.
@@ -84,7 +85,7 @@ For each grid case in the initialized manifest's `grid_order` (`fresh_reproducti
    If a standardized grid was published before terminal-order forcing existed, complete Grid Generation's `join-forcing` certificate revision and require `validate --require-submission-ready` to pass. Do not overwrite frozen grid-quality/remapping companions or clear their original findings to certify new forcing.
    For explicitly accepted retained inputs with documented preprocessing cleanup, the owning `certify_retained_grid_join.py` route may instead return a replay-verified retained certificate under its narrow unchanged-geometry/diagnosed-endpoint contract. Bind it in the preparation join and disclose absent generation intermediates. Fresh grids still require the complete standardized route; this exception never waives current quality, boundary, source-TGE, preconfiguration or forcing checks.
 3. Invoke `$noaa-coops-tides` to discover regional water-level and current stations, retaining exact wet-polygon membership as evidence. With `water_level_mapping_policy=containing_cell_or_nearest_wet_cell`, outside water-level gauges use documented geometry-selected cell-centroid proxies; outside status and distance are not execution gates and do not require remeshing. Select before agreement statistics, preserve original gauge coordinates and report distance, basin/depth review and sampling method. Currents still require exact wet membership and downward-looking all-bin profiles; record instrument and period exclusions.
-4. Invoke `$fvcom-namelist-configuration` to generate the final namelist and cell-based station file. Require zero rivers in tide-only mode and the frozen river inputs in `barotropic-tide-river`. Exclude surface, atmospheric-pressure, temperature/salinity OBC, mean-flow, wave, ice, biology, sediment, and particle forcing.
+4. Invoke `$fvcom-namelist-configuration` to generate the final namelist and cell-based station file. Require zero rivers in tide-only mode and the frozen river inputs in `barotropic-tide-river`. For the wind mode follow its surface, pressure and elevation contract. For tide-only and river runs exclude surface and atmospheric-pressure forcing. All three modes exclude temperature/salinity OBC, mean-flow, wave, ice, biology, sediment, and particle forcing.
 5. Recompute every file reference and hash. Do not submit a bundle whose mesh, OBC, forcing, namelist, executable, or station mapping disagrees.
    Have Run Control verify staged runtime permissions, including FVCOM's writable `.fvcomtestfile` marker, before freezing a submission. Hash agreement alone does not establish that initialization can write its required runtime files.
 

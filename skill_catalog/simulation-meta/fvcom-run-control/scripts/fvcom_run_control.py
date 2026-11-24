@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 
-from fvcom_profiles import PAIR_PROFILE, PAPER_PROFILE, RIVER_MODE, is_cold_pair_stage, resolve_request
+from fvcom_profiles import PAIR_PROFILE, PAPER_PROFILE, RIVER_MODE, WIND_PROFILE, WIND_MODE, is_cold_pair_stage, resolve_request
 
 
 G = 9.81
@@ -69,12 +69,14 @@ def write_json(path: Path, value: Any) -> None:
 def validate_request(req: dict[str, Any]) -> None:
     if req.get("schema") != "simulation_request_v1":
         raise ValueError("schema must be simulation_request_v1")
-    if req.get("mode") not in {"barotropic_tide", RIVER_MODE, "benchmark"}:
+    if req.get("mode") not in {"barotropic_tide", WIND_MODE, RIVER_MODE, "benchmark"}:
         raise ValueError("unsupported FVCOM simulation mode")
     if not str(req.get("case_id", "")).strip():
         raise ValueError("case_id is required")
-    if req.get("grid_policy") not in {"accepted_then_fresh", "fresh_only"}:
-        raise ValueError("grid_policy must be accepted_then_fresh or fresh_only")
+    if req.get("grid_policy") == "retained_only" and req.get("profile") != WIND_PROFILE:
+        raise ValueError("retained_only currently requires columbia_wind_pair")
+    if req.get("grid_policy") not in {"accepted_then_fresh", "fresh_only", "retained_only"}:
+        raise ValueError("unsupported grid_policy")
     if req.get("grid_policy") == "fresh_only" and req.get("accepted_grid"):
         raise ValueError("fresh_only cannot consume an accepted grid")
     physics = req.get("physics", {})
@@ -90,6 +92,8 @@ def validate_request(req: dict[str, Any]) -> None:
 
 
 def grid_order(policy: str = "accepted_then_fresh") -> list[str]:
+    if policy == "retained_only":
+        return ["retained_columbia"]
     if policy == "fresh_only":
         return ["fresh_reproduction"]
     if policy == "accepted_then_fresh":
@@ -102,7 +106,7 @@ def project_layout(root: Path, mode: str = "barotropic_tide", policy: str = "acc
         "forcing/shared_source",
         "run/build", "analysis/observations",
     ]
-    if mode in {"barotropic_tide", RIVER_MODE}:
+    if mode in {"barotropic_tide", WIND_MODE, RIVER_MODE}:
         paths += list(BAROTROPIC_AGENT_ROOTS.values())
     for case in grid_order(policy):
         paths += [
@@ -136,7 +140,7 @@ def init_project(request_path: Path, project: Path) -> dict[str, Any]:
         "immutable_attempts": True,
         **({"profile": req["profile"]} if req.get("profile") else {}),
     }
-    if req["mode"] in {"barotropic_tide", RIVER_MODE}:
+    if req["mode"] in {"barotropic_tide", WIND_MODE, RIVER_MODE}:
         manifest["agent_layout"] = {
             "schema": "fvcom_barotropic_agent_layout_v1",
             "role_roots": dict(BAROTROPIC_AGENT_ROOTS),
@@ -623,13 +627,26 @@ def verify_river_stage(request: dict, namelist: Path, input_root: Path) -> None:
     verify_staged_river(river, request, parse_values(namelist.read_text(encoding="utf-8")), input_root)
 
 
+def verify_stage_forcing(request: dict, namelist: Path, input_root: Path) -> Path | None:
+    if request.get("mode") == WIND_MODE or request.get("profile") == WIND_PROFILE:
+        scripts = Path(__file__).resolve().parents[2] / "fvcom-namelist-configuration" / "scripts"
+        if str(scripts) not in sys.path:
+            sys.path.insert(0, str(scripts))
+        from fvcom_namelist import verify_wind_stage
+        return verify_wind_stage(request, namelist, input_root)
+    verify_river_stage(request, namelist, input_root)
+    return None
+
+
 def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
     project = Path(args.project)
     request_path = project / "request.json"
     request = resolve_request(load_data(request_path)) if request_path.exists() else {}
     installation = {}
-    if request.get("profile") == PAIR_PROFILE:
+    if request.get("profile") in {PAIR_PROFILE, WIND_PROFILE}:
         args.job_prefix = "columbia_river" if request["mode"] == RIVER_MODE else "columbia_control"
+        if request["profile"] == WIND_PROFILE:
+            args.job_prefix = "columbia_wind" if request["mode"] == WIND_MODE else "columbia_wind_control"
         environment = request.get("kestrel", {}).get("build_environment", {})
         args.module_init = environment.get("module_init")
         if environment.get("modules"):
@@ -653,8 +670,8 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
     if is_cold_pair_stage(request):
         if paper_stage not in {"smoke", "production"} or not 0 <= args.index < 3:
             raise ValueError("cold-start profile requires --stage smoke|production and index 0, 1 or 2 (three total attempts per stage)")
-        if args.grid_case != "fresh_reproduction" or getattr(args, "stage_namelist", None):
-            raise ValueError("cold-start profile uses fresh-only single-stage attempts")
+        if args.grid_case not in grid_order(request["grid_policy"]) or getattr(args, "stage_namelist", None):
+            raise ValueError("cold-start attempt must use the profile grid and one stage")
         if args.plan or not getattr(args, "controls", None):
             raise ValueError("cold-start profile requires --controls, not the exhaustive --plan")
         if getattr(args, "revision", 0):
@@ -703,12 +720,15 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"base input must contain exactly one *_spg.dat; found {len(sponge_sources)}")
     nml_sources = attempt_namelist_sources(args)
     for path in nml_sources.values():
-        verify_river_stage(request, path, base_input)
+        verify_stage_forcing(request, path, base_input)
     if paper_stage:
-        from audit_fvcom_production import parse_namelist
+        from audit_fvcom_production import parse_namelist, parse_utc
         nml = parse_namelist(nml_sources[None])
-        expected_end = "2025-03-30 00:00:00" if paper_stage == "smoke" else "2025-04-15 00:00:00"
-        if nml.get("START_DATE") != "2025-03-29 00:00:00" or nml.get("END_DATE") != expected_end or nml.get("STARTUP_TYPE", "").lower() != "coldstart":
+        period = request["period"]
+        start = parse_utc(period["analysis_start"]) - dt.timedelta(days=period["spinup_days"])
+        end = (start + dt.timedelta(hours=request["execution"]["smoke_simulated_hours"])
+               if paper_stage == "smoke" else parse_utc(period["analysis_end"]))
+        if parse_utc(nml["START_DATE"]) != start or parse_utc(nml["END_DATE"]) != end or nml.get("STARTUP_TYPE", "").lower() != "coldstart":
             raise ValueError("cold-start attempt must use the profile's cold-start stage dates")
     staged = None not in nml_sources
     attempt_input_reference = (
@@ -1013,7 +1033,7 @@ def build_parser() -> argparse.ArgumentParser:
     q = sub.add_parser("plan")
     q.add_argument("--controls", required=True); q.add_argument("--output", required=True)
     q = sub.add_parser("attempt")
-    q.add_argument("--project", required=True); q.add_argument("--grid-case", required=True, choices=["accepted_t6v6", "fresh_reproduction"])
+    q.add_argument("--project", required=True); q.add_argument("--grid-case", required=True, choices=["accepted_t6v6", "fresh_reproduction", "retained_columbia"])
     q.add_argument("--plan"); q.add_argument("--index", type=int, required=True)
     q.add_argument("--controls", help="Diagnosed controls for one paper_barotropic attempt")
     q.add_argument("--stage", "--paper-stage", dest="paper_stage", choices=["smoke", "production"])

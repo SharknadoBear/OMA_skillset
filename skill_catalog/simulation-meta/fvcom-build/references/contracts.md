@@ -34,7 +34,7 @@ Forbidden definition families include `SPHERICAL`, `TWO_D_MODEL`, `SEMI_IMPLICIT
 ## `simulation_request_v1` fields used here
 
 ```yaml
-mode: barotropic_tide | barotropic-tide-river | benchmark
+mode: barotropic_tide | barotropic-tide-river | barotropic-tide-wind | benchmark
 case_id: string
 project_dir: optional path
 physics:

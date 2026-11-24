@@ -76,6 +76,11 @@ PRODUCTS: dict[str, dict[str, Any]] = {
         "stem": "pressfc",
         "fields": [{"name": "absolute_air_pressure", "units": "Pa", "short": {"pres", "sp"}, "contains": ("pressure",), "level": {"surface", "sfc"}}],
     },
+    "mean_sea_level_pressure": {
+        "stem": "prmsl",
+        "fields": [{"name": "air_pressure_at_mean_sea_level", "units": "Pa", "short": {"msl", "prmsl"},
+                    "contains": (), "level": {"meansea"}}],
+    },
     "air_temperature_2m": {
         "stem": "tmp2m",
         "fields": [{"name": "air_temperature_2m", "units": "degree_Celsius", "short": {"tmp", "2t", "t2m"}, "contains": ("temperature",), "level": {"heightaboveground"}, "value": 2.0}],
@@ -351,7 +356,7 @@ def _range_supported(client: requests.Session, url: str, retries: int) -> tuple[
     return length, response.headers.get("Last-Modified"), accepted
 
 
-def ncei_inventory(model: str, request: Mapping[str, Any], *, session: requests.Session | None = None, discover_coverage: bool = True) -> dict[str, Any]:
+def _tds_inventory(model: str, request: Mapping[str, Any], *, session: requests.Session | None = None, discover_coverage: bool = True) -> dict[str, Any]:
     validate_in_era(request, model)
     own = session is None
     client = session or requests.Session()
@@ -392,6 +397,49 @@ def ncei_inventory(model: str, request: Mapping[str, Any], *, session: requests.
     finally:
         if own:
             client.close()
+
+
+def ncei_inventory(model: str, request: Mapping[str, Any], *, session: requests.Session | None = None, discover_coverage: bool = True) -> dict[str, Any]:
+    """Use NCEI's public object store when its default THREDDS service is unavailable."""
+    validate_in_era(request, model)
+    try:
+        return _tds_inventory(model, request, session=session, discover_coverage=discover_coverage)
+    except (CfsAtmosphericError, ET.ParseError) as exc:
+        config = MODEL_CONFIG[model]
+        if any(request[key] != config[setting] for key, setting in (
+            ("catalog_root", "catalog_root"), ("month_catalog_template", "month_catalog"), ("ncei_file_template", "file"))):
+            raise
+        reason = str(exc)
+    months = month_keys(parse_utc(request["start"]), parse_utc(request["end"]))
+    archive = "prod-cfs-operational-analysis" if model == "cfsv2" else "prod-cfs-reanalysis"
+    client = session or requests.Session()
+    started = time.monotonic()
+    rows = []
+    try:
+        for month in months:
+            directory = f"{month[:4]}/{month}" if model == "cfsv2" else month
+            for product in request["products"]:
+                name = f"{PRODUCTS[product]['stem']}.gdas.{month}.{config['extension']}"
+                url = f"https://www.ncei.noaa.gov/oa/{archive}/time-series/{directory}/{name}"
+                with _request(client, "GET", url, retries=int(request["max_retries"]),
+                              headers={"Range": "bytes=0-15"}, stream=True) as response:
+                    extent = re.fullmatch(r"bytes 0-15/(\d+)", response.headers.get("Content-Range", ""))
+                    if response.status_code != 206 or extent is None:
+                        raise CfsAtmosphericError(f"Object store did not provide an exact GRIB range for {name}")
+                    size = int(extent.group(1))
+                    header = response.raw.read(16)
+                    if len(header) != 16 or header[:4] != b"GRIB" or header[7] != 2 or not 16 < int.from_bytes(header[8:16], "big") <= size:
+                        raise CfsAtmosphericError(f"Invalid GRIB2 object at {url}")
+                    rows.append({"id": f"{month}:{product}", "month": month, "product": product, "url": url,
+                                 "bytes": size, "last_modified": response.headers.get("Last-Modified"), "accept_ranges": True})
+    finally:
+        if session is None:
+            client.close()
+    return {"schema_version": "cfs_ncei_inventory_v2", "model": model, "provider": "ncei",
+            "coverage": {"model": model, "scope": "requested_months", "available_months": months,
+                         "first_month": months[0], "last_month": months[-1], "month_count": len(months), "missing_months": []},
+            "transport": "ncei_https_object_store", "tds_failure": reason,
+            "source_units": rows, "total_bytes": sum(r["bytes"] for r in rows), "elapsed_seconds": round(time.monotonic()-started, 3)}
 
 
 def _plan_gate(transfer_bytes: int, free_bytes: int, conservative_seconds: float) -> dict[str, Any]:
@@ -569,6 +617,8 @@ def _message_metadata(eccodes: Any, gid: Any) -> dict[str, Any]:
         "name": name,
         "units": str(_codes_get(eccodes, gid, "units", "")).strip(),
         "type_of_level": str(_codes_get(eccodes, gid, "typeOfLevel", "")).strip(),
+        "grid_type": str(_codes_get(eccodes, gid, "gridType", "")),
+        "uv_relative_to_grid": int(_codes_get(eccodes, gid, "uvRelativeToGrid", 0) or 0),
         "level": float(_codes_get(eccodes, gid, "level", 0.0) or 0.0),
         "product_definition_template": int(-1 if pdt is None else pdt),
         "forecast_time": float(_codes_get(eccodes, gid, "forecastTime", 0.0) or 0.0),
@@ -631,7 +681,7 @@ def _bbox_indices(axis: np.ndarray, low: float, high: float, halo: int) -> np.nd
 def _convert(values: np.ndarray, meta: Mapping[str, Any], canonical: str) -> tuple[np.ndarray, str]:
     units = str(meta["units"]).lower().replace(" ", "")
     data = np.asarray(values, dtype=np.float64)
-    if canonical == "absolute_air_pressure":
+    if canonical in {"absolute_air_pressure", "air_pressure_at_mean_sea_level"}:
         if units in {"pa", "pascal", "pascals"}:
             return data, "identity_Pa"
         if units in {"hpa", "mb", "mbar"}:

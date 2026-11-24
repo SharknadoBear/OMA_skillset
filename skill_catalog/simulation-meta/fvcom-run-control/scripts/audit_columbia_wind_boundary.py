@@ -1,6 +1,7 @@
 """Compare native OBC zeta with the staged type-1 elevation and FVCOM's cold-start ramp."""
 import argparse
 import json
+import re
 from pathlib import Path
 
 import netCDF4 as nc
@@ -52,13 +53,31 @@ def check_boundary(namelist, inputs, grid_paths):
             "native_grid_files":{p.name:sha256(p) for p in grid_paths}}
 
 
+def check_readers(namelist, stdout):
+    nml = parse_namelist(namelist)
+    wind = nml["WIND_ON"].strip(".").upper() in {"T", "TRUE"}
+    if wind:
+        signatures = ["SETTING UP WIND STRESS FORCING FROM A 'FVCOM GRID' FILE",
+                      "SETTING UP AIR PRESSURE FORCING FROM A 'FVCOM GRID' FILE"]
+    else:
+        signatures = ["SURFACE WIND FORCING IS OFF", "SETTING UP CONSTANT AIR PRESSURE FORCING"]
+    log = stdout.read_bytes().replace(b"\0", b"").decode("utf-8", errors="replace").upper()
+    normalized = re.sub(r"\s+", " ", log)
+    if any(marker not in normalized for marker in signatures):
+        raise ValueError(f"missing native forcing reader evidence in {stdout}")
+    return {"stdout_sha256":sha256(stdout), "native_messages":signatures}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--namelist", type=Path, required=True)
     parser.add_argument("--inputs", type=Path, required=True)
     parser.add_argument("--grid", type=Path, action="append", required=True)
+    parser.add_argument("--stdout", type=Path, help="Also verify the wind-pair native reader messages")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     evidence = check_boundary(args.namelist, args.inputs, args.grid)
+    if args.stdout:
+        evidence["readers"] = check_readers(args.namelist, args.stdout)
     with args.output.open("x", encoding="utf-8") as report:
         json.dump(evidence, report, indent=2)

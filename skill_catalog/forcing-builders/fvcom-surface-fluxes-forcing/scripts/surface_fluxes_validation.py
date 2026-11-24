@@ -77,6 +77,25 @@ def _time_objects(times_ms: np.ndarray) -> np.ndarray:
     return times_ms.astype("datetime64[ms]").astype(object)
 
 
+def _wind_diagnostics_to_earth(dataset, loaded):
+    """Convert only the plot inputs after publishing native component statistics."""
+    if getattr(dataset, "wind_vector_frame", "earth") != "model_xy":
+        return
+    from pyproj import Proj
+
+    u = loaded["uwind_stress"][0]
+    v = loaded["vwind_stress"][0]
+    lon, lat = _locations(dataset, dataset["uwind_stress"])
+    convergence = (
+        Proj(dataset.model_horizontal_crs).get_factors(lon, lat, errcheck=True).meridian_convergence
+    )
+    c, s = np.cos(np.deg2rad(convergence)), np.sin(np.deg2rad(convergence))
+    for ux, vy in zip(u, v):
+        east = c * ux + s * vy
+        vy[:] = -s * ux + c * vy
+        ux[:] = east
+
+
 def _snapshot_plot(path: Path, name: str, values: np.ndarray, lon: np.ndarray, lat: np.ndarray, units: str) -> str:
     field = _flatten_time_space(values)
     x, y = lon.ravel(), lat.ravel()
@@ -99,13 +118,13 @@ def _snapshot_plot(path: Path, name: str, values: np.ndarray, lon: np.ndarray, l
     return str(path.resolve())
 
 
-def _series_plot(path: Path, name: str, values: np.ndarray, times_ms: np.ndarray, units: str) -> str:
+def _series_plot(path: Path, name: str, values: np.ndarray, times_ms: np.ndarray, units: str, *, locations=None) -> str:
     matrix = _flatten_time_space(values)
     points = _representatives(matrix.shape[1])
     fig, axis = plt.subplots(figsize=(11, 4.5), constrained_layout=True)
     times = _time_objects(times_ms)
     for point in points:
-        axis.plot(times, matrix[:, point], linewidth=0.9, label=f"index {point}")
+        axis.plot(times, matrix[:, point], linewidth=0.9, label=f"index {point if locations is None else locations[point]}")
     axis.set_title(f"{name}: representative locations")
     axis.set_ylabel(units)
     axis.set_xlabel("UTC")
@@ -135,13 +154,14 @@ def _package_plot(
         u = np.nanmedian(_flatten_time_space(variables[pair[0]][0]), axis=1)
         v = np.nanmedian(_flatten_time_space(variables[pair[1]][0]), axis=1)
         magnitude = np.hypot(u, v)
-        direction = (270.0 - np.degrees(np.arctan2(v, u))) % 360.0
+        stress = pair[0] == "uwind_stress"
+        direction = ((90.0 if stress else 270.0) - np.degrees(np.arctan2(v, u))) % 360.0
         fig, axes = plt.subplots(2, 1, figsize=(11, 6), sharex=True, constrained_layout=True)
         axes[0].plot(times, magnitude, color="tab:blue")
         axes[0].set_ylabel(variables[pair[0]][1])
-        axes[0].set_title("Domain-median wind magnitude")
+        axes[0].set_title("Domain-median wind stress" if stress else "Domain-median wind magnitude")
         axes[1].plot(times, direction, color="tab:orange")
-        axes[1].set_ylabel("direction from (degrees)")
+        axes[1].set_ylabel("direction toward (° true)" if stress else "direction from (° true)")
         axes[1].set_ylim(0, 360)
         axes[1].set_xlabel("UTC")
     elif package == "heat":
@@ -254,6 +274,130 @@ def _diurnal_plot(
     return str(path.resolve())
 
 
+def _native_atmosphere_qa(path, ds, output, start, end, mesh):
+    """Scan every value in bounded blocks and retain only plotting samples."""
+    from pyproj import Proj
+
+    times = _decode_exact_time(ds)
+    if ds.data_model != "NETCDF3_CLASSIC" or not ds.dimensions["time"].isunlimited():
+        raise ValueError("Expected classic native forcing with unlimited time")
+    if ds.source != "FVCOM grid (unstructured) surface forcing" or set(
+        ds.active_packages.split(",")
+    ) != {"wind", "pressure"}:
+        raise ValueError("Expected native wind and pressure")
+    if start is not None and times[0] > start or end is not None and times[-1] < end:
+        raise ValueError("Forcing does not cover model endpoints")
+    if mesh is not None:
+        for name, values in (
+            ("node_id", mesh.node_ids),
+            ("element_id", mesh.element_ids),
+            ("lon", mesh.lon),
+            ("lat", mesh.lat),
+            ("lonc", mesh.lonc),
+            ("latc", mesh.latc),
+        ):
+            if not np.allclose(ds[name][:], values, rtol=0, atol=2e-5):
+                raise ValueError(f"Native {name} disagrees with model mesh")
+    names = ("uwind_stress", "vwind_stress", "air_pressure")
+    tracks, snapshots, limits, medians = {}, {}, {}, {}
+    points, coords = {}, {}
+    indices = np.array([0, len(times) // 2, len(times) - 1])
+    for name in names:
+        var = ds[name]
+        dim = "node" if name == "air_pressure" else "nele"
+        if var.units != "Pa" or var.dimensions != ("time", dim):
+            raise ValueError(f"Invalid dimensions or units for {name}")
+        width = len(ds.dimensions[dim])
+        points[name] = _representatives(width)
+        coords[name] = _locations(ds, var)
+        tracks[name] = np.empty((len(times), len(points[name])))
+        snapshots[name] = np.asarray(var[indices, :], dtype=float)
+        limits[name] = [math.inf, -math.inf]
+        medians[name] = np.empty((len(times), 1))
+    lon, lat = coords["uwind_stress"]
+    angle = np.deg2rad(
+        Proj(ds.model_horizontal_crs).get_factors(lon, lat, errcheck=True).meridian_convergence
+    )
+    c, s = np.cos(angle), np.sin(angle)
+    peak = [0.0, 0, 0]
+    for start_row in range(0, len(times), 6):
+        rows = slice(start_row, min(start_row + 6, len(times)))
+        fields = {}
+        for name in names:
+            values = np.ma.asarray(ds[name][rows, :], dtype=float).filled(np.nan)
+            if not np.isfinite(values).all():
+                raise ValueError(f"Nonfinite {name} in forcing")
+            limits[name][0] = min(limits[name][0], float(values.min()))
+            limits[name][1] = max(limits[name][1], float(values.max()))
+            tracks[name][rows] = values[:, points[name]]
+            fields[name] = values
+        x, y, p = (fields[name] for name in names)
+        medians[names[0]][rows, 0] = np.median(c * x + s * y, axis=1)
+        medians[names[1]][rows, 0] = np.median(-s * x + c * y, axis=1)
+        medians[names[2]][rows, 0] = np.median(p, axis=1)
+        stress = np.hypot(x, y)
+        row, elem = np.unravel_index(np.argmax(stress), stress.shape)
+        if stress[row, elem] >= peak[0]:
+            peak = [float(stress[row, elem]), int(start_row + row), int(elem + 1)]
+    if limits["air_pressure"][0] < 50_000 or limits["air_pressure"][1] > 120_000:
+        raise ValueError("Implausible absolute pressure in Pa")
+    artifacts = {}
+    for name in names:
+        artifacts[name + "_maps"] = _snapshot_plot(
+            output / (name + "_maps.png"), name, snapshots[name], *coords[name], "Pa"
+        )
+        artifacts[name + "_series"] = _series_plot(
+            output / (name + "_series.png"), name, tracks[name], times, "Pa", locations=points[name]
+        )
+    x, y, _ = (snapshots[name][1] for name in names)
+    arrows = {names[0]: ((x * c + y * s)[None, :], "Pa"), names[1]: ((-x * s + y * c)[None, :], "Pa")}
+    artifacts["package_wind_quiver"] = _wind_quiver_plot(
+        output / "package_wind_quiver.png", arrows, lon, lat
+    )
+    for kind in ("wind", "pressure"):
+        artifacts["package_" + kind] = _package_plot(
+            output / f"package_{kind}_diagnostics.png",
+            kind,
+            {k: (v, "Pa") for k, v in medians.items()},
+            times,
+        )
+    cadence = np.diff(times) / 1000
+    report = dict(
+        path=str(path.resolve()),
+        sha256=sha256_file(path),
+        bytes=path.stat().st_size,
+        source=ds.source,
+        active_packages=["wind", "pressure"],
+        dimensions={k: len(v) for k, v in ds.dimensions.items()},
+        time_start_utc=str(np.datetime64(int(times[0]), "ms")) + "Z",
+        time_end_utc=str(np.datetime64(int(times[-1]), "ms")) + "Z",
+        regular_time=bool(not len(cadence) or np.all(cadence == cadence[0])),
+        cadence_seconds=float(cadence[0]) if len(cadence) else None,
+        variables={
+            k: dict(min=v[0], max=v[1], finite_fraction=1.0, units="Pa") for k, v in limits.items()
+        },
+        peak_wind_stress_pa=peak[0],
+        peak_stress_time_utc=str(np.datetime64(int(times[peak[1]]), "ms")) + "Z",
+        peak_stress_element=peak[2],
+    )
+    return dict(
+        status="pass",
+        structural_checks={
+            k: True
+            for k in (
+                "netcdf3_classic",
+                "exact_time_representations",
+                "strictly_monotonic_time",
+                "zero_nan_gate",
+                "bundle_time_alignment",
+                "fvcom_source_contract",
+            )
+        },
+        files=[report],
+        qa_artifacts=artifacts,
+    )
+
+
 def validate_forcing_files(
     paths: Iterable[str | Path],
     qa_dir: str | Path,
@@ -267,6 +411,10 @@ def validate_forcing_files(
         raise ValueError("At least one forcing file is required")
     output_dir = Path(qa_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if len(files)==1:
+        with nc4.Dataset(files[0]) as ds:
+            if getattr(ds,"wind_vector_frame","")=="model_xy" and set(getattr(ds,"active_packages","").split(",")) == {"wind","pressure"}:
+                return _native_atmosphere_qa(files[0],ds,output_dir,model_start_ms,model_end_ms,mesh)
     reports: list[dict[str, Any]] = []
     all_times: list[np.ndarray] = []
     source_contracts: list[str] = []
@@ -352,6 +500,8 @@ def validate_forcing_files(
                     output_dir / f"{stem}_series.png", name, values, times_ms, units
                 )
             active = [value.strip() for value in str(getattr(dataset, "active_packages", "")).split(",") if value.strip()]
+            if "wind" in active:
+                _wind_diagnostics_to_earth(dataset, loaded)
             for package in active:
                 package_variables.setdefault(package, {}).update(loaded)
                 package_times[package] = times_ms

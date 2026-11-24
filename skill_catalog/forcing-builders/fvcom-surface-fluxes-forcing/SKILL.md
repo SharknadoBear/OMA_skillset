@@ -5,7 +5,15 @@ description: Package and scientifically validate modular FVCOM surface forcing f
 
 # FVCOM Surface Fluxes Forcing
 
-Use this skill only after atmospheric fields have been prepared on their final structured grid or exact FVCOM node/element locations. Keep data fetching, horizontal interpolation, temporal resampling, bulk-flux calculation, and physical reconstruction outside this writer.
+The general writer accepts atmospheric fields prepared on their final structured grid or exact FVCOM node/element locations. For a barotropic wind-and-pressure experiment, use the dedicated acquisition and preparation workflow below before packaging. The selected data connector owns archive access.
+
+## Barotropic wind and pressure
+
+Run `scripts/acquire_wind_pressure.py --start START --end END --bbox WEST SOUTH EAST NORTH --output SOURCES` for inclusive hourly UTC endpoints. Set `--hrrr-python`, `--era5-python`, and `--cfs-python` to the corresponding connector environments. `--skill-root` can point to a local connector catalog. The first complete bundle wins in the order HRRR CONUS f00, ERA5, CFSv2, CFSR. The routing record retains per-provider logs, raw provenance and health. An existing set of complete daily HRRR runs can be reused via `--hrrr-cache`; each day must match the requested period, region and products. CFS eligibility follows its archive era. Its NCEI bundle requires full-resolution PRMSL at mean sea level. Surface pressure cannot stand in for MSLP.
+
+Run `scripts/prepare_wind_pressure.py --source-index SOURCES/source_index.json --grd CASE_grd.dat --obc CASE_obc.dat --model-crs EPSG_CODE --mod-bulk PINNED/mod_bulk.F --start START --end END --case-name CASE --output BUNDLE`. Requires pyproj and a projected, conformal runtime mesh in meters. The helper samples native atmospheric grid cells bilinearly, verifies the source wind frame, rotates true wind to model x/y at projected triangle centroids, and applies the pinned FVCOM PSIMPLE_DRAG law. Node pressure remains absolute MSLP in Pa. It checks hourly coverage, exact IDs, finite fields and equality of the separate ordered OBC pressure slice. The compact slice supports an external inverse-barometer adjustment for prescribed elevations when required by the FVCOM boundary formulation.
+
+`BUNDLE/atmosphere_manifest.json` binds `CASE_surface.nc`, `ordered_obc_pressure.nc`, the runtime mesh and OBC hashes, connector data, scientific transformations and diagnostics. An input stager can call `verify_bundle(manifest_path, grid_path, obc_path, start=..., end=...)` from `scripts/prepare_wind_pressure.py` to recheck the staged native files. `scripts/selftest_wind_pressure.py` exercises the drag thresholds, vector frame, native clock and OBC pressure order.
 
 ## Core workflow
 

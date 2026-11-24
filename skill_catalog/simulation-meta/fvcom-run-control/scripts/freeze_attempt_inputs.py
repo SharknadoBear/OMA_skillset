@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 
 from fvcom_profiles import resolve_request
-from fvcom_run_control import load_data, sha256, verify_river_stage
+from fvcom_run_control import load_data, sha256, verify_stage_forcing
 
 
 def freeze_attempt(project: Path, attempt: Path) -> dict:
@@ -32,7 +32,7 @@ def freeze_attempt(project: Path, attempt: Path) -> dict:
     if nml_hash != manifest["attempt_namelist_sha256"]:
         raise ValueError("run namelist changed after attempt creation")
     request = resolve_request(load_data(project / "request.json"))
-    verify_river_stage(request, nml, inputs)
+    verify_stage_forcing(request, nml, inputs)
     binding = load_data(project / "run/build/executable_reuse_binding.json")
     executable = binding.get("executable_sha256", "")
     if binding.get("status") != "frozen" or not re.fullmatch(r"[0-9a-f]{64}", executable):

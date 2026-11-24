@@ -16,6 +16,8 @@ import numpy as np
 from cfs_grib_core import (
     CfsAtmosphericError,
     ERA_SPLIT,
+    PRODUCTS,
+    _convert,
     _match_field,
     _download_unit,
     _plan_gate,
@@ -82,6 +84,17 @@ class SharedCoreTests(unittest.TestCase):
         self.assertEqual(_plan_gate(100, 400, 1)["state"], "blocked")
         self.assertTrue(hycom_eligibility("cfsv2", ["wind_10m", "surface_pressure"])["eligible"])
         self.assertFalse(hycom_eligibility("cfsv2", ["air_temperature_2m"])["eligible"])
+
+    def test_mean_sea_level_pressure(self) -> None:
+        self.assertEqual(PRODUCTS["mean_sea_level_pressure"]["stem"], "prmsl")
+        spec = PRODUCTS["mean_sea_level_pressure"]["fields"][0]
+        meta = {"short_name": "msl", "name": "Mean sea level pressure", "type_of_level": "meanSea", "units": "hPa"}
+        self.assertTrue(_match_field(meta, spec))
+        self.assertFalse(_match_field(dict(meta, type_of_level="surface"), spec))
+        self.assertFalse(_match_field(dict(meta, short_name="sp"), spec))
+        actual, _ = _convert(np.array([1013.25]), meta, spec["name"])
+        np.testing.assert_allclose(actual, [101325.0])
+        self.assertFalse(hycom_eligibility("cfsv2", ["wind_10m", "mean_sea_level_pressure"])["eligible"])
 
     def test_catalog_full_resolution_selection(self) -> None:
         server = ThreadingHTTPServer(("127.0.0.1", 0), CatalogHandler)

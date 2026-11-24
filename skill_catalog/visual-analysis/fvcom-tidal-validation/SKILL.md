@@ -1,6 +1,6 @@
 ---
 name: fvcom-tidal-validation
-description: Condense FVCOM station output and validate tide-only elevation and depth-integrated currents against NOAA CO-OPS observations and predictions. Use for reproducible time alignment, datum-offset disclosure, scalar/vector metrics, resolvable harmonics, tidal ellipses, plots, and validation HTML.
+description: Condense FVCOM station output and validate tidal and wind-forced elevation and depth-integrated currents against NOAA CO-OPS observations and predictions. Use for reproducible time alignment, datum-offset disclosure, scalar/vector metrics, resolvable harmonics, tidal ellipses, plots, and validation HTML.
 ---
 
 # FVCOM Tidal Validation
@@ -21,6 +21,13 @@ from workflow completion. Report the harmonic-resolution limits of 14 days;
 do not apply the ordinary one-month interpretability claim to this profile.
 
 ## Inputs and Scientific Rules
+
+For `columbia_wind_pair`, run the regional pipeline on each production member, then
+run `python scripts/paired_wind_validation.py --control-project CONTROL --control-attempt ATTEMPT --wind-project WIND --wind-attempt ATTEMPT --output OUTPUT`.
+Use the actual pressure-enabled build and the treatment's component certificate alongside
+the original TPXO manifest. Report matched total-level and residual metrics, the signed
+wind-minus-control response, peak timing and changes during spin-up. Only gauges with
+observed levels can support the residual comparison.
 
 For the `columbia_river_pair` profile, run the regional pipeline for each member,
 then invoke `scripts/paired_river_budget.py --control-project ... --control-attempt ...

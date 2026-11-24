@@ -22,7 +22,7 @@ for _run_control in (_script_path.parents[2] / "fvcom-run-control" / "scripts",
 from audit_fvcom_production import parse_namelist, parse_utc, sha256
 from fvcom_time_anchor import resolve_anchor
 from fvcom_profiles import is_cold_pair_stage, resolve_request
-from fvcom_run_control import verify_river_stage
+from fvcom_run_control import verify_stage_forcing
 
 
 def read(path: Path) -> dict[str, Any]:
@@ -85,7 +85,7 @@ def verify_prerequisites(args: argparse.Namespace) -> dict[str, Any]:
     if attempt_manifest.get("attempt_namelist_sha256", nml_hash) != nml_hash:
         raise ValueError("attempt manifest and frozen run namelist disagree")
     nml = parse_namelist(namelist)
-    verify_river_stage(request, namelist, input_dir)
+    pure_tide = verify_stage_forcing(request, namelist, input_dir)
     start = parse_utc(request["period"]["analysis_start"])
     end = parse_utc(request["period"]["analysis_end"])
     cold = is_cold_pair_stage(request)
@@ -144,6 +144,11 @@ def verify_prerequisites(args: argparse.Namespace) -> dict[str, Any]:
     if forcing.get("status") != "ready" or forcing.get("blocking_reasons") or len(constituents) != expected_count or len(set(constituents)) != len(constituents):
         raise ValueError("forcing manifest does not contain the complete ordered constituent set")
     elevation_name = nml.get("OBC_ELEVATION_FILE")
+    # For a composite OBC, audit the actual runtime file and recover its pure tide input.
+    if pure_tide is not None:
+        if pure_tide.parent.resolve() != input_dir:
+            raise ValueError("pure tide must belong to the actual frozen input bundle")
+        elevation_name = pure_tide.name
     if elevation_name not in files or forcing.get("hashes", {}).get("forcing_sha256") != files[elevation_name]:
         raise ValueError("forcing manifest does not bind the actual run elevation file")
     provenance = forcing.get("provenance", {})

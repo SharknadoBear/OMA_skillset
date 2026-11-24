@@ -5,7 +5,7 @@
 `simulation_request_v1` supplies the science and period:
 
 ```yaml
-mode: barotropic_tide | barotropic-tide-river | benchmark
+mode: barotropic_tide | barotropic-tide-river | barotropic-tide-wind | benchmark
 case_id: string
 period:
   analysis_start: UTC timestamp

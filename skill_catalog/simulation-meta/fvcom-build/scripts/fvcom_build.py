@@ -14,7 +14,7 @@ from typing import Any, Dict, Iterable, List, Tuple
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fvcom-run-control" / "scripts"))
-from fvcom_profiles import PAIR_PROFILE, RIVER_MODE, is_cold_pair_stage, resolve_request
+from fvcom_profiles import PAIR_PROFILE, RIVER_MODE, WIND_MODE, WIND_PROFILE, is_cold_pair_stage, resolve_request
 
 
 SCHEMA = "fvcom_build_worker_manifest_v1"
@@ -42,6 +42,7 @@ FORBIDDEN_EXACT = {
     "DATA_ASSIMILATION",
     "ONLINE_NESTING",
 }
+WIND_INCOMPATIBLE_DEFINES = {"ATMO_TIDE", "MEAN_FLOW"}
 FORBIDDEN_PARTS = ("SEDIMENT", "PARTICLE", "PLASTIC", "RIVER", "BIOGEN", "FABM", "ASSIM")
 PAPER_TEMPLATE_FIELDS = {
     "NML_PHYSICS": ("FLUME_BOTTOM", "FLUME_DRAG_COEF"),
@@ -104,7 +105,7 @@ def write_json(path: Path, value: Dict[str, Any]) -> None:
 
 
 def validate_request(request: Dict[str, Any]) -> None:
-    if request.get("mode") not in {"barotropic_tide", RIVER_MODE, "benchmark"}:
+    if request.get("mode") not in {"barotropic_tide", RIVER_MODE, WIND_MODE, "benchmark"}:
         raise ContractError("unsupported build mode")
     case_id = request.get("case_id")
     if not isinstance(case_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", case_id):
@@ -118,13 +119,13 @@ def validate_request(request: Dict[str, Any]) -> None:
     source = kestrel.get("source_dir")
     if is_cold_pair_stage(request):
         project = kestrel.get("project_dir", "")
-        build_root = kestrel.get("pair_root") if request.get("profile") == PAIR_PROFILE else project
+        build_root = kestrel.get("pair_root") if request.get("profile") in {PAIR_PROFILE, WIND_PROFILE} else project
         if (not isinstance(build_root, str) or not build_root.startswith(("/scratch/", "/kfs3/scratch/"))
                 or not isinstance(project, str) or not isinstance(source, str)
                 or any(".." in PurePosixPath(path).parts for path in (build_root, project, source))
                 or PurePosixPath(build_root) not in PurePosixPath(source).parents):
             raise ContractError("profile source_dir must be inside the explicit project or pair scratch root")
-        if request.get("profile") == PAIR_PROFILE and PurePosixPath(project).parent != PurePosixPath(build_root):
+        if request.get("profile") in {PAIR_PROFILE, WIND_PROFILE} and PurePosixPath(project).parent != PurePosixPath(build_root):
             raise ContractError("each paired project_dir must be a child of kestrel.pair_root")
     elif not isinstance(source, str) or not source.startswith("/home/yhuang168/"):
         raise ContractError("kestrel.source_dir must be an explicit path below /home/yhuang168")
@@ -173,13 +174,20 @@ def topdir_values(text: str) -> List[str]:
     return values
 
 
-def audit_make_inc(path: Path, expected_topdir: str) -> Dict[str, Any]:
+def pressure_build(request: Dict[str, Any]) -> bool:
+    return request.get("mode") == WIND_MODE or request.get("profile") == WIND_PROFILE
+
+
+def audit_make_inc(path: Path, expected_topdir: str, air_pressure: bool = False) -> Dict[str, Any]:
     text = path.read_text(encoding="utf-8-sig", errors="replace")
     defines = active_defines(text)
-    missing = sorted(REQUIRED_DEFINES.difference(defines))
+    required = REQUIRED_DEFINES | ({"AIR_PRESSURE"} if air_pressure else set())
+    forbidden_exact = ((FORBIDDEN_EXACT - {"AIR_PRESSURE"}) | WIND_INCOMPATIBLE_DEFINES
+                       if air_pressure else FORBIDDEN_EXACT)
+    missing = sorted(required.difference(defines))
     forbidden = sorted(
         name for name in defines
-        if name in FORBIDDEN_EXACT or any(part in name for part in FORBIDDEN_PARTS)
+        if name in forbidden_exact or any(part in name for part in FORBIDDEN_PARTS)
     )
     topdirs = topdir_values(text)
     topdir_ok = topdirs == [expected_topdir]
@@ -190,7 +198,7 @@ def audit_make_inc(path: Path, expected_topdir: str) -> Dict[str, Any]:
         "expected_topdir": expected_topdir,
         "active_topdir_values": topdirs,
         "active_defines": defines,
-        "required_defines": sorted(REQUIRED_DEFINES),
+        "required_defines": sorted(required),
         "missing_required_defines": missing,
         "forbidden_active_defines": forbidden,
         "topdir_ok": topdir_ok,
@@ -216,8 +224,9 @@ def build_plan(request: Dict[str, Any], local_root: Path, remote_root: str) -> D
             "source_commit": request["kestrel"]["source_commit"]}
            if is_cold_pair_stage(request) else {}),
         **environment,
-        "required_defines": sorted(REQUIRED_DEFINES),
-        "forbidden_defines": sorted(FORBIDDEN_EXACT),
+        "required_defines": sorted(REQUIRED_DEFINES | ({"AIR_PRESSURE"} if pressure_build(request) else set())),
+        "forbidden_defines": sorted((FORBIDDEN_EXACT - {"AIR_PRESSURE"}) | WIND_INCOMPATIBLE_DEFINES
+                                   if pressure_build(request) else FORBIDDEN_EXACT),
         "authoritative_blank_namelist_command": (
             "srun --account=hindcastra --partition=debug --nodes=1 --ntasks=1 "
             "fvcom_with_init --create_namelist=blank"
@@ -294,6 +303,17 @@ def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Di
         if audit.get("status") != "pass":
             blocking.append("make.inc audit did not pass")
         hashes["make_inc_sha256"] = str(audit.get("sha256", ""))
+    if pressure_build(request) and (evidence / "make.inc.after").is_file():
+        native = audit_make_inc(evidence / "make.inc.after", request["kestrel"]["source_dir"], True)
+        if native["status"] != "pass" or native["sha256"] != hashes.get("make_inc_sha256"):
+            blocking.append("native make.inc does not bind the pressure-enabled feature set")
+        log_path = evidence / "build.log"
+        if log_path.is_file():
+            commands = log_path.read_text(encoding="utf8", errors="replace").splitlines()
+            for src in ("mod_obcs.F", "advave_edge_gcn.F", "external_step.F"):
+                if not any("cpp " in command and "-DAIR_PRESSURE " in command
+                           and src in command.split() for command in commands):
+                    blocking.append(f"no observed AIR_PRESSURE preprocessing for {src}")
     executable_checksum = evidence / "executable.sha256"
     freeze_path = evidence / "freeze.json"
     if executable_checksum.is_file():
@@ -337,6 +357,11 @@ def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Di
             template_fields["NML_RIVER_TYPE"] = (
                 "RIVER_NUMBER", "RIVER_TS_SETTING", "RIVER_INFLOW_LOCATION", "RIVER_KIND", "RIVER_INFO_FILE",
             )
+        if pressure_build(request):
+            template_fields["NML_SURFACE_FORCING"] = (
+                "WIND_ON", "WIND_TYPE", "WIND_KIND", "WIND_FILE", "AIRPRESSURE_ON",
+                "AIRPRESSURE_KIND", "AIRPRESSURE_VALUE", "AIRPRESSURE_FILE",
+            )
         for group, keys in template_fields.items():
             body = re.search(r"^\s*&" + group + r"\b(.*?)^\s*/", blank, re.I | re.M | re.S)
             for key in keys:
@@ -376,6 +401,7 @@ def cli(argv: Iterable[str] | None = None) -> int:
     audit = sub.add_parser("audit-make-inc", help="Audit active TOPDIR and preprocessor definitions")
     audit.add_argument("--make-inc", type=Path, required=True)
     audit.add_argument("--expected-topdir", required=True)
+    audit.add_argument("--air-pressure", action="store_true", help="Require the pressure-capable wind-pair build")
     audit.add_argument("--output", type=Path)
     plan = sub.add_parser("plan", help="Validate a simulation request and emit a build plan")
     plan.add_argument("--request", type=Path, required=True)
@@ -389,7 +415,7 @@ def cli(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
         if args.command == "audit-make-inc":
-            result = audit_make_inc(args.make_inc, args.expected_topdir)
+            result = audit_make_inc(args.make_inc, args.expected_topdir, args.air_pressure)
             if args.output:
                 write_json(args.output, result)
             print(json.dumps(result, indent=2, sort_keys=True))

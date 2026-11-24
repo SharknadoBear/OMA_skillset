@@ -81,3 +81,7 @@ Use `$kestrel-hpc` as the sole SSH, upload/download, and remote-command bridge. 
 - `blocked_physics_change_required`: success would require a forbidden physics/source change.
 
 Do not blur a blocker into a warning. Set a resume token identifying the last immutable evidence checkpoint.
+
+## Shared pressure-capable build
+
+For a wind scenario or its matched control, run the make audit with `--air-pressure`. Both members require the same `AIR_PRESSURE` executable. Capture the compiler's expanded preprocessing commands for `mod_obcs.F`, `advave_edge_gcn.F` and `external_step.F`, the exact edited make.inc, binary hash, and native blank namelist. Run both native namelist parser probes and then exercise the actual variable field readers in the wind smoke run. Bind the shared executable to both member requests.
