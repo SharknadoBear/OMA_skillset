@@ -66,6 +66,25 @@ Start-Process -WorkingDirectory "<session-dir>" -FilePath "powershell.exe" `
   -WindowStyle Normal
 ```
 
+If the launcher exits before the sign-in prompt, check the named session's
+`bridge_status.json` and its server PID first. When the server is absent, use a
+working Kestrel bridge Python environment whose Paramiko version matches the
+new session's `requirements.txt`. Start the **new session's own server** with
+its own working directory and identity. The interpreter can be reused across
+sessions. Keep its console visible for secure sign-in.
+
+```powershell
+& $verifiedPython -c "import paramiko; print(paramiko.__version__)"
+Start-Process -FilePath $verifiedPython -WorkingDirectory $sessionDir `
+  -ArgumentList @('-u', 'bridge_server.py') -WindowStyle Normal -PassThru
+```
+
+Before telling the user that the prompt is ready, verify a live PID and fresh
+`authenticating` state in that session. After entry, wait for `connected` and
+verify a bounded account/host command before submitting work. Seeing a
+console window alone does not establish either state.
+
+
 The bridge keeps commands and transfers in separate lanes, reports local health every second, and uses a 60-second SSH keepalive. Reuse a healthy purpose-matched session. For transfer recovery, cancellation, or remote waits, read [bridge reliability and continuity](references/bridge-reliability.md).
 
 Use an explicit `--timeout` for the operation; the caller returns a request ID after a short wait. A pending response is not failure: inspect `status <request-id>` and `result <request-id>` before retrying. Reconcile uncertain remote effects before any repeat submission. Transfers use verified partial files; `--resume` checks the prefix, and `--overwrite` explicitly permits replacing a different destination. Await an upload's successful receipt before running a command that consumes it.
