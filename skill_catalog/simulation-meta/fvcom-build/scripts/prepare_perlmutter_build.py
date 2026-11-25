@@ -12,7 +12,7 @@ import fvcom_build as build
 import fvcom_profiles as profiles
 
 
-def package(source_package, control_nml, combined_nml, river_nml, output, account, qos="debug"):
+def package(source_package, control_nml, combined_nml, river_nml, output, account, qos="debug", lake_nml=None):
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]+", account) or qos not in {"debug", "regular"}:
         raise ValueError("Require an explicit Perlmutter CPU account and debug or regular QoS")
     if account.endswith("_g"):
@@ -48,10 +48,28 @@ def package(source_package, control_nml, combined_nml, river_nml, output, accoun
             (stage / name).write_bytes((assets / name).read_bytes().replace(b"\r\n", b"\n"))
         for module in (profiles, build):
             (stage / Path(module.__file__).name).write_bytes(Path(module.__file__).read_bytes().replace(b"\r\n", b"\n"))
-        for label, path in (("control", control_nml), ("combined", combined_nml)):
+        lake_profile = Path(profiles.__file__).with_name("fvcom_lake.py")
+        if lake_profile.is_file():
+            (stage/lake_profile.name).write_bytes(lake_profile.read_bytes().replace(b"\r\n", b"\n"))
+        probes = (("control", control_nml), ("combined", combined_nml))
+        if lake_nml:
+            if control_nml or combined_nml:
+                raise ValueError("select one freshwater lake probe or the paired Columbia probes")
+            probes = (("lake", lake_nml),)
+            for name in ("fvcom_mp_lake_signed_donor.patch", "fvcom_mp_lake_surface_units.patch",
+                         "fvcom_mp_spherical_integer.patch", "perlmutter_lake_probe.f90"):
+                (stage/name).write_bytes((assets/name).read_bytes().replace(b"\r\n", b"\n"))
+        for label, path in probes:
+            if not path:
+                raise ValueError("supply the native namelist for every selected probe")
             text = path.read_text(encoding="utf-8-sig")
-            build.check_cpu_reader(text, label)
-            for key, value in (("INPUT_DIR","../input"),("OUTPUT_DIR","../output"),("OBC_NODE_LIST_FILE","expected_read_end.dat")):
+            edits = {"INPUT_DIR":"../input", "OUTPUT_DIR":"../output", "OBC_NODE_LIST_FILE":"expected_read_end.dat"}
+            if label == "lake":
+                edits.update(STARTUP_FILE="expected_read_end.nc", SIGMA_LEVELS_FILE="expected_read_end.dat",
+                             RIVER_INFO_FILE="river.nml")
+            else:
+                build.check_cpu_reader(text, label)
+            for key, value in edits.items():
                 text, count = re.subn(r"(?mi)^(\s*" + key + r"\s*=\s*)[^\n]*$", lambda m: m[1]+"'"+value+"',", text)
                 if count != 1:
                     raise ValueError(f"{label} native reader probe needs one {key}")
@@ -74,8 +92,10 @@ def package(source_package, control_nml, combined_nml, river_nml, output, accoun
 
 if __name__ == "__main__":
     p=argparse.ArgumentParser(description=__doc__)
-    for name in ("source-package","control-nml","combined-nml","river-nml","output"):
+    for name in ("source-package","river-nml","output"):
         p.add_argument("--"+name, type=Path,required=True)
+    for name in ("control-nml","combined-nml","lake-nml"):
+        p.add_argument("--"+name, type=Path)
     p.add_argument("--account",required=True)
     p.add_argument("--qos",choices=("debug","regular"),default="debug")
     args=p.parse_args()

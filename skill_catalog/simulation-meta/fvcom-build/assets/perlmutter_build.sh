@@ -120,7 +120,22 @@ for name in "${portable[@]}"; do cp "$name" "$evidence/$name.before"; done
 cp "$payload/fvcom_mp_fortran_portability.patch" "$evidence/fortran_portability.diff"
 patch -p1 --fuzz=0 --forward < "$evidence/fortran_portability.diff"
 printf '%s\n' 'Replace comparisons of a single logical flag with its equivalent logical expression, type an exact unit SIGN magnitude to match UN, and write the same adjacency list with standard I10 repeat syntax.' > "$evidence/fortran_portability_reason.txt"
+if [[ -f $payload/perlmutter_lake_probe.f90 ]]; then
+  cp mod_prec.F "$evidence/mod_prec.F.before"
+  cp "$payload/fvcom_mp_lake_signed_donor.patch" "$evidence/lake_signed_donor.diff"
+  patch -p1 --fuzz=0 --forward < "$evidence/lake_signed_donor.diff"
+  cp mod_main.F "$evidence/mod_main.F.before"
+  cp bcond_gcn.F "$evidence/bcond_gcn.F.before"
+  cp "$payload/fvcom_mp_lake_surface_units.patch" "$evidence/lake_surface_units.diff"
+  patch -p1 --fuzz=0 --forward < "$evidence/lake_surface_units.diff"
+  cp adv_uv_edge_gcn.F "$evidence/adv_uv_edge_gcn.F.before"
+  cp adv_uv_edge_gcy.F "$evidence/adv_uv_edge_gcy.F.before"
+  cp "$payload/fvcom_mp_spherical_integer.patch" "$evidence/spherical_integer.diff"
+  patch -p1 --fuzz=0 --forward < "$evidence/spherical_integer.diff"
+  printf '%s\n' 'Use the local lake tracer for a negative edge discharge at each receiving node and layer. Preserve prescribed tributary tracers and native geometry/vertical flux weights.' > "$evidence/lake_signed_donor_reason.txt"
+fi
 sha256sum mod_utils.F mod_interp.F mod_plast.F mod_newinp.F "${portable[@]}" > "$evidence/patched_sources.sha256"
+if [[ -f $payload/perlmutter_lake_probe.f90 ]]; then sha256sum mod_prec.F mod_main.F bcond_gcn.F adv_uv_edge_gcn.F adv_uv_edge_gcy.F >> "$evidence/patched_sources.sha256"; fi
 printf '%s\n' 'Both SIGN operands must use the same Fortran kind. The typed 1.0_sp magnitude is exact in either kind. All sign arguments and expressions are preserved.' > "$evidence/sign_kind_reason.txt"
 case "$family" in
   gnu) macro=GFORTRAN; options='-O2 -ffree-line-length-none -fallow-argument-mismatch -fno-range-check'; julian_fc='ftn -fallow-argument-mismatch';;
@@ -129,9 +144,14 @@ case "$family" in
 esac
 printf 'TOPDIR = %s\nCOMPILER = -D%s\nOPT = %s\n' "$src" "$macro" "$options" > make.inc
 cat "$payload/perlmutter_make.inc" >> make.inc
+audit_options=(--air-pressure)
+if [[ -f $payload/perlmutter_lake_probe.f90 ]]; then
+  echo 'MODEL_FLAGS += -DSPHERICAL -DFRESHWATER_LAKE' >> make.inc
+  audit_options+=(--spherical)
+fi
 cp make.inc "$evidence/make.inc.after"
 diff -u "$evidence/make.inc.before" make.inc > "$evidence/make.inc.diff" || test "$?" = 1
-run_python "$payload/fvcom_build.py" audit-make-inc --air-pressure --make-inc make.inc --expected-topdir "$src" > "$evidence/make_inc_audit.json"
+run_python "$payload/fvcom_build.py" audit-make-inc "${audit_options[@]}" --make-inc make.inc --expected-topdir "$src" > "$evidence/make_inc_audit.json"
 cd libs
 tar xzf metis.tgz
 tar xzf julian.tgz
@@ -150,7 +170,7 @@ print-objects:
 	@echo $(FVCOM_OBJS)
 MAKE
 run_python "$payload/perlmutter_dependencies.py" "$evidence/make_inc_audit.json" "$evidence/compiled_objects.txt" > "$evidence/active_dependencies.mk"
-make -f makefile -f "$evidence/active_dependencies.mk" -j8 fvcom_plased
+make -k -f makefile -f "$evidence/active_dependencies.mk" -j8 fvcom_plased
 sha256sum fvcom_plased > "$evidence/executable.sha256"
 file fvcom_plased > "$evidence/executable.file.txt"
 ldd fvcom_plased > "$evidence/executable.ldd.txt"
@@ -160,13 +180,25 @@ cd "$work/reader/run"
 srun --exact --ntasks=1 --cpus-per-task=1 --cpu-bind=cores "$src/fvcom_plased" --create_namelist=blank > "$evidence/blank_probe.log" 2>&1
 cp blank_run.nml "$evidence/blank_namelist.nml"
 cp "$payload/river.nml" ../input/
-for member in control combined; do
+members=(control combined)
+if [[ -f $payload/perlmutter_lake_probe.f90 ]]; then
+  members=(lake)
+  cp "$payload/perlmutter_lake_probe.f90" "$evidence/"
+  (cd "$src"; ftn $options -I. "$evidence/perlmutter_lake_probe.f90" libfvcom.a -Llibs/install/lib -lmetis -ljulian -o "$work/lake_probe")
+  srun --exact --ntasks=1 --cpus-per-task=1 --cpu-bind=cores "$work/lake_probe" > "$evidence/lake_physics.log" 2>&1
+  grep -Fx 'FVCOM_LAKE_EOS_SIGNED_EDGE_PASS' "$evidence/lake_physics.log"
+fi
+for member in "${members[@]}"; do
   cp "$payload/probe_${member}_run.nml" probe_run.nml
   cp probe_run.nml "$evidence/probe_${member}_run.nml"
   reader_status=0
   srun --exact --ntasks=1 --cpus-per-task=1 --cpu-bind=cores "$src/fvcom_plased" --casename=probe --dbg=4 > "$evidence/${member}_reader.log" 2>&1 || reader_status=$?
-  grep -Fi 'Subroutine Ends: Read_Name_List;' "$evidence/${member}_reader.log"
-  grep -Fi 'expected_read_end.dat NOT FOUND' "$evidence/${member}_reader.log"
+  grep -aFi 'Subroutine Ends: Read_Name_List;' "$evidence/${member}_reader.log"
+  if [[ $member == lake ]]; then
+    grep -aEi 'expected_read_end.nc; Can not be opend by nf90_open|expected_read_end.dat NOT FOUND' "$evidence/${member}_reader.log"
+  else
+    grep -aFi 'expected_read_end.dat NOT FOUND' "$evidence/${member}_reader.log"
+  fi
   echo "$member reader completed namelist and reached intentional OBC sentinel (rc=$reader_status)." >> "$evidence/smoke.log"
 done
 echo FVCOM_INPUT_SMOKE_PASS >> "$evidence/smoke.log"

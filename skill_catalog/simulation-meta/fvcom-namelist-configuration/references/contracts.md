@@ -157,3 +157,8 @@ On this build the runtime uses `RIVER_KIND='variable'`, `RIVER_TS_SETTING='calcu
 ```powershell
 python scripts/fvcom_namelist.py validate --namelist case_run.nml --request request.json --river-manifest forcing/river_manifest.json --input-root input
 ```
+## Freshwater lake configuration
+
+Run `fvcom_namelist.py lake --help` for the complete interface. Use `--start` and `--end` as UTC instants, `--extstep` and `--isplit` from the native mesh's wave and advection bounds, `--startup` for the native thermal-state NetCDF and `--surface` and `--pe` for the atmosphere and freshwater files. Bind the actual `--river-number`, edge-source companion `--river-info`, and station file and location type. Use the output immediately within its separately frozen attempt. The native blank governs every required group and field.
+
+The lake reads hotstart elevation, momentum, turbulence and temperature state, including native reference density fields. Its active temperature and zero salinity use the `dens1` freshwater-capable EOS. Native geometry is geographic, with 20 layers and 21 interfaces for the retained NOAA lake. Enable variable wind stress, absolute atmospheric pressure, net heat including incoming shortwave, separately specified penetrating shortwave and precipitation plus negative evaporation. Set `RIVER_TS_SETTING='calculated'` and `RIVER_INFLOW_LOCATION='edge'` with the freshwater executable. The closed lake uses neither open-boundary forcing nor tides. In this experiment the configuration writes hourly station profiles, six-hour three-dimensional fields and daily restarts.

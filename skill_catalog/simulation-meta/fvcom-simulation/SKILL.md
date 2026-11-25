@@ -1,11 +1,11 @@
 ---
 name: fvcom-simulation
-description: Orchestrate reproducible FVCOM tide, wind, river and combined experiments, with Kestrel production and benchmarking, the Perlmutter Columbia combined smoke pilot, and scientific validation.
+description: Orchestrate FVCOM barotropic tide, wind and river experiments and freshwater baroclinic lake studies, including Perlmutter initialization, forcing, spin-up, benchmarking, monthly production and validation.
 ---
 
 # FVCOM Simulation
 
-The default execution site is Kestrel. An explicit `execution.site: perlmutter` selects the [Columbia combined Perlmutter pilot](references/perlmutter_columbia_pilot.md), including its native build, 52-rank CPU smoke and archived Kestrel reference. Use `$perlmutter-hpc` for all remote actions on that route.
+The default execution site is Kestrel. An explicit `execution.site: perlmutter` routes the [Columbia combined pilot](references/perlmutter_columbia_pilot.md) or the [baroclinic Lake Superior study](references/lake_superior_baroclinic.md) through `$perlmutter-hpc`.
 
 Interpret the science request and route the complete workflow. This skill is an orchestration contract only: it contains no scripts, performs no SSH itself, and never replaces the specialist skills that create or inspect artifacts.
 
@@ -48,6 +48,8 @@ timing, attempt counts or scientific gates. Do not create campaign controllers,
 global hooks or polling daemons. This rule also applies to `paper_barotropic`.
 
 ## Modes (ordinary workflow)
+
+- `baroclinic-temperature-wind-river`: use the [Lake Superior baroclinic workflow](references/lake_superior_baroclinic.md) for the native NOAA lake geometry, a dated three-dimensional initialization, freshwater surface and river budgets, spin-up sensitivity, Perlmutter benchmarking and a summer hindcast.
 
 - `barotropic_tide`: prepare, stabilize, benchmark, run, and validate a tide-only FVCOM case.
 - `barotropic-tide-river`: add observed volume discharge to the three-dimensional barotropic tide workflow. Follow [river preparation and validation](references/barotropic_tide_river.md) for the source, mesh, configuration, and experiment-specific gates. The optional `columbia_river_pair` profile selects a matched control and treatment with a short cold-start schedule.

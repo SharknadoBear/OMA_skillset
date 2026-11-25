@@ -93,3 +93,7 @@ For `execution.site=perlmutter`, use the `perlmutter-hpc` bridge to inspect the 
 ## Matched wind and discharge study
 
 Use the same pressure-capable executable for every member of `columbia_wind_river_factorial`. Rebind an archived build with `fvcom_build.py reuse --request ... --binding ... --evidence ... --archive ... --binary ... --template ... --artifact-root MEMBER/run/build`. The command verifies the original evidence, executable, flags, template, build environment and source pin, then records the destination executable path and original binding hash.
+
+## Freshwater lake
+
+For the Lake Superior freshwater baroclinic study, use the [freshwater build contract](references/contracts.md#spherical-freshwater-lake). The build retains a source-specific thermal and signed-outflow audit.

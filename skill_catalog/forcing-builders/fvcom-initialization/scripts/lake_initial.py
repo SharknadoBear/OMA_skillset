@@ -34,19 +34,23 @@ def save(path, value):
 
 
 def native_times(ds):
+    integers=None
+    if "Itime" in ds.variables and "Itime2" in ds.variables:
+        days=ds["Itime"]
+        if not days.units.startswith("days since "): raise ValueError("Unrecognized FVCOM integer date reference")
+        origin=utc(days.units.removeprefix("days since "))
+        integers=[origin+timedelta(days=int(d),milliseconds=int(ms)) for d,ms in zip(days[:],ds["Itime2"][:])]
     if "Times" in ds.variables:
-        times = [utc(b"".join(row).decode().strip(" \x00")) for row in ds["Times"][:].filled(b" ") if len(row)]
-    elif "Itime" in ds.variables and "Itime2" in ds.variables:
-        times = [MJD + timedelta(days=int(d),milliseconds=int(ms)) for d,ms in zip(ds["Itime"][:],ds["Itime2"][:])]
+        times = [utc(b"".join(row).decode().strip(" \x00")) for row in np.ma.asarray(ds["Times"][:]).filled(b" ") if len(row)]
+    elif integers is not None:
+        times=integers
     else:
         values = nc.num2date(ds["time"][:], ds["time"].units)
         times = [datetime(t.year,t.month,t.day,t.hour,t.minute,t.second,t.microsecond,tzinfo=timezone.utc) for t in values]
     if len(times) != len(set(times)) or times != sorted(times):
         raise ValueError("Invalid native clock")
-    if "Itime" in ds.variables and "Itime2" in ds.variables:
-        for t,d,ms in zip(times,ds["Itime"][:],ds["Itime2"][:]):
-            if t != MJD + timedelta(days=int(d),milliseconds=int(ms)):
-                raise ValueError("Native integer and character clocks differ")
+    if integers is not None and times!=integers:
+        raise ValueError("Native integer and character clocks differ")
     return times
 
 

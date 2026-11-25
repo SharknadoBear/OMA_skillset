@@ -12,6 +12,7 @@ import shutil
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
+import fvcom_lake as lake
 
 
 from fvcom_profiles import (BAROTROPIC_MODES, COMBINED_MODE, FACTORIAL_PROFILE, PAIR_PROFILE, PAPER_PROFILE,
@@ -71,6 +72,11 @@ def write_json(path: Path, value: Any) -> None:
 def validate_request(req: dict[str, Any]) -> None:
     if req.get("schema") != "simulation_request_v1":
         raise ValueError("schema must be simulation_request_v1")
+    if req.get("mode") == lake.MODE:
+        if not str(req.get("case_id","")).strip():
+            raise ValueError("case_id is required")
+        lake.resolve(req)
+        return
     if req.get("mode") not in BAROTROPIC_MODES | {"benchmark"}:
         raise ValueError("unsupported FVCOM simulation mode")
     if not str(req.get("case_id", "")).strip():
@@ -94,6 +100,8 @@ def validate_request(req: dict[str, Any]) -> None:
 
 
 def grid_order(policy: str = "accepted_then_fresh") -> list[str]:
+    if policy == lake.GRID_POLICY:
+        return ["native_lsofs"]
     if policy == "retained_only":
         return ["retained_columbia"]
     if policy == "fresh_only":
@@ -110,6 +118,8 @@ def project_layout(root: Path, mode: str = "barotropic_tide", policy: str = "acc
     ]
     if mode in BAROTROPIC_MODES:
         paths += list(BAROTROPIC_AGENT_ROOTS.values())
+    elif mode == lake.MODE:
+        paths += list(lake.ROLE_ROOTS.values())
     for case in grid_order(policy):
         paths += [
             f"gridding/{case}", f"forcing/{case}",
@@ -149,6 +159,14 @@ def init_project(request_path: Path, project: Path) -> dict[str, Any]:
             "schema": "fvcom_barotropic_agent_layout_v1",
             "role_roots": dict(BAROTROPIC_AGENT_ROOTS),
         }
+    elif req["mode"] == lake.MODE:
+        manifest["agent_layout"] = {"schema":"fvcom_lake_agent_layout_v1","role_roots":dict(lake.ROLE_ROOTS)}
+        plan = lake.schedule(req)
+        plan_path = project / "stage_plan.json"
+        if plan_path.exists() and load_data(plan_path)!=plan:
+            raise FileExistsError("project already contains a different Lake Superior stage plan")
+        if not plan_path.exists():
+            write_json(plan_path,plan)
     manifest_path = project / "project_manifest.json"
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -214,7 +232,7 @@ def record_command(project: Path, kind: str, command: str, status: str,
     return entry
 
 
-def evaluate_preparation_join(manifest_paths: list[Path]) -> dict[str, Any]:
+def evaluate_preparation_join(manifest_paths: list[Path], *, lake_case: bool = False) -> dict[str, Any]:
     """Validate the common manifest envelope for the three initial workers."""
     if len(manifest_paths) != 3:
         raise ValueError(f"preparation join requires exactly three worker manifests; found {len(manifest_paths)}")
@@ -227,6 +245,8 @@ def evaluate_preparation_join(manifest_paths: list[Path]) -> dict[str, Any]:
     role_aliases = {"grid": "grid", "grid_preconfiguration": "grid", "tpxo": "tpxo",
                     "tpxo_forcing": "tpxo", "configuration_build": "configuration_build",
                     "namelist_build": "configuration_build"}
+    if lake_case:
+        role_aliases["forcing_initialization"]="forcing_initialization"
     for path in manifest_paths:
         value = json.loads(path.read_text(encoding="utf-8"))
         missing = sorted(required - set(value))
@@ -257,8 +277,9 @@ def evaluate_preparation_join(manifest_paths: list[Path]) -> dict[str, Any]:
         })
     if len(set(tokens)) != len(tokens):
         raise ValueError("initial-worker resume tokens must be unique")
-    if {x["worker"] for x in workers} != {"grid", "tpxo", "configuration_build"}:
-        raise ValueError("preparation requires one manifest for each of grid, tpxo, configuration_build")
+    expected_roles={"grid","forcing_initialization" if lake_case else "tpxo","configuration_build"}
+    if {x["worker"] for x in workers} != expected_roles:
+        raise ValueError("preparation requires one manifest for each of "+", ".join(sorted(expected_roles)))
     not_ready = [item for item in workers if item["status"] != "ready" or item["hash_count"] == 0 or item["blocking_reasons"]]
     blocker_text = json.dumps(not_ready, sort_keys=True).lower()
     user_gate = any(word in blocker_text for word in ("authorization", "authentication", "credential", "locator", "password", "otp"))
@@ -588,7 +609,7 @@ def attempt_sbatch(args: argparse.Namespace, aid: str, stage: str | None) -> str
 #SBATCH --qos={cfg['qos']}
 #SBATCH --nodes={args.nodes}
 #SBATCH --ntasks={args.ranks}
-#SBATCH --ntasks-per-node={args.ranks}
+#SBATCH --ntasks-per-node={(args.ranks+args.nodes-1)//args.nodes}
 #SBATCH --cpus-per-task={cfg['threads_per_rank']}
 #SBATCH --hint=nomultithread
 #SBATCH --time={args.walltime}
@@ -1138,6 +1159,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Common divisor of stage durations and output intervals; April campaign uses 360")
     q = sub.add_parser("plan")
     q.add_argument("--controls", required=True); q.add_argument("--output", required=True)
+    q = sub.add_parser("lake-attempt",help="Freeze a baroclinic lake stage on Perlmutter")
+    for option in ("project","namelist","inputs","binding"):
+        q.add_argument("--"+option,required=True,type=Path)
+    q.add_argument("--name",required=True)
+    q.add_argument("--revision",type=int,default=0)
+    q.add_argument("--walltime",required=True)
+    q.add_argument("--qos",choices=["regular","debug"],default="regular")
+    q.add_argument("--case-name",default="superior")
+    q.add_argument("--benchmark-summary",type=Path)
     q = sub.add_parser("attempt")
     q.add_argument("--project", required=True); q.add_argument("--grid-case", required=True, choices=["accepted_t6v6", "fresh_reproduction", "retained_columbia"])
     q.add_argument("--plan"); q.add_argument("--index", type=int, required=True)
@@ -1164,6 +1194,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--command", dest="command_text", required=True); q.add_argument("--status", default="success")
     q.add_argument("--artifact", action="append", default=[])
     q = sub.add_parser("join")
+    q.add_argument("--project", help="Resolve the preparation roles from this initialized study")
     q.add_argument("--manifest", action="append", required=True); q.add_argument("--output", required=True)
     q = sub.add_parser("report"); q.add_argument("--project", required=True)
     return p
@@ -1184,6 +1215,9 @@ def main() -> int:
         result = stability_plan(load_data(Path(args.controls))); write_json(Path(args.output), result)
     elif args.command == "attempt":
         result = create_attempt(args)
+    elif args.command == "lake-attempt":
+        from fvcom_lake_attempt import materialize
+        result = materialize(args)
     elif args.command == "audit":
         result = audit_run(Path(args.stdout), Path(args.stderr) if args.stderr else None,
                            args.exit_code, args.expected_final, [Path(x) for x in args.netcdf],
@@ -1191,7 +1225,8 @@ def main() -> int:
     elif args.command == "record":
         result = record_command(Path(args.project), args.kind, args.command_text, args.status, args.artifact)
     elif args.command == "join":
-        result = evaluate_preparation_join([Path(path) for path in args.manifest]); write_json(Path(args.output), result)
+        is_lake=bool(args.project and load_data(Path(args.project)/"request.json")["mode"]==lake.MODE)
+        result = evaluate_preparation_join([Path(path) for path in args.manifest],lake_case=is_lake); write_json(Path(args.output), result)
     else:
         result = {"report": str(render_report(Path(args.project)))}
     print(json.dumps(result, indent=2, sort_keys=True))

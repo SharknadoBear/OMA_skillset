@@ -8,6 +8,19 @@ description: Build and verify observed, node-distributed barotropic FVCOM river 
 Use the observed-discharge workflow for `barotropic-tide-river`. The Delaware
 helpers below also support analytical and tracer studies.
 
+## Signed freshwater edges in a baroclinic lake
+
+Use `scripts/build_lake_edge_rivers.py --series GAUGES.csv --control NOS_RIVER.ctl --source-grid DATED_FIELDS.nc --grid-manifest GRID_MANIFEST.json --prefix PREFIX --out NEW_DIR`.
+Supply one row per station and time, with `timestamp_utc,gauge_id,discharge_m3s,temperature_degC,temperature_source`.
+Preserve station IDs as strings, including leading zeroes. Represent each gauge
+with a positive magnitude and let the operational control assign signed
+fractions to native shoreline elements. Record any temperature climatology
+and retain measured and applied volume separately. Set the native location
+to `edge` and use a reader that applies prescribed temperature to incoming
+water and local layer temperature to withdrawals. The outlet file carries a
+finite zero placeholder. The ready manifest records the source hashes, native
+face endpoints, per-gauge volumes, distribution factors and all three clocks.
+
 ## Observed barotropic inflow
 
 1. Obtain a complete, regular `usgs_continuous_discharge_v1` source through

@@ -1,0 +1,102 @@
+--- a/mod_prec.F
++++ b/mod_prec.F
+@@ -60,4 +60,13 @@
+ 
+ 
++CONTAINS
++   PURE ELEMENTAL REAL(SP) FUNCTION SIGNED_RIVER_TRACER(Q, RIVER_VALUE, LAKE_VALUE)
++      REAL(SP), INTENT(IN) :: Q, RIVER_VALUE, LAKE_VALUE
++# if defined (FRESHWATER_LAKE)
++      SIGNED_RIVER_TRACER = MERGE(LAKE_VALUE, RIVER_VALUE, Q < 0.0_SP)
++# else
++      SIGNED_RIVER_TRACER = RIVER_VALUE
++# endif
++   END FUNCTION SIGNED_RIVER_TRACER
+ END MODULE MOD_PREC
+ 
+--- a/adv_t.F
++++ b/adv_t.F
+@@ -608,14 +608,15 @@
+               J1=N_ICELLQ(J,1)
+               J2=N_ICELLQ(J,2)
+-              STPOINT=TDIS(J) !!ASK LIU SHOULD THIS BE STPOINT1(J1)/STPOINT2(J2)
+               DO K=1,KBM1
++                 STPOINT1=SIGNED_RIVER_TRACER(QDIS(J),TDIS(J),T1(J1,K))
++                 STPOINT2=SIGNED_RIVER_TRACER(QDIS(J),TDIS(J),T1(J2,K))
+               !   STPOINT1 = T1(J1,K)
+               !   STPOINT2 = T1(J2,K)
+-                 T1_FRESH(J1,K)=TDIS(J)
+-                 T1_FRESH(J2,K)=TDIS(J)
++                 T1_FRESH(J1,K)=STPOINT1
++                 T1_FRESH(J2,K)=STPOINT2
+                  XFLUX(J1,K)=XFLUX(J1,K)-  &
+-                      QDIS(J)*RDISQ(J,1)*VQDIST(J,K)*STPOINT    !1     !/DZ1(J1,K)
++                      QDIS(J)*RDISQ(J,1)*VQDIST(J,K)*STPOINT1    !1     !/DZ1(J1,K)
+                  XFLUX(J2,K)=XFLUX(J2,K)-  &      
+-                      QDIS(J)*RDISQ(J,2)*VQDIST(J,K)*STPOINT    !2     !/DZ1(J2,K)
++                      QDIS(J)*RDISQ(J,2)*VQDIST(J,K)*STPOINT2    !2     !/DZ1(J2,K)
+               END DO
+            END DO
+@@ -951,6 +952,7 @@
+               J1=N_ICELLQ(J,1)
+               J2=N_ICELLQ(J,2)
+-              STPOINT=TDIS(J) !!ASK LIU SHOULD THIS BE STPOINT1(J1)/STPOINT2(J2)
+               DO K=1,KBM1
++                 STPOINT1=SIGNED_RIVER_TRACER(QDIS(J),TDIS(J),T1(J1,K))
++                 STPOINT2=SIGNED_RIVER_TRACER(QDIS(J),TDIS(J),T1(J2,K))
+                  !STPOINT1 = T1(J1,K)
+                  !STPOINT2 = T1(J2,K)
+@@ -959,6 +961,6 @@
+                  !             XFLUX(J2,K)=XFLUX(J2,K)-  &
+                  !                         QDIS(J)*RDISQ(J,2)*VQDIST(J,K)*STPOINT2/DZ1(J2,K)
+-                 XFLUX(J1,K)=XFLUX(J1,K)-QDIS(J)*RDISQ(J,1)*VQDIST(J,K)*STPOINT   !1
+-                 XFLUX(J2,K)=XFLUX(J2,K)-QDIS(J)*RDISQ(J,2)*VQDIST(J,K)*STPOINT   !2
++                 XFLUX(J1,K)=XFLUX(J1,K)-QDIS(J)*RDISQ(J,1)*VQDIST(J,K)*STPOINT1   !1
++                 XFLUX(J2,K)=XFLUX(J2,K)-QDIS(J)*RDISQ(J,2)*VQDIST(J,K)*STPOINT2   !2
+               END DO
+            END DO
+--- a/adv_s.F
++++ b/adv_s.F
+@@ -60,5 +60,5 @@
+   REAL(SP) :: UTMP,VTMP,SITAI,FFD,FF1 !,X11,Y11,X22,Y22,X33,Y33 !,TMP1,TMP2 !,XI,YI
+   REAL(SP) :: DXA,DYA,DXB,DYB,FIJ1,FIJ2,UN
+-  REAL(SP) :: TXX,TYY,FXX,FYY,VISCOF,EXFLUX,TEMP,STPOINT
++  REAL(SP) :: TXX,TYY,FXX,FYY,VISCOF,EXFLUX,TEMP,STPOINT,STPOINT1,STPOINT2
+   REAL(SP) :: FACT,FM1
+   INTEGER  :: I,I1,I2,IA,IB,J,J1,J2,K,JTMP,JJ,II
+@@ -569,12 +569,13 @@
+               J1=N_ICELLQ(J,1)
+               J2=N_ICELLQ(J,2)
+-              STPOINT=SDIS(J) !!ASK LIU SHOULD THIS BE STPOINT1(J1)/STPOINT2(J2)
+               DO K=1,KBM1
+-                 S1_FRESH(J1,K)=SDIS(J)
+-                 S1_FRESH(J2,K)=SDIS(J)
++                 STPOINT1=SIGNED_RIVER_TRACER(QDIS(J),SDIS(J),S1(J1,K))
++                 STPOINT2=SIGNED_RIVER_TRACER(QDIS(J),SDIS(J),S1(J2,K))
++                 S1_FRESH(J1,K)=STPOINT1
++                 S1_FRESH(J2,K)=STPOINT2
+                  XFLUX(J1,K)=XFLUX(J1,K)-  &
+-                      QDIS(J)*RDISQ(J,1)*VQDIST(J,K)*STPOINT    !/DZ1(J1,K)
++                      QDIS(J)*RDISQ(J,1)*VQDIST(J,K)*STPOINT1    !/DZ1(J1,K)
+                  XFLUX(J2,K)=XFLUX(J2,K)-  &
+-                      QDIS(J)*RDISQ(J,2)*VQDIST(J,K)*STPOINT    !/DZ1(J2,K)
++                      QDIS(J)*RDISQ(J,2)*VQDIST(J,K)*STPOINT2    !/DZ1(J2,K)
+               END DO
+            END DO
+@@ -909,12 +910,13 @@
+               J1=N_ICELLQ(J,1)
+               J2=N_ICELLQ(J,2)
+-              STPOINT=SDIS(J) !!ASK LIU SHOULD THIS BE STPOINT1(J1)/STPOINT2(J2)
+               DO K=1,KBM1
++                 STPOINT1=SIGNED_RIVER_TRACER(QDIS(J),SDIS(J),S1(J1,K))
++                 STPOINT2=SIGNED_RIVER_TRACER(QDIS(J),SDIS(J),S1(J2,K))
+                  !             XFLUX(J1,K)=XFLUX(J1,K)-   &
+                  !                         QDIS(J)*RDISQ(J,1)*VQDIST(J,K)*STPOINT/DZ1(J1,K)
+                  !             XFLUX(J2,K)=XFLUX(J2,K)-   &
+                  !                         QDIS(J)*RDISQ(J,2)*VQDIST(J,K)*STPOINT/DZ1(J2,K)
+-                 XFLUX(J1,K)=XFLUX(J1,K)-QDIS(J)*RDISQ(J,1)*VQDIST(J,K)*STPOINT
+-                 XFLUX(J2,K)=XFLUX(J2,K)-QDIS(J)*RDISQ(J,2)*VQDIST(J,K)*STPOINT
++                 XFLUX(J1,K)=XFLUX(J1,K)-QDIS(J)*RDISQ(J,1)*VQDIST(J,K)*STPOINT1
++                 XFLUX(J2,K)=XFLUX(J2,K)-QDIS(J)*RDISQ(J,2)*VQDIST(J,K)*STPOINT2
+               END DO
+            END DO

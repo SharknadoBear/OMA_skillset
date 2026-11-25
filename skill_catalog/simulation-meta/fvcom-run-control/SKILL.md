@@ -5,6 +5,8 @@ description: Initialize immutable FVCOM simulation projects, derive conservative
 
 # FVCOM Run Control
 
+For `baroclinic-temperature-wind-river` with profile `lake_superior_summer`, use `init` to resolve the NOAA lake grid and write the UTC stage plan. Use `join --project PROJECT` with the grid, forcing/initialization and configuration/build manifests. Use `lake-attempt` to freeze the stage-specific native namelist, exact filename-to-SHA-256 input map and frozen Perlmutter binary binding. The generated CPU launch verifies the staged files and executable before MPI starts. The production layout comes from the benchmark summary. [Lake workflow](../fvcom-simulation/references/lake_superior_baroclinic.md)
+
 For `columbia_river_pair`, create each member with `init` and use the [matched-pair workflow](../fvcom-simulation/references/barotropic_tide_river.md). For each prepared single-stage attempt, run `python scripts/freeze_attempt_inputs.py --project PROJECT --attempt run/fresh_reproduction/attempts/ATTEMPT` before transfer. It binds the actual run namelist, station mapping, executable and flat file inventory in `input_freeze.json`. Repeating the command verifies the existing freeze.
 
 For `columbia_wind_pair`, initialize the tide control and wind treatment with the retained grid branch `retained_columbia`. The [wind workflow](../fvcom-simulation/references/barotropic_tide_wind.md) defines the 14-day spin-up, cold-start stages and forcing checks. Use the same attempt and freeze commands with that grid branch.

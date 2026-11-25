@@ -1,0 +1,18 @@
+--- a/adv_uv_edge_gcn.F
++++ b/adv_uv_edge_gcn.F
+@@ -1009,5 +1009,5 @@
+ #  if defined (SPHERICAL)
+ #  if !defined (SEMI_IMPLICIT)
+-     CALL ADV_UV_EDGE_XY(XFLUX,YFLUX,0.0_SP,0,0_SP)
++     CALL ADV_UV_EDGE_XY(XFLUX,YFLUX,0.0_SP,0,0)
+ #  else
+      CALL ADV_UV_EDGE_XY(XFLUX,YFLUX,IFCETA,STAGE,KSTAGE_UV)
+--- a/adv_uv_edge_gcy.F
++++ b/adv_uv_edge_gcy.F
+@@ -798,5 +798,5 @@
+ #  if defined (SPHERICAL)
+ #  if !defined (SEMI_IMPLICIT)
+-     CALL ADV_UV_EDGE_XY(XFLUX,YFLUX,0.0_SP,0,0_SP)
++     CALL ADV_UV_EDGE_XY(XFLUX,YFLUX,0.0_SP,0,0)
+ #  else
+      CALL ADV_UV_EDGE_XY(XFLUX,YFLUX,IFCETA,STAGE,KSTAGE_UV)

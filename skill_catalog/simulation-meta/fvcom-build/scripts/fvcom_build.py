@@ -198,12 +198,15 @@ def pressure_build(request: Dict[str, Any]) -> bool:
     return needs_air_pressure(request)
 
 
-def audit_make_inc(path: Path, expected_topdir: str, air_pressure: bool = False) -> Dict[str, Any]:
+def audit_make_inc(path: Path, expected_topdir: str, air_pressure: bool = False, spherical: bool = False) -> Dict[str, Any]:
     text = path.read_text(encoding="utf-8-sig", errors="replace")
     defines = active_defines(text)
     required = REQUIRED_DEFINES | ({"AIR_PRESSURE"} if air_pressure else set())
     forbidden_exact = ((FORBIDDEN_EXACT - {"AIR_PRESSURE"}) | WIND_INCOMPATIBLE_DEFINES
                        if air_pressure else FORBIDDEN_EXACT)
+    if spherical:
+        required = required | {"SPHERICAL"}
+        forbidden_exact = forbidden_exact - {"SPHERICAL"}
     missing = sorted(required.difference(defines))
     forbidden = sorted(
         name for name in defines
@@ -228,6 +231,19 @@ def audit_make_inc(path: Path, expected_topdir: str, air_pressure: bool = False)
 
 def build_plan(request: Dict[str, Any], local_root: Path, remote_root: str) -> Dict[str, Any]:
     request = resolve_request(request)
+    if request.get("profile") == "lake_superior_summer":
+        config = site_configuration(request)
+        source = PurePosixPath(config["source_dir"])
+        project = PurePosixPath(config["project_dir"])
+        if source.parent != project or ".." in source.parts:
+            raise ContractError("the lake build must use a shared source directory within its PSCRATCH project")
+        return {"schema":"fvcom_build_plan_v1","case_id":request["case_id"],"execution_site":"perlmutter",
+                "created_utc":utc_now(),"source_commit":config["source_commit"],"source_dir":str(source),
+                "local_artifact_root":str(local_root.resolve()),"remote_artifact_root":remote_root.rstrip("/"),
+                "required_defines":sorted(REQUIRED_DEFINES | {"AIR_PRESSURE","FRESHWATER_LAKE","SPHERICAL"}),
+                "phases":["verify_archived_source","native_cpu_mpi_netcdf","compile","native_generated_blank",
+                          "linked_freshwater_eos","positive_and_negative_edge_donor","native_namelist_reader","freeze"],
+                "production_submission_allowed":False,"source_edits_after_freeze_allowed":False}
     validate_request(request)
     environment = build_environment(request)
     source = site_configuration(request)["source_dir"].rstrip("/")
@@ -569,12 +585,18 @@ def reuse_build(request: dict, binding_path: Path, evidence: Path, archive: Path
 
 
 def cli(argv: Iterable[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["finalize-lake"]:
+        from finalize_lake_build import cli as lake_cli
+        return lake_cli(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("finalize-lake", help="Freeze a native Perlmutter freshwater baroclinic build")
     audit = sub.add_parser("audit-make-inc", help="Audit active TOPDIR and preprocessor definitions")
     audit.add_argument("--make-inc", type=Path, required=True)
     audit.add_argument("--expected-topdir", required=True)
     audit.add_argument("--air-pressure", action="store_true", help="Require the pressure-capable wind-pair build")
+    audit.add_argument("--spherical", action="store_true", help="Require geographic-coordinate model dynamics")
     audit.add_argument("--output", type=Path)
     plan = sub.add_parser("plan", help="Validate a simulation request and emit a build plan")
     plan.add_argument("--request", type=Path, required=True)
@@ -591,7 +613,7 @@ def cli(argv: Iterable[str] | None = None) -> int:
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
         if args.command == "audit-make-inc":
-            result = audit_make_inc(args.make_inc, args.expected_topdir, args.air_pressure)
+            result = audit_make_inc(args.make_inc, args.expected_topdir, args.air_pressure, args.spherical)
             if args.output:
                 write_json(args.output, result)
             print(json.dumps(result, indent=2, sort_keys=True))

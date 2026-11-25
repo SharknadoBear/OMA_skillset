@@ -1,0 +1,26 @@
+--- a/mod_main.F
++++ b/mod_main.F
+@@ -1073,5 +1073,9 @@
+    REAL(DP), PARAMETER :: DEG2RAD   = PI2/360.0_DP   !!Radians/Degree
+    REAL(DP), PARAMETER :: TPI       = DEG2RAD*REARTH !TPI=pi*rearth/180.=3.14159265/180.0*6371.*1000.
++# if defined (FRESHWATER_LAKE)
++   REAL(DP), PARAMETER :: ROFVROS   = 1.0_DP ! Freshwater precipitation and evaporation into freshwater.
++# else
+    REAL(DP), PARAMETER :: ROFVROS   = 0.9775171065_DP!!RATIO OF THE DENSITY OF FRESH AND SEA WATER 1000./1023.   
++# endif
+    real(DP), parameter :: SLP0      = 101325.0_sp    !! mean sea surface pressure (Pa)
+ 
+--- a/bcond_gcn.F
++++ b/bcond_gcn.F
+@@ -700,6 +700,11 @@
+          WTSURF_WATTS = WTSURF_WATTS * RAMP
+ 
++# if defined (FRESHWATER_LAKE)
++         SPCP=4.186E3_SP
++         ROSEA = 1.000E3_SP
++# else
+          SPCP=4.2174E3_SP
+          ROSEA = 1.023E3_SP
++# endif
+          SPRO = SPCP*ROSEA
+          

@@ -10,6 +10,16 @@ namelist finalization, or model execution.
 
 ## Core Rules
 
+For a retained spherical NOAA lake, run `scripts/prepare_retained_lake.py`
+with `--source DATED_FIELDS.nc --fix FIX_DIR --prefix PREFIX --counts NODES CELLS LAYERS --sms GRID.2dm --out OUTPUT`.
+The dated source must carry native neighbors, projected auxiliary coordinates,
+nodal control areas, and uniform sigma coordinates. Operational ASCII uses
+counterclockwise vertex numbering. FVCOM reads those vertices in order 1, 3, 2.
+The helper verifies that permutation for every cell, all neighbors, node
+depths, coordinates, vertical levels and closed shorelines, and writes the
+official geographic ASCII together with native nodal control areas for lake
+water budgets. Use `SPHERICAL` and `GRID_FILE_UNITS='degrees'`.
+
 - Prefer a `fvcom_grid_delivery_contract_v1` input. Verify its mesh hash,
   counts, projected CRS/units, and every OBC node-order hash before writing.
 - Keep `_dep.dat` and `_grd.dat` depths positive down. For 2DM meshes with

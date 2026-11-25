@@ -72,7 +72,11 @@ class InitializationTests(unittest.TestCase):
         shutil.copyfile(out/"lake_initial.nc",checkpoint)
         with nc.Dataset(checkpoint,"r+") as f:
             f["Times"][0]=np.asarray(list("2025/07/02 00:00:00.000000"),dtype="S1")
-            f["iint"][0]=8640; f["Itime"][0]+=1; f["time"][0]+=1
+            f["iint"][0]=8640
+            # The NML selects a 2018 reference for native output, while the original startup uses MJD.
+            f["Itime"].units="days since 2018-01-01 00:00:00"
+            f["Itime"][0]=int(nc.date2num(nc.num2date(f["time"][0]+1,f["time"].units),f["Itime"].units))
+            f["time"][0]+=1
         initial=out/"initialization_manifest.json"
         receipt=verify(checkpoint,initial,"2025-07-02T00:00:00Z","a"*64,"test-only",sha(checkpoint))
         self.assertEqual(receipt["source_iint"],8640)

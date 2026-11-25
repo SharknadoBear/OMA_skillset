@@ -1,6 +1,6 @@
 ---
 name: fvcom-namelist-configuration
-description: Create and validate FVCOM 4.3.1 run namelists and cell-based station files from simulation_request_v1 contracts. Use for provisional and final tide-only, barotropic-tide-river barotropic-tide-wind and barotropic-tide-wind-river configuration; do not use it to generate forcing, grids, Slurm scripts, or execute FVCOM.
+description: Render and validate native FVCOM 4.3.1 namelists for tide, wind, river, and freshwater baroclinic studies. Bind station outputs, startup state, forcing files, and stage clocks to the frozen executable's template.
 ---
 
 # FVCOM Namelist Configuration
@@ -85,3 +85,7 @@ For `barotropic-tide-wind`, set variable stress and variable pressure to the sam
 ## Matched wind and discharge study
 
 For `barotropic-tide-wind-river`, bind the complete river manifest and the same variable-stress, absolute-pressure and dynamic boundary files as the wind treatment. Use `validate --request ... --namelist ... --input-root ... --river-manifest ...` to verify both sets of inputs. The `columbia_wind_river_factorial` profile uses identical cold dates for all members and sets pressure to 101325 Pa with winds disabled in the river-only member.
+
+## Freshwater lake
+
+For a spherical, closed Lake Superior baroclinic case, use `fvcom_namelist.py lake` with the exact frozen executable's blank, explicit UTC dates, calculated time step and native input basenames. The [freshwater configuration contract](references/contracts.md#freshwater-lake-configuration) covers forcing units, startup, cadence and output fields.

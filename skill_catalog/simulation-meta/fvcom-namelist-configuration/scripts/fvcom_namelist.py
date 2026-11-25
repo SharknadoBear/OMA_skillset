@@ -957,8 +957,13 @@ def manifest(
 
 
 def cli(argv: Iterable[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["lake"]:
+        from lake_configuration import cli as lake_cli
+        return lake_cli(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("lake", help="Render a spherical freshwater baroclinic lake stage")
     for command in ("provisional", "render"):
         item = sub.add_parser(command)
         item.add_argument("--request", type=Path, required=True)
