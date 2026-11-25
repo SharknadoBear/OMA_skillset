@@ -63,6 +63,11 @@ def main() -> int:
             wind_plan = fb.build_plan(wind_pair, root / "shared", "/scratch/pair/run/build")
             assert "AIR_PRESSURE" in wind_plan["required_defines"]
             assert "AIR_PRESSURE" not in wind_plan["forbidden_defines"]
+        for mode in (fb.RIVER_MODE, fb.COMBINED_MODE):
+            factorial = dict(pair, profile=fb.FACTORIAL_PROFILE, mode=mode)
+            plan = fb.build_plan(factorial, root / "shared", "/scratch/pair/run/build")
+            assert "AIR_PRESSURE" in plan["required_defines"]
+            assert "ATMO_TIDE" in plan["forbidden_defines"]
         for key, invalid in (("project_dir", "/scratch/pair_other/river"),
                              ("source_dir", "/scratch/pair/../other/source"),
                              ("pair_root", "/scratch/other")):

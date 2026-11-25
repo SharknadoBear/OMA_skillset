@@ -22,6 +22,14 @@ do not apply the ordinary one-month interpretability claim to this profile.
 
 ## Inputs and Scientific Rules
 
+For `columbia_wind_river_factorial`, run the regional pipeline on the tide (T), wind-and-pressure (W), river (R), and combined (WR) production attempts. The archived T and W members may use `columbia_wind_pair`. Each member must have the same executable, mesh, station definitions, clock and astronomical tide. Run the matched analysis with a fresh output directory.
+
+```text
+python scripts/factorial_validation.py --tide-project T --tide-attempt TA --wind-project W --wind-attempt WA --river-project R --river-attempt RA --combined-project WR --combined-attempt WRA --geometry river_budget_geometry.json --output OUT
+```
+
+The report in `OUT/index.html` links the common NOAA metrics, native three-hour field differences and both conditional discharge budgets. `OUT/factorial_validation.json` binds the frozen inputs, production audits and output hashes. `OUT/native_contrasts.nc` retains node elevation, both element velocity components, time-varying four-member wet masks, native mesh order, and temporal means with per-location sample counts. Read the labeled contrast axis for R−T, WR−W, W−T, WR−R and (WR−W)−(R−T). NOAA prediction and observation scores use their respective common timestamps across all four members. Residual scores require observed and predicted levels on the same timestamps.
+
 For `columbia_wind_pair`, run the regional pipeline on each production member, then
 run `python scripts/paired_wind_validation.py --control-project CONTROL --control-attempt ATTEMPT --wind-project WIND --wind-attempt ATTEMPT --output OUTPUT`.
 Use the actual pressure-enabled build and the treatment's component certificate alongside

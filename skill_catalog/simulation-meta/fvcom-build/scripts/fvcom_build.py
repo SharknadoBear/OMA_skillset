@@ -8,13 +8,15 @@ import hashlib
 import json
 import re
 import sys
+import tarfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Tuple
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fvcom-run-control" / "scripts"))
-from fvcom_profiles import PAIR_PROFILE, RIVER_MODE, WIND_MODE, WIND_PROFILE, is_cold_pair_stage, resolve_request
+from fvcom_profiles import (BAROTROPIC_MODES, COMBINED_MODE, FACTORIAL_PROFILE, PAIR_PROFILE, RIVER_MODE, WIND_MODE,
+                            WIND_PROFILE, has_river, is_cold_pair_stage, needs_air_pressure, resolve_request)
 
 
 SCHEMA = "fvcom_build_worker_manifest_v1"
@@ -105,7 +107,7 @@ def write_json(path: Path, value: Dict[str, Any]) -> None:
 
 
 def validate_request(request: Dict[str, Any]) -> None:
-    if request.get("mode") not in {"barotropic_tide", RIVER_MODE, WIND_MODE, "benchmark"}:
+    if request.get("mode") not in BAROTROPIC_MODES | {"benchmark"}:
         raise ContractError("unsupported build mode")
     case_id = request.get("case_id")
     if not isinstance(case_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", case_id):
@@ -119,13 +121,13 @@ def validate_request(request: Dict[str, Any]) -> None:
     source = kestrel.get("source_dir")
     if is_cold_pair_stage(request):
         project = kestrel.get("project_dir", "")
-        build_root = kestrel.get("pair_root") if request.get("profile") in {PAIR_PROFILE, WIND_PROFILE} else project
+        build_root = kestrel.get("pair_root") if request.get("profile") in {PAIR_PROFILE, WIND_PROFILE, FACTORIAL_PROFILE} else project
         if (not isinstance(build_root, str) or not build_root.startswith(("/scratch/", "/kfs3/scratch/"))
                 or not isinstance(project, str) or not isinstance(source, str)
                 or any(".." in PurePosixPath(path).parts for path in (build_root, project, source))
                 or PurePosixPath(build_root) not in PurePosixPath(source).parents):
             raise ContractError("profile source_dir must be inside the explicit project or pair scratch root")
-        if request.get("profile") in {PAIR_PROFILE, WIND_PROFILE} and PurePosixPath(project).parent != PurePosixPath(build_root):
+        if request.get("profile") in {PAIR_PROFILE, WIND_PROFILE, FACTORIAL_PROFILE} and PurePosixPath(project).parent != PurePosixPath(build_root):
             raise ContractError("each paired project_dir must be a child of kestrel.pair_root")
     elif not isinstance(source, str) or not source.startswith("/home/yhuang168/"):
         raise ContractError("kestrel.source_dir must be an explicit path below /home/yhuang168")
@@ -175,7 +177,7 @@ def topdir_values(text: str) -> List[str]:
 
 
 def pressure_build(request: Dict[str, Any]) -> bool:
-    return request.get("mode") == WIND_MODE or request.get("profile") == WIND_PROFILE
+    return needs_air_pressure(request)
 
 
 def audit_make_inc(path: Path, expected_topdir: str, air_pressure: bool = False) -> Dict[str, Any]:
@@ -255,7 +257,8 @@ def parse_checksum_file(path: Path) -> Tuple[str, str]:
     return match.group(1).lower(), match.group(2)
 
 
-def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Dict[str, Any]:
+def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path, *,
+             original_source_dir: str | None = None) -> Dict[str, Any]:
     request = resolve_request(request)
     validate_request(request)
     environment = build_environment(request)
@@ -304,7 +307,7 @@ def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Di
             blocking.append("make.inc audit did not pass")
         hashes["make_inc_sha256"] = str(audit.get("sha256", ""))
     if pressure_build(request) and (evidence / "make.inc.after").is_file():
-        native = audit_make_inc(evidence / "make.inc.after", request["kestrel"]["source_dir"], True)
+        native = audit_make_inc(evidence / "make.inc.after", original_source_dir or request["kestrel"]["source_dir"], True)
         if native["status"] != "pass" or native["sha256"] != hashes.get("make_inc_sha256"):
             blocking.append("native make.inc does not bind the pressure-enabled feature set")
         log_path = evidence / "build.log"
@@ -353,7 +356,7 @@ def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Di
     if blank_path.is_file() and is_cold_pair_stage(request):
         blank = blank_path.read_text(encoding="utf-8-sig", errors="replace")
         template_fields = dict(PAPER_TEMPLATE_FIELDS)
-        if request.get("profile") == PAIR_PROFILE:
+        if request.get("profile") in {PAIR_PROFILE, FACTORIAL_PROFILE} or has_river(request):
             template_fields["NML_RIVER_TYPE"] = (
                 "RIVER_NUMBER", "RIVER_TS_SETTING", "RIVER_INFLOW_LOCATION", "RIVER_KIND", "RIVER_INFO_FILE",
             )
@@ -395,6 +398,55 @@ def finalize(request: Dict[str, Any], evidence: Path, artifact_root: Path) -> Di
     return manifest
 
 
+def reuse_build(request: dict, binding_path: Path, evidence: Path, archive: Path,
+                binary: Path, template: Path, artifact_root: Path) -> dict:
+    """Revalidate original archived evidence and bind the identical binary in a new case."""
+    request = resolve_request(request)
+    validate_request(request)
+    original = load_json(binding_path)
+    if original.get("schema") != "fvcom_executable_reuse_binding_v1" or original.get("status") != "frozen":
+        raise ContractError("a frozen executable reuse binding is required")
+    for key, path in (("executable_sha256", binary), ("blank_template_sha256", template),
+                      ("build_evidence_archive_sha256", archive), ("native_freeze_sha256", evidence / "freeze.json")):
+        if original.get(key) != sha256(path):
+            raise ContractError(f"archived {key} does not match {path.name}")
+    with tarfile.open(archive) as tar:
+        checked = set()
+        for member in tar:
+            if member.isdir() and member.name == "evidence":
+                continue
+            name = PurePosixPath(member.name)
+            if (not member.isfile() or name.parent != PurePosixPath("evidence")
+                    or name.name in checked or name.name in {".", ".."}):
+                raise ContractError("unexpected member in native build evidence archive")
+            with tar.extractfile(member) as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != sha256(evidence / name.name):
+                    raise ContractError(f"extracted evidence drifted for {name.name}")
+            checked.add(name.name)
+    if not set(MANDATORY_EVIDENCE).issubset(checked):
+        raise ContractError("archived native build evidence is incomplete")
+    if (original["build_environment"] != build_environment(request)
+            or original["source_commit"] != request["kestrel"]["source_commit"]
+            or sha256(evidence / "blank_namelist.nml") != sha256(template)
+            or parse_checksum_file(evidence / "executable.sha256")[0] != original["executable_sha256"]):
+        raise ContractError("archived build, template or executable differs from the request")
+    source_bin = PurePosixPath(original["native_executable"])
+    manifest = finalize(request, evidence, artifact_root, original_source_dir=str(source_bin.parent))
+    if manifest["status"] != "ready":
+        raise ContractError("source build evidence failed: " + ", ".join(manifest["blocking_reasons"]))
+    audit = load_json(evidence / "make_inc_audit.json")
+    if audit["active_defines"] != original["feature_defines"]:
+        raise ContractError("archived feature flags differ from the native make audit")
+    target = str(PurePosixPath(request["kestrel"]["source_dir"]) / source_bin.name)
+    binding = dict(original, native_executable=target, archived_native_executable=str(source_bin),
+                   archived_binding_sha256=sha256(binding_path))
+    output = artifact_root / "executable_reuse_binding.json"
+    if output.exists() and load_json(output) != binding:
+        raise ContractError("target already contains a different executable binding")
+    write_json(output, binding)
+    return binding
+
+
 def cli(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -412,6 +464,9 @@ def cli(argv: Iterable[str] | None = None) -> int:
     finish.add_argument("--request", type=Path, required=True)
     finish.add_argument("--evidence", type=Path, required=True)
     finish.add_argument("--artifact-root", type=Path, required=True)
+    reuse = sub.add_parser("reuse", help="Verify a frozen native executable and rebind it to a new project")
+    for key in ("request", "binding", "evidence", "archive", "binary", "template", "artifact-root"):
+        reuse.add_argument("--" + key, type=Path, required=True)
     args = parser.parse_args(list(argv) if argv is not None else None)
     try:
         if args.command == "audit-make-inc":
@@ -423,6 +478,11 @@ def cli(argv: Iterable[str] | None = None) -> int:
         if args.command == "plan":
             result = build_plan(load_json(args.request), args.artifact_root, args.remote_artifact_root)
             write_json(args.output, result)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
+        if args.command == "reuse":
+            result = reuse_build(load_json(args.request), args.binding, args.evidence, args.archive,
+                                 args.binary, args.template, args.artifact_root)
             print(json.dumps(result, indent=2, sort_keys=True))
             return 0
         result = finalize(load_json(args.request), args.evidence, args.artifact_root)

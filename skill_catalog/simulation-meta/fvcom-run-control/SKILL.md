@@ -124,3 +124,7 @@ python scripts/selftest_fvcom_time_anchor.py
 python -m compileall scripts
 python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_validate.py .
 ```
+
+## Matched wind and discharge study
+
+For `columbia_wind_river_factorial`, initialize each new member with the retained grid branch, the `fvcom-build` reuse binding and a common installed-skill receipt. Both the 24-hour smoke and the 28-day cold production start March 18. The river-only member uses a constant 101325 Pa atmosphere. The combined member validates the wind bundle and dynamic boundary alongside the river discharge. Freeze each attempt before transfer.

@@ -1,6 +1,6 @@
 ---
 name: fvcom-namelist-configuration
-description: Create and validate FVCOM 4.3.1 run namelists and cell-based station files from simulation_request_v1 contracts. Use for provisional and final tide-only, barotropic-tide-river and barotropic-tide-wind configuration; do not use it to generate forcing, grids, Slurm scripts, or execute FVCOM.
+description: Create and validate FVCOM 4.3.1 run namelists and cell-based station files from simulation_request_v1 contracts. Use for provisional and final tide-only, barotropic-tide-river barotropic-tide-wind and barotropic-tide-wind-river configuration; do not use it to generate forcing, grids, Slurm scripts, or execute FVCOM.
 ---
 
 # FVCOM Namelist Configuration
@@ -81,3 +81,7 @@ Preserve all rendered namelists. Stability changes create a new attempt-specific
 ## Barotropic wind and pressure
 
 For `barotropic-tide-wind`, set variable stress and variable pressure to the same FVCOM-grid surface file. Stage the atmospheric manifest, its surface file and ordered open-boundary pressure subset, and the verified dynamic boundary components and manifest beside the final namelist's input files. Run `validate --request ... --namelist ... --input-root ...` to check the native switches, file provenance, component identities and stage coverage. Keep rivers, heat, precipitation and tracer dynamics disabled. In the paired control, use the same executable with wind disabled and absolute pressure fixed at 101325 Pa. The Columbia wind pair starts cold on March 18, 2025, with a two-day ramp. Smoke ends March 19 and production ends April 15.
+
+## Matched wind and discharge study
+
+For `barotropic-tide-wind-river`, bind the complete river manifest and the same variable-stress, absolute-pressure and dynamic boundary files as the wind treatment. Use `validate --request ... --namelist ... --input-root ... --river-manifest ...` to verify both sets of inputs. The `columbia_wind_river_factorial` profile uses identical cold dates for all members and sets pressure to 101325 Pa with winds disabled in the river-only member.

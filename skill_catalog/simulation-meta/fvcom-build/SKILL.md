@@ -85,3 +85,7 @@ Do not blur a blocker into a warning. Set a resume token identifying the last im
 ## Shared pressure-capable build
 
 For a wind scenario or its matched control, run the make audit with `--air-pressure`. Both members require the same `AIR_PRESSURE` executable. Capture the compiler's expanded preprocessing commands for `mod_obcs.F`, `advave_edge_gcn.F` and `external_step.F`, the exact edited make.inc, binary hash, and native blank namelist. Run both native namelist parser probes and then exercise the actual variable field readers in the wind smoke run. Bind the shared executable to both member requests.
+
+## Matched wind and discharge study
+
+Use the same pressure-capable executable for every member of `columbia_wind_river_factorial`. Rebind an archived build with `fvcom_build.py reuse --request ... --binding ... --evidence ... --archive ... --binary ... --template ... --artifact-root MEMBER/run/build`. The command verifies the original evidence, executable, flags, template, build environment and source pin, then records the destination executable path and original binding hash.

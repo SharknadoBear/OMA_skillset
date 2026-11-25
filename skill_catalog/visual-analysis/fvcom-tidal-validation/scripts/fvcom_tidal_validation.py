@@ -201,8 +201,9 @@ def validate(water_files: list[Path], current_files: list[Path], output_dir: Pat
              station_inventory_path: Path | None = None) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     lineage = load_lineage(lineage_path)
-    river_study = lineage.get("mode") == "barotropic-tide-river" or lineage.get("profile") == "columbia_river_pair"
-    wind_study = lineage.get("mode") == "barotropic-tide-wind" or lineage.get("profile") == "columbia_wind_pair"
+    factorial = lineage.get("profile") == "columbia_wind_river_factorial" or lineage.get("mode") == "barotropic-tide-wind-river"
+    river_study = factorial or lineage.get("mode") == "barotropic-tide-river" or lineage.get("profile") == "columbia_river_pair"
+    wind_study = factorial or lineage.get("mode") == "barotropic-tide-wind" or lineage.get("profile") == "columbia_wind_pair"
     water_results, current_results = [], []
     for path in water_files:
         df = common_frame(path, ["model", "observed", "predicted"])
@@ -320,6 +321,11 @@ def validate(water_files: list[Path], current_files: list[Path], output_dir: Pat
         result["assessment_scope"] = (
             "These thresholds describe astronomical-tide and current agreement. Use the paired wind "
             "validation for observed total levels, non-tidal residuals, timing and signed response.")
+    if factorial:
+        result["assessment_scope"] = (
+            "These thresholds assess astronomical tides and available current observations. The four-member "
+            "analysis compares observed levels and residuals, conditional wind and river effects, "
+            "their interaction, and both upstream-volume budgets.")
     summary_path = output_dir / "validation_summary.json"
     summary_path.write_text(json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8")
     sections = [f"<p>{html.escape(result['assessment_scope'])}</p>"] if river_study or wind_study else []

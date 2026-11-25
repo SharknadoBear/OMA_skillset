@@ -24,10 +24,14 @@ def records(project, attempt):
 
 
 def check_pair(control, river):
-    from fvcom_profiles import PAIR_PROFILE, RIVER_MODE
-    for case, mode in ((control, "barotropic_tide"), (river, RIVER_MODE)):
-        if case["request"].get("profile") != PAIR_PROFILE or case["request"]["mode"] != mode:
-            raise ValueError("expected paired control then river experiment")
+    from fvcom_profiles import FACTORIAL_PROFILE, PAIR_PROFILE, WIND_PROFILE, has_river, has_wind
+    a, b = control["request"], river["request"]
+    if b.get("profile") == FACTORIAL_PROFILE:
+        profiles_match = a.get("profile") in {WIND_PROFILE, FACTORIAL_PROFILE}
+    else:
+        profiles_match = a.get("profile") == b.get("profile") == PAIR_PROFILE
+    if not profiles_match or has_river(a) or not has_river(b) or has_wind(a) != has_wind(b):
+        raise ValueError("expected matched river-off and river-on treatments with the same wind setting")
     if control["executable_hash"] != river["executable_hash"]:
         raise ValueError("different executables in paired experiment")
     left, right = (parse_namelist(c["namelist"]) for c in (control, river))

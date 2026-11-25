@@ -12,7 +12,7 @@ import pandas as pd
 
 from condense_fvcom_station import load_stack
 from run_case_validation import parse_namelist, read, sha256, verify_prerequisites
-from fvcom_profiles import WIND_MODE, WIND_PROFILE
+from fvcom_profiles import FACTORIAL_PROFILE, WIND_MODE, WIND_PROFILE
 
 
 def records(project, attempt):
@@ -23,7 +23,7 @@ def records(project, attempt):
 
 def check_pair(control, wind):
     for case, mode in ((control, "barotropic_tide"), (wind, WIND_MODE)):
-        if case["request"].get("profile") != WIND_PROFILE or case["request"]["mode"] != mode:
+        if case["request"].get("profile") not in (WIND_PROFILE, FACTORIAL_PROFILE) or case["request"]["mode"] != mode:
             raise ValueError("expected the Columbia wind profile control and treatment")
     if (control["executable_hash"] != wind["executable_hash"]
             or control["station_keys"] != wind["station_keys"]

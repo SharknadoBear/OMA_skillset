@@ -11,22 +11,38 @@ WIND_PROFILE = "columbia_wind_pair"
 WIND_MODE = "barotropic-tide-wind"
 RIVER_MODE = "barotropic-tide-river"
 
+FACTORIAL_PROFILE = "columbia_wind_river_factorial"
+COMBINED_MODE = "barotropic-tide-wind-river"
+BAROTROPIC_MODES = {"barotropic_tide", RIVER_MODE, WIND_MODE, COMBINED_MODE}
+
+
+def has_wind(request: dict[str, Any]) -> bool:
+    return request.get("mode") in {WIND_MODE, COMBINED_MODE}
+
+
+def has_river(request: dict[str, Any]) -> bool:
+    return request.get("mode") in {RIVER_MODE, COMBINED_MODE}
+
+
+def needs_air_pressure(request: dict[str, Any]) -> bool:
+    return has_wind(request) or request.get("profile") in {WIND_PROFILE, FACTORIAL_PROFILE}
+
 
 def is_cold_pair_stage(request: dict[str, Any]) -> bool:
     """These profiles start smoke and production independently from rest."""
-    return request.get("profile") in {PAPER_PROFILE, PAIR_PROFILE, WIND_PROFILE}
+    return request.get("profile") in {PAPER_PROFILE, PAIR_PROFILE, WIND_PROFILE, FACTORIAL_PROFILE}
 
 
 def validate_river_source(request: dict[str, Any]) -> None:
     source = request.get("river")
-    if request.get("mode") == RIVER_MODE:
+    if has_river(request):
         if not isinstance(source, dict) or not all(
             isinstance(source.get(key), str) and source[key].strip()
             for key in ("provider", "station_id", "parameter_code")
         ):
             raise ValueError("river mode requires river.provider, station_id and parameter_code")
     elif source is not None:
-        raise ValueError("river source requires mode barotropic-tide-river")
+        raise ValueError("river source requires a mode with river forcing")
 
 
 PAPER_SETTINGS = {
@@ -54,11 +70,11 @@ def resolve_request(request: dict[str, Any]) -> dict[str, Any]:
     result = deepcopy(request)
     profile = result.get("profile")
     validate_river_source(result)
-    if result.get("mode") == WIND_MODE:
+    if has_wind(result):
         result.setdefault("period", {}).setdefault("spinup_days", 14)
     if profile is None:
         return result
-    if profile not in {PAPER_PROFILE, PAIR_PROFILE, WIND_PROFILE}:
+    if profile not in {PAPER_PROFILE, PAIR_PROFILE, WIND_PROFILE, FACTORIAL_PROFILE}:
         raise ValueError(f"unsupported simulation profile: {profile}")
 
     def merge(target, settings, prefix=""):
@@ -83,10 +99,13 @@ def resolve_request(request: dict[str, Any]) -> dict[str, Any]:
         settings = {key: value for key, value in PAPER_SETTINGS.items() if key != "mode"}
         if result["mode"] == RIVER_MODE:
             settings["river"] = {"provider": "usgs", "station_id": "14246900", "parameter_code": "72137"}
-    if profile == WIND_PROFILE:
-        if result.get("mode") not in {"barotropic_tide", WIND_MODE}:
-            raise ValueError("wind pair requires tide-only control or barotropic-tide-wind treatment")
+    if profile in {WIND_PROFILE, FACTORIAL_PROFILE}:
+        allowed = BAROTROPIC_MODES if profile == FACTORIAL_PROFILE else {"barotropic_tide", WIND_MODE}
+        if result.get("mode") not in allowed:
+            raise ValueError(f"mode is incompatible with {profile}")
         settings = {key: deepcopy(value) for key, value in PAPER_SETTINGS.items() if key != "mode"}
+        if has_river(result):
+            settings["river"] = {"provider": "usgs", "station_id": "14246900", "parameter_code": "72137"}
         settings["grid_policy"] = "retained_only"
         settings["period"]["spinup_days"] = 14
     merge(result, settings)

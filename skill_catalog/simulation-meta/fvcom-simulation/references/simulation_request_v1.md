@@ -2,8 +2,8 @@
 
 ```yaml
 schema: simulation_request_v1
-mode: barotropic_tide | barotropic-tide-river | barotropic-tide-wind | benchmark
-profile: paper_barotropic | columbia_river_pair | columbia_wind_pair # optional
+mode: barotropic_tide | barotropic-tide-river | barotropic-tide-wind | barotropic-tide-wind-river | benchmark
+profile: paper_barotropic | columbia_river_pair | columbia_wind_pair | columbia_wind_river_factorial # optional
 case_id: string
 project_dir: optional absolute or workspace-relative path
 grid_policy: accepted_then_fresh | fresh_only | retained_only
@@ -16,7 +16,7 @@ physics:
   temperature_c: optional number
   salinity_psu: optional number
   sigma_levels: 10 # ten interfaces, nine layers; legacy sigma_layers also counts levels
-river: # required only for barotropic-tide-river
+river: # required for both river-bearing modes
   provider: usgs
   station_id: "14246900"
   parameter_code: "72137"
@@ -128,3 +128,7 @@ control and `barotropic-tide-wind` on the treatment. The profile resolves
 retained mesh with its earlier source-bound topology and ordered OBC evidence.
 The [wind workflow](barotropic_tide_wind.md) defines pressure handling,
 offshore reference, stage windows and the paired NOAA assessment.
+
+## Columbia wind and river factorial
+
+The `columbia_wind_river_factorial` profile accepts the four barotropic modes and fixes the retained Columbia mesh and March 18–April 15, 2025 UTC integration. Use the same Port Westward source in the two river-bearing members. The four-member validator accepts the verified tide and wind members of the earlier 28-day wind study. [Combined forcing and comparison](barotropic_tide_wind_river.md)

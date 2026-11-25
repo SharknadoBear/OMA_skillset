@@ -14,7 +14,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 
-from fvcom_profiles import PAIR_PROFILE, PAPER_PROFILE, RIVER_MODE, WIND_PROFILE, WIND_MODE, is_cold_pair_stage, resolve_request
+from fvcom_profiles import (BAROTROPIC_MODES, COMBINED_MODE, FACTORIAL_PROFILE, PAIR_PROFILE, PAPER_PROFILE,
+                            RIVER_MODE, WIND_MODE, WIND_PROFILE, has_river, is_cold_pair_stage,
+                            needs_air_pressure, resolve_request)
 
 
 G = 9.81
@@ -69,12 +71,12 @@ def write_json(path: Path, value: Any) -> None:
 def validate_request(req: dict[str, Any]) -> None:
     if req.get("schema") != "simulation_request_v1":
         raise ValueError("schema must be simulation_request_v1")
-    if req.get("mode") not in {"barotropic_tide", WIND_MODE, RIVER_MODE, "benchmark"}:
+    if req.get("mode") not in BAROTROPIC_MODES | {"benchmark"}:
         raise ValueError("unsupported FVCOM simulation mode")
     if not str(req.get("case_id", "")).strip():
         raise ValueError("case_id is required")
-    if req.get("grid_policy") == "retained_only" and req.get("profile") != WIND_PROFILE:
-        raise ValueError("retained_only currently requires columbia_wind_pair")
+    if req.get("grid_policy") == "retained_only" and req.get("profile") not in {WIND_PROFILE, FACTORIAL_PROFILE}:
+        raise ValueError("retained_only requires a retained Columbia study profile")
     if req.get("grid_policy") not in {"accepted_then_fresh", "fresh_only", "retained_only"}:
         raise ValueError("unsupported grid_policy")
     if req.get("grid_policy") == "fresh_only" and req.get("accepted_grid"):
@@ -106,7 +108,7 @@ def project_layout(root: Path, mode: str = "barotropic_tide", policy: str = "acc
         "forcing/shared_source",
         "run/build", "analysis/observations",
     ]
-    if mode in {"barotropic_tide", WIND_MODE, RIVER_MODE}:
+    if mode in BAROTROPIC_MODES:
         paths += list(BAROTROPIC_AGENT_ROOTS.values())
     for case in grid_order(policy):
         paths += [
@@ -140,7 +142,7 @@ def init_project(request_path: Path, project: Path) -> dict[str, Any]:
         "immutable_attempts": True,
         **({"profile": req["profile"]} if req.get("profile") else {}),
     }
-    if req["mode"] in {"barotropic_tide", WIND_MODE, RIVER_MODE}:
+    if req["mode"] in BAROTROPIC_MODES:
         manifest["agent_layout"] = {
             "schema": "fvcom_barotropic_agent_layout_v1",
             "role_roots": dict(BAROTROPIC_AGENT_ROOTS),
@@ -608,12 +610,12 @@ srun{bind_option} --ntasks={int(args.ranks)} {args.remote_executable} --casename
 
 def verify_river_stage(request: dict, namelist: Path, input_root: Path) -> None:
     """Bind the actual runtime inventory to the requested physics before each use."""
-    if request.get("mode") != RIVER_MODE and request.get("profile") != PAIR_PROFILE:
+    if not has_river(request) and request.get("profile") not in {PAIR_PROFILE, FACTORIAL_PROFILE}:
         return
     from audit_fvcom_production import parse_namelist, parse_utc
     actual = parse_namelist(namelist)
     path = input_root / "river_manifest.json"
-    if request["mode"] != RIVER_MODE:
+    if not has_river(request):
         if int(actual["RIVER_NUMBER"]) != 0 or path.exists():
             raise ValueError("paired tide-only control contains a river forcing")
         return
@@ -628,7 +630,7 @@ def verify_river_stage(request: dict, namelist: Path, input_root: Path) -> None:
 
 
 def verify_stage_forcing(request: dict, namelist: Path, input_root: Path) -> Path | None:
-    if request.get("mode") == WIND_MODE or request.get("profile") == WIND_PROFILE:
+    if needs_air_pressure(request):
         scripts = Path(__file__).resolve().parents[2] / "fvcom-namelist-configuration" / "scripts"
         if str(scripts) not in sys.path:
             sys.path.insert(0, str(scripts))
@@ -643,10 +645,19 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
     request_path = project / "request.json"
     request = resolve_request(load_data(request_path)) if request_path.exists() else {}
     installation = {}
-    if request.get("profile") in {PAIR_PROFILE, WIND_PROFILE}:
+    if request.get("profile") in {PAIR_PROFILE, WIND_PROFILE, FACTORIAL_PROFILE}:
         args.job_prefix = "columbia_river" if request["mode"] == RIVER_MODE else "columbia_control"
         if request["profile"] == WIND_PROFILE:
             args.job_prefix = "columbia_wind" if request["mode"] == WIND_MODE else "columbia_wind_control"
+        if request["profile"] == FACTORIAL_PROFILE:
+            binding = load_data(project / "run/build/executable_reuse_binding.json")
+            if (binding.get("status") != "frozen" or args.remote_executable != binding.get("native_executable")
+                    or binding.get("source_commit") != request["kestrel"]["source_commit"]
+                    or binding.get("build_environment") != request["kestrel"]["build_environment"]
+                    or "AIR_PRESSURE" not in binding.get("feature_defines", [])):
+                raise ValueError("factorial attempt must use the bound pressure-capable executable and environment")
+            members = {"barotropic_tide": "control", WIND_MODE: "wind", RIVER_MODE: "river", COMBINED_MODE: "combined"}
+            args.job_prefix = "columbia_factorial_" + members[request["mode"]]
         environment = request.get("kestrel", {}).get("build_environment", {})
         args.module_init = environment.get("module_init")
         if environment.get("modules"):
