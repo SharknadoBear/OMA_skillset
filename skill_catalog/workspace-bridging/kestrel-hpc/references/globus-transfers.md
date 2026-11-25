@@ -11,6 +11,12 @@ Use Globus for large uploads/downloads or repeated SSH transfer failures. Contin
 - Collection paths differ from SSH paths. Inspect `globus ls <collection-id>:/ --format json` and `globus stat <collection-id>:<approved-parent> --format json`. Verify the intended owner and directory. A scratch collection can expose `/<user>/` rather than `/scratch/<user>/`; a Windows `/~/` can map to Documents rather than the Windows profile root. Verify the mapping with a known file and size. Do not assume home is exposed or silently change the requested destination.
 - Keep source/destination roots within the approved project. Do not broaden GCP folder permissions or stage data elsewhere without authorization. Reject unexpected symlinks/junctions at selected roots and files; explicitly selected source symlinks can be followed by Globus. For many small files, a stable archive and hash manifest can reduce metadata work.
 
+### Recover a disconnected Windows workstation
+
+An active task can report `GC_NOT_CONNECTED` after the workstation client exits. Check the event details for the affected collection. On the workstation, compare `globus endpoint local-id` with the saved local collection UUID and inspect `gcp_connected` and `gcp_paused` in `globus endpoint show <local-collection-id> --format json`.
+
+If the matching Globus Connect Personal process is absent, start the installed application from its normal Start menu shortcut. For unattended recovery, use the verified shortcut target and its working directory with PowerShell `Start-Process -WindowStyle Hidden`. Give the relay time to reconnect. Verify that `globus stat <local-collection-id>:<study-directory> --format json` returns the expected directory. Then monitor the original task ID through its retry interval. Its most recent event can still show the earlier disconnection after the directory becomes reachable.
+
 ## Submit once and retain identity
 
 Transfer only closed, stable inputs/outputs. Record source size and SHA-256, collection UUIDs, exact paths, intended overwrite behavior, and a task deadline in one small private receipt. Use a new destination or verify that replacing it is within the authorized scope.
