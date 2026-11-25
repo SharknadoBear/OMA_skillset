@@ -1,0 +1,4 @@
+interface:
+  display_name: "FVCOM Freshwater Initialization"
+  short_description: "Prepare same-grid freshwater states and verify native restarts"
+  default_prompt: "Use $fvcom-initialization to build a native freshwater FVCOM hotstart from a verified analysis or check a model checkpoint for continuation."

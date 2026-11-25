@@ -1,0 +1,4 @@
+interface:
+  display_name: "Great Lakes OFS Fetcher"
+  short_description: "Retrieve NOAA Great Lakes FVCOM fields and station records"
+  default_prompt: "Use $great-lakes-ofs-fetcher to inventory a native Great Lakes OFS archive window, verify its times, and retrieve the requested field or station records."
