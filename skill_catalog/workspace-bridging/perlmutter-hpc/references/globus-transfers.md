@@ -45,7 +45,7 @@ globus task event-list <task-id> --limit 20 --format json
 - A failed or canceled task can leave files. Preserve its evidence and confirm no writer remains. A subsequent authorized task may use `--sync-level checksum --verify-checksum` against the same manifest. Retain both task IDs and their relationship; do not describe a new task as the original task resuming.
 - A user stop applies to the exact owned task: `globus task cancel <task-id>`, followed by terminal reconciliation. Stopping a bridge or Slurm job does not cancel Globus. Delete only approved disposable paths after writers are terminal; do not use `--delete-destination-extra` as cleanup.
 
-Before yielding an unfinished authorized transfer, use the [same-chat follow-up procedure](bridge-reliability.md#mandatory-follow-up-for-a-remote-wait). Save the transport, collection/submission/task IDs, exact paths, deadline, last observation, and permitted next step. No SSH session or local polling daemon is needed to keep a managed-collection transfer running. Pause the follow-up at completion or user stop and preserve human timing.
+Preserve collection, submission and task IDs, exact paths, deadline and the last verified observation. Reconcile the original task through completion. Managed transfers continue independently of SSH.
 
 ## Validation and rollout
 
