@@ -1,6 +1,6 @@
 ---
 name: fvcom-benchmark
-description: Plan and analyze reproducible FVCOM Kestrel rank/node benchmarks from identical restart segments. Use to compare throughput, memory, node-hours, speedup, efficiency, and I/O; report fastest, least-cost, and Pareto-knee layouts without submitting jobs itself.
+description: Plan and analyze FVCOM Kestrel and Perlmutter CPU benchmarks from identical restart segments. Compare throughput, resource use and node-hours, and select a production layout from job and native model evidence.
 ---
 
 # FVCOM Benchmark
@@ -12,7 +12,25 @@ counters do not measure I/O time. A recorded station-only revision after certifi
 spin-up may change the mapping and bound station file only; verify the original
 bundle first and use one identical revised bundle for all layouts and production.
 
-Use only after a stable, hash-bound restart exists. Invoke `$kestrel-hpc` for all job operations and `$fvcom-run-control` to audit completion. Every candidate must use the same executable, restart, input hashes, simulated 24-hour window, and output cadence.
+Use a stable, hash-bound restart. Every candidate must use the same executable, restart, input hashes, simulated 24-hour window, and output cadence.
+
+## Perlmutter CPU
+
+Create a dated benchmark plan using `plan --site perlmutter --start-utc 2025-07-01T00:00:00Z --output benchmark_plan.json`. Its nine slots cover three replicates at each of 64, 128 and 256 ranks on 128-core nodes. Render each through `$fvcom-run-control` with `lake-attempt`. Use `$perlmutter-hpc` for submission and preserve the returned receipt.
+
+After each completed slot, collect a headered `sacct -P -j JOB -o JobID,State,ExitCode,NNodes,NTasks,ElapsedRaw,MaxRSS,MaxDiskRead,MaxDiskWrite` table containing the allocation and numerical application step. Keep the native launch identity, log and the independently audited final restart receipt. The final receipt records `status=verified`, `utc`, `job_id` and the native restart's `sha256`. The common starting restart receipt binds its verified UTC and SHA-256.
+
+```powershell
+python scripts/fvcom_benchmark.py collect-perlmutter --plan benchmark_plan.json --attempt attempt_benchmark_064_r1_0000 --submission slurm.json --launch launch_identity.json --sacct sacct.psv --stdout stdout.log --restart selected_restart.json --terminal terminal_restart.json --output record.json
+python scripts/fvcom_benchmark.py resume --plan benchmark_plan.json --records records.json --output pending.json
+python scripts/fvcom_benchmark.py analyze --plan benchmark_plan.json --records records.json --output benchmark_summary.json --csv benchmark_summary.csv
+```
+
+The analyzer selects the shortest median FVCOM application-step elapsed time among layouts within 15 percent of the minimum median allocated node-hours. The step includes FVCOM initialization, integration and native output. Cost uses measured allocation elapsed time multiplied by allocated nodes. Empty or duplicate slots and changed scientific lineage prevent production selection.
+
+## Kestrel
+
+Use `$kestrel-hpc` for Kestrel jobs and `$fvcom-run-control` to audit completion.
 
 Create the initial plan:
 

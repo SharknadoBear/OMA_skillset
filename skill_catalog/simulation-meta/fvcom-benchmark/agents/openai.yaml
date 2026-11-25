@@ -1,4 +1,4 @@
 interface:
   display_name: "FVCOM Benchmark"
   short_description: "Benchmark FVCOM throughput and node cost."
-  default_prompt: "Use $fvcom-benchmark to compare Kestrel layouts for an identical FVCOM restart segment."
+  default_prompt: "Use $fvcom-benchmark to compare Kestrel or Perlmutter CPU layouts for an identical FVCOM restart segment."

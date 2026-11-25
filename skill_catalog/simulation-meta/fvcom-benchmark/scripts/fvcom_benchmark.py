@@ -71,6 +71,8 @@ def render_jobs(plan_path: Path, base_namelist: Path, output_root: Path,
                 account: str, partition: str, walltime: str,
                 modules: list[str], attempt: int = 1) -> dict[str, Any]:
     plan = json.loads(plan_path.read_text(encoding="utf-8-sig"))
+    if plan.get("execution_site") == "perlmutter":
+        raise ValueError("Render Perlmutter runs through fvcom-run-control lake-attempt for the frozen stage")
     if plan.get("schema") != "fvcom_benchmark_plan_v1" or plan.get("execution") != "sequential":
         raise ValueError("benchmark plan is invalid or not sequential")
     if int(plan.get("segment_simulated_hours", 0)) != 24:
@@ -267,9 +269,20 @@ def collect_record(stdout_path: Path, sacct_path: Path, namelist_path: Path,
     return record
 
 
-def make_plan(cores_per_node: int = 104, ranks: list[int] | None = None,
+def make_plan(cores_per_node: int | None = None, ranks: list[int] | None = None,
               repeats: int = 3, extend: bool = True,
-              max_ranks: int | None = None) -> dict[str, Any]:
+              max_ranks: int | None = None, site: str = "kestrel",
+              start_utc: str | None = None) -> dict[str, Any]:
+    if site == "perlmutter":
+        from perlmutter_benchmark import make_cpu_plan
+        if (cores_per_node not in (None, 128) or ranks not in (None, [64, 128, 256])
+                or repeats != 3 or (max_ranks is not None and max_ranks < 256)):
+            raise ValueError("Perlmutter CPU plan uses 128 cores/node and three repeats at 64, 128 and 256 ranks")
+        return make_cpu_plan(start_utc)
+    if site != "kestrel" or start_utc:
+        raise ValueError("dated benchmark plans require --site perlmutter")
+    if cores_per_node is None:
+        cores_per_node = 104
     selected = DEFAULT_RANKS if ranks is None else ranks
     if cores_per_node < 1 or repeats < 1 or not selected or any(r < 1 for r in selected):
         raise ValueError("cores, repeats, and ranks must be positive")
@@ -288,8 +301,11 @@ def make_plan(cores_per_node: int = 104, ranks: list[int] | None = None,
     }
 
 
-def resume_plan(plan: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, Any]:
+def resume_plan(plan: dict[str, Any], records: list[dict[str, Any]], plan_sha256: str | None = None) -> dict[str, Any]:
     """Return only benchmark replicates that lack an eligible terminal record."""
+    if plan.get("execution_site") == "perlmutter":
+        from perlmutter_benchmark import resume_cpu
+        return resume_cpu(plan, records, plan_sha256)
     completed = {
         (int(row["ranks"]), int(row["nodes"]), int(row.get("repeat", 1)))
         for row in records
@@ -356,7 +372,13 @@ def enrich(record: dict[str, Any]) -> dict[str, Any]:
     return r
 
 
-def analyze(records: list[dict[str, Any]], plan: dict[str, Any] | None = None) -> dict[str, Any]:
+def analyze(records: list[dict[str, Any]], plan: dict[str, Any] | None = None,
+            plan_sha256: str | None = None) -> dict[str, Any]:
+    if plan and plan.get("execution_site") == "perlmutter":
+        from perlmutter_benchmark import analyze_cpu
+        return analyze_cpu(plan, records, plan_sha256)
+    if any(r.get("execution_site") == "perlmutter" for r in records):
+        raise ValueError("supply the frozen Perlmutter plan to analyze Perlmutter evidence")
     if not records:
         raise ValueError("no benchmark records")
     enriched = [enrich(r) for r in records]
@@ -475,7 +497,9 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 def main() -> int:
     p = argparse.ArgumentParser(description="FVCOM benchmark planner and analyzer")
     sub = p.add_subparsers(dest="command", required=True)
-    q = sub.add_parser("plan"); q.add_argument("--output", required=True); q.add_argument("--cores-per-node", type=int, default=104)
+    q = sub.add_parser("plan"); q.add_argument("--output", required=True); q.add_argument("--cores-per-node", type=int)
+    q.add_argument("--site", choices=["kestrel", "perlmutter"], default="kestrel")
+    q.add_argument("--start-utc", help="UTC start of the common 24-hour Perlmutter restart segment")
     q.add_argument("--ranks", nargs="+", type=int); q.add_argument("--repeats", type=int, default=3)
     q.add_argument("--no-extend", action="store_true"); q.add_argument("--max-ranks", type=int)
     q = sub.add_parser("analyze"); q.add_argument("--records", required=True); q.add_argument("--output", required=True); q.add_argument("--csv")
@@ -488,6 +512,9 @@ def main() -> int:
     q.add_argument("--executable-sha256", required=True); q.add_argument("--restart-sha256", required=True)
     q.add_argument("--input-bundle-sha256", required=True); q.add_argument("--io-seconds", type=float)
     q.add_argument("--io-method"); q.add_argument("--output", required=True)
+    q = sub.add_parser("collect-perlmutter")
+    for name in ("plan", "attempt", "submission", "launch", "sacct", "stdout", "restart", "terminal", "output"):
+        q.add_argument("--" + name, type=Path, required=True)
     q = sub.add_parser("render")
     q.add_argument("--plan", required=True); q.add_argument("--base-namelist", required=True)
     q.add_argument("--output-root", required=True); q.add_argument("--remote-input-dir", required=True)
@@ -497,14 +524,21 @@ def main() -> int:
     q.add_argument("--attempt", type=int, default=1)
     args = p.parse_args()
     if args.command == "plan":
-        result = make_plan(args.cores_per_node, args.ranks, args.repeats, not args.no_extend, args.max_ranks)
+        result = make_plan(args.cores_per_node, args.ranks, args.repeats, not args.no_extend, args.max_ranks,
+                           args.site, args.start_utc)
+    elif args.command == "collect-perlmutter":
+        from perlmutter_benchmark import collect_cpu
+        result = collect_cpu(args.plan, args.attempt, args.submission, args.launch, args.sacct,
+                             args.stdout, args.restart, args.terminal)
     elif args.command == "analyze":
         result = analyze(load_records(Path(args.records)),
-                         json.loads(Path(args.plan).read_text(encoding="utf-8-sig")) if args.plan else None)
+                         json.loads(Path(args.plan).read_text(encoding="utf-8-sig")) if args.plan else None,
+                         sha256(Path(args.plan)) if args.plan else None)
         if args.csv:
             write_csv(Path(args.csv), result["layouts"])
     elif args.command == "resume":
-        result = resume_plan(json.loads(Path(args.plan).read_text(encoding="utf-8-sig")), load_records(Path(args.records)))
+        result = resume_plan(json.loads(Path(args.plan).read_text(encoding="utf-8-sig")), load_records(Path(args.records)),
+                             sha256(Path(args.plan)))
     elif args.command == "collect":
         result = collect_record(Path(args.stdout), Path(args.sacct), Path(args.namelist),
                                 args.ranks, args.nodes, args.repeat, args.executable_sha256,
