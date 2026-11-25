@@ -42,7 +42,9 @@ def package(source_package, control_nml, combined_nml, river_nml, output, accoun
         stage = Path(tmp)
         for name in ("source_revision.json", "source_inventory_before.sha256", "pinned_source.tgz", "no_plastic_guard.patch"):
             shutil.copyfile(source_package / name, stage / name)
-        for name in ("perlmutter_build.sh", "perlmutter_make.inc", "perlmutter_mpi_netcdf.f90", "fvcom_mp_sign_kind.patch"):
+        for name in ("perlmutter_build.sh", "perlmutter_make.inc", "perlmutter_mpi_netcdf.f90",
+                     "perlmutter_dependencies.py", "fvcom_mp_sign_kind.patch", "fvcom_mp_debug_format.patch",
+                     "fvcom_mp_fortran_portability.patch"):
             (stage / name).write_bytes((assets / name).read_bytes().replace(b"\r\n", b"\n"))
         for module in (profiles, build):
             (stage / Path(module.__file__).name).write_bytes(Path(module.__file__).read_bytes().replace(b"\r\n", b"\n"))

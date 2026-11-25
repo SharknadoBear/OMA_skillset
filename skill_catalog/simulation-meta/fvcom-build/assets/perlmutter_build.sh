@@ -111,7 +111,16 @@ cp mod_utils.F "$evidence/mod_utils.F.before"
 cp mod_interp.F "$evidence/mod_interp.F.before"
 cp "$payload/fvcom_mp_sign_kind.patch" "$evidence/sign_kind.diff"
 patch -p1 --fuzz=0 --forward < "$evidence/sign_kind.diff"
-sha256sum mod_utils.F mod_interp.F mod_plast.F > "$evidence/patched_sources.sha256"
+cp mod_newinp.F "$evidence/mod_newinp.F.before"
+cp "$payload/fvcom_mp_debug_format.patch" "$evidence/debug_format.diff"
+patch -p1 --fuzz=0 --forward < "$evidence/debug_format.diff"
+printf '%s\n' 'Use standard unlimited-repeat output FORMAT for the same sized diagnostic array and field widths.' > "$evidence/debug_format_reason.txt"
+portable=(adv_s.F adv_t.F internal_step.F mod_scal.F mod_action_ex.F mod_station_timeseries.F)
+for name in "${portable[@]}"; do cp "$name" "$evidence/$name.before"; done
+cp "$payload/fvcom_mp_fortran_portability.patch" "$evidence/fortran_portability.diff"
+patch -p1 --fuzz=0 --forward < "$evidence/fortran_portability.diff"
+printf '%s\n' 'Replace comparisons of a single logical flag with its equivalent logical expression, type an exact unit SIGN magnitude to match UN, and write the same adjacency list with standard I10 repeat syntax.' > "$evidence/fortran_portability_reason.txt"
+sha256sum mod_utils.F mod_interp.F mod_plast.F mod_newinp.F "${portable[@]}" > "$evidence/patched_sources.sha256"
 printf '%s\n' 'Both SIGN operands must use the same Fortran kind. The typed 1.0_sp magnitude is exact in either kind. All sign arguments and expressions are preserved.' > "$evidence/sign_kind_reason.txt"
 case "$family" in
   gnu) macro=GFORTRAN; options='-O2 -ffree-line-length-none -fallow-argument-mismatch -fno-range-check'; julian_fc='ftn -fallow-argument-mismatch';;
@@ -136,7 +145,12 @@ make -C libs/julian -j8 libjulian CC='cc -std=gnu89 -Wno-implicit-function-decla
 install -m 644 libs/julian/libjulian.a libs/install/lib/
 install -m 644 libs/julian/fjulian.inc libs/install/include/
 make clobber
-make -j8
+make -s -f makefile -f - print-objects > "$evidence/compiled_objects.txt" <<'MAKE'
+print-objects:
+	@echo $(FVCOM_OBJS)
+MAKE
+run_python "$payload/perlmutter_dependencies.py" "$evidence/make_inc_audit.json" "$evidence/compiled_objects.txt" > "$evidence/active_dependencies.mk"
+make -f makefile -f "$evidence/active_dependencies.mk" -j8 fvcom_plased
 sha256sum fvcom_plased > "$evidence/executable.sha256"
 file fvcom_plased > "$evidence/executable.file.txt"
 ldd fvcom_plased > "$evidence/executable.ldd.txt"

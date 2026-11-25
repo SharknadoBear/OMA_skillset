@@ -1,6 +1,7 @@
 """Offline contract regressions for native Perlmutter CPU build evidence."""
 import copy
 import hashlib
+import importlib.util
 from pathlib import Path
 import tarfile
 import tempfile
@@ -127,6 +128,19 @@ class CpuBuildContract(unittest.TestCase):
         with self.assertRaisesRegex(fb.ContractError, "across execution sites"):
             fb.reuse_build(self.request, binding, self.evidence, self.root/"old.tgz", self.root/"bin",
                            self.root/"blank.nml", self.artifacts)
+
+    def test_active_fortran_module_order(self):
+        path = Path(__file__).resolve().parents[1]/"assets/perlmutter_dependencies.py"
+        spec = importlib.util.spec_from_file_location("dependencies", path)
+        tool = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(tool)
+        sources = [("mod_par.F", "MODULE MOD_PAR\nend module"),
+                   ("particle.F", "module particle_class\nuse MOD_PAR, only: node\nend module"),
+                   ("mod_esmf_nesting.F", "module nest\nuse mod_par ! lower case\nuse, intrinsic :: iso_c_binding\nend module")]
+        self.assertEqual(tool.dependencies(sources),
+                         {"particle.o": ["mod_par.o"], "mod_esmf_nesting.o": ["mod_par.o"], "mod_par.o": []})
+        with self.assertRaisesRegex(ValueError, "Duplicate module"):
+            tool.dependencies(sources+[("conflict.F", "module MOD_PAR")])
 
     def test_source_packaging_and_submit_layout(self):
         src = self.root/"source_package"

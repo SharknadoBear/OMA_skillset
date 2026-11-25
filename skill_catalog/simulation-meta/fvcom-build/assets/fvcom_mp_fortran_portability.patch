@@ -1,0 +1,180 @@
+--- a/adv_s.F
++++ b/adv_s.F
+@@ -176,5 +176,5 @@
+ #    if defined (WET_DRY)
+ !J. Ge for tracer advection
+-           IF(BACKWARD_ADVECTION==.FALSE.)THEN
++           IF(.NOT. BACKWARD_ADVECTION)THEN
+ 
+             IF(ISWETN(I1) == 0 .AND. ISWETN(I2) == 1)THEN
+@@ -228,5 +228,5 @@
+ #    else
+ !J. Ge for tracer advection	 
+-           IF(BACKWARD_ADVECTION==.FALSE.)THEN
++           IF(.NOT. BACKWARD_ADVECTION)THEN
+              FFD=0.5_SP*(S1(I1,K)+S1(I2,K)-SMEAN1(I1,K)-SMEAN1(I2,K))
+              FF1=0.5_SP*(S1(I1,K)+S1(I2,K))
+@@ -303,5 +303,5 @@
+              I2=NBSN(N_DAM_MATCH(I,NX+1),J+1)
+ !J. Ge for tracer advection
+-             IF(BACKWARD_ADVECTION==.FALSE.)THEN
++             IF(.NOT. BACKWARD_ADVECTION)THEN
+                FFD=0.5_SP*(S1(I1,K)+S1(I2,K)-SMEAN1(I1,K)-SMEAN1(I2,K))
+                FF1=0.5_SP*(S1(I1,K)+S1(I2,K))
+@@ -405,5 +405,5 @@
+ 
+ !J. Ge for tracer advection
+-        IF(BACKWARD_ADVECTION==.FALSE.)THEN
++        IF(.NOT. BACKWARD_ADVECTION)THEN
+           FIJ1=S1(IA,K)+DLTXNCVE(I,1)*PSPX(IA)+DLTYNCVE(I,1)*PSPY(IA)
+           FIJ2=S1(IB,K)+DLTXNCVE(I,2)*PSPX(IB)+DLTYNCVE(I,2)*PSPY(IB)
+@@ -822,5 +822,5 @@
+ 
+ !J. Ge for tracer advection
+-           IF(BACKWARD_ADVECTION==.FALSE.)THEN
++           IF(.NOT. BACKWARD_ADVECTION)THEN
+              IF(K == 1) THEN
+               TEMP=-WTS(I,K+1)*(S1(I,K)*DZ(I,K+1)+S1(I,K+1)*DZ(I,K))/   &
+@@ -935,5 +935,5 @@
+ !        XFLUX(I,KBM1)=XFLUX(I,KBM1)-BFWDIS(I)*S1(I,KBM1)/DZ(I,KBM1)
+ !J. Ge for tracer advection
+-        IF(BACKWARD_ADVECTION==.FALSE.)THEN
++        IF(.NOT. BACKWARD_ADVECTION)THEN
+           XFLUX(I,KBM1)=XFLUX(I,KBM1)-BFWDIS(I)*S1(I,KBM1)
+         ELSE
+--- a/adv_t.F
++++ b/adv_t.F
+@@ -218,5 +218,5 @@
+ #    if defined (WET_DRY)
+ !J. Ge for tracer advection
+-         IF(BACKWARD_ADVECTION==.FALSE.)THEN
++         IF(.NOT. BACKWARD_ADVECTION)THEN
+            IF(ISWETN(I1) == 0 .AND. ISWETN(I2) == 1)THEN
+             FFD=0.5_SP*(T1(I,K)+T1(I2,K)-TMEAN1(I,K)-TMEAN1(I2,K))
+@@ -266,5 +266,5 @@
+ #    else	 
+ !J. Ge for tracer advection	 
+-       IF(BACKWARD_ADVECTION==.FALSE.)THEN
++       IF(.NOT. BACKWARD_ADVECTION)THEN
+          FFD=0.5_SP*(T1(I1,K)+T1(I2,K)-TMEAN1(I1,K)-TMEAN1(I2,K))
+          FF1=0.5_SP*(T1(I1,K)+T1(I2,K))
+@@ -343,5 +343,5 @@
+              I2=NBSN(N_DAM_MATCH(I,NX+1),J+1)
+ !J. Ge for tracer advection
+-             IF(BACKWARD_ADVECTION==.FALSE.)THEN
++             IF(.NOT. BACKWARD_ADVECTION)THEN
+                FFD=0.5_SP*(T1(I1,K)+T1(I2,K)-TMEAN1(I1,K)-TMEAN1(I2,K))
+                FF1=0.5_SP*(T1(I1,K)+T1(I2,K))
+@@ -447,5 +447,5 @@
+ 
+ !J. Ge for tracer advection
+-        IF(BACKWARD_ADVECTION==.FALSE.)THEN
++        IF(.NOT. BACKWARD_ADVECTION)THEN
+           FIJ1=T1(IA,K)+DLTXNCVE(I,1)*PTPX(IA)+DLTYNCVE(I,1)*PTPY(IA)
+           FIJ2=T1(IB,K)+DLTXNCVE(I,2)*PTPX(IB)+DLTYNCVE(I,2)*PTPY(IB)
+@@ -864,5 +864,5 @@
+ 
+ !J. Ge for tracer advection
+-           IF(BACKWARD_ADVECTION==.FALSE.)THEN
++           IF(.NOT. BACKWARD_ADVECTION)THEN
+              IF(K == 1) THEN
+               TEMP=-WTS(I,K+1)*(T1(I,K)*DZ(I,K+1)+T1(I,K+1)*DZ(I,K))/   &
+@@ -978,5 +978,5 @@
+      DO I=1,M
+  !J. Ge for tracer advection
+-        IF(BACKWARD_ADVECTION==.FALSE.)THEN
++        IF(.NOT. BACKWARD_ADVECTION)THEN
+           XFLUX(I,KBM1)=XFLUX(I,KBM1)-BFWDIS(I)*T1(I,KBM1)
+         ELSE
+--- a/internal_step.F
++++ b/internal_step.F
+@@ -1235,5 +1235,5 @@
+ #   if !defined (ONE_D_MODEL)
+ !J. Ge for tracer advection
+-     IF(BACKWARD_ADVECTION==.TRUE.)THEN
++     IF(BACKWARD_ADVECTION)THEN
+        IF(BACKWARD_STEP==1)THEN
+         T0 = T1
+@@ -1332,5 +1332,5 @@
+ #   if !defined (ONE_D_MODEL)
+ !J. Ge for tracer advection
+-     IF(BACKWARD_ADVECTION==.TRUE.)THEN
++     IF(BACKWARD_ADVECTION)THEN
+        IF(BACKWARD_STEP==1)THEN
+         S0 = S1
+--- a/mod_scal.F
++++ b/mod_scal.F
+@@ -771,5 +771,5 @@
+ 
+ #    if defined (WET_DRY)
+-         IF(BACKWARD_ADVECTION/=.TRUE.)THEN
++         IF(.NOT. BACKWARD_ADVECTION)THEN
+            IF(ISWETN(I1) == 0 .AND. ISWETN(I2) == 1)THEN
+             FFD=0.5_SP*(f(I,K)+f(I2,K))
+@@ -818,5 +818,5 @@
+          END IF
+ #    else	 
+-         IF(BACKWARD_ADVECTION/=.TRUE.)THEN
++         IF(.NOT. BACKWARD_ADVECTION)THEN
+            FFD=0.5_SP*(f(I1,K)+f(I2,K))
+            FF1=0.5_SP*(f(I1,K)+f(I2,K))
+@@ -855,5 +855,5 @@
+              I1=NBSN(N_DAM_MATCH(I,NX+1),J)
+              I2=NBSN(N_DAM_MATCH(I,NX+1),J+1)
+-             IF(BACKWARD_ADVECTION/=.TRUE.)THEN
++             IF(.NOT. BACKWARD_ADVECTION)THEN
+                FFD=0.5_SP*(f(I1,K)+f(I2,K))
+                FF1=0.5_SP*(f(I1,K)+f(I2,K))
+@@ -1062,5 +1062,5 @@
+ #      endif
+ 
+-       IF(BACKWARD_ADVECTION/=.TRUE.)THEN
++       IF(.NOT. BACKWARD_ADVECTION)THEN
+          fij1=f(ia,k)+dxa*pfpx(ia)+dya*pfpy(ia)
+          fij2=f(ib,k)+dxb*pfpx(ib)+dyb*pfpy(ib)
+@@ -1172,5 +1172,5 @@
+      if(IS_DAM(I)==1)then
+        wvel(1:kb)=0.0_sp
+-       IF(BACKWARD_ADVECTION/=.TRUE.)THEN
++       IF(.NOT. BACKWARD_ADVECTION)THEN
+          ftmp = f(i,1:kbm1)
+          call calc_vflux(kbm1,f(i,1:kbm1),wvel(1:kb),dz(i,1:kbm1),vflux)
+@@ -1184,5 +1184,5 @@
+        ENDIF
+      else
+-       IF(BACKWARD_ADVECTION/=.TRUE.)THEN
++       IF(.NOT. BACKWARD_ADVECTION)THEN
+          ftmp = f(i,1:kbm1)
+          call calc_vflux(kbm1,f(i,1:kbm1),wts(i,1:kb),dz(i,1:kbm1),vflux)
+@@ -1197,5 +1197,5 @@
+      end if
+ #    else
+-       IF(BACKWARD_ADVECTION/=.TRUE.)THEN
++       IF(.NOT. BACKWARD_ADVECTION)THEN
+          call calc_vflux(kbm1,f(i,1:kbm1),wts(i,1:kb),dz(i,1:kbm1),vflux)
+        ELSE
+@@ -1262,5 +1262,5 @@
+           jj=inodeq(j)
+           do k=1,kbm1
+-            IF(BACKWARD_ADVECTION/=.TRUE.)THEN
++            IF(.NOT. BACKWARD_ADVECTION)THEN
+               fpoint = f(jj,k)
+             ELSE
+--- a/mod_action_ex.F
++++ b/mod_action_ex.F
+@@ -562,5 +562,5 @@
+ !    UN =  - CANX*DLTYE(I)
+ !# endif
+-    EXFLUX=-UN*((1.0+SIGN(1.0,UN))*FIJ1(:,:,2)+(1.0-SIGN(1.0,UN))*FIJ1(:,:,1))*0.5
++    EXFLUX=-UN*((1.0+SIGN(1.0_sp,UN))*FIJ1(:,:,2)+(1.0-SIGN(1.0_sp,UN))*FIJ1(:,:,1))*0.5
+ 
+ #   if defined (ICE)                                 
+--- a/mod_station_timeseries.F
++++ b/mod_station_timeseries.F
+@@ -1339,5 +1339,5 @@
+ 
+        DO I=1,MGL
+-         WRITE(10,'(2I10,<MX_NBR_ELEM_GL+1>I10)') I,NTVEGL(I),(NBVEGL(I,J),J=1,NTVEGL(I))
++         WRITE(10,'(2I10,*(I10))') I,NTVEGL(I),(NBVEGL(I,J),J=1,NTVEGL(I))
+        END DO
+        CLOSE(10)
