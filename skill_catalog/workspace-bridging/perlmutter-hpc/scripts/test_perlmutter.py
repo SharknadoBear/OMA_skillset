@@ -11,7 +11,6 @@ from unittest.mock import patch
 import subprocess
 
 import perlmutter as p
-import slurm_receipt
 
 
 class NativeTransport(unittest.TestCase):
@@ -22,6 +21,8 @@ class NativeTransport(unittest.TestCase):
     def test_validity_principal_and_expiry(self):
         for date, name, state in [(1,"tester","valid"), (2,"tester","expired"), (1,"other","wrong_principal")]:
             self.assertEqual(state, p.certificate_info(self.cert,name,dt.datetime(2026,11,date,3))["status"])
+        with patch.object(p,"check",return_value={"status":"wrong_principal"}), self.assertRaises(ValueError):
+            p.renew(Namespace())
 
     def test_strict_certificate_pair(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(p,"check",return_value={"status":"valid"}), \

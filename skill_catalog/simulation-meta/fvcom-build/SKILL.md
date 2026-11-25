@@ -1,11 +1,11 @@
 ---
 name: fvcom-build
-description: Audit, configure, compile, smoke-test, and freeze a reproducible FVCOM executable on Kestrel. Use for FVCOM source/build lineage and compatibility fixes; do not use it to submit model simulations or change model physics.
+description: Audit, configure, compile, probe, and freeze reproducible native FVCOM executables on Kestrel or Perlmutter CPU. Use for source lineage, compiler portability, MPI and NetCDF verification, and native namelist reader checks.
 ---
 
 # FVCOM Build
 
-Produce an evidence-backed executable lineage, not merely a successful `make` exit.
+Freeze the native executable together with its source, compiler, runtime libraries, and input-reader evidence.
 
 
 ## paper_barotropic native build
@@ -85,6 +85,10 @@ Do not blur a blocker into a warning. Set a resume token identifying the last im
 ## Shared pressure-capable build
 
 For a wind scenario or its matched control, run the make audit with `--air-pressure`. Both members require the same `AIR_PRESSURE` executable. Capture the compiler's expanded preprocessing commands for `mod_obcs.F`, `advave_edge_gcn.F` and `external_step.F`, the exact edited make.inc, binary hash, and native blank namelist. Run both native namelist parser probes and then exercise the actual variable field readers in the wind smoke run. Bind the shared executable to both member requests.
+
+## Perlmutter CPU pilot
+
+For `execution.site=perlmutter`, use the `perlmutter-hpc` bridge to inspect the selected CPU allocation and native Cray Programming Environment. Build the pinned source anew for the destination. Use the local payload builder and submission commands in [the Perlmutter build contract](references/contracts.md#perlmutter-cpu-build). The build job tests MPI and netCDF with the selected `ftn` wrapper, generates the native blank, and exercises the control and combined input parsers. Pass the actual selected module versions to Run Control for the smoke launch.
 
 ## Matched wind and discharge study
 

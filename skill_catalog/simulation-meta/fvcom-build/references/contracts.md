@@ -152,3 +152,32 @@ Source declarations are an early compatibility check only. Finalization requires
 these fields and `NML_ADDITIONAL_MODELS.PLASTIC_MODEL` in the exact executable's
 generated blank template, then normal full rendering and input-reader validation.
 Do not synthesize missing keys or weaken the template-lineage gate.
+
+## Perlmutter CPU build
+
+The Columbia factorial combined pilot takes `execution.site=perlmutter`. Set `perlmutter.account` to the CPU charging account. Resolve `pair_root` below PSCRATCH, `project_dir` to its member directory, and `source_dir` to its shared source directory. The profile resolves the same FVCOM_MP commit used on Kestrel. Native executable bindings carry their execution site.
+
+Prepare a local source package containing `pinned_source.tgz`, `source_revision.json`, `source_inventory_before.sha256`, and `no_plastic_guard.patch`. The revision records the source repository, commit, archive SHA-256, and original Git blob count. Supply the real control and combined namelists and combined river companion. The packager checks each source blob, sets the native parser paths, and creates a checksummed archive.
+
+```bash
+python scripts/prepare_perlmutter_build.py --source-package "$source_package" \
+  --control-nml "$control_nml" --combined-nml "$combined_nml" --river-nml "$river_nml" \
+  --account "$account" --qos debug --output perlmutter_build.tgz
+```
+
+Transfer the archive to `$pair_root/run/build`, compare its remote SHA-256 with the reported digest, and submit from that directory. Use a fresh payload directory per revision.
+
+```bash
+mkdir payload_v1
+tar -C payload_v1 -xzf perlmutter_build.tgz
+(cd payload_v1 && sha256sum -c payload.sha256)
+sbatch --parsable payload_v1/build_cpu.sbatch "$PWD/payload_v1"
+```
+
+The driver selects CPU modules, tries GNU first, and keeps a separate source and log tree for each compiler candidate. Both the MPI/netCDF probe and FVCOM compilation use the same wrappers and module environment. The two-rank probe reduces a value, writes it to netCDF and verifies both ranks read it back. Bundled METIS and Julian link with the selected environment. The pressure-enabled binary must generate its own blank template and parse control and combined namelists before reaching the intentional missing OBC sentinel. [NERSC compiler wrappers](https://docs.nersc.gov/development/compilers/wrappers/) and [NERSC netCDF](https://docs.nersc.gov/development/libraries/netcdf/).
+
+The job resolves Python 3.10 or later on the compute node before auditing the make configuration. Its absolute path and version appear in `python_runtime.txt`. When a Python module is needed, the driver loads it only in the helper subprocess so its libraries cannot change FVCOM linkage.
+
+For this FVCOM_MP pin, `DOUBLE_PRECISION` makes the model's `sp` kind double precision. The CPU build applies [the SIGN argument-kind patch](../assets/fvcom_mp_sign_kind.patch) in the two limiter expressions and the two interpolation quadrant tests. It changes the exact unit magnitude to `1.0_sp` to match the second operand required by Fortran. Both source originals, the diff and the post-patch hashes are saved in the native evidence. The job installs Julian's library and Fortran include directly from the bundled source. FVCOM links `libjulian.a` and does not invoke the optional `tconvert` utility.
+
+On success, record the build job, the selected CPU module versions and compiler options from `evidence/freeze.json`. Set `perlmutter.build_environment` to that exact object. Verify the archived evidence and the shared `source/fvcom_plased` SHA-256 during retrieval. Run `fvcom_build.py finalize` with the request, extracted evidence directory and local artifact root. The readiness check binds the native scheduler job, wrapper/compiler, two-rank readback, both parser logs, source pin, build features, template and executable. Reuse the same CPU environment for the single-site smoke integration. [NERSC Perlmutter job layouts](https://docs.nersc.gov/systems/perlmutter/running-jobs/).

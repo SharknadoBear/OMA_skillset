@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timedelta
+from pathlib import PurePosixPath
+import re
 from typing import Any
 
 PAPER_PROFILE = "paper_barotropic"
@@ -14,6 +16,26 @@ RIVER_MODE = "barotropic-tide-river"
 FACTORIAL_PROFILE = "columbia_wind_river_factorial"
 COMBINED_MODE = "barotropic-tide-wind-river"
 BAROTROPIC_MODES = {"barotropic_tide", RIVER_MODE, WIND_MODE, COMBINED_MODE}
+
+
+def execution_site(request: dict[str, Any]) -> str:
+    execution = request.get("execution", {})
+    if not isinstance(execution, dict):
+        raise ValueError("execution must be an object")
+    site = execution.get("site", "kestrel")
+    if site not in ("kestrel", "perlmutter"):
+        raise ValueError("execution.site must be kestrel or perlmutter")
+    if ("perlmutter" if site == "kestrel" else "kestrel") in request:
+        raise ValueError("supply only the configuration for the selected execution.site")
+    return site
+
+
+def site_configuration(request: dict[str, Any]) -> dict[str, Any]:
+    site = execution_site(request)
+    value = request.get(site, {})
+    if not isinstance(value, dict):
+        raise ValueError(f"{site} must be an object")
+    return value
 
 
 def has_wind(request: dict[str, Any]) -> bool:
@@ -69,6 +91,9 @@ def resolve_request(request: dict[str, Any]) -> dict[str, Any]:
     """Fill profile defaults and reject contradictory settings, without mutating input."""
     result = deepcopy(request)
     profile = result.get("profile")
+    site = execution_site(result)
+    if site == "perlmutter" and (profile != FACTORIAL_PROFILE or result.get("mode") != COMBINED_MODE):
+        raise ValueError("the Perlmutter pilot requires the Columbia factorial combined member")
     validate_river_source(result)
     if has_wind(result):
         result.setdefault("period", {}).setdefault("spinup_days", 14)
@@ -108,6 +133,28 @@ def resolve_request(request: dict[str, Any]) -> dict[str, Any]:
             settings["river"] = {"provider": "usgs", "station_id": "14246900", "parameter_code": "72137"}
         settings["grid_policy"] = "retained_only"
         settings["period"]["spinup_days"] = 14
+    if site == "perlmutter":
+        site_values = site_configuration(result)
+        account = site_values.get("account")
+        if not isinstance(account, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", account):
+            raise ValueError("perlmutter.account must identify the selected CPU charging account")
+        for name in ("project_dir", "source_dir"):
+            path = site_values.get(name, "")
+            if (not isinstance(path, str) or not re.fullmatch(r"/[a-zA-Z0-9_./+-]+", path)
+                    or ".." in PurePosixPath(path).parts or path == "/"):
+                raise ValueError(f"perlmutter.{name} must be a resolved absolute site path")
+        if set(result["execution"]).intersection({"production_nodes","production_ranks","production_ranks_per_node","max_production_attempts"}):
+            raise ValueError("remove production layout from the smoke-only Perlmutter request")
+        source = settings.pop("kestrel")
+        settings["perlmutter"] = {
+            "source_repository": source["source_repository"], "source_commit": source["source_commit"],
+            "constraint": "cpu", "qos": "debug", "nodes": 1, "ranks": 52, "threads_per_rank": 1,
+            "walltime": "00:30:00",
+        }
+        settings["execution"] = {"site":"perlmutter", "stages":["smoke"], "smoke_simulated_hours":24}
+        limit = result["execution"].setdefault("max_smoke_attempts", 1)
+        if isinstance(limit,bool) or not isinstance(limit,int) or not 1 <= limit <= 3:
+            raise ValueError("max_smoke_attempts must be an integer from one to three")
     merge(result, settings)
     if result["grid_policy"] == "fresh_only" and result.get("accepted_grid"):
         raise ValueError(f"{profile} requires a fresh grid")

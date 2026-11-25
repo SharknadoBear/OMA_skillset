@@ -15,8 +15,8 @@ from typing import Any
 
 
 from fvcom_profiles import (BAROTROPIC_MODES, COMBINED_MODE, FACTORIAL_PROFILE, PAIR_PROFILE, PAPER_PROFILE,
-                            RIVER_MODE, WIND_MODE, WIND_PROFILE, has_river, is_cold_pair_stage,
-                            needs_air_pressure, resolve_request)
+                            RIVER_MODE, WIND_MODE, WIND_PROFILE, execution_site, has_river, is_cold_pair_stage,
+                            needs_air_pressure, resolve_request, site_configuration)
 
 
 G = 9.81
@@ -137,7 +137,9 @@ def init_project(request_path: Path, project: Path) -> dict[str, Any]:
         "request": "request.json",
         "request_sha256": sha256(request_copy),
         "local_root": str(project.resolve()),
-        "kestrel_root": req.get("kestrel", {}).get("project_dir") or f"/scratch/yhuang168/FVCOM_Simulation/{req['case_id']}",
+        **({"execution_site":"perlmutter", "perlmutter_root":site_configuration(req)["project_dir"]}
+           if execution_site(req) == "perlmutter" else {
+               "kestrel_root": req.get("kestrel", {}).get("project_dir") or f"/scratch/yhuang168/FVCOM_Simulation/{req['case_id']}"}),
         "grid_order": grid_order(req["grid_policy"]),
         "immutable_attempts": True,
         **({"profile": req["profile"]} if req.get("profile") else {}),
@@ -575,6 +577,50 @@ def attempt_sbatch(args: argparse.Namespace, aid: str, stage: str | None) -> str
     for name in modules:
         if not re.fullmatch(r"[A-Za-z0-9._+/-]+", name):
             raise ValueError(f"unsafe module name: {name}")
+    if getattr(args,"execution_site","kestrel") == "perlmutter":
+        cfg = args.site_configuration
+        directory = PurePosixPath(cfg["project_dir"]) / "run" / args.grid_case / "attempts" / aid
+        module_load = "\n".join(f"module load {name}" for name in modules)
+        return rf"""#!/bin/bash -l
+#SBATCH --job-name={args.job_prefix}_{aid}
+#SBATCH --account={args.account}
+#SBATCH --constraint={cfg['constraint']}
+#SBATCH --qos={cfg['qos']}
+#SBATCH --nodes={args.nodes}
+#SBATCH --ntasks={args.ranks}
+#SBATCH --ntasks-per-node={args.ranks}
+#SBATCH --cpus-per-task={cfg['threads_per_rank']}
+#SBATCH --hint=nomultithread
+#SBATCH --time={args.walltime}
+#SBATCH --chdir={directory}
+#SBATCH --output=stdout.log
+#SBATCH --error=stderr.log
+set -eo pipefail
+module reset
+if module is-loaded gpu; then module swap gpu cpu; else module load cpu; fi
+if module is-loaded cudatoolkit; then module unload cudatoolkit; fi
+{module_load}
+module -t list 2>&1
+module is-loaded cpu
+case ":${{LOADEDMODULES:-}}:" in
+  *:gpu:*|*:gpu/*:*|*:craype-accel-*:*|*:cudatoolkit:*|*:cudatoolkit/*:*) echo "GPU stack active in CPU run" >&2; exit 42;;
+esac
+set -u
+export OMP_NUM_THREADS={cfg['threads_per_rank']}
+cd '{directory}'
+[[ "${{NERSC_HOST:-}}" == perlmutter && "${{SLURM_JOB_ID:?}}" =~ ^[0-9]+$ ]]
+[[ "${{SLURM_NTASKS:?}}" == {args.ranks} ]]
+scontrol show job -o "$SLURM_JOB_ID" > launch_allocation.txt
+grep -Eq '(^|[[:space:]])Features=([^ ]*[,|&])?cpu([,|&][^ ]*)?([[:space:]]|$)' launch_allocation.txt
+sha256sum --check --quiet runtime_checksums.sha256
+native_digest=$(sha256sum -- '{args.remote_executable}')
+receipt=$(mktemp .launch_identity.XXXXXXXX)
+trap 'rm -f -- "$receipt"' EXIT
+printf '{{"schema":"fvcom_launch_identity_v1","site":"perlmutter","job_id":"%s","mpi_ranks":%s,"executable_sha256":"%s","constraint":"cpu","threads_per_rank":%s}}\n' \
+  "$SLURM_JOB_ID" "$SLURM_NTASKS" "${{native_digest%% *}}" "$OMP_NUM_THREADS" > "$receipt"
+ln -- "$receipt" launch_identity.json
+srun --ntasks={args.ranks} --cpus-per-task={cfg['threads_per_rank']} --cpu-bind=cores '{args.remote_executable}' --casename={args.case_name}
+"""
     module_setup = ""
     if modules:
         profile = getattr(args, "module_init", None)
@@ -644,6 +690,27 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
     project = Path(args.project)
     request_path = project / "request.json"
     request = resolve_request(load_data(request_path)) if request_path.exists() else {}
+    site = execution_site(request)
+    site_config = site_configuration(request)
+    args.execution_site = site
+    perlmutter = site == "perlmutter"
+    if perlmutter:
+        args.site_configuration = site_config
+        if getattr(args,"partition",None) not in (None,"auto") or getattr(args,"exclusive",False):
+            raise ValueError("the Perlmutter pilot uses the selected CPU constraint and debug QoS")
+        if getattr(args,"cpu_bind",None) not in (None,"cores"):
+            raise ValueError("the Perlmutter pilot requires core binding")
+        for key in ("account","nodes","ranks","walltime"):
+            if getattr(args,key,None) not in (None,site_config[key]):
+                raise ValueError(f"attempt {key} differs from the requested Perlmutter configuration")
+            setattr(args,key,site_config[key])
+        args.cpu_bind = "cores"
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+",args.case_name):
+            raise ValueError("unsafe Perlmutter case name")
+    else:
+        for key, value in (("account","hindcastra"),("partition","standard"),("nodes",1),("ranks",104),("walltime","01:00:00")):
+            if getattr(args,key,None) is None:
+                setattr(args,key,value)
     installation = {}
     if request.get("profile") in {PAIR_PROFILE, WIND_PROFILE, FACTORIAL_PROFILE}:
         args.job_prefix = "columbia_river" if request["mode"] == RIVER_MODE else "columbia_control"
@@ -652,13 +719,23 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
         if request["profile"] == FACTORIAL_PROFILE:
             binding = load_data(project / "run/build/executable_reuse_binding.json")
             if (binding.get("status") != "frozen" or args.remote_executable != binding.get("native_executable")
-                    or binding.get("source_commit") != request["kestrel"]["source_commit"]
-                    or binding.get("build_environment") != request["kestrel"]["build_environment"]
+                    or binding.get("source_commit") != site_config["source_commit"]
+                    or not site_config.get("build_environment")
+                    or binding.get("build_environment") != site_config.get("build_environment")
                     or "AIR_PRESSURE" not in binding.get("feature_defines", [])):
                 raise ValueError("factorial attempt must use the bound pressure-capable executable and environment")
+            if perlmutter:
+                native = PurePosixPath(args.remote_executable)
+                if (binding.get("execution_site") != site
+                        or not re.fullmatch(r"[0-9a-f]{64}",str(binding.get("executable_sha256","")))
+                        or not re.fullmatch(r"/[A-Za-z0-9_./+-]+",str(native)) or ".." in native.parts
+                        or not any(native.is_relative_to(site_config[k]) for k in ("source_dir","project_dir"))
+                        or not {"MULTIPROCESSOR","WET_DRY","GCN"} <= set(binding.get("feature_defines",[]))
+                        or not site_config.get("build_environment",{}).get("modules")):
+                    raise ValueError("Perlmutter requires a native executable, frozen module stack and matching MPI/wet-dry/GCN features")
             members = {"barotropic_tide": "control", WIND_MODE: "wind", RIVER_MODE: "river", COMBINED_MODE: "combined"}
             args.job_prefix = "columbia_factorial_" + members[request["mode"]]
-        environment = request.get("kestrel", {}).get("build_environment", {})
+        environment = site_config.get("build_environment", {})
         args.module_init = environment.get("module_init")
         if environment.get("modules"):
             if args.module and args.module != environment["modules"]:
@@ -679,8 +756,10 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
         installation = {"skill_commit": commit, "installed_skill_receipt_sha256": sha256(Path(receipt_path))}
     paper_stage = getattr(args, "paper_stage", None)
     if is_cold_pair_stage(request):
-        if paper_stage not in {"smoke", "production"} or not 0 <= args.index < 3:
-            raise ValueError("cold-start profile requires --stage smoke|production and index 0, 1 or 2 (three total attempts per stage)")
+        allowed_stages = request["execution"]["stages"]
+        attempt_limit = request["execution"].get(f"max_{paper_stage}_attempts",3)
+        if paper_stage not in allowed_stages or not 0 <= args.index < attempt_limit:
+            raise ValueError(f"cold-start profile allows {allowed_stages} and the selected stage's attempt limit")
         if args.grid_case not in grid_order(request["grid_policy"]) or getattr(args, "stage_namelist", None):
             raise ValueError("cold-start attempt must use the profile grid and one stage")
         if args.plan or not getattr(args, "controls", None):
@@ -691,7 +770,7 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError("cold-start smoke requires one CPU node and 1..104 ranks")
         if paper_stage == "production" and (args.nodes, args.ranks) != (2, 208):
             raise ValueError("cold-start production requires two nodes and 208 ranks")
-        if paper_stage == "smoke" and args.partition not in {"debug", "shared"}:
+        if paper_stage == "smoke" and not perlmutter and args.partition not in {"debug", "shared"}:
             raise ValueError("cold-start smoke must use debug or shared")
         if paper_stage == "production" and args.partition in {"debug", "shared", "sharedl"}:
             raise ValueError("cold-start production requires an eligible exclusive CPU partition")
@@ -726,10 +805,15 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
     if input_dir.exists() or run_dir.exists():
         raise FileExistsError(f"immutable attempt already exists: {aid}")
     base_input = Path(args.base_input)
+    if perlmutter and any(p.is_symlink() or not p.is_file() or "\n" in p.name or "\r" in p.name or "\\" in p.name
+                          for p in base_input.iterdir()):
+        raise ValueError("Perlmutter runtime inputs must be flat, regular files with unambiguous checksum names")
     sponge_sources = sorted(base_input.rglob("*_spg.dat"))
     if len(sponge_sources) != 1:
         raise ValueError(f"base input must contain exactly one *_spg.dat; found {len(sponge_sources)}")
     nml_sources = attempt_namelist_sources(args)
+    # Validate the scheduler text before materializing either immutable directory.
+    scripts = {stage:attempt_sbatch(args,aid,stage) for stage in nml_sources}
     for path in nml_sources.values():
         verify_stage_forcing(request, path, base_input)
     if paper_stage:
@@ -775,7 +859,7 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
         attempt_nml = stage_dir / f"{args.case_name}_run.nml"
         attempt_nml.write_text(rendered_nml, encoding="utf-8", newline="\n")
         (stage_dir / "job.sbatch").write_text(
-            attempt_sbatch(args, aid, stage), encoding="utf-8", newline="\n"
+            scripts[stage], encoding="utf-8", newline="\n"
         )
         if stage:
             stage_manifests[stage] = {
@@ -801,7 +885,7 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
         "plan_sha256": sha256(plan_path), "status": "prepared",
         **installation,
         **({"profile": request["profile"], ("paper_stage" if request["profile"] == PAPER_PROFILE else "stage"): paper_stage, "stage_attempt": args.index + 1,
-            "stage_attempt_limit": 3, "controls_sha256": sha256(plan_path)} if paper_stage else {}),
+            "stage_attempt_limit": attempt_limit, "controls_sha256": sha256(plan_path)} if paper_stage else {}),
     }
     if staged:
         manifest["stages"] = {stage: stage_manifests[stage] for stage in ("smoke", "canary", "spinup")}
@@ -813,6 +897,17 @@ def create_attempt(args: argparse.Namespace) -> dict[str, Any]:
             "base_namelist_sha256": sha256(nml_src),
             "attempt_namelist_sha256": sha256(single_nml),
         })
+    if perlmutter:
+        sums = [(binding["executable_sha256"],args.remote_executable),(sha256(single_nml),single_nml.name)]
+        sums.extend((sha256(p),f"{attempt_input_reference}/{p.name}") for p in sorted(input_dir.iterdir(),key=lambda p:p.name))
+        checks = run_dir / "runtime_checksums.sha256"
+        checks.write_text("".join(f"{digest}  {name}\n" for digest,name in sums),encoding="utf-8",newline="\n")
+        manifest.update(execution_site=site,remote_project_root=site_config["project_dir"],
+            remote_run_dir=str(PurePosixPath(site_config["project_dir"])/"run"/args.grid_case/"attempts"/aid),
+            native_build_binding_sha256=sha256(project/"run/build/executable_reuse_binding.json"),
+            runtime_checksums_sha256=sha256(checks),job_sbatch_sha256=sha256(run_dir/"job.sbatch"))
+        manifest["execution_layout"].update(account=args.account,constraint=site_config["constraint"],
+            qos=site_config["qos"],threads_per_rank=site_config["threads_per_rank"],walltime=args.walltime)
     write_json(run_dir / "attempt_manifest.json", manifest)
     render_report(project)
     return manifest
@@ -1054,11 +1149,11 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--revision", type=int, default=0)
     q.add_argument("--module", action="append", default=[])
     q.add_argument("--remote-executable", required=True); q.add_argument("--case-name", default="galveston")
-    q.add_argument("--account", default="hindcastra"); q.add_argument("--partition", default="standard")
-    q.add_argument("--nodes", type=int, default=1); q.add_argument("--ranks", type=int, default=104)
+    q.add_argument("--account"); q.add_argument("--partition")
+    q.add_argument("--nodes", type=int); q.add_argument("--ranks", type=int)
     q.add_argument("--cpu-bind", choices=["cores", "none"])
     q.add_argument("--exclusive", action="store_true")
-    q.add_argument("--walltime", default="01:00:00")
+    q.add_argument("--walltime")
     q = sub.add_parser("audit")
     q.add_argument("--stdout", required=True); q.add_argument("--stderr")
     q.add_argument("--exit-code", required=True, type=int); q.add_argument("--expected-final", required=True)

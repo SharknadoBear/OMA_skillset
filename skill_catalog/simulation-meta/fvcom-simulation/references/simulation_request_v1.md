@@ -51,6 +51,8 @@ Default new projects to `Workspace/fvcom-simulation/<case_id>`. Explicit and his
 
 ## Internal project layout
 
+`execution.site` defaults to `kestrel`. For the [Perlmutter Columbia pilot](perlmutter_columbia_pilot.md), set `execution.site: perlmutter`, use a `perlmutter` object in place of `kestrel`, and select only the smoke stage. The object accepts `account`, `project_dir`, `source_dir`, `build_environment`, the pinned `source_repository` and `source_commit`, and the pilot scheduler settings `constraint: cpu`, `qos: debug`, `nodes: 1`, `ranks: 52`, `threads_per_rank: 1`, `walltime: "00:30:00"`.
+
 For new `barotropic_tide` projects, the [fixed agent workspace contract](barotropic_agent_layout.md) adds the following role roots; `benchmark` projects do not require them:
 
 ```text

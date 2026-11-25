@@ -53,6 +53,8 @@ def renew(args):
     if state["status"] == "valid":
         print(json.dumps(state))
         return
+    if state["status"] in {"wrong_principal", "not_yet_valid"}:
+        raise ValueError(f"Certificate status {state['status']}. Verify the account and local clock before renewing.")
     if args.key != Path.home() / ".ssh/nersc":
         raise ValueError("Renew the selected custom identity in its owning sshproxy workflow")
     if os.name != "nt":
@@ -143,7 +145,8 @@ def operate(args, opts):
                      capture_output=True, text=True, timeout=args.timeout).stdout.split()[0]
     def transfer(verb, src, dst):
         local(["sftp", "-q", "-b", "-", *opts, target],
-              input=f"{verb} {sftp_quote(src)} {sftp_quote(dst)}\n".encode(), timeout=args.timeout)
+              input=f"{verb} {sftp_quote(src)} {sftp_quote(dst)}\n".encode(),
+              stdout=subprocess.DEVNULL, timeout=args.timeout)
     if args.action == "upload":
         expected = digest(path)
         partial = remote + ".partial-" + uuid.uuid4().hex

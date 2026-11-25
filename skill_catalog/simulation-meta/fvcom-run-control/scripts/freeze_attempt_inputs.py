@@ -9,7 +9,7 @@ import re
 import tempfile
 from pathlib import Path
 
-from fvcom_profiles import resolve_request
+from fvcom_profiles import execution_site, resolve_request
 from fvcom_run_control import load_data, sha256, verify_stage_forcing
 
 
@@ -47,6 +47,18 @@ def freeze_attempt(project: Path, attempt: Path) -> dict:
     }
     if manifest.get("skill_commit"):
         freeze["skill_commit"] = manifest["skill_commit"]
+    if execution_site(request) == "perlmutter":
+        checks = attempt / "runtime_checksums.sha256"
+        rows = [(executable,binding["native_executable"]),(nml_hash,nml.name)]
+        rows.extend((files[name],f"{manifest['namelist_input_dir']}/{name}") for name in sorted(files))
+        if (manifest.get("execution_site") != "perlmutter" or binding.get("execution_site") != "perlmutter"
+                or manifest.get("native_build_binding_sha256") != sha256(project/"run/build/executable_reuse_binding.json")
+                or manifest.get("job_sbatch_sha256") != sha256(attempt/"job.sbatch")
+                or manifest.get("runtime_checksums_sha256") != sha256(checks)
+                or checks.read_bytes() != "".join(f"{digest}  {name}\n" for digest,name in rows).encode("utf-8")):
+            raise ValueError("Perlmutter launch script, native binding or runtime checksum list differs from the attempt")
+        freeze.update(execution_site="perlmutter",native_build_binding_sha256=manifest["native_build_binding_sha256"],
+                      runtime_checksums_sha256=sha256(checks),job_sbatch_sha256=manifest["job_sbatch_sha256"])
     output = attempt / "input_freeze.json"
     if not output.exists():
         # Publish complete bytes exclusively, including when two callers freeze the same attempt.

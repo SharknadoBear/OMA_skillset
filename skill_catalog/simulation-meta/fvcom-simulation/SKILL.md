@@ -1,9 +1,11 @@
 ---
 name: fvcom-simulation
-description: Orchestrate reproducible FVCOM tide-only, wind-forced, river-forced, combined wind and river, and benchmark studies from source preparation through Kestrel execution and scientific validation.
+description: Orchestrate reproducible FVCOM tide, wind, river and combined experiments, with Kestrel production and benchmarking, the Perlmutter Columbia combined smoke pilot, and scientific validation.
 ---
 
 # FVCOM Simulation
+
+The default execution site is Kestrel. An explicit `execution.site: perlmutter` selects the [Columbia combined Perlmutter pilot](references/perlmutter_columbia_pilot.md), including its native build, 52-rank CPU smoke and archived Kestrel reference. Use `$perlmutter-hpc` for all remote actions on that route.
 
 Interpret the science request and route the complete workflow. This skill is an orchestration contract only: it contains no scripts, performs no SSH itself, and never replaces the specialist skills that create or inspect artifacts.
 

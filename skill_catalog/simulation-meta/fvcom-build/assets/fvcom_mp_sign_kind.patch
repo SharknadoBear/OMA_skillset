@@ -1,0 +1,27 @@
+--- a/mod_utils.F
++++ b/mod_utils.F
+@@ -2997,5 +2997,5 @@
+   real(sp) a,b,alpha
+ 
+-  lim = 0.5_sp*(sign(1.,a)+sign(1.,b))*max(min(alpha*abs(a),abs(b)),min(abs(a),alpha*abs(b)))
++  lim = 0.5_sp*(sign(1.0_sp,a)+sign(1.0_sp,b))*max(min(alpha*abs(a),abs(b)),min(abs(a),alpha*abs(b)))
+ 
+   End Function LimLED1
+@@ -3006,5 +3006,5 @@
+   real(sp) a,b,alpha
+ 
+-  lim = 0.5_sp*(sign(1.,a)+sign(1.,b))*min(0.5_sp*abs(a+b),alpha*abs(a),alpha*abs(b))
++  lim = 0.5_sp*(sign(1.0_sp,a)+sign(1.0_sp,b))*min(0.5_sp*abs(a+b),alpha*abs(a),alpha*abs(b))
+ 
+   End Function LimLED2
+--- a/mod_interp.F
++++ b/mod_interp.F
+@@ -2288,6 +2288,6 @@
+     INTEGER :: IBIT1, IBIT2
+     
+-    IBIT1 = (INT(SIGN(1.,DX))+1) / 2
+-    IBIT2 = (INT(SIGN(1.,DY))+1) / 2
++    IBIT1 = (INT(SIGN(1.0_sp,DX))+1) / 2
++    IBIT2 = (INT(SIGN(1.0_sp,DY))+1) / 2
+     !    quadrant number:
+     QUADRANT = 2 * IBIT1 + IBIT2 + 1
