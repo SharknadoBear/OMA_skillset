@@ -28,6 +28,8 @@ python scripts/fvcom_benchmark.py analyze --plan benchmark_plan.json --records r
 
 The analyzer selects the shortest median FVCOM application-step elapsed time among layouts within 15 percent of the minimum median allocated node-hours. The step includes FVCOM initialization, integration and native output. Cost uses measured allocation elapsed time multiplied by allocated nodes. Empty or duplicate slots and changed scientific lineage prevent production selection.
 
+The record also retains FVCOM's own cumulative `SECS/IT` stopwatch reading at the terminal model clock when available. Its three-replicate median measures the integration loop separately from both the complete MPI application step and the charged allocation.
+
 ## Kestrel
 
 Use `$kestrel-hpc` for Kestrel jobs and `$fvcom-run-control` to audit completion.

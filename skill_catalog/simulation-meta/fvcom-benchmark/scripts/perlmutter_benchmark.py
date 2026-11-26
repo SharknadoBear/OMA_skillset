@@ -133,10 +133,15 @@ def collect_cpu(plan_path, attempt_dir, submission_path, launch_path, sacct_path
     require(math.isclose(iterations, round(iterations), rel_tol=0, abs_tol=1e-7), "fractional segment step count")
     def optional_bytes(k):
         return parse_scaled_bytes(step[k]) if step.get(k) else None
+    # REPORT_TIME prints its cumulative stopwatch average after INTERNAL_STEP on the pinned executable.
+    report = re.compile(r"(?m)^\s*!\s*\d+\s+(\d{4}-\d{2}-\d{2}T\S+)\s+[\d:]+\s+(\d+\.\d+)\s+\|")
+    last_average = next((float(value) for when,value in reversed(report.findall(stdout))
+                         if utc(when)==plan["simulated_end"]),None)
     record = dict(schema="fvcom_perlmutter_benchmark_record_v1", execution_site="perlmutter", eligible=True,
                   **target, job_id=job, attempt=attempt["name"], simulated_start=plan["simulated_start"],
                   simulated_end=plan["simulated_end"], measured_nodes=nodes, measured_ranks=ranks,
                   model_step_seconds=model, allocation_seconds=wall, extstep_seconds=extstep, isplit=isplit,
+                  native_loop_seconds_per_iteration_at_end=last_average,
                   fvcom_iterations=round(iterations), last_logged_iint=int(progress[-1][0]),
                   peak_memory_bytes_per_task=optional_bytes("MaxRSS"),
                   max_disk_read_bytes_per_task=optional_bytes("MaxDiskRead"),
@@ -200,11 +205,13 @@ def analyze_cpu(plan, records, plan_file_sha256=None):
         nodes = rows[0]["nodes"]
         elapsed = median(r["model_step_seconds"] for r in rows)
         wall = median(r["allocation_seconds"] for r in rows)
+        loop = [r.get("native_loop_seconds_per_iteration_at_end") for r in rows]
         layouts.append(dict(ranks=ranks, nodes=nodes, repeat_count=len(rows),
                             model_step_seconds_median=elapsed, allocation_seconds_median=wall,
                             model_step_seconds_min=min(r["model_step_seconds"] for r in rows),
                             model_step_seconds_max=max(r["model_step_seconds"] for r in rows),
                             charged_node_hours_median=wall*nodes/3600, simulated_days_per_day_median=86400/elapsed,
+                            native_loop_seconds_per_iteration_median=median(loop) if all(v is not None for v in loop) else None,
                             seconds_per_internal_iteration_median=elapsed/rows[0]["fvcom_iterations"]))
     least = min(x["charged_node_hours_median"] for x in layouts)
     eligible = [x for x in layouts if x["charged_node_hours_median"] <= least * 1.15 + 1e-12]

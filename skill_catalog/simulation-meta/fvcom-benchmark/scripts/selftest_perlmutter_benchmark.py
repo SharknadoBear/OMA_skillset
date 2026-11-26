@@ -49,7 +49,8 @@ class PerlmutterCPU(unittest.TestCase):
                                         threads_per_rank=1,executable_sha256="e"*64))
         terminal = put("terminal.json",dict(status="verified",utc=self.plan["simulated_end"],job_id=job,sha256="f"*64))
         stdout, sacct = att/"stdout.log",att/"sacct.psv"
-        stdout.write_text("! 17200 2025-07-01T23:53:20\nTADA!\n")
+        stdout.write_text("! 17200 2025-07-01T23:53:20\n"
+                          "! 17280 2025-07-02T00:00:00.000000 0000:00:00:00 0.0039  |====|\nTADA!\n")
         sacct.write_text("JobID|State|ExitCode|NNodes|NTasks|ElapsedRaw|MaxRSS\n"
                          f"{job}|COMPLETED|0:0|{n}||{wall}|\n{job}.0|COMPLETED|{step_exit}|{n}|{r}|{model}|1M\n")
         restart = put("selected.json",dict(status="verified",utc=self.plan["simulated_start"],sha256="a"*64))
@@ -61,6 +62,7 @@ class PerlmutterCPU(unittest.TestCase):
         timings = {64:(95,100),128:(72,110),256:(65,80)}
         rows = [self.collect(s,*timings[s["ranks"]]) for s in self.plan["runs"]]
         self.assertEqual(rows[0]["fvcom_iterations"],17280)
+        self.assertEqual(rows[0]["native_loop_seconds_per_iteration_at_end"],0.0039)
         self.assertEqual(rows[0]["peak_memory_bytes_per_task"],1048576)
         self.assertIsNone(rows[0]["max_disk_write_bytes_per_task"])
         result = benchmark.analyze(rows,self.plan)
