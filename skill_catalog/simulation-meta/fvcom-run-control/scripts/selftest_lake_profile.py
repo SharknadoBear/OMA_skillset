@@ -1,5 +1,6 @@
 """Exercise stage dates, two-node placement and immutable input binding."""
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,6 +16,16 @@ def main():
             execution={"site":"perlmutter"},perlmutter={"account":"test","project_dir":"/scratch/lake","source_dir":"/scratch/lake/source"})))
         init_project(request,project)
         spec=json.loads((project/"stage_plan.json").read_text())
+        assert spec["profile"] == lake.PROFILE
+        screen=spec["freshwater_thermal_screen"]
+        for key in lake.THERMAL_ASSETS:
+            assert hashlib.sha256((project/screen[key]).read_bytes()).hexdigest()==screen[key+"_sha256"]
+        legacy={k:v for k,v in spec.items() if k not in {"profile","freshwater_thermal_screen"}}
+        previous=json.dumps(legacy)
+        (project/"stage_plan.json").write_text(previous)
+        init_project(request,project)
+        assert (project/"stage_plan.json").read_text()==previous
+        assert json.loads((project/"stage_plan_thermal_screen.json").read_text())==spec
         assert [s["ranks"] for s in spec["stages"] if s["name"].startswith("benchmark_")]==[64,128,256]*3
         binding.write_text(json.dumps(dict(status="frozen",site="perlmutter",source_commit=lake.SOURCE_COMMIT,
             native_executable="/scratch/lake/source/fvcom",executable_sha256="a"*64,build_environment={"modules":["cpu/1"]})))
@@ -36,5 +47,9 @@ def main():
         try: materialize(args)
         except ValueError: pass
         else: raise AssertionError("wrong science clock accepted")
+        (project/screen["policy"]).write_text("{}")
+        try: init_project(request,project)
+        except ValueError: pass
+        else: raise AssertionError("modified screening policy accepted")
     print("Lake profile, schedule, two-node launch and clock rejection passed.")
 if __name__=="__main__": main()

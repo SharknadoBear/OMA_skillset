@@ -6,7 +6,7 @@ from pathlib import Path
 
 import netCDF4 as nc
 
-from lake_physics import clocks, policy, sha, utc
+from lake_physics import clocks, policy, sha, thermal_settings, utc
 
 
 def ref(path):
@@ -69,7 +69,7 @@ if __name__ == "__main__":
     s = sub.add_parser("geometry")
     s.add_argument("--source", required=True, type=Path)
     s.add_argument("--output", required=True, type=Path)
-    for action in ("spinup", "budget"):
+    for action in ("spinup", "budget", "thermal-screen"):
         s = sub.add_parser(action)
         s.add_argument("--inventory", type=Path, required=True)
         s.add_argument("--output", required=True, type=Path)
@@ -81,16 +81,39 @@ if __name__ == "__main__":
     else:
         d = json.loads(a.inventory.read_text())
         result = dict(geometry=ref(d["geometry"]))
-        if a.action == "spinup":
+        if a.action in ("spinup", "thermal-screen"):
             result["stage_plan"] = ref(d["stage_plan"])
+            plan_path = Path(d["stage_plan"])
+            plan = json.loads(plan_path.read_text())
+            adjacent = plan_path.with_name("request.json")
+            if "project_request" in d or adjacent.is_file():
+                result["project_request"] = ref(d.get("project_request", adjacent))
+            for key, plan_key in (("thermal_policy", "policy"), ("freezing_lookup", "freezing_lookup")):
+                if key in d:
+                    result[key] = ref(d[key])
+                elif plan.get("freshwater_thermal_screen", {}).get(plan_key):
+                    result[key] = ref(plan_path.parent / plan["freshwater_thermal_screen"][plan_key])
+            screened = thermal_settings(Path("."), result) is not None
+        if a.action == "spinup":
             start, end, _, _ = policy(Path("."), result)
             result["members"] = {}
             result["excluded"] = {}
             for key, value in d["members"].items():
                 try:
-                    result["members"][key] = make_member(value, start, end)
+                    if screened:
+                        native = json.loads(Path(value["native_audit"]).read_text())
+                        full = make_member(value, utc(native["first_utc"]), utc(native["last_utc"]))
+                        full["thermal_manifest"] = ref(value["thermal_manifest"])
+                        result["members"][key] = full
+                    else:
+                        result["members"][key] = make_member(value, start, end)
                 except (KeyError, OSError, ValueError) as err:
                     result["excluded"][key] = str(err)
+        elif a.action == "thermal-screen":
+            if not screened:
+                raise ValueError("Preregister the requested thermal screen before preparing the native member")
+            native = json.loads(Path(d["member"]["native_audit"]).read_text())
+            result["member"] = make_member(d["member"], utc(native["first_utc"]), utc(native["last_utc"]))
         else:
             result["member"] = make_member(d["member"], utc(d["start_utc"]), utc(d["end_utc"]))
             for key in ("surface_manifest", "river_manifest", "surface_budget"):

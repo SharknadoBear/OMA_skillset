@@ -164,7 +164,24 @@ def init_project(request_path: Path, project: Path) -> dict[str, Any]:
         plan = lake.schedule(req)
         plan_path = project / "stage_plan.json"
         if plan_path.exists() and load_data(plan_path)!=plan:
-            raise FileExistsError("project already contains a different Lake Superior stage plan")
+            previous = {k:v for k,v in plan.items() if k not in {"profile","freshwater_thermal_screen"}}
+            if load_data(plan_path) != previous:
+                raise FileExistsError("project already contains a different Lake Superior stage plan")
+            # Existing runs retain their original schedule. New scientific selections use the bound screen.
+            plan_path = project / "stage_plan_thermal_screen.json"
+            if plan_path.exists() and load_data(plan_path) != plan:
+                raise FileExistsError("the existing thermal screening schedule differs")
+        for key,name in lake.THERMAL_ASSETS.items():
+            dest = project/plan["freshwater_thermal_screen"][key]
+            dest.parent.mkdir(exist_ok=True,parents=True)
+            with (lake.ASSETS/name).open("rb") as source:
+                try:
+                    with dest.open("xb") as new:
+                        shutil.copyfileobj(source,new)
+                except FileExistsError:
+                    pass
+            if sha256(dest) != plan["freshwater_thermal_screen"][key+"_sha256"]:
+                raise ValueError("project thermal screening file differs: "+str(dest))
         if not plan_path.exists():
             write_json(plan_path,plan)
     manifest_path = project / "project_manifest.json"

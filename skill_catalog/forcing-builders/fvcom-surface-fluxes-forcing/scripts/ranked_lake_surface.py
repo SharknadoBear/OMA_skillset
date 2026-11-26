@@ -20,6 +20,16 @@ HRRR_PRODUCTS = BASE_PRODUCTS + ["downward_shortwave_flux","downward_longwave_fl
     for code,name in (("USWRF","upward_shortwave_flux"),("ULWRF","upward_longwave_flux"))]
 
 
+def hrrr_lake_arguments(parser):
+    parser.add_argument("--lake-water-mask", type=Path, action="append",
+                        help="Checked HRRR LAND connector NetCDF. Repeat for dated mask checks.")
+    parser.add_argument("--lake-seed-lonlat", nargs=2, type=float, metavar=("LONGITUDE", "LATITUDE"))
+    parser.add_argument("--max-water-distance-km", type=float,
+                        help="Maximum distance from a model node to a replacement donor")
+    parser.add_argument("--rain-context", nargs=2, metavar=("START_UTC", "END_UTC"),
+                        help="Parent HRRR integration window for identical precipitation transitions at segment edges")
+
+
 def acquire(args, provider):
     from datetime import datetime, timezone
     start,end = (datetime.fromisoformat(v.replace("Z","+00:00")).astimezone(timezone.utc) for v in (args.start,args.end))
@@ -33,10 +43,16 @@ def acquire(args, provider):
     import hrrr_core as core
     if not core.runtime_preflight()["passed"]:
         raise ValueError("HRRR requires its pinned GRIB runtime")
-    for forecast,cache,stop in ((False,args.hrrr_analysis,end),(True,args.hrrr_precipitation,end-HOUR)):
-        tick = start.replace(hour=6*(start.hour//6))
+    rain_start,rain_end = start,end-HOUR
+    if args.rain_context:
+        outer_start,outer_end = (datetime.fromisoformat(v.replace("Z","+00:00")).astimezone(timezone.utc) for v in args.rain_context)
+        if not (outer_start<=start and end<=outer_end):
+            raise ValueError("Segment exceeds its rain context")
+        rain_start,rain_end=max(outer_start,start-HOUR),min(outer_end-HOUR,end)
+    for forecast,cache,first,stop in ((False,args.hrrr_analysis,start,end),(True,args.hrrr_precipitation,rain_start,rain_end)):
+        tick = first.replace(hour=6*(first.hour//6))
         while tick<=stop:
-            begin,finish = max(tick,start),min(tick+5*HOUR,stop)
+            begin,finish = max(tick,first),min(tick+5*HOUR,stop)
             root = cache/tick.strftime("%Y%m%d%H")
             root.mkdir(parents=True,exist_ok=True)
             req = dict(schema_version="hrrr_request_v1",domain="conus",bbox=args.bbox,halo_cells=2,
@@ -130,6 +146,7 @@ if __name__=="__main__":
     for name in ("start","end"):
         parser.add_argument("--"+name,required=True)
     parser.add_argument("--projected-crs")
+    hrrr_lake_arguments(parser)
     parser.add_argument("--acquire",action="store_true",help="Use the archive connectors for missing or rejected caches")
     parser.add_argument("--bbox",type=float,nargs=4,metavar=("WEST","SOUTH","EAST","NORTH"))
     for name in ("hrrr-analysis","hrrr-precipitation","hrrr-python","era5-python","cfs-python"):

@@ -1,0 +1,3 @@
+# Preserve the byte identity of the preregistered GSW lookup, including its CSV line endings.
+freshwater_freezing.csv -text whitespace=trailing-space,cr-at-eol
+lake_thermal_policy.json text eol=lf

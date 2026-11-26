@@ -1,0 +1,12 @@
+{
+  "schema": "fvcom_lake_summer_thermal_tail_policy_v1",
+  "scope": "Screen wet layers on every six-hour state and at the final restart of a closed freshwater summer trial.",
+  "freezing_source": "https://www.teos-10.org/pubs/gsw/html/gsw_t_freezing.html",
+  "freezing_implementation": "GSW 3.6.23 in-situ freezing temperature of freshwater, with dissolved-air saturation fractions 0 and 1, evaluated against local sea pressure in dbar.",
+  "freezing_lookup_sha256": "d758e3b318d81e97533507644855df6dd0c808435d502060b369a11a30b26436",
+  "cold_conservative_margin_C": 0.01,
+  "cold_substantial_margin_C": 0.10,
+  "persistent_condition": "The same wet node and layer is more than 0.01 degrees Celsius below the air-saturated local freezing point on consecutive six-hour records.",
+  "cold_adjudication": "Exclude a trial with a substantial or persistent cold excursion from restart selection. Report its location, duration, affected volume and local heat balance.",
+  "hot_adjudication": "Report warm source-range exceedances, locations, wet volume and duration together with surface and river heat. Gross upper-bound violations invalidate the native trial."
+}

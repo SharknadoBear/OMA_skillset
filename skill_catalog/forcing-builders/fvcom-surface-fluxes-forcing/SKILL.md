@@ -13,6 +13,8 @@ For a baroclinic lake, follow the first complete provider in the requested order
 
 The lake task sums net solar and net longwave heating and subtracts upward sensible and latent flux. It provides penetrating net shortwave separately. Hourly f00 analyses supply heat and stress. Precipitation uses independent 0–1-hour APCP accumulations, with short conservative transitions across rate changes. Signed latent flux provides evaporation or condensation using 2.5 MJ/kg and 1,000 kg/m³. The P/E file adds condensation to water gains and writes evaporative loss with a negative sign. The hourly ledger retains rain, condensation, evaporation and surface heat separately for comparison with lake storage and river transports.
 
+For shallow lake shores, inspect the HRRR land and water contribution to each native heat stencil. To remap heat and its associated vapour flux onto lake-supported donors, supply checked `--lake-water-mask` fields, `--lake-seed-lonlat` and `--max-water-distance-km`. Use the parent integration window as `--rain-context` when creating shorter matched experiments. [Donor checks and Lake Superior coverage](references/lake_providers.md#shoreline-support-for-hrrr-direct-heat)
+
 The general writer accepts atmospheric fields prepared on their final structured grid or exact FVCOM node/element locations. For a barotropic wind-and-pressure experiment, use the dedicated acquisition and preparation workflow below before packaging. The selected data connector owns archive access.
 
 ## Barotropic wind and pressure

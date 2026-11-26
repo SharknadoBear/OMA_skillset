@@ -38,6 +38,19 @@ Each day uses a trapezoidal average of the six-hourly snapshots. Temperature RMS
 
 Select the shortest spinup agreeing with all longer preregistered trials. If unresolved, select the verified longest spinup and report `advisory_unresolved`. If the longest trial is unusable and no shorter trial passes against every longer one, report `blocked`. Use the selected trial's independently verified restart at the comparison start for subsequent benchmarking or production. The reducer checks the actual restart bytes against the native audit and carries the verified source job, comparison clock, archive path and SHA-256 into the selection. Run the reducer on the filesystem containing the archived restart.
 
+## Wet-temperature eligibility for freshwater spinups
+
+The `lake_superior_summer` profile requires a thermal screen for the entire native run, from startup through its final reported state. Other freshwater profiles can opt in by adding `freshwater_thermal_screen` to their stage plan. The object contains `policy_sha256` and `freezing_lookup_sha256`. Set both before launching trials. The preparer binds an adjacent project `request.json` when present or accepts an explicit `project_request`. A Lake Superior request with an older unqualified schedule requires a new versioned schedule.
+
+Run Control can register `policy` and `freezing_lookup` paths relative to the stage plan directory. For independently staged copies, place `thermal_policy` and `freezing_lookup` paths alongside `geometry` and `stage_plan` in the thermal-screen and spinup inventories. The policy declares positive conservative and substantial temperature deficits under `cold_conservative_margin_C` and `cold_substantial_margin_C` and includes the table's `freezing_lookup_sha256`. The CSV header is `sea_pressure_dbar,air_free_temperature_C,air_saturated_temperature_C`. The table must span all wet pressures. Supply the certified `member` paths for each individual screening run.
+
+```text
+python scripts/prepare_lake_physics.py thermal-screen --inventory trial_paths.json --output trial_inputs.json
+python scripts/lake_physics.py thermal-screen --spec trial_inputs.json --output wet_thermal_manifest.json
+```
+
+Add the resulting `thermal_manifest` path to that member in the spinup inventory, then run the ordinary spinup commands. The receipt identifies the submitted job, audited native fields, initial state, policy and full six-hour time series. The selector independently checks every wet layer against the pressure-dependent air-saturated freshwater freezing point using native pressure, layer thickness and local gravity. A substantial deficit in any sampled wet layer or a conservative deficit in the same wet layer on consecutive samples makes the member ineligible. A missing, foreign, incomplete or conflicting screen also excludes its restart, including the longest trial's advisory fallback. The selector accepts compatible case receipts of schema `fvcom_lake_member_thermal_tails_v1` under the same replay checks.
+
 ## Signed heat and water budgets
 
 Use the same `ART1`, `h+zeta`, wet masks and positive layer fractions as the model for storage. The current adapter implements the freshwater model's 1,000 kg/m³ reference density and 4,186 J/(kg K) heat capacity. It integrates hourly surface fluxes, P/E on its native irregular interval clock, and signed river flux. Incoming river heat uses prescribed river temperature. Withdrawals use native endpoint control-area fractions, the corresponding cell layer fractions and local simulated donor temperatures. Surface freshwater carries the local surface-layer temperature. Include shortwave transmitted to the bed using the runtime attenuation parameters.

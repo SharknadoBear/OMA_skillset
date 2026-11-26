@@ -1,7 +1,8 @@
 """Resolve and freeze the baroclinic Lake Superior experiment."""
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+import hashlib
 import re
 
 MODE = "baroclinic-temperature-wind-river"
@@ -13,6 +14,8 @@ PROVIDERS = ["hrrr","era5","cfsv2","cfsr"]
 START = datetime(2025,7,1,tzinfo=timezone.utc)
 END = datetime(2025,8,1,tzinfo=timezone.utc)
 SOURCE_COMMIT = "f8e4b50d4fd51409febcefc763cbc5dca11870e2"
+THERMAL_ASSETS = dict(policy="lake_thermal_policy.json",freezing_lookup="freshwater_freezing.csv")
+ASSETS = Path(__file__).resolve().parents[1]/"assets"
 
 def utc(t):
     return t.isoformat().replace("+00:00","Z")
@@ -79,7 +82,12 @@ def schedule(req):
         for ranks in req["benchmark"]["ranks"]:
             add(f"benchmark_{ranks:03d}_r{rep}",START,START+timedelta(days=1),ranks,"selected_july_restart")
     add("production",START,END,None,"selected_july_restart")
-    return dict(schema="fvcom_lake_schedule_v1",case_id=req["case_id"],stages=trials,
+    screen = {}
+    for key,name in THERMAL_ASSETS.items():
+        screen[key] = "analysis/thermal_screen/"+name
+        screen[key+"_sha256"] = hashlib.sha256((ASSETS/name).read_bytes()).hexdigest()
+    return dict(schema="fvcom_lake_schedule_v1",case_id=req["case_id"],profile=PROFILE,stages=trials,
+                freshwater_thermal_screen=screen,
                 comparison_start_utc=utc(START),comparison_end_utc=utc(START+timedelta(days=3)),
                 convergence=dict(volume_weighted_temperature_rms_c=0.25,upper_20m_temperature_rms_c=0.5,
                                  median_thermocline_abs_difference_m=2.0,lake_mean_elevation_difference_m=0.02))

@@ -13,6 +13,8 @@ from prepare_wind_pressure import (array, checked_fields, coordinates, hour_axis
                                    require, source_law, source_time, stamp, utc)
 from surface_fluxes_core import MeshGeometry, _time_variables, sha256_file
 from pyproj import CRS
+from lake_water_support import from_checked_masks
+from ranked_lake_surface import hrrr_lake_arguments
 
 LATENT_HEAT = 2.5e6  # J/kg, summer liquid water
 WATER_DENSITY = 1000.0  # kg/m3
@@ -101,11 +103,13 @@ def source_index(folder,clock,forecast=False):
     require(set(index)==wanted,"missing source timestamps")
     return index,receipts
 
-def interpolate(ds,var,i,points,axes,forecast=False):
+def interpolate(ds,var,i,points,axes,forecast=False,water_support=None):
     raw=ds[var][i,0] if forecast else ds[var][i]
     values=np.ma.asarray(raw)
     require(not np.ma.getmaskarray(values).any() and np.isfinite(values).all(),f"missing values in {var}")
-    return RegularGridInterpolator(axes,np.asarray(raw),bounds_error=True)(points)
+    field = np.asarray(raw)
+    result = RegularGridInterpolator(axes,field,bounds_error=True)(points)
+    return water_support.apply(field,result) if water_support is not None else result
 
 def unit_fluxes(inputs):
     sw=inputs["down_sw"]-inputs["up_sw"]
@@ -121,8 +125,14 @@ def build(args):
     clock=hour_axis(args.start,args.end)
     require(clock.size>=2 or args.pressure_only,"surface interval requires two endpoints")
     analyses,a_receipts=source_index(args.analysis,clock)
+    rain_context = getattr(args,"rain_context",None)
     if not args.pressure_only:
-        rain,p_receipts=source_index(args.precipitation,clock[:-1],True)
+        rain_clock = clock[:-1]
+        if rain_context:
+            parent = hour_axis(*rain_context)
+            require(parent[0] <= clock[0] and parent[-1] >= clock[-1], "Segment exceeds its rain context")
+            rain_clock = parent[:-1][(parent[:-1] >= clock[0]-3600000) & (parent[:-1] <= clock[-1])]
+        rain,p_receipts=source_index(args.precipitation,rain_clock,True)
     mesh,areas=native_geometry(args.mesh)
     source_law(args.mod_bulk)
     args.output.mkdir(parents=True,exist_ok=True)
@@ -131,6 +141,7 @@ def build(args):
         path=analyses[int(clock[0])][0]
         with nc.Dataset(path) as d:
             axes,cells,_,nodes=coordinates(d,"hrrr",mesh)
+            water_support = from_checked_masks(args,d,axes,nodes) if not args.pressure_only else None
             x,y=np.array(d["x"][:]),np.array(d["y"][:])
             wkt=d["crs"].crs_wkt
         def same_grid(d):
@@ -157,14 +168,14 @@ def build(args):
                     if args.pressure_only: continue
                     u,v=[interpolate(src,n,i,cells,axes) for n in ("eastward_wind_10m","northward_wind_10m")]
                     d["uwind_stress"][k],d["vwind_stress"][k]=psimple_drag(c*u-s*v,s*u+c*v)
-                    fluxes={key:interpolate(src,n,i,nodes,axes) for key,(n,_) in FLUXES.items()}
+                    fluxes={key:interpolate(src,n,i,nodes,axes,water_support=water_support) for key,(n,_) in FLUXES.items()}
                     sw,total,ev=unit_fluxes(fluxes)
                     d["short_wave"][k],d["net_heat_flux"][k],vapor[k]=sw,total,ev
                     heat[k]=np.sum(total*areas)
         files=[atm]
         if not args.pressure_only:
             def rate(k):
-                path,i=rain[int(clock[k])]
+                path,i=rain[int(clock[0])+3600000*k]
                 with nc.Dataset(path) as src:
                     same_grid(src)
                     acc=interpolate(src,"total_precipitation",i,nodes,axes,True)
@@ -175,9 +186,10 @@ def build(args):
             with create_file(pe,mesh,pe_clock,[("precip","node","m s-1"),("evap","node","m s-1")],frame) as ds, budget.open("w",newline="") as out:
                 writer=csv.writer(out)
                 writer.writerow(("start_utc","end_utc","rain_m3","evaporated_m3","condensed_m3","net_heat_j"))
-                cur=left=rate(0)
+                cur=rate(0)
+                left=np.minimum(cur,rate(-1)) if int(clock[0])-3600000 in rain else cur
                 for k in range(len(clock)-1):
-                    following=rate(k+1) if k+2<len(clock) else cur
+                    following=rate(k+1) if int(clock[k+1]) in rain else cur
                     right=np.minimum(cur,following)
                     E=[];C=[]
                     for j,(p,sec) in enumerate(zip(precipitation_shape(cur,left,right),(0,60,3540,3600))):
@@ -207,6 +219,10 @@ def build(args):
                     files={f.name:sha256_file(f) for f in files},area_m2=float(areas.sum()),
                     latent_heat_j_kg=LATENT_HEAT,water_density_kg_m3=WATER_DENSITY)
         manifest=temp/"surface_manifest.json"
+        if water_support is not None:
+            result["lake_water_support"] = water_support.info
+        if rain_context and not args.pressure_only:
+            result["rain_context_utc"] = list(rain_context)
         manifest.write_text(json.dumps(result,indent=2)+"\n",encoding="utf8")
         for f in files+[manifest]:
             dst=args.output/f.name
@@ -220,6 +236,7 @@ if __name__=="__main__":
     for name in ("mesh","analysis","mod-bulk","output"): p.add_argument("--"+name,type=Path,required=True)
     p.add_argument("--precipitation",type=Path);p.add_argument("--start",required=True);p.add_argument("--end",required=True)
     p.add_argument("--pressure-only",action="store_true");p.add_argument("--projected-crs")
+    hrrr_lake_arguments(p)
     args=p.parse_args()
     if not args.pressure_only and not args.precipitation: p.error("--precipitation is required with heat and wind")
     print(json.dumps(build(args)["files"],indent=2))

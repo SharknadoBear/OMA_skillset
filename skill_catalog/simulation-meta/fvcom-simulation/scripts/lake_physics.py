@@ -375,13 +375,161 @@ def policy(root, spec):
     return start, end, sorted(lengths), limits
 
 
+def thermal_settings(root, spec):
+    plan_path = checked(root, spec["stage_plan"])
+    plan = json.loads(plan_path.read_text())
+    requirement = plan.get("freshwater_thermal_screen")
+    request = spec.get("project_request")
+    adjacent = plan_path.with_name("request.json")
+    request_path = checked(root, request) if request else adjacent
+    profile = json.loads(request_path.read_text()).get("profile") if request_path.is_file() else None
+    if profile and plan.get("profile") and plan["profile"] != profile:
+        raise ValueError("Stage plan and project request profiles differ")
+    superior = (profile or plan.get("profile")) == "lake_superior_summer"
+    if requirement is None and not superior:
+        return None
+    if not isinstance(requirement, dict):
+        raise ValueError("Lake Superior spinup requires a preregistered freshwater thermal screen")
+    for key, digest_key in (("thermal_policy", "policy_sha256"), ("freezing_lookup", "freezing_lookup_sha256")):
+        if not spec.get(key) or spec[key]["sha256"] != requirement.get(digest_key):
+            raise ValueError(f"Missing or changed preregistered {key}")
+    policy_data = json.loads(checked(root, spec["thermal_policy"]).read_text())
+    table_path = checked(root, spec["freezing_lookup"])
+    if policy_data.get("freezing_lookup_sha256") != spec["freezing_lookup"]["sha256"]:
+        raise ValueError("Thermal policy and freezing lookup disagree")
+    with table_path.open() as source:
+        header = source.readline().strip()
+    if header != "sea_pressure_dbar,air_free_temperature_C,air_saturated_temperature_C":
+        raise ValueError("Expected freshwater pressure, air-free and air-saturated freezing columns")
+    table = np.loadtxt(table_path, delimiter=",", skiprows=1, ndmin=2)
+    cold = float(policy_data["cold_conservative_margin_C"])
+    severe = float(policy_data["cold_substantial_margin_C"])
+    if (
+        table.shape[1] != 3 or len(table) < 2 or not np.isfinite(table).all()
+        or not np.all(np.diff(table[:, 0]) > 0) or not np.all(table[:, 2] <= table[:, 1])
+        or not np.isfinite(severe) or not 0 < cold <= severe
+    ):
+        raise ValueError("Invalid preregistered freshwater equilibrium table or thresholds")
+    return table, cold, severe
+
+
+def thermal_measurement(root, spec, record, m, geom, settings):
+    """Replay every wet layer throughout the native member, including the pre-comparison spinup."""
+    native = m["native"]
+    times = sorted(m["fields"])
+    if times[0] != utc(native["first_utc"]) or times[-1] != utc(native["last_utc"]):
+        raise ValueError("Thermal screening requires the full model window")
+    table, cold, severe = settings
+    lat = np.deg2rad(geom["lat"].astype("f8"))
+    gravity = 9.780327 * (1 + 0.0053024 * np.sin(lat) ** 2 - 0.0000058 * np.sin(2 * lat) ** 2)
+    previous = None
+    rows = []
+    eligible = True
+    with nc.Dataset(checked(root, record["forcing"]["atmosphere"])) as atmosphere:
+        pressure_clock = clocks(atmosphere)
+        pressure_var = atmosphere["air_pressure"]
+        if (len(set(pressure_clock)) != len(pressure_clock) or getattr(pressure_var, "units", None) != "Pa"
+                or pressure_var.dimensions != ("time", "node")):
+            raise ValueError("Expected unique, absolute Pa nodal pressure for freshwater screening")
+        indices = {t: i for i, t in enumerate(pressure_clock)}
+        for t in times:
+            path, i = m["fields"][t]
+            with nc.Dataset(path) as ds:
+                temperature = vals(ds, "temp", i).astype("f8")
+                salinity = vals(ds, "salinity", i)
+                flags = vals(ds, "wet_nodes", i)
+                depth = geom["h"].astype("f8") + vals(ds, "zeta", i)
+                area = vals(ds, "art1").astype("f8")
+            wet = flags == 1
+            if (
+                not wet.any() or not np.isin(flags, [0, 1]).all() or np.any(depth[wet] <= 0)
+                or np.any(salinity[:, wet] != 0) or not np.array_equal(geom["art1"], area)
+            ):
+                raise ValueError("Invalid wet support, native area or nonfresh salinity in thermal screen")
+            layer = geom["fraction"] * depth
+            volume = area * wet * layer
+            center = np.cumsum(layer, axis=0) - layer / 2
+            air = vals(atmosphere, "air_pressure", indices[t]).astype("f8")
+            if np.any(air[wet] <= 0):
+                raise ValueError("Absolute air pressure must be positive")
+            pressure = (air - 101325 + 1000 * gravity * center) / 10000
+            if pressure[:, wet].min() < table[0, 0] or pressure[:, wet].max() > table[-1, 0]:
+                raise ValueError("Wet pressure outside declared freshwater freezing lookup")
+            margin = temperature - np.interp(pressure, table[:, 0], table[:, 2])
+            below = (margin < -cold) & wet
+            substantial = (margin < -severe) & wet
+            persistent = previous is not None and np.any(previous & below)
+            eligible = eligible and not substantial.any() and not persistent
+            rows.append(dict(
+                utc=t.isoformat(), wet_volume_m3=float(volume.sum()), cold_node_layers=int(below.sum()),
+                cold_volume_m3=float(volume[below].sum()), severe_cold_volume_m3=float(volume[substantial].sum()),
+                persistent=bool(persistent), lowest_pressure_corrected_margin={"value": float(margin[:, wet].min())},
+            ))
+            previous = below
+    return dict(
+        schema="fvcom_lake_wet_temperature_screen_v1", status="qualified" if eligible else "adjudication_required",
+        stage=native["stage"], job_id=native["job_id"], attempt_sha256=native["attempt_sha256"],
+        native_audit_sha256=record["native_audit"]["sha256"], startup_sha256=native["startup_sha256"],
+        policy_sha256=spec["thermal_policy"]["sha256"], freezing_lookup_sha256=spec["freezing_lookup"]["sha256"],
+        first_utc=native["first_utc"], last_utc=native["last_utc"], report_count=len(rows), records=rows,
+    )
+
+
+def verify_thermal_member(root, spec, record, m, geom, settings):
+    ref = record.get("thermal_manifest")
+    if not ref:
+        raise ValueError("Required native wet thermal manifest missing")
+    receipt = json.loads(checked(root, ref).read_text())
+    measured = thermal_measurement(root, spec, record, m, geom, settings)
+    keys = ["stage", "native_audit_sha256", "startup_sha256", "policy_sha256", "report_count"]
+    if receipt.get("schema") == "fvcom_lake_wet_temperature_screen_v1":
+        keys += ["attempt_sha256", "freezing_lookup_sha256"]
+    elif receipt.get("schema") != "fvcom_lake_member_thermal_tails_v1":
+        raise ValueError("Unknown freshwater thermal manifest")
+    if (
+        receipt.get("status") != "qualified" or measured["status"] != "qualified"
+        or str(receipt["job_id"]) != str(measured["job_id"]) or any(receipt[k] != measured[k] for k in keys)
+        or any(utc(receipt[k]) != utc(measured[k]) for k in ("first_utc", "last_utc"))
+    ):
+        raise ValueError("Thermal manifest is ineligible or belongs to another native member, policy or clock")
+    rows = receipt["records"]
+    if len(rows) != len(measured["records"]):
+        raise ValueError("Thermal manifest does not cover every wet-field UTC")
+    for actual, reported in zip(measured["records"], rows):
+        volumes_match = all(
+            np.isclose(actual[k], reported[k], rtol=1e-8, atol=1e-6)
+            for k in ("wet_volume_m3", "cold_volume_m3", "severe_cold_volume_m3")
+        )
+        margin_matches = np.isclose(
+            reported["lowest_pressure_corrected_margin"]["value"], actual["lowest_pressure_corrected_margin"]["value"],
+            rtol=1e-8, atol=1e-6,
+        )
+        if (not volumes_match or not margin_matches or utc(reported["utc"]) != utc(actual["utc"])
+                or reported["cold_node_layers"] != actual["cold_node_layers"]):
+            raise ValueError("Thermal manifest and replayed native wet layers disagree")
+    return dict(
+        manifest_sha256=ref["sha256"], policy_sha256=measured["policy_sha256"],
+        freezing_lookup_sha256=measured["freezing_lookup_sha256"], first_utc=measured["first_utc"],
+        last_utc=measured["last_utc"], report_count=measured["report_count"],
+    )
+
+
 def spinup(root, spec, geom):
     start, end, lengths, limits = policy(root, spec)
+    settings = thermal_settings(root, spec)
     available = {}
     rejected = {}
     for day in lengths:
         try:
-            m = member(root, spec["members"][str(day)], geom, start, end)
+            record = spec["members"][str(day)]
+            if settings:
+                nml = checked(root, record["namelist"])
+                m = member(root, record, geom, utc(nml_value(nml, "START_DATE")), utc(nml_value(nml, "END_DATE")))
+                if utc(nml_value(nml, "END_DATE")) < end:
+                    raise ValueError("Thermally screened trial does not cover the comparison window")
+                m["identity"]["freshwater_thermal_screen"] = verify_thermal_member(root, spec, record, m, geom, settings)
+            else:
+                m = member(root, record, geom, start, end)
             if m["run_start"] != start - timedelta(days=day):
                 raise ValueError("Wrong spinup initialization date")
             native = m["native"]
@@ -456,7 +604,7 @@ def spinup(root, spec, geom):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("action", choices=("spinup", "budget"))
+    p.add_argument("action", choices=("spinup", "budget", "thermal-screen"))
     p.add_argument("--spec", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
@@ -465,6 +613,14 @@ if __name__ == "__main__":
     geom = setup(root, spec)
     if args.action == "spinup":
         result = spinup(root, spec, geom)
+    elif args.action == "thermal-screen":
+        settings = thermal_settings(root, spec)
+        if not settings:
+            raise ValueError("Preregister a freshwater screen in the stage plan")
+        rec = spec["member"]
+        native = json.loads(checked(root, rec["native_audit"]).read_text())
+        m = member(root, rec, geom, utc(native["first_utc"]), utc(native["last_utc"]))
+        result = thermal_measurement(root, spec, rec, m, geom, settings)
     else:
         from lake_budget import budget
 

@@ -13,7 +13,7 @@ from pathlib import Path
 import netCDF4 as nc
 import numpy as np
 
-from lake_physics import setup, sha, spinup
+from lake_physics import member, setup, sha, spinup, thermal_measurement, thermal_settings, utc
 from lake_budget import budget
 
 START = datetime(2004, 8, 1, tzinfo=timezone.utc)
@@ -32,7 +32,8 @@ class NativeDiagnostics(unittest.TestCase):
         for name in ("pe", "atmosphere", "river"):
             path = self.d / (name + ".nc")
             with nc.Dataset(path, "w") as f:
-                self.clock(f, [START + timedelta(hours=i) for i in range(73)])
+                forcing_times = [START + timedelta(hours=i) for i in range(-24 * max(DAYS),73)]
+                self.clock(f, forcing_times)
                 f.createDimension("node", 3)
                 if name == "river":
                     f.createDimension("rivers", 2)
@@ -40,12 +41,16 @@ class NativeDiagnostics(unittest.TestCase):
                     text = f.createVariable("river_names", "S1", ("rivers", "namelen"))
                     text[:] = np.asarray([["r", "1"], ["r", "2"]], dtype="S1")
                     v = f.createVariable("river_flux", "f8", ("time", "rivers"))
-                    v[:] = [[1, -1]] * 73
+                    v[:] = [[1, -1]] * len(forcing_times)
                     v = f.createVariable("river_temp", "f8", ("time", "rivers"))
-                    v[:] = [[10, 0]] * 73
+                    v[:] = [[10, 0]] * len(forcing_times)
                 else:
                     for key in ("precip", "evap") if name == "pe" else ("net_heat_flux", "short_wave"):
                         f.createVariable(key, "f8", ("time", "node"))[:] = 0.0
+                    if name == "atmosphere":
+                        air = f.createVariable("air_pressure", "f8", ("time","node"))
+                        air.units = "Pa"
+                        air[:] = 101325.
             self.force[name] = self.ref(path)
         self.surface_csv = self.d / "surface_budget.csv"
         with self.surface_csv.open("w", newline="") as stream:
@@ -66,7 +71,7 @@ class NativeDiagnostics(unittest.TestCase):
         self.riv = self.js(
             "rivers.json",
             dict(
-                count=73,
+                count=len(forcing_times),
                 files={"river.nc": self.force["river"]["sha256"]},
                 entries=[
                     dict(index=1, cell_id=1, edge_nodes=[1, 2], river_name="r1"),
@@ -115,11 +120,12 @@ class NativeDiagnostics(unittest.TestCase):
         p.write_text(json.dumps(data))
         return self.ref(p)
 
-    def gen(self, day, offset):
+    def gen(self, day, offset, *, full_window=False, cold=None):
         path = self.d / f"output{day}.nc"
+        dates = ([START-timedelta(hours=6*i) for i in range(day*4,0,-1)] if full_window else []) + self.times
         with nc.Dataset(path, "w") as f:
             f.CoordinateSystem = "GeoReferenced"
-            self.clock(f, self.times)
+            self.clock(f, dates)
             for k, size in (("node", 3), ("nele", 1), ("siglay", 4), ("siglev", 5), ("three", 3)):
                 f.createDimension(k, size)
             for k, x in (
@@ -148,8 +154,10 @@ class NativeDiagnostics(unittest.TestCase):
                 vertical = ("siglay",) if k in ("u", "v", "temp", "salinity") else ()
                 f.createVariable(k, "f8", ("time", *vertical, a))[:] = int("wet" in k)
             f["temp"][:] = np.broadcast_to(
-                np.array([16, 12, 8, 4])[None, :, None] + offset, (len(self.times), 4, 3)
+                np.array([16, 12, 8, 4])[None, :, None] + offset, (len(dates), 4, 3)
             )
+            if cold is not None:
+                f["temp"][1:3,0,0] = cold
         nml = self.d / f"stage{day}.nml"
         nml.write_text(
             "\n".join(
@@ -205,6 +213,7 @@ class NativeDiagnostics(unittest.TestCase):
                 executable_sha256="a" * 64,
                 job_id=str(day),
                 attempt=identifier,
+                stage=f"spinup_{day}d",
                 first_utc=(START - timedelta(days=day)).isoformat(),
                 last_utc=self.times[-1].isoformat(),
                 startup_sha256=str(day),
@@ -252,6 +261,67 @@ class NativeDiagnostics(unittest.TestCase):
         self.assertEqual(result["status"], "advisory_unresolved")
         self.assertIn("SHA-256 differs", result["rejected"][6])
         self.assertEqual(result["selected_restart"]["job_id"], "9")
+
+    def screened_spec(self, cold=None):
+        table = self.d/"freshwater.csv"
+        table.write_text("sea_pressure_dbar,air_free_temperature_C,air_saturated_temperature_C\n-1,0,-.001\n100,-.05,-.051\n")
+        policy = self.js("thermal.json",dict(freezing_lookup_sha256=sha(table),cold_conservative_margin_C=.01,cold_substantial_margin_C=.10))
+        plan = json.loads((self.d/self.plan["path"]).read_text())
+        plan.update(profile="lake_superior_summer",freshwater_thermal_screen=dict(policy_sha256=policy["sha256"],freezing_lookup_sha256=sha(table)))
+        rec = self.gen(9, 0, full_window=True, cold=cold)
+        spec = dict(stage_plan=self.js("thermal_plan.json",plan), thermal_policy=policy,
+                    freezing_lookup=self.ref(table), members={"9":rec}, geometry=self.geometry)
+        m = member(self.d,rec,self.geom,START-timedelta(days=9),self.times[-1])
+        receipt = thermal_measurement(self.d,spec,rec,m,self.geom,thermal_settings(self.d,spec))
+        return spec,receipt
+
+    def test_wet_screen_and_preregistration(self):
+        spec, receipt = self.screened_spec()
+        rec = spec["members"]["9"]
+        self.assertEqual(spinup(self.d,spec,self.geom)["status"],"blocked")
+        rec["thermal_manifest"] = self.js("thermal_run.json",receipt)
+        self.assertEqual(spinup(self.d,spec,self.geom)["selection_days"],9)
+        for change in (dict(job_id="unexpected"),dict(native_audit_sha256="0"*64),dict(records=receipt["records"][1:]),
+                       dict(policy_sha256="0"*64),dict(last_utc=START.isoformat()),dict(status="adjudication_required")):
+            rec["thermal_manifest"] = self.js("thermal_run.json",{**receipt,**change})
+            self.assertIsNone(spinup(self.d,spec,self.geom)["selected_restart"])
+        self.js("request.json",dict(profile="lake_superior_summer"))
+        with self.assertRaisesRegex(ValueError,"preregistered"):
+            spinup(self.d,dict(stage_plan=self.plan,members=self.members),self.geom)
+        with self.assertRaisesRegex(ValueError,"changed preregistered"):
+            spinup(self.d,{**spec,"thermal_policy":self.freeze},self.geom)
+
+    def test_freezing_even_before_comparison_blocks_restart(self):
+        for cold in (-3.,-.06):
+            spec,receipt=self.screened_spec(cold=cold)
+            self.assertEqual(receipt["status"],"adjudication_required")
+            receipt["status"]="qualified"
+            spec["members"]["9"]["thermal_manifest"]=self.js("falsely_qualified.json",receipt)
+            self.assertIsNone(spinup(self.d,spec,self.geom)["selected_restart"])
+
+    def test_portable_wet_screen_commands(self):
+        spec, _ = self.screened_spec()
+        rec = spec["members"]["9"]
+        folder = self.d/"screen_run"
+        folder.mkdir()
+        for ref, name in ((rec["namelist"],"test_run.nml"),(rec["attempt"],"attempt_manifest.json"),
+                          (rec["outputs"][0],"output9.nc")):
+            shutil.copyfile(self.d/ref["path"],folder/name)
+        inventory = {k: spec[k]["path"] for k in ("stage_plan","thermal_policy","freezing_lookup")}
+        inventory["geometry"] = rec["outputs"][0]["path"]
+        paths = dict(attempt_directory=str(folder), history_glob="output*.nc", freeze=rec["freeze"]["path"],
+                     native_audit=rec["native_audit"]["path"],accounting=rec["job"]["accounting"]["path"],
+                     submission=rec["job"]["submission"]["path"],forcing={k:f["path"] for k,f in rec["forcing"].items()})
+        scripts = Path(__file__).resolve().parent
+        for mode in ("thermal-screen","spinup"):
+            self.js("inventory.json",{**inventory,**({"member":paths} if mode=="thermal-screen" else
+                {"members":{"9":{**paths,"thermal_manifest":"thermal-screen.json"}}})})
+            for name,flags in (("prepare_lake_physics.py",["--inventory","inventory.json","--output","bound.json"]),
+                               ("lake_physics.py",["--spec","bound.json","--output",mode+".json"])):
+                subprocess.run([sys.executable,str(scripts/name),mode,*flags],cwd=self.d,check=True)
+        result=json.loads((self.d/"spinup.json").read_text())
+        self.assertEqual(result["selected_restart"]["job_id"],"9")
+        self.assertEqual(result["accepted"]["9"]["freshwater_thermal_screen"]["report_count"],49)
 
     def test_portable_commands(self):
         scripts = Path(__file__).resolve().parent
