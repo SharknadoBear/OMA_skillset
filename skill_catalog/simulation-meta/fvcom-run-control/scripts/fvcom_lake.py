@@ -70,6 +70,7 @@ def schedule(req):
     trials=[]
     def add(name,first,last,ranks,state):
         trials.append(dict(name=name,start_utc=utc(first),end_utc=utc(last),ranks=ranks,startup=state))
+    add("startup_probe",START,START+timedelta(minutes=10),128,"noaa_nowcast")
     add("smoke",START,START+timedelta(days=1),128,"noaa_nowcast")
     add("restart_probe",START+timedelta(days=1),START+timedelta(days=1,hours=1),128,"smoke_terminal_restart")
     for days in req["period"]["spinup_candidates_days"]:
