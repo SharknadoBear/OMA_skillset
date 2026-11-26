@@ -4,7 +4,6 @@ import json
 import os
 import re
 import shutil
-import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -29,9 +28,6 @@ THERMO = {"air_temperature_2m": ("TMP", "K", "2 m above ground"),
           "specific_humidity_2m": ("SPFH", "kg kg**-1", "2 m above ground"),
           "relative_humidity_2m": ("RH", "%", "2 m above ground"),
           "surface_air_pressure": ("PRES", "Pa", "surface")}
-PRODUCTS = ["air_temperature_2m", "dew_point_temperature_2m", "specific_humidity_2m", "surface_pressure",
-            dict(family="wrfsfc", short_name="RH", level_text="2 m above ground", step_type="instant",
-                 output_name="relative_humidity_2m")]
 
 
 def saturation(t_c, p_pa):
@@ -79,25 +75,6 @@ def forcing_clock(args):
     core=hour_axis(args.start,args.end)
     require(len(core)>=2,"Require at least one complete bulk forcing interval")
     return np.arange(core[0]-HOUR_MS,core[-1]+2*HOUR_MS,HOUR_MS,dtype="i8")
-
-
-def fetch_thermodynamics(args):
-    sys.path.insert(0,str(args.skill_root/"hrrr-fetcher"/"scripts"))
-    import hrrr_core as core
-    require(args.bbox and core.runtime_preflight()["passed"],"Provide an HRRR bounding box and the connector's GRIB Python")
-    for tick in forcing_clock(args):
-        time=stamp(tick);folder=args.hrrr_thermodynamics/utc(time).strftime("%Y%m%d%H")
-        folder.mkdir(parents=True,exist_ok=True)
-        request=dict(schema_version="hrrr_request_v1",domain="conus",mode="analysis",start=time,end=time,
-                     products=PRODUCTS,bbox=args.bbox,halo_cells=2,retain_raw_messages=True,missing_policy="error")
-        if (folder/"run_manifest.json").is_file():
-            require(json.loads((folder/"request.normalized.json").read_bytes())==core.normalize_request(request),
-                    "Existing thermodynamic cache belongs to another request")
-        else:
-            plan=core.build_plan(request,folder)
-            core.atomic_write_json(folder/"download_plan.json",plan)
-            core.execute_plan(plan,folder)
-        require(core.health_run(folder)["passed"],"Invalid HRRR acquisition at "+time)
 
 
 def rain_knots(start_rates, left_rate, right_rate):

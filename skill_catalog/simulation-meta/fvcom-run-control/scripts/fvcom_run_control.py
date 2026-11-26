@@ -619,6 +619,16 @@ def attempt_sbatch(args: argparse.Namespace, aid: str, stage: str | None) -> str
         cfg = args.site_configuration
         directory = PurePosixPath(cfg["project_dir"]) / "run" / args.grid_case / "attempts" / aid
         module_load = "\n".join(f"module load {name}" for name in modules)
+        coare_setup = ""
+        case_identity = ""
+        if getattr(args, "coare_case_sha256", None):
+            case_identity = ',"case_sha256":"' + args.coare_case_sha256 + '"'
+            links = ["mkdir -p input", "test ! -e launch_identity.json",
+                     f"echo '{args.coare_checks_sha256}  runtime_checksums.sha256' | sha256sum -c --quiet -"]
+            for name, source in sorted(args.coare_inputs.items()):
+                path = source["path"]
+                links.append(f"[[ 'input/{name}' -ef '{path}' ]] || ln -T -- '{path}' 'input/{name}'")
+            coare_setup = "\n".join(links) + "\n"
         return rf"""#!/bin/bash -l
 #SBATCH --job-name={args.job_prefix}_{aid}
 #SBATCH --account={args.account}
@@ -650,11 +660,11 @@ cd '{directory}'
 [[ "${{SLURM_NTASKS:?}}" == {args.ranks} ]]
 scontrol show job -o "$SLURM_JOB_ID" > launch_allocation.txt
 grep -Eq '(^|[[:space:]])Features=([^ ]*[,|&])?cpu([,|&][^ ]*)?([[:space:]]|$)' launch_allocation.txt
-sha256sum --check --quiet runtime_checksums.sha256
+{coare_setup}sha256sum --check --quiet runtime_checksums.sha256
 native_digest=$(sha256sum -- '{args.remote_executable}')
 receipt=$(mktemp .launch_identity.XXXXXXXX)
 trap 'rm -f -- "$receipt"' EXIT
-printf '{{"schema":"fvcom_launch_identity_v1","site":"perlmutter","job_id":"%s","mpi_ranks":%s,"executable_sha256":"%s","constraint":"cpu","threads_per_rank":%s}}\n' \
+printf '{{"schema":"fvcom_launch_identity_v1","site":"perlmutter","job_id":"%s","mpi_ranks":%s,"executable_sha256":"%s","constraint":"cpu","threads_per_rank":%s{case_identity}}}\n' \
   "$SLURM_JOB_ID" "$SLURM_NTASKS" "${{native_digest%% *}}" "$OMP_NUM_THREADS" > "$receipt"
 ln -- "$receipt" launch_identity.json
 srun --ntasks={args.ranks} --cpus-per-task={cfg['threads_per_rank']} --cpu-bind=cores '{args.remote_executable}' --casename={args.case_name}
@@ -1185,11 +1195,18 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--qos",choices=["regular","debug"],default="regular")
     q.add_argument("--case-name",default="superior")
     q.add_argument("--benchmark-summary",type=Path)
-    q = sub.add_parser("lake-audit",help="Verify native lake output, forcing reads and restart clocks on scratch")
-    for option in ("attempt","submission","accounting","river","cas","output","geometry"):
-        q.add_argument("--"+option,required=True,type=Path)
-    q.add_argument("--case-name",required=True)
-    q.add_argument("--checkpoint",action="append",default=[],metavar="LABEL=UTC")
+    for option in ("coare-build","coare-reader","coare-forcing","build-skill"):
+        q.add_argument("--"+option,type=Path,help="Optional freshwater COARE diagnostic evidence or skill location")
+    for name in ("lake-audit","lake-coare-audit"):
+        q = sub.add_parser(name,help="Verify closed native lake output, applied forcing and restart clocks")
+        for option in ("attempt","submission","accounting","river","cas","output","geometry"):
+            q.add_argument("--"+option,required=True,type=Path)
+        q.add_argument("--case-name",required=True)
+        q.add_argument("--checkpoint",action="append",default=[],metavar="LABEL=UTC")
+        if name=="lake-coare-audit":
+            q.add_argument("--build-skill",type=Path,help="fvcom-build directory (defaults to sibling skill)")
+            for option in ("coare-build","coare-reader","coare-forcing"):
+                q.add_argument("--"+option,type=Path,help="Override the corresponding archived evidence file")
     q = sub.add_parser("attempt")
     q.add_argument("--project", required=True); q.add_argument("--grid-case", required=True, choices=["accepted_t6v6", "fresh_reproduction", "retained_columbia"])
     q.add_argument("--plan"); q.add_argument("--index", type=int, required=True)
@@ -1240,7 +1257,7 @@ def main() -> int:
     elif args.command == "lake-attempt":
         from fvcom_lake_attempt import materialize
         result = materialize(args)
-    elif args.command == "lake-audit":
+    elif args.command in ("lake-audit","lake-coare-audit"):
         from fvcom_lake_audit import audit
         result = audit(args)
     elif args.command == "audit":

@@ -122,9 +122,12 @@ Stop for `user_stopped` or after every planned attempt has terminal evidence and
 
 ## Validation
 
+For a Lake Superior freshwater COARE26Z reader or matched 24/48-hour window, use the opt-in `lake-attempt` binding, then `lake-coare-audit` on the closed allocation. The audit emits the native certificate for the hourly heat and water reducer. [Commands and archived cold-window replay](references/lake_coare_run.md)
+
 ```powershell
 python scripts/selftest_project_layout.py
 python scripts/selftest_fvcom_run_control.py
+python scripts/selftest_lake_coare.py
 python scripts/selftest_audit_fvcom_production.py
 python scripts/selftest_fvcom_time_anchor.py
 python -m compileall scripts

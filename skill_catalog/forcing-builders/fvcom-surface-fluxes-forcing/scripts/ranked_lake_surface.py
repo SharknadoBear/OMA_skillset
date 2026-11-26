@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -118,18 +119,49 @@ def acquire(args, provider):
             tick += 6*HOUR
 
 
+def acquire_thermodynamics(args):
+    """Run inside the connector GRIB interpreter, independently of the scientific writer stack."""
+    sys.path.insert(0,str(args.skill_root/"hrrr-fetcher"/"scripts"))
+    import hrrr_core as core
+    if not args.bbox or not core.runtime_preflight()["passed"]:
+        raise ValueError("Provide an HRRR bounding box and the connector's GRIB Python")
+    start,end=(datetime.fromisoformat(s.replace("Z","+00:00")) for s in (args.start,args.end))
+    if any(v.utcoffset() is None or v.minute or v.second or v.microsecond for v in (start,end)) or start>=end:
+        raise ValueError("Diagnostic windows require ordered whole hours with explicit UTC offsets")
+    products=["air_temperature_2m","dew_point_temperature_2m","specific_humidity_2m","surface_pressure",
+              dict(family="wrfsfc",short_name="RH",level_text="2 m above ground",step_type="instant",output_name="relative_humidity_2m")]
+    tick=start-HOUR
+    while tick<=end+HOUR:
+        time=iso(tick)
+        folder=args.hrrr_thermodynamics/datetime.fromisoformat(time).strftime("%Y%m%d%H")
+        folder.mkdir(parents=True,exist_ok=True)
+        request=dict(schema_version="hrrr_request_v1",domain="conus",mode="analysis",start=time,end=time,
+                     products=products,bbox=args.bbox,halo_cells=2,retain_raw_messages=True,missing_policy="error")
+        if (folder/"run_manifest.json").is_file():
+            if json.loads((folder/"request.normalized.json").read_bytes())!=core.normalize_request(request):
+                raise ValueError("Existing thermodynamic cache belongs to another request")
+        else:
+            plan=core.build_plan(request,folder)
+            core.atomic_write_json(folder/"download_plan.json",plan)
+            core.execute_plan(plan,folder)
+        if not core.health_run(folder)["passed"]:
+            raise ValueError("Invalid HRRR acquisition at "+time)
+        tick+=HOUR
+
+
+
 def run(args):
     args.source_root=args.source_root.resolve()
     args.hrrr_analysis = args.hrrr_analysis or args.source_root/"hrrr"
     args.hrrr_precipitation = args.hrrr_precipitation or args.source_root/"hrrr_precip"
     if getattr(args,"mode","direct")=="hrrr-coare26z-diagnostic":
-        from lake_coare_diagnostic import build, fetch_thermodynamics
         args.hrrr_thermodynamics=args.hrrr_thermodynamics or args.source_root/"hrrr_thermodynamics"
         if args.fetch_worker=="hrrr-thermodynamics":
-            return fetch_thermodynamics(args)
+            return acquire_thermodynamics(args)
         if args.acquire:
             command=[str(args.hrrr_python or sys.executable),str(Path(__file__).resolve()),*sys.argv[1:],"--fetch-worker","hrrr-thermodynamics"]
             subprocess.run(command,check=True)
+        from lake_coare_diagnostic import build
         result=build(args)
         print(args.output/"coare_diagnostic_manifest.json")
         return result

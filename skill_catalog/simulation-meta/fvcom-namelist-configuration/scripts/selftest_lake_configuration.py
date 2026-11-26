@@ -58,6 +58,11 @@ class LakeConfiguration(unittest.TestCase):
                          ("T","T","'COARE26Z'"))
         self.assertEqual(bulk["HEATING_CALCULATE_FILE"],"'superior_bulk.nc'")
         self.assertEqual([bulk[k] for k in ("ZUU","ZTT","ZQQ")],["10.0","2.0","2.0"])
+        self.assertEqual(v["NML_NETCDF"]["NC_OUT_INTERVAL"], "'seconds=21600.0'")
+        self.args.end="2025-07-01T00:10:00Z"
+        self.assertEqual(lake.lake_values(self.args)["NML_NETCDF"]["NC_OUT_INTERVAL"], "'seconds=600.0'")
+        self.args.coare_bulk=None
+        self.assertEqual(lake.lake_values(self.args)["NML_NETCDF"]["NC_OUT_INTERVAL"], "'seconds=21600.0'")
         self.args.coare_bulk="../raw/superior_bulk.nc"
         with self.assertRaisesRegex(ValueError,"basename"):
             lake.lake_values(self.args)

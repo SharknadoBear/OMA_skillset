@@ -144,7 +144,7 @@ def check_initial(start, ds, i):
     return delta
 
 
-def inspect_water(ds,i,river,ranges,kind,mesh):
+def inspect_water(ds,i,river,ranges,kind,mesh,*,diagnostic=False):
     dimensions(ds,mesh)
     masks={}
     for d,k in (("node","wet_nodes"),("nele","wet_cells")):
@@ -159,7 +159,8 @@ def inspect_water(ds,i,river,ranges,kind,mesh):
         check(all(set(nodes).issubset(tri) for nodes,tri in zip(endpoints,edge_cells)),"source/donor endpoints disagree with FVCOM connectivity")
     extra=[k for k in ("ww","omega","q2","q2l","l","km","kq","kh","rho1") if k in ds.variables]
     finite_fields(ds,("zeta","temp","salinity","ua","va","u","v",*extra),i,ranges,masks)
-    check(ranges["temp"][0]>=-2 and ranges["temp"][1]<=40,"wet temperature outside liquid water bounds")
+    if not diagnostic:
+        check(ranges["temp"][0]>=-2 and ranges["temp"][1]<=40,"wet temperature outside liquid water bounds")
     check(max(abs(x) for x in ranges["salinity"])<=1e-5,"freshwater salinity has drifted")
     check(np.all((values(ds,"h")+values(ds,"zeta",i))[masks["node"]]>0),"nonpositive total depth on wet support")
     if kind=="history":
@@ -203,6 +204,9 @@ def compare_forcing(ds, i, stamp, sources):
 def audit(a):
     folder=a.attempt.resolve()
     manifest=read(folder/"attempt_manifest.json")
+    diagnostic=getattr(a,"command",None)=="lake-coare-audit"
+    check(diagnostic==(manifest.get("schema")=="fvcom_coare_diagnostic_attempt_v1"),
+          "Use lake-coare-audit for an opt-in COARE diagnostic and lake-audit for the direct lake workflow")
     stage=manifest["stage"]
     launch=read(folder/"launch_identity.json")
     receipt=read(a.submission)
@@ -216,8 +220,9 @@ def audit(a):
     check(len(allocation)==1 and allocation[0]["State"]=="COMPLETED" and allocation[0]["ExitCode"]=="0:0",
           "model allocation did not complete")
     app=[r for r in rows if r.get("JobID")==job+".0"]
+    nodes=manifest.get("nodes",(manifest["mpi_ranks"]+127)//128)
     check(len(app)==1 and app[0]["State"]=="COMPLETED" and app[0]["ExitCode"]=="0:0"
-          and int(app[0]["NNodes"])==manifest["nodes"] and int(app[0]["NTasks"])==launch["mpi_ranks"],
+          and int(app[0]["NNodes"])==nodes and int(app[0]["NTasks"])==launch["mpi_ranks"],
           "native MPI step failed or used the wrong resources")
     stdout=(folder/"stdout.log").read_text(errors="replace")
     check("TADA!" in stdout and not re.search(r"(?i)\b(blowup|fatal error|segmentation fault)\b",stdout),"model log did not finish cleanly")
@@ -225,6 +230,14 @@ def audit(a):
     nmlfile=folder/(a.case_name+"_run.nml")
     nml=nmlfile.read_text()
     check(sha(nmlfile)==manifest["run_namelist_sha256"],"runtime namelist changed")
+    if diagnostic:
+        import fvcom_coare_output as coupled
+        check(launch["site"]=="perlmutter" and launch["constraint"]=="cpu" and launch["threads_per_rank"]==1
+              and receipt["account"]==allocation[0]["Account"]==manifest["account"], "Diagnostic site/account mismatch")
+        field_reader=coupled.bind(a,folder,manifest,launch,nml)
+        phase_lookup=coupled.phase_table()
+        phases={}
+        previous=None
     first,last=map(clock,(stage["start_utc"],stage["end_utc"]))
     check(clock(key(nml,"START_DATE"))==first and clock(key(nml,"END_DATE"))==last,"frozen stage clock mismatch")
     step=float(key(nml,"EXTSTEP_SECONDS"))*int(key(nml,"ISPLIT"))
@@ -264,8 +277,10 @@ def audit(a):
               (geometry["sponge_nodes"] or np.all(startup["cc_sponge"][:]==0)),"closed-lake hotstart sponge differs")
         check(int(key(nml,"IRAMP"))==0,"direct lake forcing comparison requires IRAMP=0")
         sources={}
-        for param in sorted(set(x[0] for x in FORCING.values())):
-            path=inputs/key(nml,param)
+        params=("HEATING_CALCULATE_FILE","PRECIPITATION_FILE","AIRPRESSURE_FILE") if diagnostic else sorted(set(x[0] for x in FORCING.values()))
+        for param in params:
+            filename=coupled.coare.value(nml,param) if diagnostic else key(nml,param)
+            path=inputs/filename
             if path.name not in forcing_inputs:
                 check(sha(path)==manifest["files"][path.name],"forcing input changed: "+path.name)
                 source_data=opened.enter_context(nc.Dataset(path))
@@ -290,11 +305,16 @@ def audit(a):
                     digest=sha(path)
                     outputs[path.name]=dict(sha256=digest,count=len(stamps),first=iso(stamps[0]),last=iso(stamps[-1]))
                     for i,t in enumerate(stamps):
-                        masks.append(inspect_water(ds,i,river,ranges,kind,mesh))
+                        masks.append(inspect_water(ds,i,river,ranges,kind,mesh,diagnostic=diagnostic))
                         if kind=="history" and t==first:
                             initial=check_initial(startup,ds,i)
+                        elif kind=="history" and diagnostic:
+                            forcing_readback[iso(t)]=field_reader.checks(ds,i,*(sources[k][0] for k in params))
                         elif kind=="history":
                             forcing_readback[iso(t)]=compare_forcing(ds,i,t,sources)
+                        if diagnostic and kind=="history":
+                            pressure=field_reader.interp(sources["AIRPRESSURE_FILE"][0],"air_pressure",t)
+                            phases[iso(t)],previous=coupled.wet_phase(ds,i,phase_lookup,pressure,previous)
                         if kind=="restart":
                             check(len(stamps)==1,"downstream hotstart expects single-record restart stacks")
                             verified_restarts[t]=(path,digest)
@@ -340,6 +360,16 @@ def audit(a):
                  river_mask_records=len(masks),minimum_wet_river_edges=min(m["wet_river_edges"] for m in masks),
                  minimum_wet_cells=min(m["wet_cells"] for m in masks),minimum_wet_nodes=min(m["wet_nodes"] for m in masks),
                  restart_receipts=all_receipts)
+    if diagnostic:
+        hours=int((last-first).total_seconds()/3600)
+        ledgers,points=coupled.ledgers(folder,launch["mpi_ranks"],hours,initial_iint)
+        summary.update(schema="fvcom_coare_native_audit_v1",scope="diagnostic",wet_phase=phases,
+            phase_screen_passed=all(not phase[k]["wet_layers"] for phase in phases.values()
+                                    for k in ("substantial","persistent","gross_hot")),
+            model_accounting=allocation[0],mpi_accounting=app[0],wet_field_ranges=ranges,
+            forcing_reader=forcing_readback,ledger_sha256=ledgers,native_point_ledger=points,
+            checkpoints={iso(t):dict(utc=iso(t),model_job_id=job,path=str(path),sha256=digest,
+                         executable_sha256=launch["executable_sha256"]) for t,(path,digest) in verified_restarts.items()})
     publish_json(a.output/"native_audit.json",summary)
     return dict(status="verified",job_id=job,stage=stage["name"],records=len(masks),output=str(a.output/"native_audit.json"))
 

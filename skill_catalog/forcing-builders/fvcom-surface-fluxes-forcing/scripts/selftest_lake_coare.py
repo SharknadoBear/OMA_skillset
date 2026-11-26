@@ -3,6 +3,8 @@ from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 from pathlib import Path
 import json
+import subprocess
+import sys
 
 import netCDF4 as nc
 import numpy as np
@@ -49,5 +51,22 @@ def main():
         try:checked_thermodynamics(file,"2025-06-26T01:00:00Z")
         except ValueError:pass
         else:raise AssertionError("Wrong native analysis clock accepted")
+        # -S removes scientific site packages. The archive worker runs under the HRRR
+        # connector interpreter, while FVCOM interpolation runs in the caller.
+        connector=d/'skills/hrrr-fetcher/scripts';connector.mkdir(parents=True)
+        (connector/'hrrr_core.py').write_text("""import json
+def runtime_preflight():return {'passed':True}
+def build_plan(request,folder):return request
+def atomic_write_json(path,data):path.write_text(json.dumps(data))
+def execute_plan(plan,folder):(folder/'request.normalized.json').write_text(json.dumps(plan))
+def health_run(folder):return {'passed':(folder/'request.normalized.json').is_file()}
+""")
+        cmd=[sys.executable,'-S',str(Path(__file__).with_name('ranked_lake_surface.py')),
+             '--mode','hrrr-coare26z-diagnostic','--fetch-worker','hrrr-thermodynamics','--skill-root',str(d/'skills'),
+             '--source-root',str(d/'cache'),'--output',str(d/'out'),'--mesh',str(d/'unused.nc'),
+             '--start','2025-06-25T00:00:00Z','--end','2025-06-25T01:00:00Z','--bbox','-93','46','-84','50']
+        subprocess.run(cmd,check=True)
+        cache=d/'cache/hrrr_thermodynamics'
+        assert sorted(p.name for p in cache.iterdir())==['2025062423','2025062500','2025062501','2025062502']
     print("Passed Q2/T/P, dewpoint and supersaturation, zero raw rain under condensation, conservative APCP ramps, source-clock checks.")
 if __name__=="__main__":main()

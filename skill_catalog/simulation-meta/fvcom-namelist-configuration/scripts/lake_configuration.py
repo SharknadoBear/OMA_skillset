@@ -41,7 +41,8 @@ def lake_values(args):
     put("INTEGRATION", EXTSTEP_SECONDS=args.extstep, ISPLIT=args.isplit, IRAMP=0, MIN_DEPTH=0.1, STATIC_SSH_ADJ=0.0)
     put("RESTART", RST_ON=True, RST_FIRST_OUT=n.nml_date(min(start+timedelta(days=1),end)),
         RST_OUT_INTERVAL="days=1.0", RST_OUTPUT_STACK=1)
-    put("NETCDF", NC_ON=True, NC_FIRST_OUT=first, NC_OUT_INTERVAL="seconds=21600.0", NC_OUTPUT_STACK=4,
+    grid_interval = "seconds=600.0" if bulk and end-start == timedelta(seconds=600) else "seconds=21600.0"
+    put("NETCDF", NC_ON=True, NC_FIRST_OUT=first, NC_OUT_INTERVAL=grid_interval, NC_OUTPUT_STACK=4,
         NC_SUBDOMAIN_FILES="FVCOM", NC_GRID_METRICS=True, NC_FILE_DATE=False, NC_VELOCITY=True,
         NC_SALT_TEMP=True, NC_TURBULENCE=True, NC_AVERAGE_VEL=True, NC_VERTICAL_VEL=True, NC_WIND_VEL=False,
         NC_WIND_STRESS=True, NC_ATM_PRESS=True, NC_EVAP_PRECIP=True, NC_SURFACE_HEAT=True,
