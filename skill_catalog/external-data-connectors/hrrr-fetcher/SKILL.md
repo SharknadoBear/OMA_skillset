@@ -35,6 +35,7 @@ python scripts/hrrr_fetcher.py run --request request.json --run-dir runs/case
 - Treat live `.idx` inventories and decoded ecCodes metadata as authoritative. Field content changes across HRRR versions.
 - Pair grid-relative U/V before rotating canonical wind aliases to earth-relative components. Raw U/V selectors remain native.
 - Preserve units, levels, intervals, step type, product-definition template, grid flags, source bytes, URLs, and hashes. Do not silently change flux signs or accumulated quantities.
+- Recheck older Kelvin-labeled temperature caches with the current health command. Replay the original GRIB ranges for fields listed in `redecode_required` as described in the request contract.
 - Keep CONUS and Alaska on their native projected grids. Never concatenate domains or hourly and subhourly cadences into one file.
 - Do not store credentials, URL queries, or personal absolute paths in portable requests, examples, or committed evidence.
 

@@ -7,6 +7,7 @@ from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
+from importlib.util import find_spec
 import json
 from pathlib import Path
 import tempfile
@@ -24,6 +25,7 @@ from hrrr_core import (
     SCHEMA_MANIFEST,
     _bbox_subset,
     _coalesce_messages,
+    _decode_message,
     _download_object,
     _download_range,
     _expand_products,
@@ -252,6 +254,67 @@ class HrrrCoreTests(unittest.TestCase):
                 )
             self.assertEqual(resumed["provider"], "gcp")
             self.assertEqual(resumed_attempts[0]["state"], "resumed_complete")
+            saved = Path(messages[0]["path"])
+            damaged = bytearray(saved.read_bytes())
+            damaged[20] ^= 1
+            saved.write_bytes(damaged)
+            with requests.Session() as session:
+                _, repaired, _ = _download_object(
+                    session, inventory["objects"][0], inventory["request"], self.root / "raw", status
+                )
+            self.assertEqual(Path(repaired[0]["path"]).read_bytes(), RangeFixture.first)
+
+    @unittest.skipUnless(find_spec("eccodes"), "use the pinned HRRR GRIB runtime for the native decode test")
+    def test_native_kelvin_and_pre_fix_cache(self) -> None:
+        import eccodes
+        import netCDF4
+        import rasterio
+
+        path = self.root / "temperature.grib2"
+        gid = eccodes.codes_grib_new_from_samples("regular_ll_sfc_grib2")
+        try:
+            grid_keys = {"gridType": "lambert", "Nx": 3, "Ny": 2, "latitudeOfFirstGridPointInDegrees": 47.0,
+                         "longitudeOfFirstGridPointInDegrees": 270.0, "LoVInDegrees": 270.0, "LaDInDegrees": 38.5,
+                         "Latin1InDegrees": 38.5, "Latin2InDegrees": 38.5, "DxInMetres": 3000.0, "DyInMetres": 3000.0,
+                         "jScansPositively": 1, "shortName": "2t"}
+            for key, value in grid_keys.items():
+                eccodes.codes_set(gid, key, value)
+            eccodes.codes_set_values(gid, np.full(6, 281.5))
+            path.write_bytes(eccodes.codes_get_message(gid))
+        finally:
+            eccodes.codes_release(gid)
+        request = normalize_request(self.analysis(products=["air_temperature_2m"], bbox=[-92, 46, -88, 49]))
+        with rasterio.Env(GRIB_NORMALIZE_UNITS="YES"):
+            with rasterio.open(path) as ds:
+                np.testing.assert_allclose(ds.read(1), 8.35)
+            domain = {**DOMAIN_INFO["conus"], "nx": 3, "ny": 2}
+            with patch.dict(DOMAIN_INFO, {"conus": domain}):
+                metadata, values, grid = _decode_message(path, {"short_name": "TMP"}, request, {})
+            np.testing.assert_array_equal(values, np.full((2, 3), 281.5))
+            self.assertEqual(metadata["units"], "K")
+            self.assertEqual(metadata["gdal_normalize_units"], "NO")
+            with rasterio.open(path) as ds:
+                np.testing.assert_allclose(ds.read(1), 8.35)
+
+        scratch = self.root / "kelvin.npy"
+        np.save(scratch, values)
+        record = dict(target={"output_name": "custom_temperature"}, cadence_group="hourly", cycle=request["start"],
+                      forecast_period_minutes=0, metadata=metadata, scratch_path=str(scratch))
+        for legacy in (False, True):
+            if legacy:
+                del metadata["gdal_normalize_units"]
+                np.save(scratch, values - 273.15)
+            output = _write_output(self.root / "hrrr_fields.nc", request, hash_payload(request), [record], grid, [])
+            manifest = dict(schema_version=SCHEMA_MANIFEST, mode="analysis", outputs=[output],
+                            records=[{**record, "output_name":"custom_temperature"}])
+            manifest["manifest_hash"] = hash_payload(manifest)
+            atomic_write_json(self.root / "run_manifest.json", manifest)
+            report = health_run(self.root)
+            self.assertEqual(report["passed"], not legacy, report["issues"])
+            if legacy:
+                self.assertEqual(report["checks"][0]["redecode_required"], ["custom_temperature"])
+            with netCDF4.Dataset(output["path"]) as ds:
+                self.assertEqual(ds["custom_temperature"].units, "K")
 
     def test_vector_rotation_and_analysis_schema_health(self) -> None:
         scratch_u = self.root / "u.npy"

@@ -81,6 +81,8 @@ Required free space is the larger of four times selected raw bytes or selected r
 
 `hrrr_run_manifest_v1` links every request, provider attempt, raw message, output, and SHA-256. `hrrr_health_report_v1` checks hashes, dimensions, coordinates, time coverage, finite data, bbox coverage, and requested variables.
 
+Kelvin-valued source fields use a scoped GDAL `GRIB_NORMALIZE_UNITS=NO` read and record `gdal_normalize_units=NO` for each message in both the NetCDF and run manifest. This applies to standard aliases and exact selectors, including pressure-level temperature. Run `hrrr_fetcher.py health --run-dir CACHE` on existing temperature caches. A variable listed in `checks[].redecode_required` needs a fresh decode of its original messages. Earlier connector versions could label GDAL's Celsius values as K. Preserve the old output and its receipts when it is part of a frozen study. To replay offline, copy the original `raw_messages/` tree into a fresh run directory and run `hrrr_fetcher.py fetch --plan OLD/download_plan.json --run-dir NEW`. When the raw data were discarded, the same command fetches the planned ranges. Existing outputs without Kelvin fields remain eligible through the ordinary health checks. [GDAL GRIB temperature handling](https://gdal.org/en/stable/drivers/raster/grib.html#configuration-options)
+
 ## Archive gates
 
 - CONUS archive begins `2014-07-30T18:00:00Z`. Data before `2014-09-30T00:00:00Z` are marked pre-operational.

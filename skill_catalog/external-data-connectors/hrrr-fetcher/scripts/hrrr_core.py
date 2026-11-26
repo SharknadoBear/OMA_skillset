@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -969,8 +970,9 @@ def _download_object(
     if state_path.exists():
         try:
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            if state.get("selected_signature") == item.get("selected_signature") and all(
-                _valid_grib(final_dir / row["file"], int(row["bytes"])) for row in state.get("messages", [])
+            if state.get("selected_signature") == item.get("selected_signature") and state.get("messages") and all(
+                _valid_grib(final_dir / row["file"], int(row["bytes"])) and sha256_file(final_dir / row["file"]) == row.get("sha256")
+                for row in state["messages"]
             ):
                 rows = [{**row, "path": str(final_dir / row["file"])} for row in state["messages"]]
                 return state, rows, [{"provider": state["provider"], "state": "resumed_complete"}]
@@ -1201,6 +1203,7 @@ def _decode_message(
 ) -> tuple[dict[str, Any], Any, dict[str, Any]]:
     import numpy as np
     from pyproj import CRS, Transformer
+    from rasterio import Env
     from rasterio.io import MemoryFile
 
     metadata = _metadata(path)
@@ -1224,13 +1227,18 @@ def _decode_message(
     if target.get("level_value") is not None and abs(float(metadata["level"]) - float(target["level_value"])) > 1e-6:
         raise HrrrError(f"Decoded level {metadata['level']} does not match {target['level_value']}")
     payload = path.read_bytes()
-    with MemoryFile(payload) as memory:
+    # GDAL normally exposes Kelvin temperature messages as Celsius values.
+    kelvin = metadata["units"] == "K"
+    native_units = Env(GRIB_NORMALIZE_UNITS="NO") if kelvin else nullcontext()
+    with native_units, MemoryFile(payload) as memory:
         with memory.open() as raster:
             values = np.asarray(raster.read(1), dtype=np.float32)
             transform = raster.transform
             if raster.crs is None:
                 raise HrrrError("Rasterio did not expose the HRRR projected CRS")
             crs = CRS.from_user_input(raster.crs)
+    if kelvin:
+        metadata["gdal_normalize_units"] = "NO"
     if values.shape != (int(expected["ny"]), int(expected["nx"])):
         raise HrrrError(f"Raster shape {values.shape} does not match expected HRRR grid")
     signature = hash_payload({"shape": values.shape, "transform": tuple(transform), "crs": crs.to_wkt()})
@@ -1645,7 +1653,18 @@ def health_run(run_dir: str | Path) -> dict[str, Any]:
                     if name not in dataset.variables:
                         issues.append(f"{path.name} lacks requested variable {name}")
                         continue
-                    values = np.ma.asarray(dataset.variables[name][:])
+                    variable = dataset.variables[name]
+                    source_rows = [r.get("metadata", {}) for r in output_records if r["output_name"] == name]
+                    if getattr(variable, "units", "") == "K" or any(r.get("units") == "K" for r in source_rows):
+                        archived_rows = json.loads(getattr(variable, "source_grib_metadata", "[]"))
+                        if (getattr(variable, "units", "") != "K" or not source_rows or
+                            len(archived_rows) != len(source_rows) or
+                            any(r.get("units") != "K" or r.get("gdal_normalize_units") != "NO"
+                                for r in [*source_rows, *archived_rows])):
+                            row.setdefault("redecode_required", []).append(name)
+                            issues.append(f"{path.name}:{name} requires re-decode from its native GRIB messages "
+                                          "to establish Kelvin values. Replay the saved download plan.")
+                    values = np.ma.asarray(variable[:])
                     finite = np.isfinite(values.compressed())
                     if finite.size == 0 or not finite.any():
                         issues.append(f"{path.name}:{name} has no finite values")
