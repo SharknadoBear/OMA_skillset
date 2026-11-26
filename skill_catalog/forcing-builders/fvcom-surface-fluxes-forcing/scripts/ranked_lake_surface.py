@@ -122,6 +122,19 @@ def run(args):
     args.source_root=args.source_root.resolve()
     args.hrrr_analysis = args.hrrr_analysis or args.source_root/"hrrr"
     args.hrrr_precipitation = args.hrrr_precipitation or args.source_root/"hrrr_precip"
+    if getattr(args,"mode","direct")=="hrrr-coare26z-diagnostic":
+        from lake_coare_diagnostic import build, fetch_thermodynamics
+        args.hrrr_thermodynamics=args.hrrr_thermodynamics or args.source_root/"hrrr_thermodynamics"
+        if args.fetch_worker=="hrrr-thermodynamics":
+            return fetch_thermodynamics(args)
+        if args.acquire:
+            command=[str(args.hrrr_python or sys.executable),str(Path(__file__).resolve()),*sys.argv[1:],"--fetch-worker","hrrr-thermodynamics"]
+            subprocess.run(command,check=True)
+        result=build(args)
+        print(args.output/"coare_diagnostic_manifest.json")
+        return result
+    if not args.mod_bulk:
+        raise ValueError("Direct lake surface preparation requires --mod-bulk")
     superior = getattr(args,"lake_profile",None)=="lake_superior_summer"
     if superior:
         args.lake_seed_lonlat=args.lake_seed_lonlat or (-87.7833294179,48.0585453410)
@@ -212,8 +225,14 @@ def run(args):
 
 if __name__=="__main__":
     parser=argparse.ArgumentParser(description=__doc__)
-    for name in ("mesh","mod-bulk","output","source-root"):
+    for name in ("mesh","output","source-root"):
         parser.add_argument("--"+name,type=Path,required=True)
+    parser.add_argument("--mod-bulk",type=Path,help="Pinned drag-law source for direct heat/stress preparation")
+    parser.add_argument("--mode",choices=["direct","hrrr-coare26z-diagnostic"],default="direct")
+    parser.add_argument("--parent-surface-manifest",type=Path,help="Qualified HRRR direct forcing to retain hydrodynamic stress and MSLP")
+    parser.add_argument("--coriolis-file",type=Path,help="Native spherical grid latitude file for diagnostic bulk transfer")
+    parser.add_argument("--hrrr-thermodynamics",type=Path,help="Checked single-hour HRRR T2, Q2, DPT2, RH2 and local pressure cache")
+    parser.add_argument("--case-name",default="lake",help="Diagnostic bulk, rain and latitude file prefix")
     for name in ("start","end"):
         parser.add_argument("--"+name,required=True)
     parser.add_argument("--projected-crs")
@@ -224,5 +243,5 @@ if __name__=="__main__":
     for name in ("hrrr-analysis","hrrr-precipitation","hrrr-python","era5-python","cfs-python"):
         parser.add_argument("--"+name,type=Path)
     parser.add_argument("--skill-root",type=Path,default=Path(os.environ.get("CODEX_HOME",Path.home()/".codex"))/"skills")
-    parser.add_argument("--fetch-worker",choices=(*ORDER,"hrrr-land"),help=argparse.SUPPRESS)
+    parser.add_argument("--fetch-worker",choices=(*ORDER,"hrrr-land","hrrr-thermodynamics"),help=argparse.SUPPRESS)
     run(parser.parse_args())

@@ -33,3 +33,23 @@ Request the analysis-time `LAND` surface field from the HRRR fetcher and pass it
 For the six heat components, the writer preserves a fully supported bilinear stencil, renormalizes the lake weights in a mixed stencil, and uses the nearest pixel in the same four-connected lake if all original weights fall outside it. The latent term supplies signed water-vapour flux on the same support. Wind, pressure and rainfall use their original interpolation. Supply `--rain-context START_UTC END_UTC` for a shorter segment of a parent integration to reproduce the exact minute-scale transitions across each segment boundary. This option uses the neighboring f01 accumulation when the parent window contains it. Review `lake_water_support` in the HRRR manifest for component identity, distances, native mask records and the number of replacements. Other providers need independent shoreline checks on their native grids.
 
 For the native Lake Superior grid, the open-water source pixel near 87.78333° W, 48.05855° N identifies the lake. Seven June–August 2025 LAND analyses agreed. A 15 km limit included the downstream St. Marys outlet, where the maximum replacement distance was 14.98 km. Flag those downstream nodes when interpreting fields there. The June cold sites had replacement donors within 3.79 km.
+
+## Freshwater COARE26Z diagnostic
+
+Use this opt-in mode for an HRRR-covered spherical FVCOM lake with a qualified HRRR direct parent. It writes element east/north ten-metre winds for bulk exchange and nodal two-metre air temperature (°C), relative humidity (%), thermodynamic surface pressure (Pa), incoming longwave and net shortwave (W/m²). Hydrodynamics continues to read the parent MSLP and prescribed stress. The traceable source inputs are f00 HRRR analyses, one-hour f01 APCP accumulations, and checked shoreline LAND masks for both the node and element locations.
+
+Run the existing lake entry point in a fresh output location. Provide the parent rain-context endpoints, which can differ from the diagnostic dates. The parent hydrodynamic file and source crops must provide one guard hour before and after the requested window. The source caches come from the HRRR connector. Analysis and APCP use its six-hour batch layout. Thermodynamics uses independently checked single-hour directories named YYYYMMDDHH. Add --acquire, --bbox WEST SOUTH EAST NORTH and --hrrr-python PATH to fetch the bounded five-field thermodynamic supplement through the installed HRRR connector. The parent supplies the existing wind, radiation, rain and LAND caches.
+
+~~~bash
+python scripts/ranked_lake_surface.py --mode hrrr-coare26z-diagnostic \
+  --source-root CACHE --hrrr-analysis F00_CACHE --hrrr-precipitation APCP_CACHE \
+  --hrrr-thermodynamics THERMO_CACHE --mesh NATIVE_GEOMETRY.nc \
+  --parent-surface-manifest PARENT/surface_manifest.json --coriolis-file CASE_cor.dat \
+  --lake-water-mask CHECKED_LAND.nc --lake-seed-lonlat LON LAT --max-water-distance-km KM \
+  --rain-context PARENT_START PARENT_END --start MODEL_START --end MODEL_END \
+  --case-name CASE --output NEW_BUNDLE
+~~~
+
+The transfer calculation uses RH = 100 q₂ / qsat26(T₂,p) after interpolation and records an independent dewpoint check. RH above 100% is retained. The rain-file knots at minute 0, 1, 59 and 60 conserve each hourly raw accumulation. The evaporation variable is zero. A model that consumes these diagnostic files must take signed vapor from its own calculated latent heat, HLB / [1000 Lv(Ts)], add positive condensation to raw rain and pass evaporative loss with its negative sign. It must use element U10 and V10 for transfer while retaining separate stress and MSLP for momentum. A native cold/warm reader and model budget qualify this coupling for a particular executable. A prepared manifest certifies forcing inputs only.
+
+The diagnostic works with HRRR. The standard direct route continues to select HRRR, ERA5, CFSv2 and CFSR in order. Run scripts/selftest_lake_coare.py to check the humidity transformation, supported supersaturation, rain integration and timestamp checks.

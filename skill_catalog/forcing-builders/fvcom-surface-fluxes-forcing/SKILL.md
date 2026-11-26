@@ -17,6 +17,8 @@ For Lake Superior, use `ranked_lake_surface.py --lake-profile lake_superior_summ
 
 The general writer accepts atmospheric fields prepared on their final structured grid or exact FVCOM node/element locations. For a barotropic wind-and-pressure experiment, use the dedicated acquisition and preparation workflow below before packaging. The selected data connector owns archive access.
 
+For a bounded spherical freshwater heat-feedback experiment, `ranked_lake_surface.py --mode hrrr-coare26z-diagnostic` prepares lake-supported bulk weather and raw rain from checked HRRR sources. It binds the qualified parent stress, MSLP and rain clock, preserves supersaturation and requires a native reader that applies vapor from calculated latent heat. See [freshwater COARE26Z diagnostic](references/lake_providers.md#freshwater-coare26z-diagnostic).
+
 ## Barotropic wind and pressure
 
 Run `scripts/acquire_wind_pressure.py --start START --end END --bbox WEST SOUTH EAST NORTH --output SOURCES` for inclusive hourly UTC endpoints. Set `--hrrr-python`, `--era5-python`, and `--cfs-python` to the corresponding connector environments. `--skill-root` can point to a local connector catalog. The first complete bundle wins in the order HRRR CONUS f00, ERA5, CFSv2, CFSR. The routing record retains per-provider logs, raw provenance and health. An existing set of complete daily HRRR runs can be reused via `--hrrr-cache`; each day must match the requested period, region and products. CFS eligibility follows its archive era. Its NCEI bundle requires full-resolution PRMSL at mean sea level. Surface pressure cannot stand in for MSLP.

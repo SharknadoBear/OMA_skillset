@@ -1,6 +1,7 @@
 """Render the closed, thermally active freshwater lake from the native executable's blank."""
 import argparse
 from datetime import timedelta
+import hashlib
 import math
 from pathlib import Path
 import re
@@ -17,7 +18,11 @@ def lake_values(args):
     for seconds in ((end-start).total_seconds(), 3600, 21600, 86400):
         if abs(seconds/dt-round(seconds/dt)) > 1e-7:
             raise ValueError("internal time step must divide station, grid, restart and integration windows")
-    for name in (args.startup, args.surface, args.pe, args.river_info, args.station):
+    bulk = getattr(args, "coare_bulk", None)
+    filenames = [args.startup, args.surface, args.pe, args.river_info, args.station]
+    if bulk is not None:
+        filenames.append(bulk)
+    for name in filenames:
         if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*", name):
             raise ValueError("active native input names must be flat basenames")
     group = {}
@@ -26,7 +31,8 @@ def lake_values(args):
                               n.q(v) if isinstance(v,str) else str(v) for key,v in values.items()}
 
     first = n.nml_date(start)
-    put("CASE", CASE_TITLE="Lake Superior freshwater baroclinic", TIMEZONE="UTC", DATE_FORMAT="YMD",
+    title = "Lake Superior COARE26Z diagnostic" if bulk else "Lake Superior freshwater baroclinic"
+    put("CASE", CASE_TITLE=title, TIMEZONE="UTC", DATE_FORMAT="YMD",
         DATE_REFERENCE="2018-01-01 00:00:00", START_DATE=first, END_DATE=n.nml_date(end))
     put("STARTUP", STARTUP_TYPE="hotstart", STARTUP_FILE=args.startup, STARTUP_UV_TYPE="set values",
         STARTUP_TS_TYPE="set values", STARTUP_TURB_TYPE="set values")
@@ -43,15 +49,23 @@ def lake_values(args):
     put("NETCDF_SURFACE", NCSF_ON=False)
     put("NETCDF_AV", NCAV_ON=False)
     put("SURFACE_FORCING", WIND_ON=True, WIND_TYPE="stress", WIND_KIND="variable", WIND_FILE=args.surface,
-        HEATING_ON=True, HEATING_TYPE="flux", HEATING_KIND="variable", HEATING_FILE=args.surface,
+        HEATING_ON=not bulk, HEATING_TYPE="flux", HEATING_KIND="variable", HEATING_FILE=args.surface,
         HEATING_LONGWAVE_LENGTHSCALE=3.6, HEATING_LONGWAVE_PERCTAGE=0.55, HEATING_SHORTWAVE_LENGTHSCALE=0.35,
         AIRPRESSURE_ON=True, AIRPRESSURE_KIND="variable", AIRPRESSURE_FILE=args.surface,
         PRECIPITATION_ON=True, PRECIPITATION_KIND="variable", PRECIPITATION_FILE=args.pe, WAVE_ON=False)
+    if bulk:
+        put("HEATING_CALCULATED", HEATING_CALCULATE_ON=True, HEATING_FRESHWATER=True, COARE_VERSION="COARE26Z",
+            HEATING_CALCULATE_TYPE="flux", HEATING_CALCULATE_KIND="variable", HEATING_CALCULATE_FILE=bulk,
+            ZUU=10.0, ZTT=2.0, ZQQ=2.0, HEATING_LONGWAVE_LENGTHSCALE_IN_HEATFLUX=3.6,
+            HEATING_LONGWAVE_PERCTAGE_IN_HEATFLUX=0.55, HEATING_SHORTWAVE_LENGTHSCALE_IN_HEATFLUX=0.35)
+    limiter = getattr(args, "scalar_positivity_control", None)
+    if limiter is None:
+        limiter = not bulk
     put("PHYSICS", HORIZONTAL_MIXING_TYPE="closure", HORIZONTAL_MIXING_KIND="constant",
         HORIZONTAL_MIXING_COEFFICIENT=0.1, HORIZONTAL_PRANDTL_NUMBER=1.0, VERTICAL_MIXING_TYPE="closure",
         VERTICAL_MIXING_COEFFICIENT=1e-6, VERTICAL_PRANDTL_NUMBER=1.0, BOTTOM_ROUGHNESS_TYPE="orig",
         BOTTOM_ROUGHNESS_KIND="constant", BOTTOM_ROUGHNESS_LENGTHSCALE=0.002, BOTTOM_ROUGHNESS_MINIMUM=0.0025,
-        CONVECTIVE_OVERTURNING=False, SCALAR_POSITIVITY_CONTROL=getattr(args,"scalar_positivity_control",True),
+        CONVECTIVE_OVERTURNING=False, SCALAR_POSITIVITY_CONTROL=limiter,
         BAROTROPIC=False,
         BAROCLINIC_PRESSURE_GRADIENT="sigma levels", SEA_WATER_DENSITY_FUNCTION="dens1", TEMPERATURE_ACTIVE=True,
         SALINITY_ACTIVE=False, WETTING_DRYING_ON=True, SURFACE_WAVE_MIXING=False, FLUME_BOTTOM=False,
@@ -93,7 +107,8 @@ def cli(argv=None):
     p.add_argument("--river-number", type=int, required=True)
     p.add_argument("--extstep", type=float, required=True)
     p.add_argument("--isplit", type=int, required=True)
-    p.add_argument("--scalar-positivity-control", action=argparse.BooleanOptionalAction, default=True,
+    p.add_argument("--coare-bulk", help="Native FVCOM-grid freshwater COARE26Z file. The lake build must support independent stress and signed vapor. Use raw rain for --pe.")
+    p.add_argument("--scalar-positivity-control", action=argparse.BooleanOptionalAction, default=None,
                    help="Set the native scalar limiter for reproducible heat-budget sensitivity tests")
     p.add_argument("--input-root",type=Path,help="Verify the staged native input names, grid, signed rivers and hotstart")
     a=p.parse_args(argv)
@@ -155,15 +170,65 @@ def check_native_inputs(a):
         if not {"omega","w"} & dataset.variables.keys():
             raise ValueError("missing native vertical velocity omega or w")
         check_startup_clock(dataset, a.start)
+    bulk = getattr(a, "coare_bulk", None)
     with netCDF4.Dataset(root/a.surface) as met:
-        for name,place in (("uwind_stress","nele"),("vwind_stress","nele"),("air_pressure","node"),
-                           ("short_wave","node"),("net_heat_flux","node")):
+        met_fields = [("uwind_stress","nele"),("vwind_stress","nele"),("air_pressure","node")]
+        if not bulk:
+            met_fields.extend([("short_wave","node"),("net_heat_flux","node")])
+        for name,place in met_fields:
             if name not in met.variables or met[name].dimensions!=("time",place):
                 raise ValueError("missing or mislocated surface variable "+name)
     with netCDF4.Dataset(root/a.pe) as pe:
         for name in ("precip","evap"):
             if name not in pe.variables or pe[name].dimensions!=("time","node"):
                 raise ValueError("missing or mislocated freshwater variable "+name)
+    if bulk:
+        check_coare_inputs(a)
+
+
+def check_coare_inputs(a):
+    import netCDF4
+    import numpy as np
+
+    root = a.input_root
+    def digest(path):
+        with path.open("rb") as f:
+            return hashlib.file_digest(f, "sha256").digest()
+
+    if digest(root/"superior_cor.dat") != digest(root/"lsofs_cor.dat"):
+        raise ValueError("The COARE latitude file superior_cor.dat differs from the native grid Coriolis file")
+    with (netCDF4.Dataset(root/a.coare_bulk) as bulk, netCDF4.Dataset(root/a.pe) as rain,
+          netCDF4.Dataset(root/a.surface) as hydro):
+        for ds, ids in ((bulk, ("node_id","element_id")), (rain, ("node_id",)), (hydro, ())):
+            for key in ids:
+                if not np.array_equal(ds[key][:], hydro[key][:]):
+                    raise ValueError("COARE forcing and hydrodynamic grid disagree on "+key)
+            day, millis = ds["Itime"], ds["Itime2"]
+            if not day.units.startswith("days since ") or not millis.units.lower().startswith(("msec","millisecond")):
+                raise ValueError("Unexpected native COARE time units")
+            origin = n.parse_utc(day.units.removeprefix("days since "), "COARE time origin")
+            clock = np.asarray(day[:], dtype=np.int64)*86400000 + np.asarray(millis[:], dtype=np.int64)
+            left = (n.parse_utc(a.start,"start")-origin) / timedelta(milliseconds=1)
+            right = (n.parse_utc(a.end,"end")-origin) / timedelta(milliseconds=1)
+            if len(clock)<2 or np.any(np.diff(clock)<=0) or clock[0]>left or clock[-1]<right:
+                raise ValueError("COARE forcing clocks must increase and cover the integration window")
+        wind_units = {"ms-1","m/s"}
+        radiation_units = {"wm-2","w/m2"}
+        for name, place, units in (
+            ("U10","nele",wind_units), ("V10","nele",wind_units),
+            ("air_temperature","node",{"c","degc","degreecelsius","degreescelsius","celsius"}),
+            ("relative_humidity","node",{"percent","%"}), ("air_pressure","node",{"pa","pascal","pascals"}),
+            ("short_wave","node",radiation_units), ("long_wave","node",radiation_units),
+        ):
+            var=bulk.variables.get(name)
+            unit=re.sub(r"[\s_*^]","",getattr(var,"units","").lower())
+            if var is None or var.dimensions != ("time",place) or unit not in units:
+                raise ValueError("Missing, mislocated or incorrectly labeled COARE field "+name)
+        for i in range(0,len(rain.dimensions["time"]),8):
+            p,e=(np.ma.asarray(rain[k][i:i+8]) for k in ("precip","evap"))
+            if (np.ma.getmaskarray(p).any() or np.ma.getmaskarray(e).any() or not np.isfinite(p.data).all()
+                    or np.any(p.data<0) or np.any(e.data!=0)):
+                raise ValueError("Coupled heat requires nonnegative raw rainfall and a zero prescribed vapor field")
 
 
 if __name__=="__main__":

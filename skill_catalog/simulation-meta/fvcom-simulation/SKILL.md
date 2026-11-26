@@ -11,6 +11,8 @@ Interpret the science request and route the complete workflow through the releva
 
 For freshwater baroclinic runs, use the [native heat and water budgets and spinup sensitivity CLI](references/lake_physics.md) to evaluate the common-period trials and document the selected restart.
 
+When a prescribed HRRR heat flux drives wet Lake Superior water below its local freezing point, use the [freshwater COARE26Z diagnostic](references/lake_superior_baroclinic.md#freshwater-coare26z-diagnostic) to compare the same cold and warm windows with surface-temperature-dependent exchange. Keep the physically qualified restart and the longer experiment's choice of heat forcing explicit.
+
 Read [simulation request contract](references/simulation_request_v1.md) before initializing a project and [state and manifest contract](references/state_contract.md) before resuming one.
 
 For `barotropic_tide`, read the [fixed agent workspace contract](references/barotropic_agent_layout.md) before initialization or delegation. The caller supplies the project root; this skill owns the structure beneath `agents/`. Experiment matrix names belong outside the project, not in this contract.

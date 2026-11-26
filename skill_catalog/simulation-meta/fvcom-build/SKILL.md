@@ -97,3 +97,5 @@ Use the same pressure-capable executable for every member of `columbia_wind_rive
 ## Freshwater lake
 
 For the Lake Superior freshwater baroclinic study, use the [freshwater build contract](references/contracts.md#spherical-freshwater-lake). The build retains a source-specific thermal and signed-outflow audit.
+
+For an explicitly requested freshwater COARE26Z experiment using prescribed hydrodynamic stress, prepare a separate diagnostic build from the frozen direct-heat baseline. Verify its calculated surface fields against a registered parallel reader run before comparing science windows. [Freshwater COARE26Z diagnostic build](references/freshwater_coare.md)
