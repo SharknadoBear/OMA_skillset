@@ -2,6 +2,7 @@
 import numpy as np
 from lake_surface import unit_fluxes,precipitation_shape
 from lake_water_support import LakeWaterSupport
+from ranked_lake_surface import mask_samples
 
 
 def check_shoreline():
@@ -22,6 +23,11 @@ def check_shoreline():
 
 def main():
     check_shoreline()
+    all_masks = mask_samples("2025-06-03T00:00:00Z","2025-08-01T00:00:00Z")
+    assert [t.strftime("%Y%m%d") for t in all_masks] == [
+        "20250603","20250617","20250619","20250624","20250626","20250701","20250801"]
+    short_masks = mask_samples("2025-06-24T00:00:00Z","2025-06-24T03:00:00Z")
+    assert [t.hour for t in short_masks] == [0,3]
     sw,heat,e=unit_fluxes(dict(down_sw=200,up_sw=20,down_lw=300,up_lw=380,sensible=10,latent=25))
     assert (sw,heat)==(180,65) and np.isclose(e,1e-8,rtol=1e-12,atol=0)
     rates=np.array([0,3,2,8,0])*1e-7

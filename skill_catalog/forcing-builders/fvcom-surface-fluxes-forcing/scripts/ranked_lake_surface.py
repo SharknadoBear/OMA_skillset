@@ -8,7 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-from acquire_wind_pressure import HOUR, ORDER, collect, iso, write
+from acquire_wind_pressure import HOUR, ORDER, collect, digest, iso, write
 
 BASE_PRODUCTS = ["wind_10m","mean_sea_level_pressure"]
 CFS_PRODUCTS = ["downward_shortwave_surface_flux","upward_shortwave_surface_flux",
@@ -30,6 +30,53 @@ def hrrr_lake_arguments(parser):
                         help="Parent HRRR integration window for identical precipitation transitions at segment edges")
 
 
+def mask_samples(start, end):
+    from datetime import datetime, timezone
+    def parse(s):
+        value=datetime.fromisoformat(s.replace("Z","+00:00"))
+        if value.tzinfo is None:
+            raise ValueError("Mask samples require explicit UTC endpoints")
+        return value.astimezone(timezone.utc)
+    first,last=parse(start),parse(end)
+    # Check the static land cover at each dated initialization and the June qualification endpoints.
+    samples={first,last}
+    for date in ("2025-06-03","2025-06-17","2025-06-19","2025-06-24","2025-06-26","2025-07-01","2025-08-01"):
+        sample=parse(date+"T00:00:00Z")
+        if first<=sample<=last:
+            samples.add(sample)
+    return sorted(samples)
+
+
+def acquire_lake_masks(args):
+    sys.path.insert(0,str(args.skill_root/"hrrr-fetcher"/"scripts"))
+    import hrrr_core as core
+    if not core.runtime_preflight()["passed"]:
+        raise ValueError("HRRR LAND acquisition requires the pinned HRRR runtime")
+    for sample in mask_samples(args.start,args.end):
+        dest=args.source_root/"hrrr_land"/sample.strftime("%Y%m%d%H")
+        dest.mkdir(parents=True,exist_ok=True)
+        if (dest/"health_check.json").is_file() and core.health_run(dest)["passed"]:
+            continue
+        request=dict(schema_version="hrrr_request_v1",mode="analysis",domain="conus",start=iso(sample),end=iso(sample),
+                     bbox=args.bbox,halo_cells=2,missing_policy="error",retain_raw_messages=True,
+                     products=[dict(family="wrfsfc",short_name="LAND",level_text="surface",step_type="instant",output_name="land_mask")])
+        plan=core.build_plan(request,dest)
+        core.atomic_write_json(dest/"download_plan.json",plan)
+        core.execute_plan(plan,dest)
+        if not core.health_run(dest)["passed"]:
+            raise ValueError("Fetched HRRR LAND did not verify at "+iso(sample))
+
+
+def checked_mask_cache(path):
+    if not path.is_file() or not (path.parent/"health_check.json").is_file():
+        return False
+    try:
+        health=json.loads((path.parent/"health_check.json").read_bytes())
+        return health["passed"] and any(c.get("sha256")==digest(path) for c in health["checks"])
+    except (ValueError,KeyError,OSError):
+        return False
+
+
 def acquire(args, provider):
     from datetime import datetime, timezone
     start,end = (datetime.fromisoformat(v.replace("Z","+00:00")).astimezone(timezone.utc) for v in (args.start,args.end))
@@ -44,7 +91,7 @@ def acquire(args, provider):
     if not core.runtime_preflight()["passed"]:
         raise ValueError("HRRR requires its pinned GRIB runtime")
     rain_start,rain_end = start,end-HOUR
-    if args.rain_context:
+    if getattr(args,"rain_context",None):
         outer_start,outer_end = (datetime.fromisoformat(v.replace("Z","+00:00")).astimezone(timezone.utc) for v in args.rain_context)
         if not (outer_start<=start and end<=outer_end):
             raise ValueError("Segment exceeds its rain context")
@@ -75,13 +122,28 @@ def run(args):
     args.source_root=args.source_root.resolve()
     args.hrrr_analysis = args.hrrr_analysis or args.source_root/"hrrr"
     args.hrrr_precipitation = args.hrrr_precipitation or args.source_root/"hrrr_precip"
+    superior = getattr(args,"lake_profile",None)=="lake_superior_summer"
+    if superior:
+        args.lake_seed_lonlat=args.lake_seed_lonlat or (-87.7833294179,48.0585453410)
+        if args.max_water_distance_km is None:
+            args.max_water_distance_km=15.
+        samples=mask_samples(args.start,args.end)
+        first=samples[0]
+        campaign_bounds=["2025-06-03T00:00:00Z","2025-08-01T00:00:00Z"]
+        if not args.rain_context and campaign_bounds[0]<=iso(first) and iso(samples[-1])<=campaign_bounds[1]:
+            args.rain_context=campaign_bounds
+        cached_request=args.hrrr_analysis/first.replace(hour=first.hour//6*6).strftime("%Y%m%d%H")/"request.normalized.json"
+        if not args.bbox:
+            args.bbox=json.loads(cached_request.read_bytes())["bbox"] if cached_request.exists() else [-92.14,46.37,-84.31,49.06]
     if args.fetch_worker:
-        acquire(args,args.fetch_worker)
+        if args.fetch_worker=="hrrr-land":
+            acquire_lake_masks(args)
+        else:
+            acquire(args,args.fetch_worker)
         return
     from lake_interval_surface import build as build_intervals
     from lake_surface import build as build_hrrr
     from prepare_wind_pressure import hour_axis, require
-    from acquire_wind_pressure import digest
     clock = hour_axis(args.start,args.end)
     require(len(clock)>=2,"Need at least one complete forcing interval")
     args.output.mkdir(parents=True,exist_ok=True)
@@ -89,6 +151,15 @@ def run(args):
     for provider in ORDER:
         root = args.source_root/provider
         try:
+            if superior and provider=="hrrr" and not args.lake_water_mask:
+                masks=[args.source_root/"hrrr_land"/t.strftime("%Y%m%d%H")/"hrrr_fields.nc" for t in mask_samples(args.start,args.end)]
+                if args.acquire and not all(checked_mask_cache(p) for p in masks):
+                    command=[str(args.hrrr_python or sys.executable),str(Path(__file__).resolve()),*sys.argv[1:],"--fetch-worker","hrrr-land"]
+                    with (args.output/"hrrr_land_acquire.log").open("w",encoding="utf8") as log:
+                        status=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT).returncode
+                    require(status==0,"HRRR LAND acquisition failed; see hrrr_land_acquire.log")
+                require(all(checked_mask_cache(p) for p in masks),"Prepare the checked HRRR LAND files or use --acquire")
+                args.lake_water_mask=masks
             available = ((args.hrrr_analysis.is_dir() and args.hrrr_precipitation.is_dir()) if provider=="hrrr"
                          else (root/"health_check.json").is_file())
             def prepare(staging):
@@ -146,11 +217,12 @@ if __name__=="__main__":
     for name in ("start","end"):
         parser.add_argument("--"+name,required=True)
     parser.add_argument("--projected-crs")
+    parser.add_argument("--lake-profile",choices=["lake_superior_summer"],help="Use the Lake Superior shoreline support for HRRR fluxes")
     hrrr_lake_arguments(parser)
     parser.add_argument("--acquire",action="store_true",help="Use the archive connectors for missing or rejected caches")
     parser.add_argument("--bbox",type=float,nargs=4,metavar=("WEST","SOUTH","EAST","NORTH"))
     for name in ("hrrr-analysis","hrrr-precipitation","hrrr-python","era5-python","cfs-python"):
         parser.add_argument("--"+name,type=Path)
     parser.add_argument("--skill-root",type=Path,default=Path(os.environ.get("CODEX_HOME",Path.home()/".codex"))/"skills")
-    parser.add_argument("--fetch-worker",choices=ORDER,help=argparse.SUPPRESS)
+    parser.add_argument("--fetch-worker",choices=(*ORDER,"hrrr-land"),help=argparse.SUPPRESS)
     run(parser.parse_args())

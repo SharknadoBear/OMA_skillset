@@ -13,6 +13,8 @@ Choose `mode=baroclinic-temperature-wind-river`, `profile=lake_superior_summer` 
 
 After validation, publish the tested Lake Superior configuration and a compact case record with the spin-up choice, benchmark result, observation coverage and remaining model errors in the OMA `fvcom-simulation` skill. Commit and push the tested changes, synchronize the local Codex installation, and verify its files against the published revision. Store native NetCDF inputs, model fields and restarts with the study.
 
+For this profile, the forcing worker invokes `ranked_lake_surface.py --lake-profile lake_superior_summer`. Supply the parent integration dates as `--rain-context` for each subset. Inspect the selected provider and compare its short-window arrays and hourly budget rows with the common full-period product. On HRRR, require `lake_water_support` in the manifest and inspect the longest replacement distances in the St. Marys outlet. For a fallback provider, verify its coastal heat donors and repeat the dated multi-day wet-temperature qualification. [HRRR mask acquisition and donor rules](https://github.com/SharknadoBear/OMA_skillset/blob/main/skill_catalog/forcing-builders/fvcom-surface-fluxes-forcing/references/lake_providers.md#shoreline-support-for-hrrr-direct-heat)
+
 ### July 2025 heat-budget qualification
 
 Reproduce the limiter-off sensitivity test with `--no-scalar-positivity-control` and `NOFLUX_BOT_CONDITION=T`. Two 128-rank July 1–2 runs held the executable, initialization and forcing fixed. Disabling the scalar limiter moved the wet-domain heat residual from −30.58 to −3.68 W/m². Both runs preserved the wet masks and closed the one-day water budget within 0.0001 mm of lake-equivalent depth. In the limiter-off run, global samples every 500 model seconds ranged from 2.117 to 26.332 °C. The 24-hour volume-weighted difference between settings was 0.052 °C RMS for 3-D temperature, with a local maximum difference of 3.96 °C.
@@ -20,3 +22,15 @@ Reproduce the limiter-off sensitivity test with `--no-scalar-positivity-control`
 The June 24 and June 17 trials failed the multi-day freshwater temperature check. At 48 hours, both native restarts showed subfreezing water at the same wet Sturgeon Bay shoreline node (48.55243° N, 88.43671° W, chart depth 0.10 m). Its upper layer reached −3.105 and −2.879 °C, respectively. Across the lake, about 387,000 and 46,000 m³ were more than 0.01 °C below their local freshwater freezing points. A six-hourly June 25 field had already reached −8.126 °C there. The two attempts were stopped with their checkpoints retained. The 28-day trial was withdrawn before allocation.
 
 Treat the limiter-off setting as a diagnostic sensitivity. The July 1 smoke qualifies the startup, readers, restart and one-day execution. For spin-up qualification, evaluate wet-layer temperatures against the local pressure-dependent freezing point on every stored clock, including closed restarts. Inspect affected volume, duration and column energy. In shallow water, quantify shortwave reaching the bed, the atmospheric interpolation weights coming from land, and the signed water heat budget. Require a physically passing multi-day case before selecting a July restart, benchmarking or publishing month-long skill scores.
+
+### Lake-supported HRRR qualification
+
+The original Sturgeon Bay heat stencil drew 85.8% of its weight from land. All 24 nodes with a freezing excursion in the two June trials had some land influence. The repeat runs sampled direct heat and vapour flux from the connected Lake Superior water body. The executable, initial conditions, surface stress, pressure, river inputs, bathymetry, optical coefficients and scalar limiter setting matched their original controls. Native wind stress and pressure were bitwise identical on every target and clock. Rainfall matched to storage precision after accounting for condensation.
+
+| Start, UTC | Duration | Perlmutter model / native QA job | Lowest saved wet-layer temperature | Lowest model log temperature |
+| --- | ---: | --- | ---: | ---: |
+| 2025-06-17 | 48 h | 62010714 / 62010750 | 1.363 °C | 1.184 °C |
+| 2025-06-24 | 48 h | 62010715 / 62010764 | 1.722 °C | 1.396 °C |
+| 2025-07-01 | 24 h | 62010713 / 62011177 | 2.491 °C | 2.120 °C |
+
+Every saved wet layer passed its local freezing check. At hour 42 of the June 24 run, the lake-wide wet minimum rose from −8.126 to 2.656 °C. At the end of the June 17 run, the upper layer at the original cold node reached 24.84 °C, compared with 16.29 °C in the NOAA nowcast. On July 1 the revised lake-wide surface mean was 15.34 °C against 7.54 °C from daily GLSEA. Retain the shoreline warm error and the broader initialization bias when interpreting the longer experiments.
