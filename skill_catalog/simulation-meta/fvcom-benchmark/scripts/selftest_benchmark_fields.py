@@ -24,6 +24,8 @@ class NativeDifferences(unittest.TestCase):
                     ds.createDimension(n,k)
                 for name in ("lon","lat","h"):
                     ds.createVariable(name,"f4",("node",))[:]=[1,2,3]
+                ds.createVariable("partition","i4",("nele",))[:]=1
+                ds.createVariable("nprocs","i4",())[:]=slot["ranks"]
                 ds.createVariable("nv","i4",("three","nele"))[:]=np.array([[1],[2],[3]])
                 ds.createVariable("siglev","f4",("siglev","node"))[:]=np.array([0,-.5,-1])[:,None]
                 day=ds.createVariable("Itime","i4",("time",))
@@ -50,6 +52,8 @@ class NativeDifferences(unittest.TestCase):
         pair=next(p for p in result["comparisons"] if p["left"]=="benchmark_064_r1" and p["right"]=="benchmark_256_r3")
         self.assertEqual(pair["pooled"]["temp"],dict(count=20,max_abs=8.,rms=8.))
         self.assertEqual(pair["mask_disagreements"]["node"],5)
+        self.assertTrue(pair["identical_element_partition"])
+        self.assertEqual(result["distinct_partitions_per_layout"],{"64":1,"128":1,"256":1})
         path.write_bytes(b"damaged")
         with self.assertRaisesRegex(ValueError,"history file changed"):
             evaluate(fixture.plan_path,rows,inventory)

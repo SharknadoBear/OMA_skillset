@@ -84,10 +84,21 @@ def evaluate(plan_path, records, inventory_path):
             expected=[first+i*interval for i in range((last-first)//interval+1)]
             found={}
             science_files={}
+            partitions=set()
+            ownership={}
             for p in sorted(folder.glob(case+"_[0-9][0-9][0-9][0-9].nc")):
                 h=sha256(p)
                 require(audit["output_files"][p.name]["sha256"]==h,"history file changed: "+str(p))
                 ds=files.enter_context(nc.Dataset(p))
+                owner=np.asarray(ds["partition"][:],dtype="<i4")
+                ranks=int(np.asarray(ds["nprocs"][:]).item())
+                require(owner.shape==(len(ds.dimensions["nele"]),) and ranks==row["ranks"],
+                        "native partition dimensions or process count mismatch")
+                ids,counts=np.unique(owner,return_counts=True)
+                require(ids.size and ((ids[0]>=0 and ids[-1]<ranks) or (ids[0]>=1 and ids[-1]<=ranks)),
+                        "native partition owner outside the launched MPI layout")
+                partitions.add(hashlib.sha256(owner.tobytes()).hexdigest())
+                ownership={str(r):int(n) for r,n in zip(ids,counts)}
                 if not found:
                     grid_hashes.add(grid_digest(ds))
                 for i,time in enumerate(native_times(ds)):
@@ -96,7 +107,9 @@ def evaluate(plan_path, records, inventory_path):
                 science_files[p.name]=h
             require(list(found)==expected,"incomplete benchmark history: "+name)
             stamps[name]=found
-            hashes[name]={"audit_sha256":sha256(audit_path),"native_histories":science_files}
+            require(len(partitions)==1,"element ownership changed between native stacks")
+            hashes[name]={"audit_sha256":sha256(audit_path),"native_histories":science_files,
+                          "partition_sha256":next(iter(partitions)),"elements_by_native_partition":ownership}
         require(len(grid_hashes)==1,"ordered mesh, bathymetry or sigma geometry differs across native histories")
         require(all(list(s)==list(stamps[names[0]]) for s in stamps.values()),"benchmark clocks differ")
         for t in stamps[names[0]]:
@@ -128,6 +141,8 @@ def evaluate(plan_path, records, inventory_path):
                     pooled["sum_squared"]+=squared
                     pooled["max_abs"]=max(pooled["max_abs"],metrics["max_abs"])
     for pair in per_pair.values():
+        pair["identical_element_partition"]=(hashes[pair["left"]]["partition_sha256"]
+                                             ==hashes[pair["right"]]["partition_sha256"])
         for field in pair["pooled"].values():
             field["rms"]=math.sqrt(field.pop("sum_squared")/field["count"])
     return dict(schema="fvcom_benchmark_native_differences_v1",status="verified",execution_site="perlmutter",
@@ -135,4 +150,6 @@ def evaluate(plan_path, records, inventory_path):
                 units={k:v[1] for k,v in FIELDS.items()},
                 weighting="Equal weight per common-wet native node or element, sigma layer and retained timestamp",
                 lineage=science["lineage"],records_sha256=science["records_sha256"],grid_sha256=next(iter(grid_hashes)),
+                distinct_partitions_per_layout={str(r):len({hashes[n]["partition_sha256"] for n in names
+                                                            if rows[n]["ranks"]==r}) for r in {x["ranks"] for x in records}},
                 source_hashes=hashes,comparisons=list(per_pair.values()))
