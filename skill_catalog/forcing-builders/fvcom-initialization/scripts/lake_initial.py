@@ -61,6 +61,23 @@ def complete(var, index=slice(None)):
     return np.asarray(array.data)
 
 
+def verify_reader_layout(ds):
+    """Inputs used by LOAD_GRID, COORDS_N_CONST, SET_MODEL_TIME and STARTUP for the active build."""
+    groups={
+        ("three","nele"):("nv",), ("node",):("lon","lat","h"), ("nele",):("cor","cc_sponge"),
+        ("siglev","node"):("siglev",), ("siglay","node"):("tmean1","smean1","rmean1"),
+        ("time",):("iint",), ("time","node"):("zeta","et","el_press","wet_nodes","wet_nodes_prev_int"),
+        ("time","nele"):("ua","va","wet_cells","wet_cells_prev_int","wet_cells_prev_ext"),
+        ("time","siglay","node"):("temp","salinity","rho1"), ("time","siglay","nele"):("u","v"),
+        ("time","siglev","node"):("omega","q2","q2l","l","km","kh","kq")}
+    for axes,names in groups.items():
+        for name in names:
+            if name not in ds.variables or ds[name].dimensions!=axes:
+                raise ValueError(f"Required FVCOM_MP hotstart {name}{axes} missing or misstaggered")
+    if len(ds.dimensions["siglev"])!=len(ds.dimensions["siglay"])+1: raise ValueError("Invalid native layer count")
+    if not native_times(ds): raise ValueError("Native hotstart has no UTC record")
+
+
 def check_geometry(ds, ref, contract, directory):
     for name in GEOMETRY:
         if ds[name].dimensions!=ref[name].dimensions or not np.array_equal(complete(ds[name]), complete(ref[name])):
@@ -70,7 +87,7 @@ def check_geometry(ds, ref, contract, directory):
         raise ValueError("Dimensions differ from the runtime grid")
     if contract["geometry"]!="spherical" or contract["grid_file_units"]!="degrees" or ds.CoordinateSystem!="GeoReferenced":
         raise ValueError("Expected spherical native grid and earth-frame vectors")
-    for key in ("grd","dep","sig"):
+    for key in ("grd","dep","sig","cor","spg"):
         entry=contract["files"][key]
         if sha(directory/entry["name"])!=entry["sha256"]:
             raise ValueError(f"Frozen runtime {key} changed")
@@ -98,7 +115,26 @@ def check_geometry(ds, ref, contract, directory):
             or not np.allclose(interfaces[[0,-1]],[[0],[-1]]) or not np.allclose(layers,(interfaces[1:]+interfaces[:-1])/2,atol=1e-7,rtol=0)):
         raise ValueError("Sigma interfaces or midpoint order differ from runtime")
     if not all(abs(v)<1e-6 for v in (interfaces[0,0],interfaces[-1,0]+1)): raise ValueError("Bad sigma endpoints")
-    return {key:contract["files"][key]["sha256"] for key in ("grd","dep","sig")}
+    return {key:contract["files"][key]["sha256"] for key in ("grd","dep","sig","cor","spg")}
+
+
+def restart_face_constants(ds,contract,directory):
+    """Mirror FVCOM cold grid construction for fields read directly in the hotstart branch."""
+    cor=np.loadtxt(directory/contract["files"]["cor"]["name"],skiprows=1,ndmin=2)
+    n=len(ds.dimensions["node"])
+    if cor.shape!=(n,3): raise ValueError("Nodal Coriolis DAT must have three columns in native order")
+    lat=complete(ds["lat"]);lon=complete(ds["lon"])
+    if (np.max(abs((cor[:,0]-lon+180)%360-180))>2e-5 or np.max(abs(cor[:,1]-lat))>4e-6 or
+            np.max(abs(cor[:,2]-lat))>4e-6):
+        raise ValueError("Coriolis node coordinates or latitude values differ from the spherical mesh")
+    nv=complete(ds["nv"])-1
+    latitude=cor[:,2][nv].mean(axis=0)
+    coriolis=2*7.292e-5*np.sin(np.deg2rad(latitude))
+    coriolis=np.where((abs(coriolis)<1e-5)&(coriolis!=0),np.sign(coriolis)*1e-5,coriolis)
+    sponge=(directory/contract["files"]["spg"]["name"]).read_text().strip().splitlines()
+    if (len(sponge)!=1 or int(sponge[0].split("=")[-1])!=0 or contract.get("sponge_nodes")!=0 or contract.get("obc_nodes")!=0):
+        raise ValueError("This closed-lake adapter requires frozen zero sponge and open-boundary counts")
+    return {"cor":coriolis.astype("f4"),"cc_sponge":np.zeros(len(latitude),dtype="f4")}
 
 
 def barotropic(u,v,siglev,depth,nv):
@@ -174,7 +210,8 @@ def state(ds, record, pressure):
 
 def write_state(path,ds,fields,t):
     derived={"tmean1":("siglay","node"),"smean1":("siglay","node"),"rmean1":("siglay","node"),"rho1":("time","siglay","node"),
-             "ua":("time","nele"),"va":("time","nele"),"el_press":("time","node"),"et":("time","node")}
+             "ua":("time","nele"),"va":("time","nele"),"el_press":("time","node"),"et":("time","node"),
+             "cor":("nele",),"cc_sponge":("nele",)}
     with nc.Dataset(path,"w",format="NETCDF3_64BIT_OFFSET") as out:
         for name in ("node","nele","siglay","siglev","three","DateStrLen","time"):
             out.createDimension(name,None if name=="time" else len(ds.dimensions[name]))
@@ -189,7 +226,7 @@ def write_state(path,ds,fields,t):
             target.setncatts({k:original.getncattr(k) for k in original.ncattrs() if k!="_FillValue"})
         for name,dims in derived.items():
             target=out.createVariable(name,"f4",dims)
-            target.units={"ua":"m s-1","va":"m s-1","el_press":"m","et":"m","tmean1":"degrees_C"}.get(name,"1")
+            target.units={"ua":"m s-1","va":"m s-1","el_press":"m","et":"m","tmean1":"degrees_C","cor":"s-1","cc_sponge":"nd"}.get(name,"1")
         elapsed=t-MJD
         date=t.strftime("%Y/%m/%d %H:%M:%S.%f")
         out.createVariable("iint","i4",("time",))
@@ -232,8 +269,12 @@ def build(source,reference,contract_path,pressure,output):
             hashes=check_geometry(ds,ref,contract,contract_path.parent)
             data,pressure_info=pressure_at(pressure,target,ds,record,hashes["grd"])
             fields,profile,reports=state(ds,record,data)
+            fields.update(restart_face_constants(ds,contract,contract_path.parent))
+            reports["cell_coriolis_range_s1"]=[float(fields["cor"].min()),float(fields["cor"].max())]
+            reports["active_sponge_cells"]=int(np.count_nonzero(fields["cc_sponge"]))
             write_state(file,ds,fields,target)
             with nc.Dataset(file) as out:
+                verify_reader_layout(out)
                 if native_times(out)!=[target] or out["iint"][0]!=0: raise ValueError("New run clock mismatch")
                 for name,expected in fields.items():
                     v=out[name]; array=complete(v,0 if "time" in v.dimensions else slice(None))

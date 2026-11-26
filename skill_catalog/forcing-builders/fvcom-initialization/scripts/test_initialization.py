@@ -8,7 +8,7 @@ import netCDF4 as nc
 import numpy as np
 
 from freshwater import anomaly
-from lake_initial import DIRECT, FLAGS, barotropic, build, save, sha
+from lake_initial import DIRECT, FLAGS, build, save, sha, verify_reader_layout
 from restart_handoff import verify
 
 
@@ -43,8 +43,11 @@ class InitializationTests(unittest.TestCase):
         g=self.root/"grid.dat"; g.write_text("Node Number = 3\nCell Number = 1\n1 1 3 2 1\n1 4 4 3\n2 5 5 6\n3 6 6 9\n")
         d=self.root/"depth.dat"; d.write_text("Node Number = 3\n4 4 3\n5 5 6\n6 6 9\n")
         s=self.root/"sigma.dat"; s.write_text("NUMBER OF SIGMA LEVELS = 3\nSIGMA COORDINATE TYPE = UNIFORM\n")
+        c=self.root/"cor.dat"; c.write_text("Node Number = 3\n4 4 4\n5 5 5\n6 6 6\n")
+        sp=self.root/"spg.dat"; sp.write_text("Sponge Node Number = 0\n")
         self.contract=self.root/"grid.json"
-        save(self.contract,dict(status="ready",source_sha256=sha(self.reference),files={k:dict(name=p.name,sha256=sha(p)) for k,p in (("grd",g),("dep",d),("sig",s))},
+        save(self.contract,dict(status="ready",source_sha256=sha(self.reference),obc_nodes=0,sponge_nodes=0,
+             files={k:dict(name=p.name,sha256=sha(p)) for k,p in (("grd",g),("dep",d),("sig",s),("cor",c),("spg",sp))},
              nodes=3,elements=1,sigma_layers=2,sigma_interfaces=3,sigma_interface_values=[0,-.5,-1],geometry="spherical",
              grid_file_units="degrees",ascii_to_native_nv_one_based=[1,3,2]))
         self.pressure=self.root/"p.nc"
@@ -68,6 +71,9 @@ class InitializationTests(unittest.TestCase):
             np.testing.assert_array_equal(f["u"][0,:,0],[.5,-.25])
             self.assertGreater(np.ptp(f["temp"][0],axis=0).max(),0)
             self.assertEqual(float(f["salinity"][:].max()),0)
+            self.assertEqual(f["cor"].dimensions,("nele",))
+            np.testing.assert_allclose(f["cor"][:],2*7.292e-5*np.sin(np.deg2rad(5)),rtol=1e-6)
+            np.testing.assert_array_equal(f["cc_sponge"][:],[0])
         checkpoint=self.root/"restart.nc"
         shutil.copyfile(out/"lake_initial.nc",checkpoint)
         with nc.Dataset(checkpoint,"r+") as f:
@@ -95,6 +101,13 @@ class InitializationTests(unittest.TestCase):
     def test_reject_layer_reversal(self):
         with nc.Dataset(self.source,"r+") as f: f["siglay"][:]=f["siglay"][::-1,:]
         with self.assertRaisesRegex(ValueError,"siglay"): self.run_build()
+
+    def test_native_hotstart_rejects_missing_face_constant(self):
+        self.run_build()
+        with nc.Dataset(self.root/"state"/"lake_initial.nc","r+") as ds:
+            ds.renameVariable("cc_sponge","unregistered")
+            with self.assertRaisesRegex(ValueError,"cc_sponge"):
+                verify_reader_layout(ds)
 
     def test_freshwater_density_maximum(self):
         t=np.asarray([0,4,8,20],dtype="f4")

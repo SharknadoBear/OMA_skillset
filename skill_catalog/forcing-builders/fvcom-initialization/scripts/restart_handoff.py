@@ -6,7 +6,7 @@ from pathlib import Path
 import netCDF4 as nc
 import numpy as np
 
-from lake_initial import DIRECT, FLAGS, complete, native_times, save, sha, utc
+from lake_initial import DIRECT, FLAGS, complete, native_times, save, sha, utc, verify_reader_layout
 
 
 def verify(restart, initial_manifest, when, executable_sha256, source_job_id, expected_sha256):
@@ -24,6 +24,7 @@ def verify(restart, initial_manifest, when, executable_sha256, source_job_id, ex
     if t<=utc(manifest["case_epoch_utc"]):
         raise ValueError("Checkpoint must be later than the parent analysis")
     with nc.Dataset(restart) as ds,nc.Dataset(initial) as prior:
+        verify_reader_layout(ds)
         times=native_times(ds)
         if t not in times: raise ValueError("Missing exact continuation timestamp")
         record=times.index(t)
@@ -32,8 +33,9 @@ def verify(restart, initial_manifest, when, executable_sha256, source_job_id, ex
         for key in ("node","nele","siglay","siglev"):
             if len(ds.dimensions[key])!=manifest["dimensions"][key]:
                 raise ValueError("Native restart dimensions changed")
-        for key in ("nv","h","siglay","siglev","lon","lat"):
+        for key in ("nv","h","siglay","siglev","lon","lat","cor","cc_sponge"):
             old,new=complete(prior[key]),complete(ds[key])
+            if prior[key].dimensions!=ds[key].dimensions: raise ValueError(f"Checkpoint axes differ at {key}")
             if key=="lon": ok=np.max(abs((new.astype(float)-old+180)%360-180))<3.2e-5
             elif key=="lat": ok=np.max(abs(new-old))<4e-6
             else: ok=np.allclose(new,old,rtol=0,atol=1e-7) if key.startswith("sig") else np.array_equal(new,old)
