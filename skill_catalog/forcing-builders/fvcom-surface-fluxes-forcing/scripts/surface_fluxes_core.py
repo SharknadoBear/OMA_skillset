@@ -613,23 +613,25 @@ def _time_variables(dataset: nc4.Dataset, times_ms: np.ndarray) -> None:
     mjd = (itime.astype(np.float64) + itime2.astype(np.float64) / DAY_MS).astype(np.float32)
     variable = dataset.createVariable("iint", "i4", ("time",))
     variable.long_name = "internal mode iteration number"
-    variable[:] = np.arange(1, len(times_ms) + 1, dtype=np.int32)
     variable = dataset.createVariable("time", "f4", ("time",))
     variable.units = "days since 1858-11-17 00:00:00"
     variable.format = "modified julian day (MJD)"
     variable.time_zone = "UTC"
-    variable[:] = mjd
     variable = dataset.createVariable("Itime", "i4", ("time",))
     variable.units = "days since 1858-11-17 00:00:00"
     variable.time_zone = "UTC"
-    variable[:] = itime
     variable = dataset.createVariable("Itime2", "i4", ("time",))
     variable.units = "msec since 00:00:00"
     variable.time_zone = "UTC"
-    variable[:] = itime2
     variable = dataset.createVariable("Times", "S1", ("time", "DateStrLen"))
     variable.time_zone = "UTC"
-    variable[:] = format_times(times_ms)
+    # In classic NetCDF each record has a fixed stride. Define every clock
+    # variable before extending time so a new clock never rewrites all records.
+    dataset["iint"][:] = np.arange(1, len(times_ms) + 1, dtype=np.int32)
+    dataset["time"][:] = mjd
+    dataset["Itime"][:] = itime
+    dataset["Itime2"][:] = itime2
+    dataset["Times"][:] = format_times(times_ms)
 
 
 def _package_variables(

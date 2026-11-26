@@ -28,7 +28,13 @@ STEP = 0.25
 PRODUCTS = {
     "wind_10m": [("10m_u_component_of_wind", "u10"), ("10m_v_component_of_wind", "v10")],
     "mean_sea_level_pressure": [("mean_sea_level_pressure", "msl")],
+    "surface_heat_and_precipitation": [
+        ("surface_net_solar_radiation", "ssr"), ("surface_net_thermal_radiation", "str"),
+        ("surface_sensible_heat_flux", "sshf"), ("surface_latent_heat_flux", "slhf"),
+        ("total_precipitation", "tp"),
+    ],
 }
+ACCUMULATED = {"ssr": 176, "str": 177, "sshf": 146, "slhf": 147, "tp": 228}
 PACKAGES = ["cdsapi", "ecmwf-datastores-client", "numpy", "xarray", "netCDF4", "requests", "PyYAML", "matplotlib"]
 
 
@@ -227,7 +233,7 @@ def normalize_request(request, base_dir=None):
         raise RequestError("Require start < end and dates from 1940 onward")
     products = request.get("products", ["wind_10m", "mean_sea_level_pressure"])
     if not isinstance(products, list) or not products or any(not isinstance(p, str) or p not in PRODUCTS for p in products):
-        raise RequestError("Use wind_10m and/or mean_sea_level_pressure")
+        raise RequestError("Choose one or more products from " + ", ".join(PRODUCTS))
     if len(set(products)) != len(products):
         raise RequestError("Repeated products")
     halo = request.get("halo_cells", 1)
@@ -453,13 +459,16 @@ def validate_fields(ds, chunk, request):
             raise ValidationError("Unexpected dimensions for " + name)
         unit = str(field.attrs.get("units", ""))
         allowed = {"Pa", "pascal", "pascals"} if name == "msl" else {"m s**-1", "m s-1", "m s^-1", "m/s", "m s^{-1}"}
+        if name in ACCUMULATED:
+            allowed = {"m"} if name == "tp" else {"J m**-2", "J m-2", "J m^-2", "J/m^2"}
         if unit not in allowed:
             raise ValidationError("Wrong source units for " + name + ": " + unit)
-        expected_parameter = {"u10": 165, "v10": 166, "msl": 151}[name]
+        expected_parameter = {"u10": 165, "v10": 166, "msl": 151, **ACCUMULATED}[name]
         if "GRIB_paramId" in field.attrs and int(field.attrs["GRIB_paramId"]) != expected_parameter:
             raise ValidationError("Wrong source parameter for " + name)
-        if field.attrs.get("GRIB_stepType", "instant") != "instant":
-            raise ValidationError("Non-instantaneous source field " + name)
+        expected_step = "accum" if name in ACCUMULATED else "instant"
+        if field.attrs.get("GRIB_stepType", expected_step) != expected_step:
+            raise ValidationError("Wrong source interval type for " + name)
         if name in ("u10", "v10") and int(field.attrs.get("GRIB_uvRelativeToGrid", 0)) != 0:
             raise ValidationError("Wind must be earth-relative; no implicit rotation")
         if name in ("u10", "v10") and "GRIB_level" in field.attrs and float(field.attrs["GRIB_level"]) != 10:
@@ -536,6 +545,10 @@ def canonicalize(payload, output, chunk, request):
                 ds[name].attrs["source_standard_name"] = ds[name].attrs.get("standard_name", "not provided")
                 ds[name].attrs["standard_name"] = "eastward_wind" if name == "u10" else "northward_wind"
                 ds[name].attrs["height_above_ground_m"] = 10.0
+            if name in ACCUMULATED:
+                # CDS hourly HRES accumulations are for the preceding hour,
+                # including the previous day's 23–00 UTC interval at midnight.
+                ds[name].attrs.update(interval_seconds=3600, interval_anchor="end")
             ds[name].encoding = {}
         encoding = {name: {"zlib": True, "complevel": 4} for name in names}
         part = output.with_name(output.name + ".part")

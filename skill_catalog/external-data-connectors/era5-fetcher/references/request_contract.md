@@ -13,7 +13,7 @@
 }
 ```
 
-Use `bbox: [west, south, east, north]` instead of `mesh` for an explicit geographic rectangle. Exactly one spatial input is required. Start/end are whole UTC hours, start inclusive and end exclusive. Product aliases expand to `10m_u_component_of_wind`, `10m_v_component_of_wind`, and `mean_sea_level_pressure`. Unknown or repeated products/options fail. No additional ERA5 fields are implemented in v1.
+Use `bbox: [west, south, east, north]` for an explicit geographic rectangle. Exactly one spatial input is required. Start/end are whole UTC hours, start inclusive and end exclusive. The wind and pressure products supply `u10`, `v10` and `msl`. Add `surface_heat_and_precipitation` for `ssr`, `str`, `sshf`, `slhf` (J/m², positive downward) and `tp` (m of water). Each accumulation covers the hour ending at its UTC timestamp. For a simulation ending at midnight, include that timestamp in the request.
 
 Read every fort.14 node, require ordered IDs 1..NP and declared `crs=EPSG:4326`, retain the source hash, and resolve paths against the request file. Normalize 0..360 or -180..180 longitudes; reject a dateline crossing with guidance to request two regions. Halo is a nonnegative integer, default 1. Expand by halo*0.25 degrees and round outward to the CDS lattice. Require at least two points on each axis. CRS conversion and regridding are outside v1.
 

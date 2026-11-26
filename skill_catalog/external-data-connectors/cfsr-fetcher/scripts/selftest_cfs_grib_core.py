@@ -21,6 +21,7 @@ from cfs_grib_core import (
     PRODUCTS,
     _convert,
     _match_field,
+    _selection_score,
     _native_field_grids,
     _download_unit,
     _plan_gate,
@@ -65,6 +66,17 @@ class CatalogHandler(BaseHTTPRequestHandler):
 
 
 class SharedCoreTests(unittest.TestCase):
+    def test_cycle_boundary_prefers_nonzero_mean_and_requires_physical_units(self):
+        spec=PRODUCTS["precipitation_rate"]["fields"][0]
+        row=dict(step_type="avg",step_range="0",forecast_time=0)
+        self.assertGreater(_selection_score(dict(row,step_range="0-6"),spec,100),_selection_score(row,spec,100))
+        for product,units in (("precipitation_rate","kg m**-2 s**-1"),("upward_shortwave_surface_flux","W m**-2")):
+            name=PRODUCTS[product]["fields"][0]["name"]
+            values,_=_convert(np.array([2.]),dict(units=units),name)
+            np.testing.assert_array_equal(values,[2.])
+            with self.assertRaisesRegex(CfsAtmosphericError,"native units"):
+                _convert(np.array([2.]),dict(units="J m-2"),name)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

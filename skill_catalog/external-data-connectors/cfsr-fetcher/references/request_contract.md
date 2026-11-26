@@ -36,11 +36,13 @@ Times are inclusive exact UTC hours. The bbox is `[west,south,east,north]` in 0-
 
 ## Providers and products
 
-NCEI uses full-resolution monthly files and rejects `.l.` products. Request `mean_sea_level_pressure` for `prmsl.gdas` at mean sea level, decoded from GRIB msl/prmsl and published as `air_pressure_at_mean_sea_level` in Pa. The separate `surface_pressure` product uses `pressfc.gdas`. Only the NCEI route supports the MSLP and wind bundle. Each selected GRIB message must match its parameter, native level, and requested valid time. Duplicate valid times retain the shortest forecast lead.
+NCEI uses full-resolution monthly files and rejects `.l.` products. Request `mean_sea_level_pressure` for `prmsl.gdas` at mean sea level, decoded from GRIB msl/prmsl and published as `air_pressure_at_mean_sea_level` in Pa. The separate `surface_pressure` product uses `pressfc.gdas`. Only the NCEI route supports the MSLP and wind bundle. Each selected GRIB message must match its parameter, native level, and requested valid time. For instantaneous fields on the chosen lattice, duplicate valid times retain the shortest forecast lead.
 
 Provider selection is atomic for one era segment. HYCOM is eligible only if every requested product has an exact mapping; unsupported temperature/humidity or composite mappings fail closed instead of being fabricated. Provider attempts and the final lock are recorded.
 
 Canonical fields use `time`, `latitude`, and `longitude`, plus provider-neutral names such as `eastward_wind`, `northward_wind`, `absolute_air_pressure`, `air_temperature_2m`, `specific_humidity_2m`, and `precipitation_rate`. Output variables retain source GRIB units, level, product-definition template, interval/step, forecast lead, filename, conversion, and checksum metadata.
+
+Request `upward_shortwave_surface_flux` and `upward_longwave_surface_flux` with the corresponding downward products, sensible and latent heat and precipitation rate for the complete surface budget. For a full fetch, each flux variable's `source_grib_metadata.intervals` records its valid time, cycle date/time, step range, step units, statistical processing, packing uncertainty and source SHA-256. When two records on the selected lattice share an hour, a positive-duration average takes precedence over the next cycle's zero-duration value. The canonical field retains the reported mean over its native interval. Downstream hourly flux derivation must difference cumulative integrals from the same cycle and lower bound.
 
 When the archive publishes PRMSL on a distinct native grid, its dimensions are `time, mslp_latitude, mslp_longitude`. The coordinate variables retain the original pressure locations in degrees. Read each field's own dimensions to interpolate wind and pressure independently.
 

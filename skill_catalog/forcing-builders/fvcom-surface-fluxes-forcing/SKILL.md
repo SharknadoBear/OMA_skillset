@@ -7,6 +7,8 @@ description: Package and scientifically validate modular FVCOM surface forcing f
 
 ## Lake surface heat and freshwater
 
+Use `scripts/ranked_lake_surface.py` to select and build a complete lake package. Its [lake provider guide](references/lake_providers.md) gives the archive command, cache layout, native interval definitions, readback checks and water-budget policy.
+
 For a baroclinic lake, follow the first complete provider in the requested order HRRR, ERA5, CFSv2, CFSR. Check archive era, heat component definitions, vector frame, pressure reference and interval coverage. Require a complete heat and water budget for a provider to qualify. The native HRRR implementation in `scripts/lake_surface.py` accepts the SHA-verified output batches of the HRRR fetcher in six-hour UTC directories. Supply `--mesh` (native geometry with ART1), `--mod-bulk`, `--analysis`, `--precipitation`, `--start`, `--end` and `--output`. Use `--pressure-only` for an initialization timestamp.
 
 The lake task sums net solar and net longwave heating and subtracts upward sensible and latent flux. It provides penetrating net shortwave separately. Hourly f00 analyses supply heat and stress. Precipitation uses independent 0–1-hour APCP accumulations, with short conservative transitions across rate changes. Signed latent flux provides evaporation or condensation using 2.5 MJ/kg and 1,000 kg/m³. The P/E file adds condensation to water gains and writes evaporative loss with a negative sign. The hourly ledger retains rain, condensation, evaporation and surface heat separately for comparison with lake storage and river transports.

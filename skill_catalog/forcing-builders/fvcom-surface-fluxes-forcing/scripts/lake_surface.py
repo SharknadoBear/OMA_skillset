@@ -35,12 +35,14 @@ def native_geometry(path):
         require(area.shape==lon.shape and np.all(area>0),"invalid native tracer control-volume areas")
         return mesh,area
 
-def create_file(path,mesh,times,variables,frame):
+def create_file(path,mesh,times,variables,frame,provider="HRRR"):
     ds=nc.Dataset(path,"w",format="NETCDF3_64BIT_OFFSET")
     ds.source="FVCOM grid (unstructured) surface forcing"
     ds.type="FVCOM SURFACE FORCING FILE"
-    ds.source_provider="HRRR"
+    ds.source_provider=provider
     ds.wind_vector_frame=frame
+    if any(name=="air_pressure" for name,_,_ in variables):
+        ds.pressure_reference="absolute_mean_sea_level"
     ds.createDimension("time",None)
     ds.createDimension("DateStrLen",26)
     for dim,idx,lon,lat,cn in (("node",mesh.node_ids,mesh.lon,mesh.lat,""),("nele",mesh.element_ids,mesh.lonc,mesh.latc,"c")):
@@ -48,9 +50,9 @@ def create_file(path,mesh,times,variables,frame):
         ds.createVariable("node_id" if dim=="node" else "element_id","i4",(dim,))[:]=idx
         for n,values,units in (("lon"+cn,lon,"degrees_east"),("lat"+cn,lat,"degrees_north")):
             var=ds.createVariable(n,"f4",(dim,));var.units=units;var[:]=values
-    _time_variables(ds,times)
     for name,dim,unit in variables:
         var=ds.createVariable(name,"f4",("time",dim));var.units=unit;var.grid="fvcom_grid"
+    _time_variables(ds,times)
     return ds
 
 def source_index(folder,clock,forecast=False):
@@ -141,7 +143,6 @@ def build(args):
                                                      ("short_wave","node","W m-2"),("net_heat_flux","node","W m-2")])
         atm=temp/("pressure.nc" if args.pressure_only else "superior_atmosphere.nc")
         with create_file(atm,mesh,clock,variables,frame) as d:
-            d.pressure_reference="absolute_mean_sea_level"
             # Keep hourly signed vapour and heat integrals outside the atmosphere file.
             if not args.pressure_only:
                 vapor=np.lib.format.open_memmap(temp/"vapor.npy",mode="w+",dtype="f4",shape=(len(clock),len(areas)))

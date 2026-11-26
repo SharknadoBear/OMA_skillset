@@ -120,7 +120,7 @@ def hrrr_runs(args, start, end, root):
     return files
 
 
-def collect(args, provider, start, end):
+def collect(args, provider, start, end, products=None):
     root = args.output / provider
     root.mkdir(exist_ok=True)
     skill_name = {
@@ -133,7 +133,8 @@ def collect(args, provider, start, end):
     sys.path.insert(0, str(scripts))
     if provider == "hrrr":
         return hrrr_runs(args, start, end, root)
-    products = ["wind_10m", "mean_sea_level_pressure"]
+    if products is None:
+        products = ["wind_10m", "mean_sea_level_pressure"]
     if provider == "era5":
         import era5_core as core
 

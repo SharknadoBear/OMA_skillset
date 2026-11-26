@@ -101,6 +101,14 @@ PRODUCTS: dict[str, dict[str, Any]] = {
         "stem": "dlwsfc",
         "fields": [{"name": "surface_downwelling_longwave_flux", "units": "W m-2", "short": {"dlwrf", "strd"}, "contains": ("downward long-wave", "downward longwave"), "level": {"surface", "sfc"}}],
     },
+    "upward_shortwave_surface_flux": {
+        "stem": "uswsfc",
+        "fields": [{"name": "surface_upwelling_shortwave_flux", "units": "W m-2", "short": {"uswrf"}, "contains": ("upward short-wave", "upward shortwave"), "level": {"surface", "sfc"}}],
+    },
+    "upward_longwave_surface_flux": {
+        "stem": "ulwsfc",
+        "fields": [{"name": "surface_upwelling_longwave_flux", "units": "W m-2", "short": {"ulwrf"}, "contains": ("upward long-wave", "upward longwave"), "level": {"surface", "sfc"}}],
+    },
     "surface_wind_stress": {
         "stem": "wndstrs",
         "fields": [
@@ -623,9 +631,27 @@ def _message_metadata(eccodes: Any, gid: Any) -> dict[str, Any]:
         "product_definition_template": int(-1 if pdt is None else pdt),
         "forecast_time": float(_codes_get(eccodes, gid, "forecastTime", 0.0) or 0.0),
         "step_range": str(_codes_get(eccodes, gid, "stepRange", "")),
+        "step_type": str(_codes_get(eccodes, gid, "stepType", "")),
+        "step_units": str(_codes_get(eccodes, gid, "stepUnits", "")),
+        "packing_error": _packing_error(eccodes, gid),
         "data_date": int(_codes_get(eccodes, gid, "dataDate", 0) or 0),
         "data_time": int(_codes_get(eccodes, gid, "dataTime", 0) or 0),
     }
+
+
+def _packing_error(eccodes, gid):
+    """Absolute half increment of the native scaled-integer GRIB representation."""
+    error = _codes_get(eccodes, gid, "packingError", None)
+    if error is not None:
+        return float(error)
+    kind = _codes_get(eccodes, gid, "packingType", "")
+    if kind not in ("grid_simple", "grid_complex", "grid_complex_spatial_differencing"):
+        return 0.0
+    binary = _codes_get(eccodes, gid, "binaryScaleFactor", None)
+    decimal = _codes_get(eccodes, gid, "decimalScaleFactor", None)
+    if binary is None or decimal is None or int(_codes_get(eccodes, gid, "bitsPerValue", 0))==0:
+        return 0.0
+    return 0.5 * 2.**int(binary) * 10.**(-int(decimal))
 
 
 def _match_field(meta: Mapping[str, Any], spec: Mapping[str, Any]) -> bool:
@@ -693,6 +719,19 @@ def _convert(values: np.ndarray, meta: Mapping[str, Any], canonical: str) -> tup
         if "c" in units:
             return data, "identity_degree_Celsius"
         raise CfsAtmosphericError(f"Unsupported temperature units {meta['units']!r}")
+    conventional = units.replace("**", "").replace("^", "").replace("{", "").replace("}", "")
+    if canonical in {"eastward_wind", "northward_wind"}:
+        accepted = {"ms-1", "m/s"}
+    elif canonical == "precipitation_rate":
+        accepted = {"kgm-2s-1", "kg/m2/s", "kg/(m2s)"}
+    elif canonical in {"surface_downwelling_shortwave_flux", "surface_upwelling_shortwave_flux",
+                       "surface_downwelling_longwave_flux", "surface_upwelling_longwave_flux",
+                       "latent_heat_net_flux", "sensible_heat_net_flux"}:
+        accepted = {"wm-2", "w/m2"}
+    else:
+        return data, "identity"
+    if conventional not in accepted:
+        raise CfsAtmosphericError(f"Unsupported native units {meta['units']!r} for {canonical}")
     return data, "identity"
 
 
@@ -928,6 +967,14 @@ def _iter_grib(path: Path) -> Iterable[tuple[Any, Any]]:
         stream.close()
 
 
+def _selection_score(meta, spec, grid_size):
+    """A nonzero ending mean must survive the next cycle's coincident zero-lead analysis."""
+    mean = meta["step_type"] in {"avg", "average"} and spec["units"] in {"W m-2", "kg m-2 s-1"}
+    bounds = re.fullmatch(r"(\d+)-(\d+)",str(meta["step_range"]))
+    positive = bool(mean and bounds and int(bounds[2])>int(bounds[1]))
+    return (int(grid_size), int(positive), -float(meta["forecast_time"]))
+
+
 def fetch_ncei_full(model: str, plan: Mapping[str, Any], run_dir: Path, destination: Path, status: DownloadStatus, cleanup_raw: bool = False) -> None:
     request = plan["request"]
     raw_dir = run_dir / "raw"
@@ -937,7 +984,7 @@ def fetch_ncei_full(model: str, plan: Mapping[str, Any], run_dir: Path, destinat
         downloaded[unit["id"]] = _download_unit(unit, raw_dir, request, status)
     source_hashes = {unit_id: sha256_file(path) for unit_id, path in downloaded.items()}
     start, end = parse_utc(request["start"]), parse_utc(request["end"])
-    records: dict[str, dict[datetime, tuple[tuple[int, float], np.ndarray, dict[str, Any], np.ndarray, np.ndarray]]] = defaultdict(dict)
+    records: dict[str, dict[datetime, tuple[tuple[int, int, float], np.ndarray, dict[str, Any], np.ndarray, np.ndarray]]] = defaultdict(dict)
     for unit in plan["source_units"]:
         specs = PRODUCTS[unit["product"]]["fields"]
         for eccodes, gid in _iter_grib(downloaded[unit["id"]]):
@@ -953,10 +1000,9 @@ def fetch_ncei_full(model: str, plan: Mapping[str, Any], run_dir: Path, destinat
             xi = _bbox_indices(lon, request["bbox"][0], request["bbox"][2], int(request["halo_cells"]))
             local_lat, local_lon = lat[yi], lon[xi]
             data, conversion = _convert(values[np.ix_(yi, xi)], meta, matched["name"])
-            lead = float(meta["forecast_time"])
             prior = records[matched["name"]].get(valid)
             detail = {**meta, "canonical_units": matched["units"], "conversion": conversion, "source_file": downloaded[unit["id"]].name, "source_sha256": source_hashes[unit["id"]]}
-            score = (int(lat.size * lon.size), -lead)
+            score = _selection_score(meta, matched, lat.size * lon.size)
             if prior is None or score > prior[0]:
                 records[matched["name"]][valid] = (score, data, detail, local_lat, local_lon)
     times = [start]
@@ -976,7 +1022,13 @@ def fetch_ncei_full(model: str, plan: Mapping[str, Any], run_dir: Path, destinat
                 raise CfsAtmosphericError(f"Native grid of {spec['name']} changed during the request")
             grids[spec["name"]] = grid
             fields[spec["name"]] = np.stack([record[1] for record in chosen])
-            metadata[spec["name"]] = chosen[0][2]
+            metadata[spec["name"]] = dict(chosen[0][2])
+            if spec["units"] in {"W m-2", "kg m-2 s-1"}:
+                metadata[spec["name"]]["intervals"] = [
+                    {key: record[2][key] for key in ("valid_time", "data_date", "data_time",
+                         "step_type", "step_units", "step_range", "packing_error", "source_sha256")}
+                    for record in chosen
+                ]
     grid, mslp_grid = _native_field_grids(grids)
     _write_canonical(destination, times, *grid, fields, metadata, {"connector": MODEL_CONFIG[model]["connector"], "model": model, "source_provider": "ncei", "request_hash": plan["request_hash"], "provider_lock": "whole_request", "request_bbox_0_360": request["bbox"]}, mslp_grid=mslp_grid)
     if cleanup_raw:

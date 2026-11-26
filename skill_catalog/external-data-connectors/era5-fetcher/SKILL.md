@@ -1,11 +1,11 @@
 ---
 name: era5-fetcher
-description: Plan, download, resume, subset, and health-check hourly ERA5 10 m wind and mean sea-level pressure through CDS. Use for bounded geographic or ADCIRC-mesh requests and multi-year monthly acquisition; keep model interpolation and forcing packaging downstream.
+description: Acquire and verify hourly ERA5 10 m wind, absolute mean sea-level pressure, surface heat and precipitation through CDS. Use for bounded geographic or ADCIRC-mesh requests and multi-year monthly acquisition.
 ---
 
 # ERA5 Fetcher
 
-Acquire the standard CDS 0.25-degree atmospheric grid with server-side regional trimming. Version 1 supports `wind_10m` (paired earth-relative components) and `mean_sea_level_pressure`. Preserve m/s and Pa; model interpolation, wind stress, and forcing-file conversion are downstream.
+Acquire the standard CDS 0.25-degree atmospheric grid with server-side regional trimming. Use `wind_10m` for paired earth-relative components, `mean_sea_level_pressure` for absolute pressure, and `surface_heat_and_precipitation` for hourly net solar and thermal radiation, sensible and latent heat, and total precipitation. The hourly HRES energy and water accumulations end at their reported validity time. Request the final interval endpoint, including midnight when applicable. Keep native units for downstream conversion. [ECMWF ERA5 data documentation](https://confluence.ecmwf.int/spaces/CKB/pages/76414402/ERA5+data+documentation)
 
 ## Workflow
 

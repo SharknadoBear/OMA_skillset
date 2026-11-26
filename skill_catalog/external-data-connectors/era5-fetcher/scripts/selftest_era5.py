@@ -42,8 +42,12 @@ class SimulatedCDS:
         names = {v[0]: v[1] for p in core.PRODUCTS.values() for v in p}
         for variable in request["variable"]:
             name = names[variable]
-            values = base + {"u10": 2, "v10": -3, "msl": 100000}[name]
-            fields[name] = (("valid_time", "latitude", "longitude"), values, {"units": "Pa" if name == "msl" else "m s**-1", "source_test": "synthetic"})
+            values = base + {"u10": 2, "v10": -3, "msl": 100000}.get(name, 0)
+            unit = {"msl": "Pa", "u10": "m s**-1", "v10": "m s**-1", "tp": "m"}.get(name, "J m**-2")
+            attrs = {"units": unit, "source_test": "synthetic"}
+            if name in core.ACCUMULATED:
+                attrs.update(GRIB_stepType="accum", GRIB_paramId=core.ACCUMULATED[name])
+            fields[name] = (("valid_time", "latitude", "longitude"), values, attrs)
         ds = xr.Dataset(fields, coords={"valid_time": times, "latitude": lat, "longitude": lon,
                                        "expver": ("valid_time", ["0001"] * len(times)), "number": 0})
         if self.mode == "missing_hour":
@@ -114,6 +118,17 @@ class ERA5Tests(unittest.TestCase):
         self.assertEqual(plan["request"]["area"], [35.5, -121.5, 34.5, -120.25])
         for chunk in plan["chunks"]:
             self.assertEqual(len(chunk["request"]["day"]) * len(chunk["request"]["time"]), chunk["hours"])
+
+    def test_heat_and_rain_midnight(self):
+        request = dict(self.request, products=self.request["products"] + ["surface_heat_and_precipitation"],
+                       start="2025-07-31T23:00:00Z", end="2025-08-01T01:00:00Z")
+        root = self.prepare(request)
+        self.assertTrue(core.run(root, SimulatedCDS())["health"]["pass_all"])
+        for path in (root / "fields").glob("*.nc"):
+            with xr.open_dataset(path) as ds:
+                for name in core.ACCUMULATED:
+                    self.assertEqual(ds[name].attrs["interval_anchor"], "end")
+                    self.assertEqual(ds[name].attrs["interval_seconds"], 3600)
 
     def test_mesh_bounds_all_nodes_and_halo(self):
         mesh = self.root / "fort.14"

@@ -215,7 +215,7 @@ def coordinates(ds, provider, mesh):
     return (y, x), points(mesh.lonc, mesh.latc), pressure_axes, nodes
 
 
-def checked_fields(ds, provider, times):
+def checked_fields(ds, provider, times, *, load_values=True):
     u, v, p = (ds[n] for n in NAMES[provider])
     spatial = ("y", "x") if provider == "hrrr" else ("latitude", "longitude")
     pressure_dimensions = {("time", *spatial)}
@@ -226,7 +226,8 @@ def checked_fields(ds, provider, times):
         "Unexpected provider field dimensions",
     )
     require(
-        u.units.replace(" ", "") in ("ms-1", "ms**-1", "m/s") and v.units == u.units and p.units == "Pa",
+        u.units.replace(" ", "") in ("ms-1", "ms**-1", "ms^-1", "ms^{-1}", "m/s")
+        and v.units == u.units and p.units.lower() in ("pa","pascal","pascals"),
         "Require matched 10-m wind in m/s and mean sea-level pressure in Pa",
     )
     if provider == "hrrr":
@@ -283,7 +284,8 @@ def checked_fields(ds, provider, times):
                 wind["uv_relative_to_grid"] == 0 or wind["grid_type"] in ("regular_ll", "regular_gg"),
                 "CFS grid-relative wind is not on an unrotated geographic grid",
             )
-    return array(u), array(v), array(p)
+    if load_values:
+        return array(u), array(v), array(p)
 
 
 def write_pressure_slice(path, clock, ids, pressure):
