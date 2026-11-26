@@ -7,7 +7,9 @@ description: Orchestrate FVCOM barotropic tide, wind and river experiments and f
 
 The default execution site is Kestrel. An explicit `execution.site: perlmutter` routes the [Columbia combined pilot](references/perlmutter_columbia_pilot.md) or the [baroclinic Lake Superior study](references/lake_superior_baroclinic.md) through `$perlmutter-hpc`.
 
-Interpret the science request and route the complete workflow. This skill is an orchestration contract only: it contains no scripts, performs no SSH itself, and never replaces the specialist skills that create or inspect artifacts.
+Interpret the science request and route the complete workflow through the relevant specialist skills. Use the packaged lake validation CLI for the freshwater hindcast and operational-reference comparisons. Site access follows the selected HPC skill.
+
+For freshwater baroclinic runs, use the [native heat and water budgets and spinup sensitivity CLI](references/lake_physics.md) to evaluate the common-period trials and document the selected restart.
 
 Read [simulation request contract](references/simulation_request_v1.md) before initializing a project and [state and manifest contract](references/state_contract.md) before resuming one.
 
