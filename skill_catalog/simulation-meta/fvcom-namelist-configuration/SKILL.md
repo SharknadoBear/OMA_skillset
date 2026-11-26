@@ -93,3 +93,17 @@ Use `--input-root` to verify a staged startup or continuation against its own in
 For a spherical, closed Lake Superior baroclinic case, use `fvcom_namelist.py lake` with the exact frozen executable's blank, explicit UTC dates, calculated time step and native input basenames. The [freshwater configuration contract](references/contracts.md#freshwater-lake-configuration) covers forcing units, startup, cadence and output fields.
 
 For the Lake Superior freshwater COARE26Z diagnostic, supply `--coare-bulk superior_bulk.nc --pe superior_rain.nc` with the blank emitted by the coupled executable. Keep `--surface superior_atmosphere.nc` for wind stress and hydrodynamic pressure. With `--input-root`, the renderer checks the separate bulk forcing, raw-rain file, grid IDs, coverage and native latitude alias. Check the forcing builder's independent rain and humidity receipts and run the coupled executable's native reader before a model experiment.
+
+## Columbia fixed-temperature salinity pilot
+
+Use the accepted Cartesian Columbia combined-case namelist, the exact derivative binary's generated blank, its SSCOFS startup, documented ocean T/S, fresh river T/S, and retained tide and atmospheric files. The `salinity` renderer keeps the gridded startup temperature at every node and layer, evolves salinity with DENS2, and uses zero ramp. Type-1 elevation includes the supplied inverse-barometer term. The native inflow salinity coefficient is one per internal step. Outflow uses the native type-3 tracer treatment.
+
+```shell
+python scripts/fvcom_namelist.py salinity-stations --base retained_inputs --startup accepted/columbia_start.nc --output inputs
+python scripts/fvcom_namelist.py salinity --base retained_combined_run.nml --blank build/blank_namelist.nml --stage reader --output reader/columbia_run.nml
+python scripts/fvcom_namelist.py salinity --base retained_combined_run.nml --blank build/blank_namelist.nml --stage smoke --output smoke/columbia_run.nml
+```
+
+The station builder appends SATURN03 to the 53 legacy names after independently locating −123.94001°, 46.19973° in native cell 19424 using EPSG:32610. The one-day smoke writes 25 hourly three-dimensional records and 241 six-minute station profiles. The diagnostic-only `bottom-sensitivity` stage repeats the 12-minute reader with the pinned native sloping-bed tracer term disabled. Its scientific comparison uses the same startup, forcing, executable and output cadence.
+
+The `bottom-sensitivity-day` stage repeats the full day with that same isolated native switch after its matching reader succeeds.

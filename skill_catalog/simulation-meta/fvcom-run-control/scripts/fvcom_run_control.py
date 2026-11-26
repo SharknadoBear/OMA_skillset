@@ -15,7 +15,7 @@ from typing import Any
 import fvcom_lake as lake
 
 
-from fvcom_profiles import (BAROTROPIC_MODES, COMBINED_MODE, FACTORIAL_PROFILE, PAIR_PROFILE, PAPER_PROFILE,
+from fvcom_profiles import (BAROTROPIC_MODES, COMBINED_MODE, FACTORIAL_PROFILE, PAIR_PROFILE, PAPER_PROFILE, SALINITY_MODE,
                             RIVER_MODE, WIND_MODE, WIND_PROFILE, execution_site, has_river, is_cold_pair_stage,
                             needs_air_pressure, resolve_request, site_configuration)
 
@@ -72,6 +72,10 @@ def write_json(path: Path, value: Any) -> None:
 def validate_request(req: dict[str, Any]) -> None:
     if req.get("schema") != "simulation_request_v1":
         raise ValueError("schema must be simulation_request_v1")
+    if req.get("mode")==SALINITY_MODE:
+        if not str(req.get("case_id","")).strip(): raise ValueError("case_id is required")
+        resolve_request(req)
+        return
     if req.get("mode") == lake.MODE:
         if not str(req.get("case_id","")).strip():
             raise ValueError("case_id is required")
@@ -120,6 +124,8 @@ def project_layout(root: Path, mode: str = "barotropic_tide", policy: str = "acc
         paths += list(BAROTROPIC_AGENT_ROOTS.values())
     elif mode == lake.MODE:
         paths += list(lake.ROLE_ROOTS.values())
+    elif mode == SALINITY_MODE:
+        paths += ["initialization","validation","forcing/ocean","forcing/river"]
     for case in grid_order(policy):
         paths += [
             f"gridding/{case}", f"forcing/{case}",
@@ -1186,6 +1192,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Common divisor of stage durations and output intervals; April campaign uses 360")
     q = sub.add_parser("plan")
     q.add_argument("--controls", required=True); q.add_argument("--output", required=True)
+    q=sub.add_parser("salinity-audit",help="Audit the closed Columbia estuary salinity reader or 24-hour pilot")
+    for name in ("attempt","inputs","output"):
+        q.add_argument("--"+name,type=Path,required=True)
+    q=sub.add_parser("salinity-attempt",help="Freeze a Columbia estuary salinity reader or 24-hour pilot")
+    for name in ("project","build","inputs","namelist"):
+        q.add_argument("--"+name,type=Path,required=True)
+    q.add_argument("--stage",choices=("reader","smoke","pilot","bottom-sensitivity","bottom-sensitivity-day"),required=True)
+    q.add_argument("--reader",type=Path)
+    q.add_argument("--ocean-manifest",type=Path,help="Bind producer provenance when supplied outside the flat runtime inputs")
     q = sub.add_parser("lake-attempt",help="Freeze a baroclinic lake stage on Perlmutter")
     for option in ("project","namelist","inputs","binding"):
         q.add_argument("--"+option,required=True,type=Path)
@@ -1254,6 +1269,12 @@ def main() -> int:
         result = stability_plan(load_data(Path(args.controls))); write_json(Path(args.output), result)
     elif args.command == "attempt":
         result = create_attempt(args)
+    elif args.command == "salinity-attempt":
+        from fvcom_salinity import prepare
+        result = prepare(args)
+    elif args.command == "salinity-audit":
+        from fvcom_salinity_audit import audit as salinity_audit
+        result = salinity_audit(args)
     elif args.command == "lake-attempt":
         from fvcom_lake_attempt import materialize
         result = materialize(args)
@@ -1272,6 +1293,8 @@ def main() -> int:
     else:
         result = {"report": str(render_report(Path(args.project)))}
     print(json.dumps(result, indent=2, sort_keys=True))
+    if args.command=="salinity-audit" and result["status"]!="verified":
+        return 3
     return 0
 
 

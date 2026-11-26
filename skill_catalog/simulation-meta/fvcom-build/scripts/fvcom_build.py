@@ -589,9 +589,13 @@ def cli(argv: Iterable[str] | None = None) -> int:
     if argv[:1] == ["finalize-lake"]:
         from finalize_lake_build import cli as lake_cli
         return lake_cli(argv[1:])
+    if argv[:1] == ["salinity"]:
+        from salinity_recipe import cli as salinity_cli
+        return salinity_cli(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("finalize-lake", help="Freeze a native Perlmutter freshwater baroclinic build")
+    sub.add_parser("salinity",help="Prepare or verify a Cartesian, active-salinity budget build")
     audit = sub.add_parser("audit-make-inc", help="Audit active TOPDIR and preprocessor definitions")
     audit.add_argument("--make-inc", type=Path, required=True)
     audit.add_argument("--expected-topdir", required=True)

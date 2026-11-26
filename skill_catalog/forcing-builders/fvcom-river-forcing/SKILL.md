@@ -50,6 +50,16 @@ The node-based variable inflow uses the native character `'uniform'` vertical
 distribution. The reader requires `river_temp` and `river_salt`, populated
 with 20 °C and 30 PSU for the uniform, inactive scalars in this scenario.
 
+For an estuarine baroclinic salinity run with fixed temperature, pass
+`--freshwater-temperature-startup START.nc` to the same builder. It writes
+zero practical salinity at every receiving node and time, and the reader's
+temperature companion uses each receiver's sigma-thickness-weighted startup
+profile. The single startup record must match the first river clock and mesh
+bathymetry. Its SHA-256 and temperature values are recorded in the manifest.
+Use calculated river tracer transport with this input. Positive freshwater
+adds volume and zero salt. Verify native receiver wetness and incoming
+discharge throughout the run.
+
 ## Core Rules
 
 - Reuse the bundled scripts; write the least new code possible.

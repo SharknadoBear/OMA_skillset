@@ -16,6 +16,7 @@ RIVER_MODE = "barotropic-tide-river"
 
 FACTORIAL_PROFILE = "columbia_wind_river_factorial"
 COMBINED_MODE = "barotropic-tide-wind-river"
+SALINITY_MODE = "baroclinic-salinity-tide-wind-river"
 BAROTROPIC_MODES = {"barotropic_tide", RIVER_MODE, WIND_MODE, COMBINED_MODE}
 
 
@@ -40,11 +41,11 @@ def site_configuration(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def has_wind(request: dict[str, Any]) -> bool:
-    return request.get("mode") in {WIND_MODE, COMBINED_MODE, lake.MODE}
+    return request.get("mode") in {WIND_MODE, COMBINED_MODE, SALINITY_MODE, lake.MODE}
 
 
 def has_river(request: dict[str, Any]) -> bool:
-    return request.get("mode") in {RIVER_MODE, COMBINED_MODE, lake.MODE}
+    return request.get("mode") in {RIVER_MODE, COMBINED_MODE, SALINITY_MODE, lake.MODE}
 
 
 def needs_air_pressure(request: dict[str, Any]) -> bool:
@@ -93,6 +94,9 @@ def resolve_request(request: dict[str, Any]) -> dict[str, Any]:
     result = deepcopy(request)
     profile = result.get("profile")
     site = execution_site(result)
+    if result.get("mode")==SALINITY_MODE:
+        from fvcom_salinity import resolve
+        return resolve(result)
     if result.get("mode")==lake.MODE or profile==lake.PROFILE:
         return lake.resolve(result)
     if site == "perlmutter" and (profile != FACTORIAL_PROFILE or result.get("mode") != COMBINED_MODE):

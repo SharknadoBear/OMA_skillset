@@ -135,7 +135,37 @@ def source_nodes(mapping, mesh, depths, ocean):
             for n, w, d, p in zip(ids, widths, h, weights)]
 
 
-def build(source, mapping_path, grid_path, depth_path, obc_path, start, end, step, output):
+def freshwater_temperatures(startup, nodes, depth_path, start):
+    """Recover the inactive river temperature placeholder from the matching frozen water column."""
+    ids = np.array([row["node_id"] for row in nodes], dtype=int) - 1
+    target_depth = np.loadtxt(depth_path, skiprows=1, ndmin=2)[:, 2]
+    with netCDF4.Dataset(startup) as ds:
+        if ds["temp"].dimensions != ("time", "siglay", "node") or len(ds.dimensions["time"]) != 1:
+            raise ValueError("one native startup temperature profile per node is required")
+        if not np.allclose(ds["h"][:], target_depth, rtol=0, atol=.001):
+            raise ValueError("startup bathymetry differs from runtime depths")
+        ticks = np.asarray(ds["Itime"][:], dtype="i8") * 86400000 + np.asarray(ds["Itime2"][:], dtype="i8")
+        if ticks.shape != (1,) or ticks[0] != 40587*86400000 + start*1000:
+            raise ValueError("startup clock must equal the first river forcing timestamp")
+        sigma = ds["siglev"]
+        if sigma.dimensions == ("siglev",):
+            levels = np.broadcast_to(sigma[:][:, None], (len(sigma), len(ids)))
+        elif sigma.dimensions == ("siglev", "node"):
+            levels = sigma[:, ids]
+        else:
+            raise ValueError("unsupported startup sigma interface dimensions")
+        thickness = -np.diff(levels, axis=0)
+        temps = np.ma.asarray(ds["temp"][0, :, ids])
+        if (np.ma.is_masked(temps) or np.ma.is_masked(thickness) or not np.isfinite(temps).all()
+            or not np.isfinite(thickness).all() or np.any(thickness <= 0)
+            or not np.allclose(levels[[0,-1]], [[0.],[-1.]], rtol=0., atol=1e-6)
+            or np.any((temps < -5) | (temps > 45))):
+            raise ValueError("invalid startup temperature or physical layer thickness")
+        return np.average(np.asarray(temps, dtype=float), axis=0, weights=np.asarray(thickness, dtype=float))
+
+
+def build(source, mapping_path, grid_path, depth_path, obc_path, start, end, step, output,
+          *, freshwater_temperature_startup=None):
     if output.exists():
         raise FileExistsError(f"choose a new output directory: {output}")
     seconds, q, expected_volume, manifest = series_window(source, start, end, step)
@@ -143,6 +173,13 @@ def build(source, mapping_path, grid_path, depth_path, obc_path, start, end, ste
     nodes = source_nodes(mapping, grid_path, depth_path, obc_path)
     names = [n["name"] for n in nodes]
     distributed = q[:, None] * np.array([n["weight"] for n in nodes])
+    temperature = np.full(len(nodes),20.)
+    salinity = 30.
+    info = ("Barotropic river volume forcing", "Uniform inactive scalars", "barotropic-tide-river")
+    if freshwater_temperature_startup is not None:
+        temperature = freshwater_temperatures(freshwater_temperature_startup, nodes, depth_path, start)
+        salinity = 0.
+        info = ("Freshwater inflow for active salinity", "Fixed temperature from startup receiver depth averages", "estuarine-salinity")
     mjd = datetime64_to_mjd(seconds.astype("datetime64[s]"))
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output.parent) as stage:
@@ -150,9 +187,9 @@ def build(source, mapping_path, grid_path, depth_path, obc_path, start, end, ste
         products.mkdir()
         nc = products / "river.nc"
         nml = products / "river.nml"
-        write_river_nc(nc, names, mjd, distributed, np.full(distributed.shape, 20.0),
-                       np.full(distributed.shape, 30.0), info1="Barotropic river volume forcing",
-                       info2="Uniform inactive scalars", casename="barotropic-tide-river", precise_clock=True)
+        write_river_nc(nc, names, mjd, distributed, np.broadcast_to(temperature,distributed.shape),
+                       np.full(distributed.shape, salinity), info1=info[0],
+                       info2=info[1], casename=info[2], precise_clock=True)
         write_river_nml(nml, names, [n["node_id"] for n in nodes], nc.name, named_distribution=True)
         with netCDF4.Dataset(nc) as ds:
             received = ds["river_flux"][:].astype(np.float64).sum(axis=1)
@@ -166,6 +203,8 @@ def build(source, mapping_path, grid_path, depth_path, obc_path, start, end, ste
             file_names = [v.strip() for v in netCDF4.chartostring(ds["river_names"][:])]
             if names != file_names:
                 raise ValueError("river entry order mismatch")
+            if not np.all(ds["river_salt"][:]==salinity) or not np.all(ds["river_temp"][:]==temperature.astype("f4")):
+                raise ValueError("river scalar readback differs from the declared freshwater or barotropic policy")
             for name, unit in [("river_flux", "m^3s^-1"), ("river_temp", "Celsius"), ("river_salt", "PSU")]:
                 if ds[name].units != unit:
                     raise ValueError(f"FVCOM reader unit mismatch for {name}")
@@ -186,6 +225,11 @@ def build(source, mapping_path, grid_path, depth_path, obc_path, start, end, ste
                        "volume_basis": "unramped forcing over inclusive piecewise-linear sample intervals",
                        "minimum_receiving_depth_m": min(node["depth_m"] for node in nodes),
                        "wet_depth_floor_m": mapping["wet_depth_floor_m"]}}
+        if freshwater_temperature_startup is not None:
+            result["tracers"] = {"mode":"active_salinity_freshwater", "salinity_psu":0.,
+                "temperature_role":"inactive reader companion, sigma-thickness-weighted frozen startup profile",
+                "temperature_degC_by_node":dict(zip(names, temperature.tolist())),
+                "startup_sha256":digest(freshwater_temperature_startup), "source_salt_transport_psu_m3_s":0.}
         (products / "river_manifest.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         products.rename(output)
     return result
@@ -198,6 +242,9 @@ if __name__ == "__main__":
     parser.add_argument("--start", required=True, type=second)
     parser.add_argument("--end", required=True, type=second)
     parser.add_argument("--interval-seconds", default=360, type=int)
+    parser.add_argument("--freshwater-temperature-startup", type=Path,
+                        help="Set active river salinity to zero and use the single-record frozen startup for the inactive temperature companion")
     args = parser.parse_args()
     print(json.dumps(build(args.source_manifest, args.mapping, args.grd, args.dep, args.obc,
-                           args.start, args.end, args.interval_seconds, args.output_dir)["checks"], indent=2))
+                           args.start, args.end, args.interval_seconds, args.output_dir,
+                           freshwater_temperature_startup=args.freshwater_temperature_startup)["checks"], indent=2))

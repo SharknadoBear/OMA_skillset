@@ -101,3 +101,19 @@ For the Lake Superior freshwater baroclinic study, use the [freshwater build con
 For an explicitly requested freshwater COARE26Z experiment using prescribed hydrodynamic stress, prepare a separate diagnostic build from the frozen direct-heat baseline. Verify its calculated surface fields against a registered parallel reader run before comparing science windows. [Freshwater COARE26Z diagnostic build](references/freshwater_coare.md)
 
 For a diagnosed vertical temperature transport excursion, the same builder accepts `prepare --temperature-donor`. Its separate freeze includes the source-locked temperature change and native moving-layer conservation and boundedness test. Qualify this derivative with its own coupled reader before a matched science window. [Temperature-only vertical donor experiment](references/freshwater_coare.md#temperature-only-vertical-donor-experiment)
+
+## Columbia active-salinity build
+
+The March estuary pilot uses the pressure-capable Cartesian three-dimensional Perlmutter GNU build of FVCOM_MP commit `f8e4b50d4fd51409febcefc763cbc5dca11870e2`. Prepare a separate derivative from its native source, objects, libraries, binding and evidence.
+
+```shell
+python scripts/fvcom_build.py salinity prepare --parent-binding parent_binding.json --parent-source /scratch/parent/source/build_JOB_gnu --parent-evidence /scratch/parent/run/build/attempt_JOB/gnu/evidence --output build
+```
+
+Transfer the complete generated version directory to the study-owned scratch workspace. Submit `columbia_salinity_build.sbatch` from that directory using the authorized Perlmutter CPU account. The build verifies parent hashes, copies the build tree, recompiles the salinity diagnostics and writes a frozen native blank, compiler evidence and executable identity to `job_JOB/evidence`. Retrieve its evidence archive and check a headerless, pipe-delimited `sacct -nP -j JOB -o JobIDRaw,State,ExitCode,Elapsed` record.
+
+```shell
+python scripts/fvcom_build.py salinity verify --evidence job_JOB/evidence --accounting accounting.psv
+```
+
+The native writer emits the station wet mask and two six-minute salt ledgers per MPI rank. The instrument receipt identifies the column order and native source hashes. Practical salinity multiplied by volume is an inventory proxy in PSU·m³. The diagnosed pre/post updates distinguish the actual boundary replacement and scalar limiter from the gross signed transport estimate. Evaluate stage differences, ocean sign conventions, receiver discharge, T invariance and warm-start clocks with the run-control reader before a one-day attempt.

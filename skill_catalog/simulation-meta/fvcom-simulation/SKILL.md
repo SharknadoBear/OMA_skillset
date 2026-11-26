@@ -1,11 +1,11 @@
 ---
 name: fvcom-simulation
-description: Orchestrate FVCOM barotropic tide, wind and river experiments and freshwater baroclinic lake studies, including Perlmutter initialization, forcing, spin-up, benchmarking, monthly production and validation.
+description: Orchestrate FVCOM barotropic tide, wind and river experiments, baroclinic lake temperature studies, and estuarine salt-intrusion runs with fixed temperature and Perlmutter validation.
 ---
 
 # FVCOM Simulation
 
-The default execution site is Kestrel. An explicit `execution.site: perlmutter` routes the [Columbia combined pilot](references/perlmutter_columbia_pilot.md) or the [baroclinic Lake Superior study](references/lake_superior_baroclinic.md) through `$perlmutter-hpc`.
+The default execution site is Kestrel. An explicit `execution.site: perlmutter` routes the [Columbia combined pilot](references/perlmutter_columbia_pilot.md), [estuarine salinity pilot](references/columbia_baroclinic_salinity.md) or [baroclinic Lake Superior study](references/lake_superior_baroclinic.md) through `$perlmutter-hpc`.
 
 Interpret the science request and route the complete workflow through the relevant specialist skills. Use the packaged lake validation CLI for the freshwater hindcast and operational-reference comparisons. Site access follows the selected HPC skill.
 
@@ -52,6 +52,8 @@ timing, attempt counts or scientific gates. Do not create campaign controllers,
 global hooks or polling daemons. This rule also applies to `paper_barotropic`.
 
 ## Modes (ordinary workflow)
+
+- `baroclinic-salinity-tide-wind-river`: use the [estuarine salinity workflow](references/columbia_baroclinic_salinity.md) for a dated estuarine hotstart, fixed temperature, ocean and river salinity, and depth-resolved gauge and salt-intrusion comparisons.
 
 - `baroclinic-temperature-wind-river`: use the [Lake Superior baroclinic workflow](references/lake_superior_baroclinic.md) for the native NOAA lake geometry, a dated three-dimensional initialization, freshwater surface and river budgets, spin-up sensitivity, Perlmutter benchmarking and a summer hindcast.
 

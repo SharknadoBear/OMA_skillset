@@ -961,9 +961,17 @@ def cli(argv: Iterable[str] | None = None) -> int:
     if argv[:1] == ["lake"]:
         from lake_configuration import cli as lake_cli
         return lake_cli(argv[1:])
+    if argv[:1] == ["salinity"]:
+        from salinity_configuration import cli as salinity_cli
+        return salinity_cli(argv[1:])
+    if argv[:1] == ["salinity-stations"]:
+        from salinity_stations import cli as salinity_stations_cli
+        return salinity_stations_cli(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("lake", help="Render a spherical freshwater baroclinic lake stage")
+    sub.add_parser("salinity",help="Render an active-salinity estuary reader or 24-hour pilot")
+    sub.add_parser("salinity-stations",help="Append the geometry-verified SATURN03 station")
     for command in ("provisional", "render"):
         item = sub.add_parser(command)
         item.add_argument("--request", type=Path, required=True)

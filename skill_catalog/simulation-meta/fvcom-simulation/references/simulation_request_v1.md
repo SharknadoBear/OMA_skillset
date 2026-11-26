@@ -2,8 +2,8 @@
 
 ```yaml
 schema: simulation_request_v1
-mode: barotropic_tide | barotropic-tide-river | barotropic-tide-wind | barotropic-tide-wind-river | benchmark
-profile: paper_barotropic | columbia_river_pair | columbia_wind_pair | columbia_wind_river_factorial # optional
+mode: barotropic_tide | barotropic-tide-river | barotropic-tide-wind | barotropic-tide-wind-river | baroclinic-temperature-wind-river | baroclinic-salinity-tide-wind-river | benchmark
+profile: paper_barotropic | columbia_river_pair | columbia_wind_pair | columbia_wind_river_factorial | columbia_baroclinic_salinity_pilot # optional, mode-specific
 case_id: string
 project_dir: optional absolute or workspace-relative path
 grid_policy: accepted_then_fresh | fresh_only | retained_only
@@ -89,6 +89,21 @@ The scientific product layout remains:
 ```
 
 Project and worker manifests contain relative artifact paths when inside the project, UTC timestamps, SHA-256 for immutable inputs/outputs, code and source lineage, warnings, blocking reasons, and resume tokens. They never contain credentials.
+
+## Columbia estuarine salinity profile
+
+The estuarine salinity pilot uses its own explicit profile and a marine baroclinic formulation. A minimal private request for the [March salinity workflow](columbia_baroclinic_salinity.md) is shown below. Resolve the allocation and absolute scratch project directory for the selected site before use.
+
+```yaml
+schema: simulation_request_v1
+case_id: columbia_baroclinic_salinity_20250318
+mode: baroclinic-salinity-tide-wind-river
+profile: columbia_baroclinic_salinity_pilot
+execution: {site: perlmutter, stages: [reader, smoke]}
+perlmutter: {account: example_cpu, project_dir: /scratch/example/columbia_salinity}
+```
+
+The profile resolves the nine layers, March 18–19 analysis period, native hotstart schedule and fixed-temperature active-salinity formulation. Preserve the selected temperature source and any fallbacks in the initialization manifest.
 
 ## Paired Columbia profile
 

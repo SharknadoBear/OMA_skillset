@@ -1,11 +1,11 @@
 ---
 name: fvcom-boundary-ts-forcing
-description: Generate and scientifically validate FVCOM open-boundary temperature and salinity forcing from an existing sigma-ready NetCDF time series mapped to FVCOM boundary node IDs. Use when Codex needs to package per-node, per-sigma-layer T/S data as an FVCOM TIME SERIES OBC TS FILE, repair auditable missing values, enforce a zero-NaN gate, or create boundary time-series, time-depth, Hovmöller, and vertical-transect QA plots.
+description: Build and validate FVCOM open-boundary temperature and salinity forcing from sigma-ready profiles, daily GLORYS temperature/salinity, or three-hourly HYCOM salinity with a frozen native temperature companion. Audit wet donor connectivity, physical layer depths, source clocks, missing values and native boundary order.
 ---
 
 # FVCOM Boundary Temperature/Salinity Forcing
 
-Use this skill only after temperature and salinity have been placed on every target FVCOM open-boundary node and FVCOM sigma layer. Keep source fetching, horizontal interpolation, z-to-sigma remapping, multi-source merging, and physical reconstruction outside this skill.
+Use the native writer for a sigma-ready time series. For a geographic mesh with uniform native sigma, the optional ocean remapper prepares such a series from an audited external source. Fetch GLORYS or HYCOM through its source connector. Select and document the ocean source for each experiment. [Ocean remapping](references/ocean_remapping.md)
 
 ## Core rules
 
@@ -95,4 +95,4 @@ Retain evidence when needed:
 python scripts/selftest_boundary_ts.py --work-dir WORK
 ```
 
-Use a source connector such as `$hycom-fetcher-codex` only to prepare an external native-grid test input; perform horizontal and sigma remapping outside this forcing writer. Do not copy acquisition logic into this package.
+The synthetic suite exercises the native writer, wet donor selection, and the salinity-only HYCOM contract.

@@ -137,3 +137,23 @@ python C:\Users\huan111\.codex\skills\.system\skill-creator\scripts\quick_valida
 ## Matched wind and discharge study
 
 For `columbia_wind_river_factorial`, initialize each new member with the retained grid branch, the `fvcom-build` reuse binding and a common installed-skill receipt. Both the 24-hour smoke and the 28-day cold production start March 18. The river-only member uses a constant 101325 Pa atmosphere. The combined member validates the wind bundle and dynamic boundary alongside the river discharge. Freeze each attempt before transfer.
+
+## Columbia baroclinic estuary salinity
+
+Initialize the scenario `baroclinic-salinity-tide-wind-river` using profile `columbia_baroclinic_salinity_pilot`, a named case, `execution.site=perlmutter`, a resolved `perlmutter.project_dir` and a CPU account. The dated pilot covers March 18–19, 2025 on one CPU node with 52 MPI ranks, nine sigma layers and a 1.2-second step. Each independently materialized attempt gets a distinct identity. Supply the validated flat runtime inputs, producer manifest for the ocean salinity, the frozen native derivative from FVCOM Build and namelists from FVCOM Namelist Configuration.
+
+```shell
+python scripts/fvcom_run_control.py init --request request.json --project study
+python scripts/fvcom_run_control.py salinity-attempt --project study --stage reader --build evidence/freeze.json --inputs inputs --ocean-manifest ocean/ocean_ts_manifest.json --namelist reader/columbia_run.nml
+```
+
+Transfer the generated attempt and identical flat inputs under its `input/` directory, verify its inventory and submit its `run.sbatch` through Perlmutter HPC. Collect the original `slurm.json`, `launch_identity.json`, stdout/stderr, all native NetCDF files and 52 rank files each for stage and boundary ledgers. Record the charged parent with `sacct -nP -j JOB -o JobIDRaw,State,ExitCode,Elapsed` as `accounting.psv`. Create `native_files.sha256` using `sha256sum accounting.psv launch_identity.json stdout.log stderr.log columbia*.nc salt_*_rank_*.dat` in the closed attempt. The audit reads native integer clocks, cell wetness, every layer of temperature and salinity, actual inflowing salinity, tide, station indexing and restart equivalence.
+
+```shell
+python scripts/fvcom_run_control.py salinity-audit --attempt reader_attempt --inputs inputs --output reader_attempt/native_audit.json
+python scripts/fvcom_run_control.py salinity-attempt --project study --stage smoke --build evidence/freeze.json --inputs inputs --ocean-manifest ocean/ocean_ts_manifest.json --namelist smoke/columbia_run.nml --reader reader_attempt/native_audit.json
+```
+
+Wet negative salinity is reported with its actual volume, sigma level and node even when all numerical and reader checks pass. An optional `bottom-sensitivity` stage tests the native sloping-bottom tracer term over the same 12-minute reader interval and has its own audit.
+
+For a matched one-day sensitivity, render and freeze `bottom-sensitivity-day`. Pass the successful `bottom-sensitivity` native audit with `--reader`. Each daily case requires its corresponding reader, forcing inventory and executable. Compare both cases over the same observational and physical acceptance criteria.

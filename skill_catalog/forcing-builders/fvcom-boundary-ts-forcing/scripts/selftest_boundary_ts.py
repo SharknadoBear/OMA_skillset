@@ -4,6 +4,7 @@ import argparse
 import tempfile
 from contextlib import nullcontext
 from pathlib import Path
+import unittest
 
 try:
     import matplotlib  # noqa: F401
@@ -142,6 +143,11 @@ def _write_source(path: Path, boundary, *, surface_first: bool = False, two_dime
 
 
 def run(root: Path) -> dict[str, object]:
+    from selftest_wet_ocean import WetOceanTests
+
+    cases = unittest.defaultTestLoader.loadTestsFromTestCase(WetOceanTests)
+    if not unittest.TextTestRunner().run(cases).wasSuccessful():
+        raise AssertionError("Wet ocean regression failed")
     root.mkdir(parents=True, exist_ok=True)
     mesh = root / "synthetic.2dm"
     _write_mesh(mesh)

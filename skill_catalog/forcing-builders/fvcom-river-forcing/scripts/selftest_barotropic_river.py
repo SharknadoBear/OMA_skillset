@@ -36,7 +36,7 @@ class RiverTest(unittest.TestCase):
                        "parameter_code": "72137", "units": "m3/s", "original_units": "ft^3/s",
                        "approval_counts": {"Provisional": 3}, "records": 3, "interval_seconds": 3600}
 
-    def run_builder(self):
+    def run_builder(self, startup=None):
         mapping_file = self.root / "mapping.json"
         mapping_file.write_text(json.dumps(self.mapping))
         table = self.root / "discharge.csv"
@@ -51,7 +51,37 @@ class RiverTest(unittest.TestCase):
         manifest = self.root / "source.json"
         manifest.write_text(json.dumps(self.source))
         return build(manifest, mapping_file, self.mesh, self.dep, self.obc,
-                     self.start, self.end, 360, self.root / "product")
+                     self.start, self.end, 360, self.root / "product", freshwater_temperature_startup=startup)
+
+    def make_startup(self):
+        path=self.root/"startup.nc"
+        with netCDF4.Dataset(path,"w") as ds:
+            for k,n in (("time",1),("siglay",2),("siglev",3),("node",6)):
+                ds.createDimension(k,n)
+            days,ms=divmod(40587*86400000+self.start*1000,86400000)
+            ds.createVariable("Itime","i4",("time",))[:]=days
+            ds.createVariable("Itime2","i4",("time",))[:]=ms
+            ds.createVariable("h","f4",("node",))[:]=np.loadtxt(self.dep,skiprows=1)[:,2]
+            ds.createVariable("siglev","f4",("siglev","node"))[:]=np.tile([[0],[-.25],[-1]],(1,6))
+            ds.createVariable("temp","f4",("time","siglay","node"))[:]=[[[5,6,7,8,9,10],[9,10,11,12,13,14]]]
+        return path
+
+    def test_freshwater_uses_zero_salt_and_depth_weighted_startup(self):
+        path=self.make_startup()
+        m=self.run_builder(path)
+        self.assertEqual(m["tracers"]["salinity_psu"],0.)
+        self.assertEqual(m["tracers"]["startup_sha256"],digest(path))
+        with netCDF4.Dataset(self.root/"product/river.nc") as ds:
+            self.assertTrue(np.all(ds["river_salt"][:]==0))
+            np.testing.assert_array_equal(ds["river_temp"][:],np.tile([10.,13.],(len(ds.dimensions["time"]),1)))
+            np.testing.assert_allclose(ds["river_flux"][10],[100*.028316846592,200*.028316846592])
+
+    def test_freshwater_refuses_wrong_start(self):
+        path=self.make_startup()
+        with netCDF4.Dataset(path,"r+") as ds:
+            ds["Itime2"][:]=1000
+        with self.assertRaisesRegex(ValueError,"clock"):
+            self.run_builder(path)
 
     def test_written_forcing(self):
         result = self.run_builder()
