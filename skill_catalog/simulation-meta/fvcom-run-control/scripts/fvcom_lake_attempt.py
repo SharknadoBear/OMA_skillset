@@ -36,7 +36,7 @@ def materialize(args):
         spec=coare.configuration(nml,args.name)
         spec["ranks"]=req["execution"]["smoke_ranks"]
         derived=load_data(args.coare_build)
-        coare.verify_build(derived,coare.build_assets(args.build_skill))
+        coare.verify_build(derived,coare.build_assets(args.build_skill),nml)
         if (derived.get("baseline_binding_sha256")!=digest(args.binding)
                 or derived["baseline_executable_sha256"]!=binding["executable_sha256"]):
             raise ValueError("COARE build did not derive from the supplied native module/baseline binding")
@@ -112,6 +112,8 @@ def materialize(args):
         checks.extend([(facts["run_namelist_sha256"],args.case_name+"_run.nml"),(facts["executable_sha256"],binary)])
         if diagnostic:
             facts["schema"]="fvcom_coare_diagnostic_attempt_v1"
+            if "temperature_transport" in derived:
+                facts["temperature_transport"]=derived["temperature_transport"]
             facts["qualification"]={name:digest(path) for name,path in evidence.items()}
             case=dict(schema="fvcom_diagnostic_coare_case_v1",kind=args.name,mpi_ranks=ranks,inputs=sources,
                       start_utc=spec["start_utc"],end_utc=spec["end_utc"],executable=derived,

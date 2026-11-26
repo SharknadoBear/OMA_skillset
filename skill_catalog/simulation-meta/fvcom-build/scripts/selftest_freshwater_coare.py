@@ -60,8 +60,44 @@ class RecipeTests(unittest.TestCase):
                 self.assertIn("srun --exact --ntasks=1",batch)
                 self.assertIn("payload=/scratch/new_study/diagnostics/bulk",batch)
             with self.assertRaises(FileExistsError):recipe.package(args)
+            args.temperature_donor=True
+            args.output=root/"donor.tgz"
+            recipe.package(args)
+            with tarfile.open(args.output) as tf:
+                self.assertIn("temperature_donor.py",tf.getnames())
+                batch=tf.extractfile("build.sbatch").read().decode()
+                self.assertIn('temperature_donor.py" "$src" "$e"',batch)
+                self.assertIn("--temperature-donor",batch)
             baseline["source_commit"]="0"*40;binding.write_text(json.dumps(baseline))
             with self.assertRaisesRegex(ValueError,"pinned"):recipe.package(args)
+
+    def test_operator_pin_and_sibling_identity(self):
+        with self.assertRaisesRegex(ValueError,"bypass"):
+            recipe.check_temperature_flags({"FRESHWATER_LAKE","NH"})
+        with tempfile.TemporaryDirectory() as tmp:
+            src=Path(tmp);f=src/"adv_t.F";f.write_bytes(b"ordinary transport")
+            before=recipe.digest(f)
+            f.write_bytes(b"donor transport")
+            transport=dict(before=before,after=recipe.digest(f),source_file=f.name)
+            pin={"optional_temperature_donor":transport}
+            with self.assertRaisesRegex(ValueError,"selected recipe"):recipe.donor_evidence(src,src,pin,False)
+            (src/"donor_source.json").write_text(json.dumps(transport))
+            probe=dict(native_cases=177147,max_extensive_error=5e-15,upper_range_error=0,lower_range_error=0)
+            (src/"donor_operator.json").write_text(json.dumps(probe))
+            self.assertEqual(recipe.donor_evidence(src,src,pin,True)["temperature_transport"],"vertical_donor_temperature_only")
+            (src/"donor_operator.json").write_text(json.dumps({**probe,"upper_range_error":0.2}))
+            with self.assertRaisesRegex(ValueError,"range test"):recipe.donor_evidence(src,src,pin,True)
+
+    def test_temperature_transform_refuses_different_input(self):
+        sys.path.insert(0,str(recipe.asset_root()))
+        import temperature_donor
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            (root/"adv_t.F").write_text("SUBROUTINE ADV_T\nEND\n")
+            original=(root/"adv_t.F").read_bytes()
+            with self.assertRaisesRegex(ValueError,"frozen"):
+                temperature_donor.patch(root)
+            self.assertEqual((root/"adv_t.F").read_bytes(),original)
 
 
 def actual_replay(baseline, original_kernel):
@@ -85,8 +121,19 @@ if __name__=="__main__":
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("--baseline-source",type=Path)
     p.add_argument("--original-kernel",type=Path)
+    p.add_argument("--temperature-source",type=Path,help="Replay the opt-in transform on the frozen direct adv_t.F")
     a=p.parse_args()
     if not unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(RecipeTests)).wasSuccessful():
         raise SystemExit(1)
     if a.baseline_source:
         actual_replay(a.baseline_source,a.original_kernel or a.baseline_source/"coare26z.F")
+    if a.temperature_source:
+        sys.path.insert(0,str(recipe.asset_root()))
+        import temperature_donor
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);shutil.copyfile(a.temperature_source,root/"adv_t.F")
+            changed=temperature_donor.patch(root)
+            pin=recipe.read(recipe.asset_root()/"source_pin.json")["optional_temperature_donor"]
+            if not all(changed[k]==v for k,v in pin.items()):
+                raise ValueError("Temperature transform differs from native donor build")
+        print("The temperature donor source reproduces the native diagnostic hash.")

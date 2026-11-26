@@ -36,6 +36,11 @@ def safe_path(value):
     return p
 
 
+def check_temperature_flags(flags):
+    bypass = {"MPDATA","NH","LIMITER_VER_ADV","SEMI_IMPLICIT","ONE_D_MODEL","TWO_D_MODEL","THIN_DAM"}
+    require(not set(flags).intersection(bypass), "compile options bypass the tested vertical donor temperature branch")
+
+
 def check_changes(source, pin):
     exchange = "IF(PAR)CALL AEXCHANGE(NC,MYID,NPROCS,COARE_WIND_SPEED)"
     boundary = (source/"bcond_gcn.F").read_text(encoding="latin1")
@@ -76,6 +81,10 @@ def package(args):
     with tempfile.TemporaryDirectory(dir=args.output.parent) as temp:
         out = Path(temp)
         files = {n:root/n for n in ("patch_coare.py", "ledger.F", "source_pin.json", "check_fields.py")}
+        donor = getattr(args, "temperature_donor", False)
+        if donor:
+            check_temperature_flags(binding["feature_defines"])
+            files["temperature_donor.py"] = root/"temperature_donor.py"
         files.update({"freshwater_coare.py":Path(__file__), "perlmutter_dependencies.py":root.parent/"perlmutter_dependencies.py"})
         for name, source in files.items():
             (out/name).write_bytes(source.read_bytes().replace(b"\r\n", b"\n"))
@@ -87,6 +96,8 @@ def package(args):
         for key,value in replacements.items():
             require(body.count(key) == 1, "build template key differs: " + key)
             body = body.replace(key, value)
+        body = body.replace("@DONOR_TRANSFORM@", '"$py" "$payload/temperature_donor.py" "$src" "$e"' if donor else "")
+        body = body.replace("@DONOR_OPTION@", "--temperature-donor" if donor else "")
         (out/"build.sbatch").write_text(body, encoding="utf8", newline="\n")
         ledger = "".join(f"{digest(f)}  {f.name}\n" for f in sorted(out.iterdir()))
         (out/"inputs.sha256").write_text(ledger, encoding="ascii", newline="\n")
@@ -115,8 +126,26 @@ def baseline(args):
             "missing baseline EOS, signed edge or MPI/netCDF evidence")
     for name, record in pin["changed"].items():
         require(digest(source/name) == record["before"], "baseline source differs: " + name)
+    require(digest(source/"adv_t.F") == pin["optional_temperature_donor"]["before"], "baseline vertical temperature transport differs")
     require(digest(source/"coare26z.F") == pin["coare26z_sha256"], "baseline COARE26Z mismatch")
     return dict(status="baseline_verified", executable_sha256=binding["executable_sha256"])
+
+
+def donor_evidence(source, evidence, pin, requested):
+    """Keep the optional transport change separate from the five flux/diagnostic changes."""
+    transport = pin["optional_temperature_donor"]
+    require(digest(source/"adv_t.F") == transport["after" if requested else "before"],
+            "temperature operator differs from the selected recipe")
+    if not requested:
+        require(not (evidence/"donor_source.json").exists(), "unexpected donor change in ordinary COARE build")
+        return {}
+    transform = read(evidence/"donor_source.json")
+    require(all(transform[k] == v for k,v in transport.items()), "temperature donor source pin mismatch")
+    probe = read(evidence/"donor_operator.json")
+    require(probe["native_cases"] == 177147 and all(0 <= probe[k] < 1.e-12 for k in
+            ("max_extensive_error","lower_range_error","upper_range_error")), "temperature donor conservation or range test failed")
+    return dict(temperature_transport="vertical_donor_temperature_only",temperature_source=transform,
+                temperature_operator_probe=probe,temperature_operator_probe_sha256=digest(evidence/"donor_operator.json"))
 
 
 def finish(args):
@@ -129,7 +158,10 @@ def finish(args):
     require(set(defined) == set(binding["feature_defines"]) | {"HEATING_CALCULATED", "LAKE_COARE_DIAG"},
             "COARE compile flags differ")
     log = (args.evidence/"build.log").read_text(errors="replace").splitlines()
-    for name in (*pin["changed"], "coare26z.F"):
+    extra = donor_evidence(args.source,args.evidence,pin,getattr(args,"temperature_donor",False))
+    if extra:
+        check_temperature_flags(defined)
+    for name in (*pin["changed"], "coare26z.F", "adv_t.F"):
         require(any(name in row.split() and "cpp " in row and "-DLAKE_COARE_DIAG " in row
                     and "-DHEATING_CALCULATED " in row for row in log), "missing preprocessed native unit: " + name)
     blank=(args.evidence/"blank_namelist.nml").read_text().upper()
@@ -143,7 +175,7 @@ def finish(args):
                 source_commit=pin["source_commit"], source_repository=pin["source_repository"], build_job=args.job_id,
                 changed=changes, cpp=defined, exe=str(binary.resolve()), sha256=digest(binary),
                 baseline_executable_sha256=binding["executable_sha256"], baseline_binding_sha256=digest(args.binding),
-                native_blank_sha256=digest(args.evidence/"blank_namelist.nml"), reader_status="pending")
+                native_blank_sha256=digest(args.evidence/"blank_namelist.nml"), reader_status="pending", **extra)
 
 
 def verify_reader(args):
@@ -157,6 +189,18 @@ def verify_reader(args):
             and launch["site"] == "perlmutter" and int(launch["mpi_ranks"]) > 1,
             "native launch differs from qualified parallel diagnostic executable")
     case=read(args.case)
+    transport=freeze.get("temperature_transport")
+    require(case["executable"].get("temperature_transport")==transport, "case selected a different vertical transport build")
+    if transport:
+        check_temperature_flags(freeze["cpp"])
+        nml=args.launch.parent/"superior_run.nml"
+        flags=re.findall(r"(?im)^\s*BACKWARD_ADVECTION\s*=\s*([^!,\r\n]+)",nml.read_text())
+        require(digest(nml)==case["nml_sha256"] and len(flags)==1 and flags[0].strip().upper().strip(".") in {"FALSE","F"},
+                "reader must exercise the forward explicit temperature donor branch")
+        require(transport=="vertical_donor_temperature_only" and
+                all(freeze["temperature_source"][k]==v for k,v in pin["optional_temperature_donor"].items()) and
+                freeze["temperature_operator_probe"]["native_cases"]==177147,
+                "reader requires the source-pinned, operator-tested temperature derivative")
     require(launch["case_sha256"] == digest(args.case) and case["executable"]["sha256"] == freeze["sha256"]
             and case["mpi_ranks"] == launch["mpi_ranks"] and str(args.history.resolve().parent) == str(args.launch.resolve().parent),
             "case or history differs from native launch")
@@ -170,8 +214,11 @@ def verify_reader(args):
                 and times[0].isoformat().replace("+00:00","Z")==case["start_utc"]
                 and times[-1].isoformat().replace("+00:00","Z")==case["end_utc"], "supply a closed benchmark reader stack covering its registered interval")
         results={t.isoformat():checks(out,i,bulk,rain,hydro) for i,t in enumerate(times) if i}
-    return dict(status="verified", scope="diagnostic", job_id=launch["job_id"], executable_sha256=freeze["sha256"],
+    result=dict(status="verified", scope="diagnostic", job_id=launch["job_id"], executable_sha256=freeze["sha256"],
                 input_sha256=source_hashes, history_sha256=digest(args.history), records=results)
+    if transport:
+        result["temperature_transport"]=transport
+    return result
 
 
 def main():
@@ -182,12 +229,15 @@ def main():
         p.add_argument("--"+key,required=True)
     p.add_argument("--output",required=True,type=Path)
     p.add_argument("--qos",choices=("debug","regular"),default="debug")
+    p.add_argument("--temperature-donor",action="store_true",help="Also test first-order donor faces for temperature vertical advection")
     p.add_argument("--binding",type=Path,required=True)
     p.set_defaults(fn=package)
     for cmd, fn in (("check-baseline",baseline),("freeze",finish)):
         p=commands.add_parser(cmd)
         for key in ("source","binding","evidence"):p.add_argument("--"+key,type=Path,required=True)
-        if cmd=="freeze":p.add_argument("--job-id",required=True)
+        if cmd=="freeze":
+            p.add_argument("--job-id",required=True)
+            p.add_argument("--temperature-donor",action="store_true")
         p.set_defaults(fn=fn)
     p=commands.add_parser("verify-reader")
     for key in ("freeze","launch","case","history","bulk","rain","hydrodynamic"):

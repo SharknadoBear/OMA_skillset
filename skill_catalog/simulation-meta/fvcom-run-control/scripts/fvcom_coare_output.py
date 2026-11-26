@@ -30,8 +30,10 @@ def bind(args, folder, attempt, launch, nml):
         if key == "forcing":
             native.check(native.sha(path) == case["forcing_manifest_sha256"], "Changed native forcing manifest")
     build = evidence["build"]
-    coare.verify_build(build, assets)
-    coare.verify_build(case["executable"], assets)
+    coare.verify_build(build, assets, nml)
+    coare.verify_build(case["executable"], assets, nml)
+    native.check(build.get("temperature_transport") == attempt.get("temperature_transport") ==
+                 case["executable"].get("temperature_transport"), "Vertical temperature transport identity differs")
     native.check(native.sha(Path(attempt["executable"])) == case["executable"]["sha256"] == build["sha256"] ==
                  launch["executable_sha256"] and case["executable"]["exe"] == attempt["executable"],
                  "Runtime executable differs from the build and launch")

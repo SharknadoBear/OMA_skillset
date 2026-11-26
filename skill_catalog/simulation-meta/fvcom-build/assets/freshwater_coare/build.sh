@@ -29,6 +29,7 @@ tar -C "$base" --exclude='./.git' --exclude='./fvcom_plased' --exclude='./*.o' -
 module -t list > "$e/modules.txt" 2>&1
 scontrol show job -o "$SLURM_JOB_ID" > "$e/allocation.txt"
 "$py" "$payload/patch_coare.py" "$src" "$e/changes.json"
+@DONOR_TRANSFORM@
 cd "$src"
 "$py" - "$base" "$previous" "$e" <<'PY'
 import json,sys
@@ -51,5 +52,5 @@ ldd fvcom_plased > "$e/ldd.txt"
 mkdir "$out/template"
 (cd "$out/template"; srun --exact --ntasks=1 --cpus-per-task=1 --cpu-bind=cores "$src/fvcom_plased" --create_namelist=blank > "$e/blank_probe.log" 2>&1)
 cp "$out/template/blank_run.nml" "$e/blank_namelist.nml"
-"$py" "$payload/freshwater_coare.py" freeze --source "$src" --evidence "$e" --binding "$payload/base_binding.json" --job-id "$SLURM_JOB_ID" > "$e/coare_build_freeze.json"
+"$py" "$payload/freshwater_coare.py" freeze --source "$src" --evidence "$e" --binding "$payload/base_binding.json" --job-id "$SLURM_JOB_ID" @DONOR_OPTION@ > "$e/coare_build_freeze.json"
 tar -C "$out" -czf "$payload/evidence_$SLURM_JOB_ID.tgz" evidence

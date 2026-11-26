@@ -88,5 +88,26 @@ class Coupled(unittest.TestCase):
         with self.assertRaises(ValueError):c.checked_sources({"../unsafe":files["bulk.nc"]},Path("/scratch/lake"))
         with self.assertRaises(ValueError):ledgers(self.root,128,24,0)
 
+    def test_uses_only_qualified_temperature_donor(self):
+        transport="vertical_donor_temperature_only"
+        source=dict(self.pin["optional_temperature_donor"],field="T1 only",positive_wts_donor="lower",
+                    negative_wts_donor="upper",upper_and_bed_faces="zero")
+        probe=dict(native_cases=177147,max_extensive_error=5.e-15,lower_range_error=0.,upper_range_error=0.)
+        donor=dict(self.derivative,temperature_transport=transport,temperature_source=source,
+                   temperature_operator_probe=probe,temperature_operator_probe_sha256="9"*64)
+        self.requirements["backward_advection"]="F"
+        self.put("build.json",donor)
+        with self.assertRaises(ValueError):self.run_attempt("coare_cold")
+        self.put("reader.json",dict(c.read(self.reader),temperature_transport=transport))
+        self.assertEqual(self.run_attempt("coare_cold")["temperature_transport"],transport)
+        for changes in (dict(cpp=[*donor["cpp"],"MPDATA"]),
+                        dict(temperature_source=dict(source,after="0"*64)),
+                        dict(temperature_operator_probe=dict(probe,max_extensive_error=.01))):
+            self.put("build.json",dict(donor,**changes))
+            with self.assertRaises(ValueError):self.run_attempt("coare_warm")
+        self.put("build.json",donor)
+        self.requirements["backward_advection"]="T"
+        with self.assertRaises(ValueError):self.run_attempt("coare_warm")
+
 if __name__=="__main__":
     unittest.main()

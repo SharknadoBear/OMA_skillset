@@ -22,6 +22,11 @@
     }
   },
   "coare26z_sha256": "3a1cda4c1099da808a0bfe9295973e94878e02f445b89d79f2e773a72f2ac561",
+  "optional_temperature_donor": {
+    "source_file": "adv_t.F",
+    "before": "1835493c31c9bea1e2022d41efac5dd7916e0d1386d7208469b4b497beeeefe9",
+    "after": "4b8762508eb605305b20a5e74ef58d1af743f10889197eafe02f0f2db361fb0f"
+  },
   "source_commit": "f8e4b50d4fd51409febcefc763cbc5dca11870e2",
   "source_repository": "https://github.com/SharknadoBear/FVCOM_MP.git"
 }

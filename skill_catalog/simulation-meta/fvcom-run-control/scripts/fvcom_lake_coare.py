@@ -74,7 +74,7 @@ def configuration(nml, name):
                 end_utc=end.isoformat().replace("+00:00","Z"))
 
 
-def verify_build(build, assets):
+def verify_build(build, assets, nml):
     pin = read(assets/"source_pin.json")
     flags = set(build["cpp"])
     require(build.get("schema") == "fvcom_coare_diagnostic_build_v1" and build.get("scope") == "diagnostic"
@@ -83,11 +83,28 @@ def verify_build(build, assets):
             "MULTIPROCESSOR","SPHERICAL","AIR_PRESSURE","WET_DRY"}.issubset(flags) and "TWO_D_MODEL" not in flags
             and re.fullmatch("[a-f0-9]{64}",build["sha256"]) and build["sha256"] != build["baseline_executable_sha256"],
             "Expected the pinned freshwater COARE diagnostic derivative")
+    transport_keys = {"temperature_transport", "temperature_source", "temperature_operator_probe",
+                      "temperature_operator_probe_sha256"}
+    if transport_keys.isdisjoint(build):
+        return
+    require(transport_keys <= build.keys() and build["temperature_transport"] == "vertical_donor_temperature_only",
+            "Incomplete or unknown vertical temperature transport qualification")
+    require(flags.isdisjoint({"MPDATA", "NH", "LIMITER_VER_ADV", "SEMI_IMPLICIT", "ONE_D_MODEL", "TWO_D_MODEL", "THIN_DAM"})
+            and value(nml, "BACKWARD_ADVECTION").upper().strip(".") in {"F", "FALSE"},
+            "This temperature donor requires explicit forward tracer advection")
+    source = dict(pin["optional_temperature_donor"], field="T1 only", positive_wts_donor="lower",
+                  negative_wts_donor="upper", upper_and_bed_faces="zero")
+    probe = build["temperature_operator_probe"]
+    require(build["temperature_source"] == source and probe.get("native_cases") == 177147
+            and all(0 <= probe[k] < 1.e-12 for k in ("max_extensive_error", "lower_range_error", "upper_range_error"))
+            and re.fullmatch("[0-9a-f]{64}", build["temperature_operator_probe_sha256"]),
+            "Vertical temperature source or compiled conservation and range test differs")
 
 
 def verify_reader(reader, build):
     require(reader.get("status") == "verified" and reader.get("scope") == "diagnostic"
             and reader["executable_sha256"] == build["sha256"] and reader.get("records")
+            and reader.get("temperature_transport") == build.get("temperature_transport")
             and re.fullmatch("[a-f0-9]{64}", reader["history_sha256"])
             and all({"coare_wind_speed","short_wave","latent_mass_Wm2","heat_addition_Wm2","raw_rain",
             "rain_and_dew","evap","hydro_mslp","uwind_stress","vwind_stress"} <= set(row["max_abs_error"])

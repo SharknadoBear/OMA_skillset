@@ -233,7 +233,8 @@ def audit(a):
     if diagnostic:
         import fvcom_coare_output as coupled
         check(launch["site"]=="perlmutter" and launch["constraint"]=="cpu" and launch["threads_per_rank"]==1
-              and receipt["account"]==allocation[0]["Account"]==manifest["account"], "Diagnostic site/account mismatch")
+              and receipt["account"]==allocation[0].get("Account")==manifest["account"],
+              "Diagnostic site/account mismatch. Include Account in the sacct columns.")
         field_reader=coupled.bind(a,folder,manifest,launch,nml)
         phase_lookup=coupled.phase_table()
         phases={}
@@ -362,6 +363,8 @@ def audit(a):
                  restart_receipts=all_receipts)
     if diagnostic:
         hours=int((last-first).total_seconds()/3600)
+        if "temperature_transport" in manifest:
+            summary["temperature_transport"]=manifest["temperature_transport"]
         ledgers,points=coupled.ledgers(folder,launch["mpi_ranks"],hours,initial_iint)
         summary.update(schema="fvcom_coare_native_audit_v1",scope="diagnostic",wet_phase=phases,
             phase_screen_passed=all(not phase[k]["wet_layers"] for phase in phases.values()
