@@ -206,12 +206,14 @@ def analyze_cpu(plan, records, plan_file_sha256=None):
         elapsed = median(r["model_step_seconds"] for r in rows)
         wall = median(r["allocation_seconds"] for r in rows)
         loop = [r.get("native_loop_seconds_per_iteration_at_end") for r in rows]
+        rss = [r.get("peak_memory_bytes_per_task") for r in rows]
         layouts.append(dict(ranks=ranks, nodes=nodes, repeat_count=len(rows),
                             model_step_seconds_median=elapsed, allocation_seconds_median=wall,
                             model_step_seconds_min=min(r["model_step_seconds"] for r in rows),
                             model_step_seconds_max=max(r["model_step_seconds"] for r in rows),
                             charged_node_hours_median=wall*nodes/3600, simulated_days_per_day_median=86400/elapsed,
                             native_loop_seconds_per_iteration_median=median(loop) if all(v is not None for v in loop) else None,
+                            peak_memory_bytes_per_task_max=max(rss) if all(v is not None for v in rss) else None,
                             seconds_per_internal_iteration_median=elapsed/rows[0]["fvcom_iterations"]))
     least = min(x["charged_node_hours_median"] for x in layouts)
     eligible = [x for x in layouts if x["charged_node_hours_median"] <= least * 1.15 + 1e-12]

@@ -30,7 +30,8 @@ class PerlmutterCPU(unittest.TestCase):
             return path
         nml = att / "superior_run.nml"
         nml.write_text("START_DATE='2025-07-01 00:00:00'\nEND_DATE='2025-07-02 00:00:00'\n"
-                       "STARTUP_TYPE='hotstart'\nSTARTUP_FILE='a.nc'\nEXTSTEP_SECONDS=2.5\nISPLIT=2\n")
+                       "STARTUP_TYPE='hotstart'\nSTARTUP_FILE='a.nc'\nEXTSTEP_SECONDS=2.5\nISPLIT=2\n"
+                       "NC_FIRST_OUT='2025-07-01 00:00:00'\nNC_OUT_INTERVAL='seconds=21600.0'\n")
         script = att / "job.sbatch"
         script.write_text("srun --ntasks=" + str(r))
         script_sha, nml_sha = map(benchmark.sha256, (script, nml))

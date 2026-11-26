@@ -1168,6 +1168,11 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--qos",choices=["regular","debug"],default="regular")
     q.add_argument("--case-name",default="superior")
     q.add_argument("--benchmark-summary",type=Path)
+    q = sub.add_parser("lake-audit",help="Verify native lake output, forcing reads and restart clocks on scratch")
+    for option in ("attempt","submission","accounting","river","cas","output","geometry"):
+        q.add_argument("--"+option,required=True,type=Path)
+    q.add_argument("--case-name",required=True)
+    q.add_argument("--checkpoint",action="append",default=[],metavar="LABEL=UTC")
     q = sub.add_parser("attempt")
     q.add_argument("--project", required=True); q.add_argument("--grid-case", required=True, choices=["accepted_t6v6", "fresh_reproduction", "retained_columbia"])
     q.add_argument("--plan"); q.add_argument("--index", type=int, required=True)
@@ -1218,6 +1223,9 @@ def main() -> int:
     elif args.command == "lake-attempt":
         from fvcom_lake_attempt import materialize
         result = materialize(args)
+    elif args.command == "lake-audit":
+        from fvcom_lake_audit import audit
+        result = audit(args)
     elif args.command == "audit":
         result = audit_run(Path(args.stdout), Path(args.stderr) if args.stderr else None,
                            args.exit_code, args.expected_final, [Path(x) for x in args.netcdf],

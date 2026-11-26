@@ -515,6 +515,9 @@ def main() -> int:
     q = sub.add_parser("collect-perlmutter")
     for name in ("plan", "attempt", "submission", "launch", "sacct", "stdout", "restart", "terminal", "output"):
         q.add_argument("--" + name, type=Path, required=True)
+    q = sub.add_parser("differences",help="Compare matched native histories from all nine Perlmutter replicates")
+    for name in ("plan","records","inventory","output"):
+        q.add_argument("--"+name,type=Path,required=True)
     q = sub.add_parser("render")
     q.add_argument("--plan", required=True); q.add_argument("--base-namelist", required=True)
     q.add_argument("--output-root", required=True); q.add_argument("--remote-input-dir", required=True)
@@ -526,6 +529,12 @@ def main() -> int:
     if args.command == "plan":
         result = make_plan(args.cores_per_node, args.ranks, args.repeats, not args.no_extend, args.max_ranks,
                            args.site, args.start_utc)
+    elif args.command == "differences":
+        from fvcom_benchmark_fields import evaluate
+        result=evaluate(args.plan,load_records(args.records),args.inventory)
+        write_json(args.output,result)
+        print(json.dumps({k:result[k] for k in ("status","run_count","pair_count","timestamps")}))
+        return 0
     elif args.command == "collect-perlmutter":
         from perlmutter_benchmark import collect_cpu
         result = collect_cpu(args.plan, args.attempt, args.submission, args.launch, args.sacct,

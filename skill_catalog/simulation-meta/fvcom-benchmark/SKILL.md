@@ -30,6 +30,8 @@ The analyzer selects the shortest median FVCOM application-step elapsed time amo
 
 The record also retains FVCOM's own cumulative `SECS/IT` stopwatch reading at the terminal model clock when available. Its three-replicate median measures the integration loop separately from both the complete MPI application step and the charged allocation.
 
+On scratch, compare all nine verified native runs with `differences --plan benchmark_plan.json --records records.json --inventory native_histories.json --output numerical_comparison.json`. Supply `members` keyed by each stage name; each value gives its `attempt` directory and `audit` path to the verified run-control native audit. Relative paths resolve against the inventory. The reducer binds exact history hashes and ordered mesh geometry, verifies the entire matched clock, and reports pairwise RMS and maximum absolute differences in elevation, temperature, salinity and currents on common wet nodes/elements. Wet-mask disagreement counts are preserved at each timestamp. Timing summaries include measured per-task peak RSS where Slurm provides all three replicates.
+
 ## Kestrel
 
 Use `$kestrel-hpc` for Kestrel jobs and `$fvcom-run-control` to audit completion.
