@@ -43,6 +43,24 @@ class LakeConfiguration(unittest.TestCase):
         self.args.end="2025-07-01T01:00:00Z"
         self.assertEqual(lake.lake_values(self.args)["NML_RESTART"]["RST_FIRST_OUT"],"'2025-07-01 01:00:00'")
 
+    def test_native_checkpoint_origins_and_limiter(self):
+        import netCDF4 as nc
+        start = "2025-07-02T01:00:00Z"
+        for origin in ("2018-01-01", "1858-11-17"):
+            with nc.Dataset("clock", "w", diskless=True) as ds:
+                ds.createDimension("time", 1)
+                day = ds.createVariable("Itime", "i4", ("time",))
+                millis = ds.createVariable("Itime2", "i4", ("time",))
+                day.units = "days since " + origin + " 00:00:00"
+                millis.units = "msec since 00:00:00"
+                day[:] = (n.parse_utc(start, "start") - n.parse_utc(origin, "origin")).days
+                millis[:] = 3600000
+                lake.check_startup_clock(ds, start)
+                with self.assertRaisesRegex(ValueError, "no startup record"):
+                    lake.check_startup_clock(ds, "2025-07-02T02:00:00Z")
+        self.args.scalar_positivity_control = False
+        self.assertEqual(lake.lake_values(self.args)["NML_PHYSICS"]["SCALAR_POSITIVITY_CONTROL"], "F")
+
 
 if __name__=="__main__":
     unittest.main()

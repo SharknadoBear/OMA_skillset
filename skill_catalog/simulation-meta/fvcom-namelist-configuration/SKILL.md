@@ -88,4 +88,6 @@ For `barotropic-tide-wind-river`, bind the complete river manifest and the same 
 
 ## Freshwater lake
 
+Use `--input-root` to verify a staged startup or continuation against its own integer-clock epoch. The July pilot uses both MJD analysis files and native restarts referenced to 2018. Use `--scalar-positivity-control` or `--no-scalar-positivity-control` to reproduce paired limiter experiments, and retain the chosen setting with the heat budget and wet-cell temperature ranges.
+
 For a spherical, closed Lake Superior baroclinic case, use `fvcom_namelist.py lake` with the exact frozen executable's blank, explicit UTC dates, calculated time step and native input basenames. The [freshwater configuration contract](references/contracts.md#freshwater-lake-configuration) covers forcing units, startup, cadence and output fields.

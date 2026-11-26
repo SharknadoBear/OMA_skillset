@@ -51,7 +51,8 @@ def lake_values(args):
         HORIZONTAL_MIXING_COEFFICIENT=0.1, HORIZONTAL_PRANDTL_NUMBER=1.0, VERTICAL_MIXING_TYPE="closure",
         VERTICAL_MIXING_COEFFICIENT=1e-6, VERTICAL_PRANDTL_NUMBER=1.0, BOTTOM_ROUGHNESS_TYPE="orig",
         BOTTOM_ROUGHNESS_KIND="constant", BOTTOM_ROUGHNESS_LENGTHSCALE=0.002, BOTTOM_ROUGHNESS_MINIMUM=0.0025,
-        CONVECTIVE_OVERTURNING=False, SCALAR_POSITIVITY_CONTROL=True, BAROTROPIC=False,
+        CONVECTIVE_OVERTURNING=False, SCALAR_POSITIVITY_CONTROL=getattr(args,"scalar_positivity_control",True),
+        BAROTROPIC=False,
         BAROCLINIC_PRESSURE_GRADIENT="sigma levels", SEA_WATER_DENSITY_FUNCTION="dens1", TEMPERATURE_ACTIVE=True,
         SALINITY_ACTIVE=False, WETTING_DRYING_ON=True, SURFACE_WAVE_MIXING=False, FLUME_BOTTOM=False,
         FLUME_DRAG_COEF=0.0, ADCOR_ON=True, RECALCULATE_RHO_MEAN=False, INTERVAL_RHO_MEAN="days=1.0",
@@ -92,6 +93,8 @@ def cli(argv=None):
     p.add_argument("--river-number", type=int, required=True)
     p.add_argument("--extstep", type=float, required=True)
     p.add_argument("--isplit", type=int, required=True)
+    p.add_argument("--scalar-positivity-control", action=argparse.BooleanOptionalAction, default=True,
+                   help="Set the native scalar limiter for reproducible heat-budget sensitivity tests")
     p.add_argument("--input-root",type=Path,help="Verify the staged native input names, grid, signed rivers and hotstart")
     a=p.parse_args(argv)
     values=lake_values(a)
@@ -105,6 +108,20 @@ def cli(argv=None):
         raise FileExistsError(a.output)
     a.output.write_text(rendered,encoding="utf-8",newline="\n")
     return 0
+
+
+def check_startup_clock(dataset, start):
+    from numpy import asarray
+
+    day = dataset["Itime"]
+    subday = dataset["Itime2"]
+    if not day.units.startswith("days since ") or not subday.units.lower().startswith(("msec", "millisecond")):
+        raise ValueError("unexpected units for native integer clock")
+    origin = n.parse_utc(day.units.removeprefix("days since "), "native integer date reference")
+    delta = n.parse_utc(start, "start") - origin
+    millis = delta.seconds * 1000 + delta.microseconds // 1000
+    if delta.microseconds % 1000 or not ((asarray(day[:]) == delta.days) & (asarray(subday[:]) == millis)).any():
+        raise ValueError("no startup record at the requested UTC start")
 
 
 def check_native_inputs(a):
@@ -132,18 +149,12 @@ def check_native_inputs(a):
             raise ValueError("lake startup must retain the NOAA 20 layers and 21 interfaces")
         for key in ("zeta","et","u","v","ua","va","temp","salinity","rho1","tmean1","smean1","rmean1",
                     "q2","q2l","l","km","kq","kh","el_press","iint","wet_nodes","wet_cells","wet_nodes_prev_int",
-                    "wet_cells_prev_int","wet_cells_prev_ext"):
+                    "wet_cells_prev_int","wet_cells_prev_ext","cor","cc_sponge"):
             if key not in dataset.variables:
                 raise ValueError("missing native hotstart field "+key)
         if not {"omega","w"} & dataset.variables.keys():
             raise ValueError("missing native vertical velocity omega or w")
-        start=n.parse_utc(a.start,"start")
-        epoch=n.parse_utc("1858-11-17T00:00:00Z","MJD epoch")
-        delta=start-epoch
-        mjd=delta.days
-        millis=delta.seconds*1000+delta.microseconds//1000
-        if not ((asarray(dataset["Itime"][:])==mjd)&(asarray(dataset["Itime2"][:])==millis)).any():
-            raise ValueError("no startup record at the requested UTC start")
+        check_startup_clock(dataset, a.start)
     with netCDF4.Dataset(root/a.surface) as met:
         for name,place in (("uwind_stress","nele"),("vwind_stress","nele"),("air_pressure","node"),
                            ("short_wave","node"),("net_heat_flux","node")):
